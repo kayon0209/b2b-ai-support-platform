@@ -9,7 +9,7 @@ route distribution, latency percentiles.
 import uuid
 from dataclasses import dataclass, field
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime.models import AgentRun, RunStatus
@@ -25,6 +25,9 @@ class QualityMetrics:
     failed: int = 0
     runs_with_citations: int = 0
     route_counts: dict[str, int] = field(default_factory=dict)
+    # Rows this tenant owns that carry no `started_at` (written before
+    # migration 0012). Reported so a shrinking window is explainable.
+    untimed_runs: int = 0
     latency_p50_ms: int | None = None
     latency_p95_ms: int | None = None
     # Ratios derived after aggregation
@@ -51,15 +54,23 @@ def _percentile(sorted_values: list[int], pct: float) -> int | None:
 async def aggregate_quality_metrics(
     session: AsyncSession, *, tenant_id: uuid.UUID, window_seconds: int = 3600
 ) -> QualityMetrics:
-    """Aggregate AgentRun rows in the trailing window. RLS context must be
-    set on the session by the caller (same convention as other services)."""
+    """Aggregate AgentRun rows in the trailing window.
+
+    RLS context must be set on the session by the caller (same convention as
+    other services).
+
+    The window filters on `started_at`, which is nullable: rows written
+    before migration 0012 have no timestamp. They are excluded rather than
+    assigned `now`, because counting an old run as current would inflate the
+    dashboard exactly when an operator is looking at it for an incident.
+    The count of excluded rows is reported so the gap is visible.
+    """
     cutoff = _now() - window_seconds
     stmt = select(AgentRun).where(
         AgentRun.tenant_id == tenant_id,
-        AgentRun.created_at >= cutoff,
+        AgentRun.started_at.is_not(None),
+        AgentRun.started_at >= cutoff,
     )
-    # created_at lives on... AgentRun lacks TimestampMixin; filter by id
-    # time-ordered instead is unreliable — use occurred window via SQL:
     rows = (await session.execute(stmt)).scalars().all()
 
     metrics = QualityMetrics(window_seconds=window_seconds)
@@ -77,6 +88,17 @@ async def aggregate_quality_metrics(
             metrics.failed += 1
         if run.latency_ms is not None:
             latencies.append(int(run.latency_ms))
+
+    # Observability: how many rows the window could not place in time.
+    metrics.untimed_runs = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(AgentRun)
+                .where(AgentRun.tenant_id == tenant_id, AgentRun.started_at.is_(None))
+            )
+        ).scalar_one()
+    )
 
     # Citation coverage: runs whose status is completed must carry citations.
     if rows:

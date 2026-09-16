@@ -58,6 +58,12 @@ class AgentRun(Base, PkMixin, TenantMixin):
     case_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     route: Mapped[str] = mapped_column(String(31), nullable=False)
     status: Mapped[str] = mapped_column(String(31), nullable=False, default="queued")
+    # When the run was enqueued, in epoch seconds (UTC). Named to match
+    # AuditEvent.occurred_at rather than `created_at`: AgentRun records an
+    # event, and the quality dashboard windows over this column. It is
+    # nullable because rows written before migration 0012 have no value;
+    # the aggregator skips them rather than guessing a timestamp.
+    started_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     prompt_version_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("prompt_versions.id"), nullable=True
     )

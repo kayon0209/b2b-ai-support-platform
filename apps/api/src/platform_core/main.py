@@ -30,6 +30,7 @@ from platform_core.agent_runtime.router import router as agent_runtime_router
 from platform_core.audit.router import router as audit_router
 from platform_core.cases.router import router as cases_router
 from platform_core.config import Settings, get_settings
+from platform_core.evaluation.router import router as quality_router
 from platform_core.identity.middleware import (
     TenantContextMiddleware,
     bootstrap_token_resolver,
@@ -45,6 +46,7 @@ app.include_router(cases_router)
 app.include_router(retrieval_router)
 app.include_router(agent_runtime_router)
 app.include_router(tool_gateway_router)
+app.include_router(quality_router)
 app.add_middleware(TenantContextMiddleware, resolver=bootstrap_token_resolver)
 
 

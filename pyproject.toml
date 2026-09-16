@@ -50,6 +50,16 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Source roots for the modular monolith. Declared here rather than relying on
+# an editable install so a fresh checkout runs the suite with nothing but
+# `pip install -r requirements-dev.txt` and `pytest`.
+pythonpath = [
+    "apps/api/src",
+    "apps/worker/src",
+    "packages/policy/src",
+    "packages/contracts/src",
+    "packages/observability/src",
+]
 testpaths = ["apps/api/tests", "packages/contracts/tests", "tests/evals"]
 addopts = "-q --strict-markers"
 markers = [
