@@ -52,6 +52,7 @@ from platform_core.tool_gateway.models import (
     ToolProposal,
     ToolRisk,
 )
+from platform_core.tool_gateway.registry import resolve_executors
 from platform_policy import Action
 
 router = APIRouter(prefix="/v1/tool-proposals", tags=["tool-gateway"])
@@ -240,6 +241,9 @@ async def propose_tool_call(request: Request, body: ToolProposeIn) -> Any:
                 status_code=403,
             )
 
+        # Proposing never executes, so no executor is resolved here. The
+        # adapter is only needed at execute time, and resolving it early
+        # would create a connector lookup on the propose path for nothing.
         gateway = ToolGateway(session, {})
         try:
             proposal = await gateway.propose(
@@ -317,6 +321,7 @@ async def confirm_tool_call(request: Request, proposal_id: str) -> Any:
         if denied is not None:
             return denied
 
+        # Confirming records a decision; it does not call the adapter.
         gateway = ToolGateway(session, {})
         try:
             confirmation = await gateway.confirm(
@@ -450,7 +455,17 @@ async def execute_tool_call(request: Request, proposal_id: str, body: ToolPropos
             )
         ).scalar_one_or_none()
 
-        gateway = ToolGateway(session, {})
+        # Resolve the executor from this tenant's active connectors. A
+        # tenant with no connected system yields no executor, and the
+        # gateway reports TOOL_EXECUTOR_MISSING rather than the router
+        # inventing a different failure.
+        executors = await resolve_executors(
+            session,
+            tenant_id=ctx.tenant_id,
+            tool_names=[tool.name] if tool is not None else [],
+        )
+
+        gateway = ToolGateway(session, executors)
         try:
             execution = await gateway.execute(
                 tenant_id=ctx.tenant_id,

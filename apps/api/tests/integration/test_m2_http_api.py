@@ -19,6 +19,7 @@ The pattern mirrors `test_audit_api.py`: a role-fabricating resolver is
 injected so policy gates can be tested without a live Keycloak.
 """
 
+import json
 import os
 import uuid
 from typing import Any
@@ -48,6 +49,10 @@ SLUG_B = "m2-api-b"
 CONFIRMED_TOOL = "m2_test_refund"
 # A tool whose risk class does not require confirmation.
 LOW_RISK_TOOL = "m2_test_add_note"
+
+# The platform tool that has a real adapter behind it. The connector-backed
+# tests below use this name so `resolve_executors` finds a provider mapping.
+JIRA_TOOL = "jira.create_issue"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -92,6 +97,17 @@ def seed_tenants_and_tools() -> None:
                     "inschema": '{"type":"object","properties":{"note":{"type":"string"}}}',
                     "reqconf": False,
                 },
+                {
+                    # The adapter-backed tool. Seeded here because the
+                    # connector-backed tests need a real catalog row; in
+                    # production a migration seeds the platform catalog.
+                    "name": JIRA_TOOL,
+                    "risk": "confirmed_write",
+                    "inschema": '{"type":"object","properties":{"title":{"type":"string"},'
+                    '"description":{"type":"string"},"case_ref":{"type":"string"}},'
+                    '"required":["title"]}',
+                    "reqconf": True,
+                },
             ],
         )
     yield
@@ -107,7 +123,7 @@ def _cleanup(admin: Any) -> None:
     proposal still points at it.
     """
     with admin.begin() as conn:
-        names = (CONFIRMED_TOOL, LOW_RISK_TOOL)
+        names = (CONFIRMED_TOOL, LOW_RISK_TOOL, JIRA_TOOL)
         conn.execute(
             text(
                 "DELETE FROM tool_executions WHERE proposal_id IN ("
@@ -136,6 +152,10 @@ def _cleanup(admin: Any) -> None:
         conn.execute(
             text("DELETE FROM tool_definitions WHERE name = ANY(:names)"),
             {"names": list(names)},
+        )
+        conn.execute(
+            text("DELETE FROM connectors WHERE tenant_id IN (:t1, :t2)"),
+            {"t1": TENANT_A, "t2": TENANT_B},
         )
         conn.execute(
             text("DELETE FROM cases WHERE tenant_id IN (:t1, :t2)"),
@@ -527,3 +547,236 @@ def test_execute_without_executor_reports_missing_executor() -> None:
     # The proposal must not be reported as executed.
     after = client.get(f"/v1/tool-proposals/{proposal_id}", headers=_auth()).json()
     assert after["proposal"]["status"] not in ("executed", "verified")
+
+
+# --- 8. Connector-backed execution ----------------------------------------
+#
+# The tests above prove the gateway refuses correctly. These prove the
+# other half: when a tenant genuinely has the connector, a confirmed write
+# reaches the adapter and the postcondition decides the final status.
+
+
+def _seed_connector(tenant_id: str, provider: str, capabilities: list[str]) -> None:
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO connectors (id, tenant_id, provider, name, status, "
+                "capabilities, configuration, credential_ref, last_health_at) VALUES "
+                "(gen_random_uuid(), :tid, :prov, :name, 'active', "
+                "CAST(:caps AS jsonb), CAST(:cfg AS jsonb), :cref, NULL) "
+                "ON CONFLICT (tenant_id, provider, name) DO UPDATE "
+                "SET capabilities = CAST(:caps AS jsonb), status = 'active'"
+            ),
+            {
+                "tid": tenant_id,
+                "prov": provider,
+                "name": f"m2-{provider}",
+                "caps": json.dumps(capabilities),
+                "cfg": json.dumps({"base_url": "https://jira.example"}),
+                "cref": f"vault://kv/{provider}",
+            },
+        )
+    admin.dispose()
+
+
+def _clear_connectors(tenant_id: str) -> None:
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(text("DELETE FROM connectors WHERE tenant_id = :t"), {"t": tenant_id})
+    admin.dispose()
+
+
+def test_connector_without_capability_cannot_execute() -> None:
+    """Connecting Jira for reads must not authorize creating issues.
+
+    The tenant holds a Jira connector that does not claim `create_issue`,
+    so even a fully confirmed proposal cannot execute. This is the
+    connector-level half of the same guarantee the gateway enforces.
+    """
+    _clear_connectors(TENANT_A)
+    _seed_connector(TENANT_A, "jira", ["read_issue"])
+    try:
+        client = _client(TENANT_A, "support_admin")
+        proposed = client.post(
+            "/v1/tool-proposals",
+            headers={**_auth(), "Idempotency-Key": "conn-cap-1"},
+            json={"tool_name": "jira.create_issue", "arguments": {"title": "x"}},
+        )
+        assert proposed.status_code == 200, proposed.text
+        assert proposed.json()["proposal"]["required_confirmation"] is True
+        proposal_id = proposed.json()["proposal"]["proposal_id"]
+
+        client.post(f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={})
+        resp = client.post(
+            f"/v1/tool-proposals/{proposal_id}/execute",
+            headers={**_auth(), "Idempotency-Key": "conn-cap-exec"},
+            json={},
+        )
+        assert resp.status_code == 501
+        assert resp.json()["error"]["code"] == "TOOL_EXECUTOR_MISSING"
+    finally:
+        _clear_connectors(TENANT_A)
+
+
+def test_confirmed_write_with_connector_reaches_adapter() -> None:
+    """The happy path: propose -> confirm -> execute -> verified.
+
+    The adapter is stubbed at the factory boundary so the test does not
+    depend on a live Jira. What it proves is that the whole chain is wired:
+    the proposal is confirmable, the confirmation satisfies the gate, the
+    executor is resolved from the tenant's connector, and the postcondition
+    result becomes the reported status.
+    """
+    import importlib
+
+    from platform_core.integrations.sdk import ConnectorContext
+    from platform_core.tool_gateway import registry as registry_mod
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _StubJira:
+        def __init__(self, context: ConnectorContext) -> None:
+            self.context = context
+
+        async def execute(
+            self, tool_name: str, parameters: dict[str, Any], idempotency_key: str
+        ) -> dict[str, Any] | None:
+            calls.append((tool_name, parameters))
+            return {"ok": True, "issue_key": "SUP-42"}
+
+        async def verify_postcondition(
+            self,
+            tool_name: str,
+            parameters: dict[str, Any],
+            output: dict[str, Any] | None,
+        ) -> bool | None:
+            return True
+
+    _clear_connectors(TENANT_A)
+    _seed_connector(TENANT_A, "jira", ["create_issue"])
+
+    # Patch the factory table so the resolver builds the stub instead of a
+    # real Jira client. Restored in `finally` so other tests are unaffected.
+    original = registry_mod.default_factories
+
+    def _patched() -> dict[str, registry_mod.AdapterFactory]:
+        real = original()
+        # Keep every real factory except Jira, which is stubbed so the test
+        # never touches the network.
+        patched = dict(real)
+        patched["jira"] = registry_mod.AdapterFactory(provider="jira", build=_StubJira)
+        return patched
+
+    registry_mod.default_factories = _patched
+    try:
+        main_mod = importlib.import_module("platform_core.main")
+        assert main_mod  # imported for side effects of router registration
+
+        client = _client(TENANT_A, "support_admin")
+        proposed = client.post(
+            "/v1/tool-proposals",
+            headers={**_auth(), "Idempotency-Key": "conn-ok-1"},
+            json={"tool_name": "jira.create_issue", "arguments": {"title": "Refund stuck"}},
+        )
+        assert proposed.status_code == 200, proposed.text
+        proposal_id = proposed.json()["proposal"]["proposal_id"]
+
+        confirmed = client.post(
+            f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={}
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        assert confirmed.json()["confirmation"]["action_hash"]
+
+        executed = client.post(
+            f"/v1/tool-proposals/{proposal_id}/execute",
+            headers={**_auth(), "Idempotency-Key": "conn-ok-exec"},
+            json={},
+        )
+        assert executed.status_code == 200, executed.text
+        body = executed.json()
+        # Two distinct fields, two distinct meanings: the execution reports
+        # that it ran, `verification_status` reports that the postcondition
+        # was actually confirmed, and the proposal advances to `verified`.
+        # Conflating them would let an ambiguous outcome look like success.
+        assert body["execution"]["status"] == "executed"
+        assert body["execution"]["verification_status"] == "verified"
+        assert body["proposal"]["status"] == "verified"
+
+        # The adapter actually received the frozen, sanitized arguments.
+        assert calls == [("jira.create_issue", {"title": "Refund stuck"})]
+    finally:
+        registry_mod.default_factories = original
+        _clear_connectors(TENANT_A)
+
+
+def test_execute_is_idempotent_under_retry() -> None:
+    """A retried execute returns the same execution, not a second one."""
+    import importlib
+
+    from platform_core.integrations.sdk import ConnectorContext
+    from platform_core.tool_gateway import registry as registry_mod
+
+    calls: list[str] = []
+
+    class _StubJira:
+        def __init__(self, context: ConnectorContext) -> None:
+            self.context = context
+
+        async def execute(
+            self, tool_name: str, parameters: dict[str, Any], idempotency_key: str
+        ) -> dict[str, Any] | None:
+            calls.append(idempotency_key)
+            return {"ok": True, "issue_key": "SUP-43"}
+
+        async def verify_postcondition(
+            self,
+            tool_name: str,
+            parameters: dict[str, Any],
+            output: dict[str, Any] | None,
+        ) -> bool | None:
+            return True
+
+    _clear_connectors(TENANT_A)
+    _seed_connector(TENANT_A, "jira", ["create_issue"])
+
+    original = registry_mod.default_factories
+
+    def _patched() -> dict[str, registry_mod.AdapterFactory]:
+        real = original()
+        # Keep every real factory except Jira, which is stubbed so the test
+        # never touches the network.
+        patched = dict(real)
+        patched["jira"] = registry_mod.AdapterFactory(provider="jira", build=_StubJira)
+        return patched
+
+    registry_mod.default_factories = _patched
+    try:
+        importlib.import_module("platform_core.main")
+        client = _client(TENANT_A, "support_admin")
+        proposal_id = client.post(
+            "/v1/tool-proposals",
+            headers={**_auth(), "Idempotency-Key": "idem-ok-1"},
+            json={"tool_name": "jira.create_issue", "arguments": {"title": "dup"}},
+        ).json()["proposal"]["proposal_id"]
+        client.post(f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={})
+
+        first = client.post(
+            f"/v1/tool-proposals/{proposal_id}/execute",
+            headers={**_auth(), "Idempotency-Key": "idem-ok-exec"},
+            json={},
+        )
+        second = client.post(
+            f"/v1/tool-proposals/{proposal_id}/execute",
+            headers={**_auth(), "Idempotency-Key": "idem-ok-exec"},
+            json={},
+        )
+        assert first.status_code == 200 and second.status_code == 200
+        assert (
+            first.json()["execution"]["execution_id"] == second.json()["execution"]["execution_id"]
+        )
+        # The adapter ran exactly once.
+        assert len(calls) == 1
+    finally:
+        registry_mod.default_factories = original
+        _clear_connectors(TENANT_A)
