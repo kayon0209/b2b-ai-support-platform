@@ -191,3 +191,51 @@ class ChatwootClient:
     @property
     def breaker(self) -> CircuitBreaker:
         return self._breaker
+
+    async def fetch_message(
+        self,
+        *,
+        account_id: str,
+        conversation_id: str,
+        message_id: str,
+    ) -> str | None:
+        """Read one message body from Chatwoot.
+
+        The platform stores only minimized webhook metadata (docs/security.md
+        logging policy: raw customer content is not persisted in the inbox).
+        The runtime therefore fetches the body on demand, which also means a
+        rotated or deleted message is never served from a stale local copy.
+
+        Returns None when the message cannot be read; the caller must then
+        abstain or hand off rather than answer without the question.
+        """
+        url = (
+            f"{self._base_url}/api/v1/accounts/{account_id}"
+            f"/conversations/{conversation_id}/messages"
+        )
+        self._breaker.before_call()
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                headers=self._headers,
+                timeout=self._timeout,
+            ) as client:
+                resp = await client.get(url)
+        except (httpx.TimeoutException, httpx.TransportError):
+            self._breaker.on_failure()
+            return None
+
+        if resp.status_code >= 300:
+            self._breaker.on_failure()
+            return None
+        self._breaker.on_success()
+
+        payload = resp.json()
+        messages = payload.get("payload") if isinstance(payload, dict) else payload
+        if not isinstance(messages, list):
+            return None
+        for message in messages:
+            if str(message.get("id")) == str(message_id):
+                content = message.get("content")
+                return content if isinstance(content, str) else None
+        return None

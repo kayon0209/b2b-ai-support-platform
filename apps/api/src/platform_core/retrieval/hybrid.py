@@ -12,11 +12,25 @@ retrievable (docs/domain-model.md knowledge rule).
 import struct
 import uuid
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 RRF_K = 60  # standard reciprocal-rank-fusion constant
+
+
+class Embedder(Protocol):
+    """Query-embedding boundary.
+
+    Implemented by the provider-backed embedder in production and by
+    `DeterministicEmbedder` in tests that must not depend on a provider.
+    """
+
+    async def embed_query(self, query: str) -> list[float]: ...
+
+    @property
+    def dimensions(self) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -46,11 +60,12 @@ def _vector_literal(vec: list[float]) -> str:
 
 
 def embed_deterministic(text_input: str, dim: int = 1536) -> list[float]:
-    """Placeholder embedding: deterministic hash-based vector.
+    """Deterministic hash-based vector, for tests only.
 
-    Real embeddings arrive with the model integration; retrieval tests use
-    this to exercise the vector path without a provider dependency.
-    Splits the SHA-256 digest chain into normalized floats.
+    NOT a semantic embedding: it encodes no meaning and must never be used
+    for production retrieval. `DeterministicEmbedder` wires it behind the
+    Embedder protocol so tests exercise the vector path without a provider
+    dependency or a credential.
     """
     out: list[float] = []
     counter = 0
@@ -72,6 +87,41 @@ def hashlib_sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
 
 
+@dataclass
+class DeterministicEmbedder:
+    """Test double satisfying the Embedder protocol."""
+
+    _dimensions: int = 1536
+
+    @property
+    def dimensions(self) -> int:
+        return self._dimensions
+
+    async def embed_query(self, query: str) -> list[float]:
+        return embed_deterministic(query, self._dimensions)
+
+
+@dataclass
+class ProviderEmbedder:
+    """Provider-backed embedder (production path)."
+
+    Wraps a ChatProvider-style embedding capability behind the retrieval
+    module's narrow interface so `hybrid_search` does not depend on the
+    llm package directly.
+    """
+
+    provider: object  # EmbeddingProvider; typed loosely to keep layering clean
+    _dimensions: int = 1536
+
+    @property
+    def dimensions(self) -> int:
+        return self._dimensions
+
+    async def embed_query(self, query: str) -> list[float]:
+        result = await self.provider.embed([query])  # type: ignore[attr-defined]
+        return list(result.vectors[0])
+
+
 async def hybrid_search(
     session: AsyncSession,
     *,
@@ -83,6 +133,7 @@ async def hybrid_search(
     now_ts: int | None = None,
     fts_candidates: int = 40,
     vector_candidates: int = 40,
+    embedder: Embedder | None = None,
 ) -> list[RetrievedChunk]:
     """Run FTS + vector search under tenant/ACL filter, fuse with RRF.
 
@@ -91,11 +142,16 @@ async def hybrid_search(
     When `principal` is given, knowledge ACLs narrow results further:
     spaces without any ACL rows stay open; a space/document with ACL rows
     requires a matching principal entry (fail closed per resource).
+
+    `embedder` selects the query vector source. Omitting it falls back to
+    the deterministic test embedder so existing call sites and tests keep
+    working; production callers must pass a provider-backed embedder.
     """
     import time
 
     now = now_ts or int(time.time())
-    vec = embed_deterministic(query)
+    active_embedder: Embedder = embedder or DeterministicEmbedder()
+    vec = await active_embedder.embed_query(query)
     space_filter = ""
     params: dict = {
         "tid": str(tenant_id),

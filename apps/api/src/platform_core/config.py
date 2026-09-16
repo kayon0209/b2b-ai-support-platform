@@ -32,6 +32,22 @@ class Settings(BaseSettings):
     chatwoot_api_token: SecretStr | None = None
     chatwoot_webhook_secret: SecretStr | None = None
 
+    # LLM provider (Gitee AI / 模力方舟, OpenAI-compatible surface).
+    # Credentials are resolved server-side and never reach the model or logs
+    # (docs/security.md). Unset api_key means the model boundary fails closed.
+    llm_base_url: str = "https://ai.gitee.com/v1"
+    llm_api_key: SecretStr | None = None
+    llm_model: str = "qwen3.8-flash"
+    llm_embedding_model: str = "Qwen3-Embedding-8B"
+    llm_rerank_model: str = "bge-reranker-v2-m3"
+    # Matches the chunks.embedding vector(1536) column; the provider honors
+    # a dimensions request so no schema migration is required.
+    llm_embedding_dimensions: int = 1536
+    llm_timeout_seconds: float = 30.0
+    llm_max_retries: int = 2
+    # Retrieval reranker deadline; on breach we fall back to fused order.
+    rerank_timeout_seconds: float = 2.0
+
 
 @lru_cache
 def get_settings() -> Settings:

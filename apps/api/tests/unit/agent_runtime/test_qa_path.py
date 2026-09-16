@@ -110,3 +110,58 @@ def test_abstention_text_never_invents_explanation() -> None:
 def test_excerpt_hash_stable() -> None:
     assert excerpt_hash("abc") == excerpt_hash("abc")
     assert excerpt_hash("abc") != excerpt_hash("abd")
+
+
+# --- Regression: stopwords must not make an unrelated question look grounded ---
+#
+# Before the stopword filter, `_term_overlap` counted function words, so the
+# single shared token "the" was enough to clear MIN_EXCERPT_OVERLAP (0.12):
+#   "who won the world cup in 1998?"  -> 0.167  (passed)
+#   "what is the capital of the moon?" -> 0.250  (passed)
+#   "the the the the"                  -> 1.000  (passed)
+# An off-topic question would therefore reach the model on irrelevant evidence,
+# defeating the abstention contract in docs/agent.md.
+
+
+def test_stopword_only_query_abstains() -> None:
+    """A query of function words carries no topic and must abstain."""
+    decision = decide_abstention("the the the the", [_chunk()])
+    assert decision.abstain is True
+    assert decision.reason_code == ABSTAIN_LOW_RELEVANCE
+
+
+def test_shared_stopword_does_not_imply_relevance() -> None:
+    """Off-topic questions that happen to share "the"/"who"/"what" with the
+    excerpt must still abstain."""
+    excerpt = _chunk("The refund window is 30 days for annual plans.")
+    for query in (
+        "what is the capital of the moon?",
+        "who won the world cup in 1998?",
+        "how is the weather today?",
+    ):
+        decision = decide_abstention(query, [excerpt])
+        assert decision.abstain is True, query
+        assert decision.reason_code == ABSTAIN_LOW_RELEVANCE, query
+
+
+def test_on_topic_query_still_passes_after_stopword_filter() -> None:
+    """Tightening must not cause false abstention on a real question."""
+    excerpt = _chunk("The refund window is 30 days for annual plans.")
+    for query in (
+        "how long is the refund window?",
+        "what is the refund policy?",
+        "refund window",
+    ):
+        decision = decide_abstention(query, [excerpt])
+        assert decision.abstain is False, query
+
+
+def test_content_terms_drops_stopwords_and_short_tokens() -> None:
+    from platform_core.agent_runtime.qa_path import _content_terms
+
+    terms = _content_terms("What is the refund window?")
+    assert "refund" in terms
+    assert "window" in terms
+    assert "the" not in terms
+    assert "what" not in terms
+    assert "is" not in terms

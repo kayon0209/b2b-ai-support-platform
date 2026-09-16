@@ -70,8 +70,56 @@ services:
       APP_SECRET_KEY: local-dev-secret
       APP_CHATWOOT_WEBHOOK_SECRET: local-dev-webhook-secret
       APP_CHATWOOT_BASE_URL: http://chatwoot-web:3000
+      APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
+      APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
+      APP_LLM_MODEL: ${APP_LLM_MODEL:-qwen3.8-flash}
     ports:
       - "8000:8000"
+    depends_on:
+      ai-postgres:
+        condition: service_healthy
+      ai-redis:
+        condition: service_healthy
+
+  # Customer-visible AI work: InboxEvent -> agent run. Same image as the
+  # API, different entrypoint (docs/deployment-and-operations.md worker
+  # classes). Runs against the AI database and the AI Redis only.
+  ai-worker-interactive:
+    build:
+      context: ../..
+      dockerfile: infra/compose/api.Dockerfile
+    command: ["python", "-m", "worker.runner"]
+    environment:
+      APP_ENVIRONMENT: local
+      APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
+      APP_REDIS_URL: redis://ai-redis:6379/0
+      APP_SECRET_KEY: local-dev-secret
+      APP_CHATWOOT_BASE_URL: http://chatwoot-web:3000
+      APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
+      APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
+      APP_LLM_MODEL: ${APP_LLM_MODEL:-qwen3.8-flash}
+    depends_on:
+      ai-postgres:
+        condition: service_healthy
+      ai-redis:
+        condition: service_healthy
+
+  # Bulk work: parsing, chunking, embedding. Lowest priority, so it can
+  # never starve interactive work (evaluation.queues reservation model).
+  ai-worker-ingestion:
+    build:
+      context: ../..
+      dockerfile: infra/compose/api.Dockerfile
+    command: ["python", "-m", "worker.runner"]
+    environment:
+      APP_ENVIRONMENT: local
+      APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
+      APP_REDIS_URL: redis://ai-redis:6379/0
+      APP_SECRET_KEY: local-dev-secret
+      APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
+      APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
+      APP_LLM_MODEL: ${APP_LLM_MODEL:-qwen3.8-flash}
+      APP_WORKER_QUEUE: ingestion
     depends_on:
       ai-postgres:
         condition: service_healthy

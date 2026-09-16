@@ -93,6 +93,111 @@ class AbstentionDecision:
 
 MIN_EXCERPT_OVERLAP = 0.12
 
+# Function words carry no topical signal. Without this list a query such as
+# "who won the world cup in 1998?" scores against any excerpt containing
+# "the", which would let an unrelated question clear the abstention gate and
+# reach the model (docs/agent.md: abstention, not guessing).
+STOPWORDS = frozenset(
+    {
+        "about",
+        "after",
+        "again",
+        "against",
+        "all",
+        "also",
+        "and",
+        "any",
+        "are",
+        "because",
+        "been",
+        "before",
+        "being",
+        "between",
+        "both",
+        "but",
+        "can",
+        "cannot",
+        "could",
+        "did",
+        "does",
+        "doing",
+        "done",
+        "down",
+        "during",
+        "each",
+        "few",
+        "for",
+        "from",
+        "further",
+        "had",
+        "has",
+        "have",
+        "having",
+        "her",
+        "here",
+        "hers",
+        "him",
+        "his",
+        "how",
+        "into",
+        "its",
+        "just",
+        "more",
+        "most",
+        "much",
+        "must",
+        "not",
+        "now",
+        "off",
+        "onto",
+        "only",
+        "other",
+        "our",
+        "ours",
+        "out",
+        "over",
+        "own",
+        "same",
+        "she",
+        "should",
+        "some",
+        "such",
+        "than",
+        "that",
+        "the",
+        "their",
+        "theirs",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "through",
+        "too",
+        "under",
+        "until",
+        "very",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "who",
+        "whom",
+        "why",
+        "will",
+        "with",
+        "would",
+        "you",
+        "your",
+        "yours",
+    }
+)
+
 
 def _stem(term: str) -> str:
     """Crude singular/stem fold so refund~refunds, day~days match.
@@ -105,17 +210,29 @@ def _stem(term: str) -> str:
     return term
 
 
+def _content_terms(text_input: str) -> set[str]:
+    """Stemmed content words: no stopwords, no tokens of length <= 2.
+
+    The length filter alone is not enough — "the", "who", "what" pass it and
+    would let an unrelated question look grounded. Dropping stopwords first
+    makes the overlap signal depend on topic words only.
+    """
+    tokens = re.findall(r"\w+", text_input.lower())
+    return {_stem(t) for t in tokens if len(t) > 2 and t not in STOPWORDS}
+
+
 def _term_overlap(query: str, excerpt: str) -> float:
-    """Cheap lexical overlap: fraction of query terms present in excerpt.
+    """Cheap lexical overlap: fraction of query content terms in excerpt.
 
     A real semantic confidence model arrives with the LLM integration;
     per docs/agent.md we treat similarity scores as ranking signals, not
     confidence, so abstention uses this conservative groundedness proxy.
+    Queries made entirely of stopwords yield 0.0 and therefore abstain.
     """
-    q_terms = {_stem(t) for t in re.findall(r"\w+", query.lower()) if len(t) > 2}
+    q_terms = _content_terms(query)
     if not q_terms:
         return 0.0
-    e_terms = {_stem(t) for t in re.findall(r"\w+", excerpt.lower())}
+    e_terms = _content_terms(excerpt)
     return len(q_terms & e_terms) / len(q_terms)
 
 

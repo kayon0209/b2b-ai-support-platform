@@ -34,11 +34,18 @@ ignore = ["S101"]  # assert allowed in tests
 [tool.mypy]
 python_version = "3.12"
 strict = true
-mypy_path = ["apps/api/src", "packages/contracts/src", "packages/policy/src", "packages/observability/src"]
-files = ["apps/api/src", "apps/worker/src", "packages/contracts/src", "packages/policy/src", "packages/observability/src"]
+mypy_path = ["apps/api/src", "apps/worker/src", "packages/contracts/src", "packages/policy/src", "packages/observability/src"]
+explicit_package_bases = true
+# packages/contracts is a placeholder with no modules yet; listing it would
+# abort the whole run, so the file list names only populated roots.
+files = ["apps/api/src", "apps/worker/src", "packages/policy/src", "packages/observability/src"]
 
 [[tool.mypy.overrides]]
 module = ["alembic.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["jsonschema.*", "uuid6.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

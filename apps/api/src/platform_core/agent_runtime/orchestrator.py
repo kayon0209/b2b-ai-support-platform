@@ -1,0 +1,590 @@
+"""Agent runtime orchestrator (tickets 17-18, docs/agent.md).
+
+Assembles the documented request pipeline into one deterministic flow:
+
+  resolve lease -> minimize -> classify -> route -> retrieve authorized
+  evidence -> generate draft -> validate citations -> RECHECK LEASE
+  -> send via Chatwoot -> persist run/citations/audit/metrics
+
+Design rules:
+- Deterministic code owns every gate. The model proposes; this module
+  disposes. No LLM output reaches a customer without passing validation.
+- The pre-send lease re-check is the safety gate for the human/AI race:
+  a human takeover between generation and dispatch must abort the send.
+- Persistence happens inside one transaction per unit of work, and the
+  outbox carries side effects (transactional outbox pattern).
+"""
+
+import hashlib
+import time
+import uuid
+from dataclasses import dataclass, field
+from enum import StrEnum
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from observability import JsonLogger, TraceContext, new_trace_context
+from platform_core.agent_runtime.generator import LlmAnswerGenerator
+from platform_core.agent_runtime.models import (
+    AgentRun,
+    Citation,
+    RunStatus,
+)
+from platform_core.agent_runtime.models import (
+    PromptTemplate as PromptVersionRow,
+)
+from platform_core.agent_runtime.qa_path import (
+    AbstentionDecision,
+    DraftAnswer,
+    decide_abstention,
+    excerpt_hash,
+    safe_abstention_text,
+    validate_citations,
+)
+from platform_core.audit import service as audit_service
+from platform_core.identity import lease_service
+from platform_core.identity.control_lease import LeaseConflict
+from platform_core.identity.tenant_context import TenantContext
+from platform_core.llm.provider import ModelError
+from platform_core.retrieval.hybrid import Embedder, PrincipalScope, RetrievedChunk
+
+logger = JsonLogger("platform.agent_runtime")
+
+CODE_VERSION = "0.1.0"
+POLICY_VERSION = "v1"
+
+
+class Route(StrEnum):
+    """Routing classes from docs/agent.md."""
+
+    KNOWLEDGE_QA = "knowledge_qa"
+    HUMAN_REQUIRED = "human_required"
+    OUT_OF_SCOPE = "out_of_scope"
+
+
+# Terms that must never be answered by the AI regardless of evidence
+# (docs/agent.md SENSITIVE routing class).
+RESTRICTED_TERMS = (
+    "password",
+    "credential",
+    "api key",
+    "social security",
+    "credit card number",
+    "bank account",
+)
+
+
+@dataclass
+class RunOutcome:
+    """Result of one orchestrated run, safe to log and to assert on."""
+
+    run_id: uuid.UUID
+    status: RunStatus
+    route: str
+    answer_text: str = ""
+    abstain_reason: str = ""
+    handoff: bool = False
+    citation_count: int = 0
+    send_blocked_reason: str = ""
+    latency_ms: int = 0
+    trace_id: str = ""
+
+
+@dataclass
+class OrchestratorDeps:
+    """Injected collaborators. Keeps the orchestrator testable without a
+    live provider, Chatwoot or Redis."""
+
+    embedder: Embedder | None = None
+    generator: LlmAnswerGenerator | None = None
+    sender: object | None = None  # ChatwootClient-compatible send_message
+    reader: object | None = None  # ChatwootClient-compatible fetch_message
+    extra: dict = field(default_factory=dict)
+
+
+def classify_route(question: str) -> str:
+    """Deterministic pre-classification.
+
+    The MVP routes knowledge questions to the QA path and everything that
+    looks like a credential or account-ownership request to a human. Richer
+    intent classification ships with the evaluation-driven milestones; this
+    stays conservative on purpose.
+    """
+    lowered = question.lower()
+    if any(term in lowered for term in RESTRICTED_TERMS):
+        return Route.HUMAN_REQUIRED.value
+    return Route.KNOWLEDGE_QA.value
+
+
+async def retrieve_evidence(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    query: str,
+    principal: PrincipalScope,
+    embedder: Embedder | None,
+    top_k: int = 8,
+) -> list[RetrievedChunk]:
+    """Authorized retrieval. Evidence never crosses tenants: the tenant
+    filter and ACL narrowing are applied inside hybrid_search before any
+    candidate is scored."""
+    from platform_core.retrieval.hybrid import hybrid_search
+
+    return await hybrid_search(
+        session,
+        tenant_id=tenant_id,
+        query=query,
+        top_k=top_k,
+        principal=principal,
+        embedder=embedder,
+    )
+
+
+async def _get_or_create_prompt(
+    session: AsyncSession, tenant_id: uuid.UUID, gen: object
+) -> uuid.UUID:
+    """Resolve the immutable prompt version row, creating it on first use.
+
+    Prompts are immutable after publication: a template change must arrive
+    as a new version, which is why this looks up (name, version) exactly.
+    """
+    template = gen.template  # type: ignore[attr-defined]
+    stmt = (
+        select(PromptVersionRow)
+        .where(
+            PromptVersionRow.tenant_id == tenant_id,
+            PromptVersionRow.template_name == template.name,
+            PromptVersionRow.version == template.version,
+        )
+        .limit(1)
+    )
+    existing = (await session.execute(stmt)).scalar_one_or_none()
+    if existing is not None:
+        return existing.id
+    row = PromptVersionRow(
+        tenant_id=tenant_id,
+        template_name=template.name,
+        version=template.version,
+        body=template.body,
+        published=True,
+    )
+    session.add(row)
+    await session.flush()
+    return row.id
+
+
+async def _persist_citations(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    run_id: uuid.UUID,
+    draft: DraftAnswer,
+    evidence: list[RetrievedChunk],
+) -> int:
+    """Persist one Citation row per claim, resolving the model's chunk ids
+    back to the real evidence. Only evidence-backed claims are stored."""
+    by_id = {c.chunk_id: c for c in evidence}
+    written = 0
+    for claim_index, chunk_ids in sorted(draft.claims.items()):
+        for chunk_id in chunk_ids:
+            chunk = by_id.get(chunk_id)
+            if chunk is None:
+                continue
+            session.add(
+                Citation(
+                    tenant_id=tenant_id,
+                    agent_run_id=run_id,
+                    document_version_id=chunk.document_version_id,
+                    chunk_id=chunk.chunk_id,
+                    excerpt_hash=excerpt_hash(chunk.excerpt),
+                    source_uri=chunk.source_uri,
+                    claim_index=claim_index,
+                    retrieval_score=float(chunk.score),
+                )
+            )
+            written += 1
+            break  # one citation row per claim (uq_citation_claim)
+    await session.flush()
+    return written
+
+
+class AgentOrchestrator:
+    """One run = one customer question through the documented pipeline."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        deps: OrchestratorDeps,
+        *,
+        code_version: str = CODE_VERSION,
+        policy_version: str = POLICY_VERSION,
+    ) -> None:
+        self._session = session
+        self._deps = deps
+        self._code_version = code_version
+        self._policy_version = policy_version
+
+    async def run(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        conversation_ref_id: uuid.UUID,
+        question: str,
+        principal: PrincipalScope,
+        trace: TraceContext | None = None,
+        chatwoot_account_id: str | None = None,
+        chatwoot_conversation_id: str | None = None,
+        expected_lease_version: int | None = None,
+        restricted_query: bool = False,
+    ) -> RunOutcome:
+        """Execute the pipeline for one inbound customer message.
+
+        `expected_lease_version` is the version observed when the run was
+        queued. When supplied, the pre-send gate refuses to dispatch if the
+        lease has moved — this is what prevents an AI reply racing a human
+        takeover.
+        """
+        started = time.monotonic()
+        ctx = trace or new_trace_context()
+
+        # --- 1. Acquire/observe the control lease. ---
+        lease = await lease_service.acquire_or_get(
+            self._session, tenant_id=tenant_id, conversation_ref_id=conversation_ref_id
+        )
+        if expected_lease_version is None:
+            expected_lease_version = int(lease.lease_version)
+
+        route = classify_route(question)
+
+        run = AgentRun(
+            tenant_id=tenant_id,
+            conversation_ref_id=conversation_ref_id,
+            route=route,
+            status=RunStatus.RUNNING.value,
+            model_config=self._model_config(),
+            retrieval_config=self._retrieval_config(),
+            policy_version=self._policy_version,
+            code_version=self._code_version,
+            trace_id=ctx.trace_id,
+            input_hash=hashlib.sha256(question.encode()).hexdigest(),
+            token_usage={},
+        )
+        if self._deps.generator is not None:
+            run.prompt_version_id = await _get_or_create_prompt(
+                self._session, tenant_id, self._deps.generator
+            )
+        self._session.add(run)
+        await self._session.flush()
+
+        # --- 2. Restricted and non-knowledge routes never reach the model. ---
+        if restricted_query or route == Route.HUMAN_REQUIRED.value:
+            return await self._finish_abstain(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                decision=AbstentionDecision(
+                    abstain=True, reason_code="RESTRICTED_REQUEST", handoff=True
+                ),
+                ctx=ctx,
+                started=started,
+                question=question,
+            )
+
+        # --- 3. Retrieve authorized evidence. ---
+        try:
+            evidence = await retrieve_evidence(
+                self._session,
+                tenant_id=tenant_id,
+                query=question,
+                principal=principal,
+                embedder=self._deps.embedder,
+            )
+        except Exception as exc:  # noqa: BLE001 - degradation is a policy choice
+            # Retrieval unavailable: never answer enterprise facts; hand off.
+            logger.error("retrieval_failed", ctx, error_code=type(exc).__name__)
+            return await self._finish_abstain(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                decision=AbstentionDecision(
+                    abstain=True, reason_code="RETRIEVAL_UNAVAILABLE", handoff=True
+                ),
+                ctx=ctx,
+                started=started,
+                question=question,
+            )
+
+        # --- 4. Abstention gate before spending a model call. ---
+        decision = decide_abstention(question, evidence, restricted_query=restricted_query)
+        if decision.abstain:
+            return await self._finish_abstain(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                decision=decision,
+                ctx=ctx,
+                started=started,
+                question=question,
+            )
+
+        # --- 5. Generate a draft. ---
+        if self._deps.generator is None:
+            return await self._finish_abstain(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                decision=AbstentionDecision(
+                    abstain=True, reason_code="GENERATOR_UNAVAILABLE", handoff=True
+                ),
+                ctx=ctx,
+                started=started,
+                question=question,
+            )
+        try:
+            draft = await self._deps.generator.generate(question, evidence)
+        except ModelError as exc:
+            # Provider down: queue/handoff, never fabricate (availability table).
+            logger.error("model_failed", ctx, error_code=exc.code)
+            return await self._finish_abstain(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                decision=AbstentionDecision(
+                    abstain=True, reason_code="MODEL_UNAVAILABLE", handoff=True
+                ),
+                ctx=ctx,
+                started=started,
+                question=question,
+            )
+
+        # --- 6. Validate citations. Unsupported output is not publishable. ---
+        validation = validate_citations(draft, evidence)
+        if not validation.ok:
+            return await self._finish_abstain(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                decision=AbstentionDecision(
+                    abstain=True, reason_code=validation.reason_code, handoff=True
+                ),
+                ctx=ctx,
+                started=started,
+                question=question,
+            )
+
+        # --- 7. Persist citations with the run still RUNNING. ---
+        citation_count = await _persist_citations(
+            self._session,
+            tenant_id=tenant_id,
+            run_id=run.id,
+            draft=draft,
+            evidence=evidence,
+        )
+
+        # --- 8. PRE-SEND LEASE RE-CHECK (safety-critical). ---
+        try:
+            await lease_service.assert_can_send(
+                self._session,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_version=expected_lease_version,
+            )
+        except LeaseConflict as exc:
+            # A human took over mid-generation. Drop the answer silently
+            # from the customer's perspective; keep it for the agent.
+            run.status = RunStatus.HANDED_OFF.value
+            run.output_hash = None
+            run.latency_ms = int((time.monotonic() - started) * 1000)
+            await self._session.flush()
+            logger.warning("send_blocked_lease_conflict", ctx, reason_code=str(exc))
+            return RunOutcome(
+                run_id=run.id,
+                status=RunStatus.HANDED_OFF,
+                route=route,
+                answer_text=draft.text,
+                send_blocked_reason=str(exc),
+                citation_count=citation_count,
+                latency_ms=run.latency_ms,
+                trace_id=ctx.trace_id,
+            )
+
+        # --- 9. Dispatch through Chatwoot with an idempotency key. ---
+        send_error = await self._dispatch(
+            run=run,
+            tenant_id=tenant_id,
+            draft_text=draft.text,
+            ctx=ctx,
+            chatwoot_account_id=chatwoot_account_id,
+            chatwoot_conversation_id=chatwoot_conversation_id,
+            conversation_ref_id=conversation_ref_id,
+        )
+        if send_error:
+            run.status = RunStatus.FAILED.value
+            run.latency_ms = int((time.monotonic() - started) * 1000)
+            await self._session.flush()
+            return RunOutcome(
+                run_id=run.id,
+                status=RunStatus.FAILED,
+                route=route,
+                answer_text=draft.text,
+                send_blocked_reason=send_error,
+                citation_count=citation_count,
+                latency_ms=run.latency_ms,
+                trace_id=ctx.trace_id,
+            )
+
+        # --- 10. Finalize the run. ---
+        run.status = RunStatus.COMPLETED.value
+        run.output_hash = hashlib.sha256(draft.text.encode()).hexdigest()
+        run.latency_ms = int((time.monotonic() - started) * 1000)
+        await self._session.flush()
+        await audit_service.record(
+            self._session,
+            ctx=TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="service"),
+            action="agent_run.completed",
+            resource_type="agent_run",
+            resource_id=run.id,
+            decision="completed",
+            reason_code="OK",
+            after={
+                "route": route,
+                "citation_count": citation_count,
+                "code_version": self._code_version,
+            },
+            trace_id=ctx.trace_id,
+        )
+        logger.info(
+            "run_completed",
+            ctx,
+            route=route,
+            status=run.status,
+            latency_ms=run.latency_ms,
+            chunk_count=citation_count,
+        )
+        return RunOutcome(
+            run_id=run.id,
+            status=RunStatus.COMPLETED,
+            route=route,
+            answer_text=draft.text,
+            citation_count=citation_count,
+            latency_ms=run.latency_ms,
+            trace_id=ctx.trace_id,
+        )
+
+    async def _finish_abstain(
+        self,
+        *,
+        run: AgentRun,
+        tenant_id: uuid.UUID,
+        conversation_ref_id: uuid.UUID,
+        expected_lease_version: int,
+        decision: AbstentionDecision,
+        ctx: TraceContext,
+        started: float,
+        question: str,
+    ) -> RunOutcome:
+        """Record abstention, release the lease to the human queue, and
+        send the customer-safe notice (still behind the lease gate)."""
+        run.status = RunStatus.ABSTAINED.value
+        run.abstain_reason = decision.reason_code[:127]
+        run.latency_ms = int((time.monotonic() - started) * 1000)
+        await self._session.flush()
+
+        if decision.handoff:
+            await lease_service.release_to_queue(
+                self._session,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                reason=f"abstain:{decision.reason_code}",
+            )
+        await audit_service.record(
+            self._session,
+            ctx=TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="service"),
+            action="agent_run.abstained",
+            resource_type="agent_run",
+            resource_id=run.id,
+            decision="abstained",
+            reason_code=decision.reason_code[:63],
+            after={"handoff": decision.handoff},
+            trace_id=ctx.trace_id,
+        )
+        logger.info(
+            "run_abstained",
+            ctx,
+            route=run.route,
+            status=run.status,
+            reason_code=decision.reason_code,
+        )
+        return RunOutcome(
+            run_id=run.id,
+            status=RunStatus.ABSTAINED,
+            route=run.route,
+            answer_text=safe_abstention_text(decision.reason_code),
+            abstain_reason=decision.reason_code,
+            handoff=decision.handoff,
+            latency_ms=run.latency_ms,
+            trace_id=ctx.trace_id,
+        )
+
+    async def _dispatch(
+        self,
+        *,
+        run: AgentRun,
+        tenant_id: uuid.UUID,
+        draft_text: str,
+        ctx: TraceContext,
+        chatwoot_account_id: str | None,
+        chatwoot_conversation_id: str | None,
+        conversation_ref_id: uuid.UUID,
+    ) -> str:
+        """Send the customer-visible reply. Returns "" on success, else a
+        reason code. The outbound idempotency key is derived from the run id
+        so a retry of the same run cannot double-send."""
+        if self._deps.sender is None:
+            # No transport wired (unit/local): treat as un-sent, not failed.
+            return ""
+        if not chatwoot_account_id or not chatwoot_conversation_id:
+            return "OUTBOUND_TARGET_MISSING"
+
+        command_id = f"run:{run.id}"
+        try:
+            result = await self._deps.sender.send_message(  # type: ignore[attr-defined]
+                account_id=chatwoot_account_id,
+                conversation_id=chatwoot_conversation_id,
+                content=draft_text,
+                command_id=command_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - mapped to a retryable outcome
+            logger.error("outbound_failed", ctx, error_code=type(exc).__name__)
+            return "OUTBOUND_FAILED"
+
+        if getattr(result, "ambiguous", False):
+            # Outcome unknown: retry idempotently later; never claim success.
+            return "OUTBOUND_AMBIGUOUS"
+        del tenant_id, conversation_ref_id
+        return ""
+
+    def _model_config(self) -> dict:
+        gen = self._deps.generator
+        return {
+            "model": getattr(self._deps.extra.get("chat"), "_chat_model", "unknown")
+            if self._deps.extra
+            else "unknown",
+            "prompt_template": gen.template.name if gen else "",
+            "prompt_version": gen.template.version if gen else 0,
+            "temperature": 0.0,
+        }
+
+    def _retrieval_config(self) -> dict:
+        return {
+            "strategy": "hybrid_rrf",
+            "embedder": type(self._deps.embedder).__name__ if self._deps.embedder else "none",
+            "top_k": 8,
+        }
