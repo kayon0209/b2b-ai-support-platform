@@ -84,6 +84,11 @@ services:
   # Customer-visible AI work: InboxEvent -> agent run. Same image as the
   # API, different entrypoint (docs/deployment-and-operations.md worker
   # classes). Runs against the AI database and the AI Redis only.
+  #
+  # APP_CHATWOOT_API_TOKEN is required here and NOT optional: the orchestrator
+  # treats a missing sender as "un-sent, not failed", so a worker without a
+  # token would consume real customer messages and reply to nobody while
+  # reporting success. worker.wiring fails closed on this.
   ai-worker-interactive:
     build:
       context: ../..
@@ -95,6 +100,7 @@ services:
       APP_REDIS_URL: redis://ai-redis:6379/0
       APP_SECRET_KEY: local-dev-secret
       APP_CHATWOOT_BASE_URL: http://chatwoot-web:3000
+      APP_CHATWOOT_API_TOKEN: ${APP_CHATWOOT_API_TOKEN:-}
       APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
       APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
       APP_LLM_MODEL: ${APP_LLM_MODEL:-qwen3.8-flash}

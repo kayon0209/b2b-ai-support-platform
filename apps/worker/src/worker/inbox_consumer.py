@@ -33,6 +33,23 @@ logger = JsonLogger("platform.worker")
 # inbox does not grow unbounded on conversation-lifecycle chatter.
 ACTIONABLE_EVENT_TYPES = {"message_created"}
 
+# Only customer-authored messages may trigger a run.
+#
+# This is a self-reply guard, and it is load-bearing. Chatwoot fires
+# `message_created` for outbound messages too, so without this filter the
+# agent's own reply arrives as a new inbox event, the agent answers that,
+# and the loop never terminates — one customer question becomes an
+# unbounded stream of LLM calls and customer-visible messages. Verified
+# against a live Chatwoot: a single question produced replies up to
+# message id 17 before the worker was stopped.
+#
+# `message_type` is Chatwoot's own field: "incoming" is the customer,
+# "outgoing" is an agent or bot. Anything else (missing, unknown) is
+# treated as non-actionable: for a reply guard the safe default is to
+# stay silent, since answering a message we did not author is only
+# correct for genuine inbound traffic.
+CUSTOMER_MESSAGE_TYPES = {"incoming"}
+
 # System principal for AI-initiated retrieval. Group membership is granted
 # explicitly; the AI never inherits a human's scope.
 AI_PRINCIPAL = PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",))
@@ -142,6 +159,19 @@ async def resolve_question(event: ClaimedEvent, deps: OrchestratorDeps) -> str |
     return body
 
 
+def is_customer_message(event: ClaimedEvent) -> bool:
+    """True only for a message the *customer* authored.
+
+    The agent must never answer its own replies: Chatwoot emits
+    `message_created` for outbound messages too, which would otherwise
+    feed each answer straight back in as the next question.
+    """
+    message_type = event.minimized_payload.get("message_type")
+    if not isinstance(message_type, str):
+        return False
+    return message_type.strip().lower() in CUSTOMER_MESSAGE_TYPES
+
+
 async def process_event(
     session: AsyncSession,
     event: ClaimedEvent,
@@ -154,6 +184,16 @@ async def process_event(
     but deliberately not actioned.
     """
     if event.event_type not in ACTIONABLE_EVENT_TYPES:
+        return None
+
+    if not is_customer_message(event):
+        # Either the agent's own reply looping back, or an event type we do
+        # not treat as a question. Recorded and acked, never answered.
+        logger.info(
+            "event_skipped_not_customer",
+            delivery_id=event.delivery_id,
+            message_type=str(event.minimized_payload.get("message_type")),
+        )
         return None
 
     # The inbox row may legitimately lack routing fields (e.g. non-message
