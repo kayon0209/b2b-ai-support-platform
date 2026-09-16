@@ -65,6 +65,11 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
             Action.KNOWLEDGE_ACL_MANAGE,
             Action.TOOL_READ,
             Action.TOOL_WRITE_LOW,
+            # A support admin can authorize a confirmed write (the
+            # confirmation still binds to the exact action hash and
+            # expires) but not a human_approval tool, which is reserved
+            # for tenant_owner.
+            Action.TOOL_WRITE_CONFIRMED,
         }
     ),
     "knowledge_manager": frozenset(
@@ -165,7 +170,8 @@ class PolicyEngine:
             if p_type == "role" and p_id == principal.role:
                 return True
             if p_type in ("department", "enterprise_account"):
-                if p_id in principal.attributes.get("groups", ()):  # type: ignore[operator]
+                groups = principal.attributes.get("groups", ())
+                if isinstance(groups, (list, tuple, set, frozenset)) and p_id in groups:
                     return True
         return False
 

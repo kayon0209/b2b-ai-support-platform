@@ -129,3 +129,18 @@ class ModelBundle(Protocol):
     embedding: EmbeddingProvider
     rerank: RerankProvider
     breaker: CircuitBreaker
+
+
+@dataclass
+class ConcreteModelBundle:
+    """Dataclass implementation of ModelBundle.
+
+    A Protocol cannot be instantiated, so composition roots need a concrete
+    carrier. `breaker` is exposed so health/metrics code can read circuit
+    state without reaching into the client.
+    """
+
+    chat: ChatProvider
+    embedding: EmbeddingProvider
+    rerank: RerankProvider
+    breaker: CircuitBreaker
