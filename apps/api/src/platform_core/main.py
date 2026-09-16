@@ -36,6 +36,7 @@ from platform_core.identity.middleware import (
     TenantContextMiddleware,
     bootstrap_token_resolver,
 )
+from platform_core.knowledge.gap_router import router as knowledge_gap_router
 from platform_core.retrieval.router import router as retrieval_router
 from platform_core.support_bridge.router import router as support_bridge_router
 from platform_core.tool_gateway.router import router as tool_gateway_router
@@ -49,6 +50,7 @@ app.include_router(agent_runtime_router)
 app.include_router(tool_gateway_router)
 app.include_router(quality_router)
 app.include_router(prompt_router)
+app.include_router(knowledge_gap_router)
 app.add_middleware(TenantContextMiddleware, resolver=bootstrap_token_resolver)
 
 
