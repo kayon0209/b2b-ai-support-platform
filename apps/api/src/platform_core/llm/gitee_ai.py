@@ -149,7 +149,9 @@ class GiteeAiClient:
         started = time.monotonic()
         payload: dict[str, Any] = {
             "model": model or self._chat_model,
-            "messages": [{"role": m.role.value, "content": m.content} for m in messages],
+            # ProviderRole is a StrEnum, so `str()` normalises both members
+            # and plain strings onto the wire without a .value lookup.
+            "messages": [{"role": str(m.role), "content": m.content} for m in messages],
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": False,
