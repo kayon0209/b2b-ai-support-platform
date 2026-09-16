@@ -1,0 +1,58 @@
+[project]
+name = "b2b-ai-support"
+version = "0.1.0"
+description = "Enterprise AI customer support platform (Chatwoot kernel + FastAPI control plane)"
+requires-python = ">=3.12"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "detect-secrets>=1.5",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["apps/api/src", "apps/worker/src", "packages/*/src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC"]
+ignore = ["S101"]  # assert allowed in tests
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S107", "S110"]
+"**/tests/**" = ["S105", "S106", "S107", "S110"]
+# retrieval/hybrid.py: SQL f-string interpolates only the code-owned
+# space_filter constant; every value is a bound parameter.
+"apps/api/src/platform_core/retrieval/hybrid.py" = ["S608"]
+# negative suite builds DELETE/SELECT from a code-owned table list
+"apps/api/tests/integration/test_cross_tenant_negative.py" = ["S608"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = ["apps/api/src", "packages/contracts/src", "packages/policy/src", "packages/observability/src"]
+files = ["apps/api/src", "apps/worker/src", "packages/contracts/src", "packages/policy/src", "packages/observability/src"]
+
+[[tool.mypy.overrides]]
+module = ["alembic.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["apps/api/tests", "packages/contracts/tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "integration: requires docker-compose services",
+    "contract: schema contract tests",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true

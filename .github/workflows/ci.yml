@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check apps packages
+      - run: ruff format --check apps packages
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install detect-secrets
+      - name: Scan for secrets
+        run: |
+          detect-secrets scan --all-files \
+            --exclude-files '\.venv' \
+            --exclude-files '\.lock$' \
+            --exclude-files 'package-lock\.json$' \
+            > .secrets.baseline.new
+          python - <<'EOF'
+          import json, sys
+          with open(".secrets.baseline.new") as f:
+              results = json.load(f)["results"]
+          if results:
+              print("Potential secrets detected:", json.dumps(results, indent=2)[:4000])
+              sys.exit(1)
+          print("No secrets found")
+          EOF
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install fastapi "sqlalchemy[asyncio]" "psycopg[binary]" pydantic pydantic-settings uuid6 alembic pytest pytest-asyncio httpx
+      - name: Run unit tests
+        run: pytest apps/api/tests/unit packages/contracts/tests -m "not integration"
+        env:
+          PYTHONPATH: apps/api/src:packages/contracts/src
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start services
+        run: docker compose -f infra/compose/docker-compose.yml up -d ai-postgres ai-redis
+      - name: Create app role
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            psql -U platform -d platform -c \
+            "DO \$\$ BEGIN
+               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'platform_app') THEN
+                 CREATE ROLE platform_app LOGIN PASSWORD 'platform_app' NOBYPASSRLS;
+               END IF;
+             END \$\$;
+             GRANT platform_app TO platform;
+             GRANT ALL ON SCHEMA public TO platform_app;"
+      - name: Install dependencies
+        run: pip install fastapi "sqlalchemy[asyncio]" "psycopg[binary]" pydantic pydantic-settings uuid6 alembic pytest pytest-asyncio httpx
+      - name: Run migrations
+        run: alembic -c apps/api/migrations/alembic.ini upgrade head
+        env:
+          APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
+          PYTHONPATH: apps/api/src
+      - name: Run integration tests
+        run: pytest apps/api/tests/integration -m integration
+        env:
+          APP_TEST_DATABASE_URL: postgresql+psycopg://platform_app:platform_app@localhost:5435/platform
+          APP_ADMIN_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
+          PYTHONPATH: apps/api/src

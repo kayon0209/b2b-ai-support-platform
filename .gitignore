@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+secrets-report.json
+raw-scan.json
+
+# Local environment: holds provider credentials. Never commit.
+.env
+.env.*
+!.env.example
