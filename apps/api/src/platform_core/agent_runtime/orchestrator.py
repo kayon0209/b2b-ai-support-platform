@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -100,7 +101,7 @@ class OrchestratorDeps:
     generator: LlmAnswerGenerator | None = None
     sender: object | None = None  # ChatwootClient-compatible send_message
     reader: object | None = None  # ChatwootClient-compatible fetch_message
-    extra: dict = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 def classify_route(question: str) -> str:
@@ -571,7 +572,7 @@ class AgentOrchestrator:
         del tenant_id, conversation_ref_id
         return ""
 
-    def _model_config(self) -> dict:
+    def _model_config(self) -> dict[str, Any]:
         gen = self._deps.generator
         return {
             "model": getattr(self._deps.extra.get("chat"), "_chat_model", "unknown")
@@ -582,7 +583,7 @@ class AgentOrchestrator:
             "temperature": 0.0,
         }
 
-    def _retrieval_config(self) -> dict:
+    def _retrieval_config(self) -> dict[str, Any]:
         return {
             "strategy": "hybrid_rrf",
             "embedder": type(self._deps.embedder).__name__ if self._deps.embedder else "none",

@@ -28,7 +28,7 @@ class ImNotificationAdapter(ConnectorAdapter):
 
     async def fetch(
         self, resource: str, cursor: str | None = None
-    ) -> tuple[list[dict[str, Any]], str | None]:
+    ) -> tuple[list[Any], str | None]:
         return [], None  # notification-only adapter
 
     async def send_notification(

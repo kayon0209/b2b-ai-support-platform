@@ -13,22 +13,30 @@ LLM-judged rubric scoring plugs in at the same seam.
 
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from platform_core.agent_runtime.qa_path import (
     DraftAnswer,
-    RetrievedChunk,
     decide_abstention,
     validate_citations,
 )
-from platform_core.retrieval.hybrid import PrincipalScope
+
+# RetrievedChunk is defined in retrieval.hybrid; qa_path re-exports it for
+# its own signature. Import it from the defining module so the dependency is
+# explicit rather than riding on someone else's re-export.
+from platform_core.retrieval.hybrid import PrincipalScope, RetrievedChunk
 
 
 class AnswerFn(Protocol):
     """pluggable generation: evidence + question -> DraftAnswer."""
 
     async def __call__(self, question: str, evidence: list[RetrievedChunk]) -> DraftAnswer: ...
+
+
+# The retrieval seam: a question plus the caller's ACL scope -> evidence.
+RetrieveFn = Callable[[str, PrincipalScope], Awaitable[list[RetrievedChunk]]]
 
 
 @dataclass
@@ -96,7 +104,7 @@ class EvalReport:
 
 
 class EvaluationRunner:
-    def __init__(self, answer_fn: AnswerFn, retrieve_fn) -> None:
+    def __init__(self, answer_fn: AnswerFn, retrieve_fn: RetrieveFn) -> None:
         """retrieve_fn(question, principal_scope) -> list[RetrievedChunk]."""
         self._answer_fn = answer_fn
         self._retrieve_fn = retrieve_fn

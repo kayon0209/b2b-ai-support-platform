@@ -8,6 +8,7 @@
 
 import enum
 import uuid
+from typing import Any
 
 from sqlalchemy import BigInteger, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
@@ -33,8 +34,8 @@ class Connector(Base, PkMixin, TenantMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(31), nullable=False, default="active")
     # feature capabilities claimed by the adapter: read_account, create_issue...
-    capabilities: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    configuration: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    capabilities: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    configuration: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     # Secret manager reference (e.g. "vault://kv/crm/acme"), never credentials.
     credential_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Webhook endpoint signing secret reference for inbound deliveries.

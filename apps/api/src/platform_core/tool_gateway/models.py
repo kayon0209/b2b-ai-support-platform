@@ -13,6 +13,7 @@ Execution sequence: propose -> authorize -> preview -> confirm -> execute
 
 import enum
 import uuid
+from typing import Any
 
 from sqlalchemy import BigInteger, ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
@@ -53,9 +54,11 @@ class ToolDefinition(Base, PkMixin, TenantMixin):
     name: Mapped[str] = mapped_column(String(127), nullable=False, index=True)
     version: Mapped[int] = mapped_column(nullable=False, default=1)
     risk: Mapped[str] = mapped_column(String(31), nullable=False, default="read")
-    input_schema: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    output_schema: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    required_permissions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    input_schema: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    output_schema: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    required_permissions: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
     timeout_ms: Mapped[int] = mapped_column(nullable=False, default=10_000)
     idempotent: Mapped[bool] = mapped_column(nullable=False, default=True)
     requires_confirmation: Mapped[bool] = mapped_column(nullable=False, default=False)
@@ -73,8 +76,8 @@ class ToolProposal(Base, PkMixin, TenantMixin):
     action_hash: Mapped[str] = mapped_column(String(127), nullable=False, index=True)
     actor_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     # Sanitized: credentials, tokens, PII stripped before storage.
-    sanitized_input: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    sanitized_output: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    sanitized_input: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    sanitized_output: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(String(31), nullable=False, default="proposed")
     permission_decision: Mapped[str] = mapped_column(String(31), nullable=False, default="pending")
     permission_reason: Mapped[str] = mapped_column(String(63), nullable=False, default="")
@@ -117,8 +120,8 @@ class ToolExecution(Base, PkMixin, TenantMixin):
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(31), nullable=False, default="executing")
     # executed | verified | failed | unknown
-    sanitized_input: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    sanitized_output: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    sanitized_input: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    sanitized_output: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     verification_status: Mapped[str | None] = mapped_column(String(31), nullable=True)
     started_at: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     completed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

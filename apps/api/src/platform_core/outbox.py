@@ -8,6 +8,7 @@ and publish loses nothing — the row is still queued.
 
 import enum
 import uuid
+from typing import Any
 
 from sqlalchemy import BigInteger, Index, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -32,7 +33,7 @@ class OutboxEvent(Base, PkMixin, TenantMixin):
     event_version: Mapped[int] = mapped_column(nullable=False, default=1)
     aggregate_type: Mapped[str] = mapped_column(String(63), nullable=False)
     aggregate_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(
         String(31), nullable=False, default=OutboxStatus.QUEUED.value, index=True
     )

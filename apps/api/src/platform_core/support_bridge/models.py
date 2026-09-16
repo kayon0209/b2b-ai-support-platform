@@ -11,6 +11,7 @@ hash plus redacted metadata, never the full customer payload unencrypted.
 
 import enum
 import uuid
+from typing import Any
 
 from sqlalchemy import BigInteger, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
@@ -37,7 +38,7 @@ class ExternalResourceRef(Base, PkMixin, TenantMixin):
     external_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_version: Mapped[str | None] = mapped_column(String(63), nullable=True)
     last_synced_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    metadata_json: Mapped[dict] = mapped_column(
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default="{}"
     )
 
@@ -64,7 +65,9 @@ class InboxEvent(Base, PkMixin, TenantMixin):
     event_type: Mapped[str] = mapped_column(String(127), nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(127), nullable=False)
     # Minimized payload: IDs, timestamps, content hash — no raw message body.
-    minimized_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    minimized_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
     status: Mapped[InboxEventStatus] = mapped_column(
         String(31), nullable=False, default=InboxEventStatus.RECEIVED.value
     )

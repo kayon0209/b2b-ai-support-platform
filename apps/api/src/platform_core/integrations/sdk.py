@@ -73,7 +73,25 @@ class ExecutionResult:
 class ConnectorAdapter(ABC):
     """Base class for all external system adapters (docs/api-contracts.md
     connector interface). Subclasses implement provider-specific calls and
-    map payloads to canonical models."""
+    map payloads to canonical models.
+
+    Read surface only: `health_check` and `fetch`. The write surface
+    (`execute` / `verify_postcondition`) deliberately does NOT live here.
+
+    It used to, with the shape `execute(command, parameters, key) ->
+    ExecutionResult`. But the Tool Gateway consumes a different protocol for
+    the same two method names - `ToolExecutor`, with
+    `execute(tool_name, parameters, key) -> dict | None` and
+    `verify_postcondition(tool_name, parameters, output)`. A subclass cannot
+    satisfy both, so any adapter implementing the write surface was a Liskov
+    violation: the mismatch is invisible at runtime (Python resolves by name)
+    until a caller passes the other shape and gets a `TypeError`.
+
+    `CrmReadAdapter` was excluded from the executor registry to work around
+    exactly this, which treated the symptom. Removing the conflicting
+    declarations is the fix: write-capable adapters now satisfy
+    `ToolExecutor` structurally and can be registered.
+    """
 
     provider: str = "abstract"
     capabilities: tuple[str, ...] = ()
@@ -88,18 +106,16 @@ class ConnectorAdapter(ABC):
     @abstractmethod
     async def fetch(
         self, resource: str, cursor: str | None = None
-    ) -> tuple[list[dict[str, Any]], str | None]:
-        """Return (canonical records, next_cursor)."""
+    ) -> tuple[list[Any], str | None]:
+        """Return (canonical records, next_cursor).
 
-    async def execute(
-        self, command: str, parameters: dict[str, Any], idempotency_key: str
-    ) -> ExecutionResult:
-        """Write operation with idempotency. Default: not supported."""
-        raise NotImplementedError(f"{self.provider} does not support execute")
-
-    async def verify_postcondition(self, execution: ExecutionResult) -> bool:
-        """Verify a write actually took effect. Default: trust ok flag."""
-        return bool(execution.ok)
+        Records are the adapter's canonical projections, not raw provider
+        payloads - docs/api-contracts.md: "Connector-specific payloads stay
+        inside the adapter. Domain modules consume canonical models." Typed
+        as `list[Any]` because each provider projects to its own frozen
+        dataclass, and forcing a shared dict shape would push provider
+        detail back out to callers.
+        """
 
     # --- Shared bounded HTTP helper ---
 

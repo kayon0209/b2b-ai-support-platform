@@ -10,6 +10,7 @@ import enum
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import BigInteger, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
@@ -120,7 +121,11 @@ def sla_deadline(
     multiplier = policy.priority_multipliers.get(priority, 1.0)
     target = policy.first_response_minutes if first_response else policy.resolution_minutes
     target_seconds = target * 60 * multiplier
-    return opened_at + max(target_seconds - elapsed_running_seconds, 0)
+    # int(), not float: a deadline is an epoch-second timestamp and must land
+    # on a whole second. The multiplier is fractional (p0 = 0.25), so the
+    # product is a float; truncating toward zero keeps the deadline no later
+    # than the policy intends, which is the safe direction for an SLA clock.
+    return opened_at + max(int(target_seconds) - elapsed_running_seconds, 0)
 
 
 def is_breached(deadline_ts: int, now: int | None = None) -> bool:
@@ -151,7 +156,7 @@ class Case(Base, PkMixin, TenantMixin):
     closed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     elapsed_running_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     last_state_changed_at: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    metadata_json: Mapped[dict] = mapped_column(
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default="{}"
     )
 

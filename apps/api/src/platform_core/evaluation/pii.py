@@ -6,9 +6,12 @@ versions and prunes expired data by tenant policy.
 """
 
 import re
+import uuid
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class Sensitivity(StrEnum):
@@ -43,7 +46,7 @@ class RedactionReport:
 
 
 # Regex-based value redaction for untyped content (message bodies etc.)
-_VALUE_PATTERNS: list[tuple[re.Pattern, str]] = [
+_VALUE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b"), "[EMAIL]"),
     (re.compile(r"\b(?:\d[ -]?){13,19}\b"), "[CARD]"),
     (re.compile(r"\b\+?\d[\d\s-]{7,14}\d\b"), "[PHONE]"),
@@ -118,9 +121,9 @@ DEFAULT_RETENTION = RetentionPolicy()
 
 
 async def sweep_expired_data(
-    session,  # AsyncSession
+    session: AsyncSession,
     *,
-    tenant_id,
+    tenant_id: uuid.UUID,
     now: int,
     policy: RetentionPolicy = DEFAULT_RETENTION,
 ) -> dict[str, int]:
@@ -130,6 +133,16 @@ async def sweep_expired_data(
     policy-driven data lifecycle, not ad-hoc removal.
     """
     from sqlalchemy import delete, update
+    from sqlalchemy.engine import CursorResult
+
+    def _affected(result: object) -> int:
+        """DML row count.
+
+        `AsyncSession.execute` is typed as returning `Result[Any]`, which
+        does not expose `rowcount` - but every DML statement actually
+        returns a `CursorResult` that does.
+        """
+        return int(cast(CursorResult[Any], result).rowcount or 0)
 
     from platform_core.integrations.models import DeadLetterItem
     from platform_core.knowledge.models import DocumentVersion, IngestionStatus
@@ -138,17 +151,23 @@ async def sweep_expired_data(
     counts: dict[str, int] = {}
 
     # 1) SUPERSEDED versions past retention -> EXPIRED status (retrieval stops)
+    #
+    # The age test is `expires_at`, not a creation timestamp: DocumentVersion
+    # has no `created_at` column, and `expires_at` is the field retrieval
+    # itself gates on (retrieval/hybrid.py). Using a non-existent column here
+    # would have raised UndefinedColumn on every sweep.
     cutoff = now - policy.superseded_version_days * 86400
     result = await session.execute(
         update(DocumentVersion)
         .where(
             DocumentVersion.tenant_id == tenant_id,
             DocumentVersion.status == IngestionStatus.SUPERSEDED.value,
-            DocumentVersion.created_at < cutoff,
+            DocumentVersion.expires_at.is_not(None),
+            DocumentVersion.expires_at < cutoff,
         )
         .values(status=IngestionStatus.EXPIRED.value)
     )
-    counts["document_versions_expired"] = result.rowcount or 0
+    counts["document_versions_expired"] = _affected(result)
 
     # 2) resolved dead letters past retention -> delete
     dl_cutoff = now - policy.dead_letter_days * 86400
@@ -156,10 +175,11 @@ async def sweep_expired_data(
         delete(DeadLetterItem).where(
             DeadLetterItem.tenant_id == tenant_id,
             DeadLetterItem.status == "resolved",
+            DeadLetterItem.resolved_at.is_not(None),
             DeadLetterItem.resolved_at < dl_cutoff,
         )
     )
-    counts["dead_letters_pruned"] = result.rowcount or 0
+    counts["dead_letters_pruned"] = _affected(result)
 
     # 3) completed inbox events past retention -> delete (payload already minimized)
     ie_cutoff = now - policy.inbox_event_days * 86400
@@ -170,5 +190,5 @@ async def sweep_expired_data(
             InboxEvent.received_at < ie_cutoff,
         )
     )
-    counts["inbox_events_pruned"] = result.rowcount or 0
+    counts["inbox_events_pruned"] = _affected(result)
     return counts

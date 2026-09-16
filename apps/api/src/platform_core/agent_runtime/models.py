@@ -8,6 +8,7 @@ versions that were present in the runtime context.
 
 import enum
 import uuid
+from typing import Any
 
 from sqlalchemy import BigInteger, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
@@ -67,14 +68,14 @@ class AgentRun(Base, PkMixin, TenantMixin):
     prompt_version_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("prompt_versions.id"), nullable=True
     )
-    model_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    retrieval_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    model_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    retrieval_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     policy_version: Mapped[str] = mapped_column(String(63), nullable=False, default="v1")
     code_version: Mapped[str] = mapped_column(String(63), nullable=False, default="dev")
     trace_id: Mapped[str] = mapped_column(String(63), nullable=False, default="")
     input_hash: Mapped[str] = mapped_column(String(127), nullable=False, default="")
     output_hash: Mapped[str | None] = mapped_column(String(127), nullable=True)
-    token_usage: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    token_usage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     latency_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     abstain_reason: Mapped[str | None] = mapped_column(String(127), nullable=True)
 

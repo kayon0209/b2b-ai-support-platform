@@ -10,6 +10,7 @@
 
 import enum
 import uuid
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -42,12 +43,12 @@ class IngestionStatus(enum.StrEnum):
     PROCESSING = "processing"
 
 
-class Vector(UserDefinedType):
+class Vector(UserDefinedType[str]):
     """pgvector column placeholder (dim set at index build time)."""
 
     cache_ok = True
 
-    def get_col_spec(self) -> str:
+    def get_col_spec(self, **kw: Any) -> str:
         return "vector(1536)"
 
 
@@ -115,7 +116,7 @@ class DocumentVersion(Base, PkMixin, TenantMixin):
     object_uri: Mapped[str] = mapped_column(Text, nullable=False)
     parser_version: Mapped[str] = mapped_column(String(63), nullable=False, default="v1")
     ingestion_status: Mapped[str] = mapped_column(String(31), nullable=False, default="uploaded")
-    metadata_json: Mapped[dict] = mapped_column(
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default="{}"
     )
 
@@ -131,10 +132,10 @@ class Chunk(Base, PkMixin, TenantMixin):
     document_version_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("document_versions.id"), nullable=False, index=True
     )
-    section_path: Mapped[dict] = mapped_column(JSONB, nullable=False, default=list)
+    section_path: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     ordinal: Mapped[int] = mapped_column(nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     text_hash: Mapped[str] = mapped_column(String(127), nullable=False)
-    metadata_json: Mapped[dict] = mapped_column(
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default="{}"
     )

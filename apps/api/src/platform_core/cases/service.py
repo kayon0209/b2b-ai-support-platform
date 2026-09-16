@@ -8,6 +8,7 @@ case.events without any extra writes from the caller.
 
 import time
 import uuid
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,7 +74,7 @@ class CaseService:
         case_id: uuid.UUID,
         command: str,
         expected_version: int | None = None,
-        parameters: dict | None = None,
+        parameters: dict[str, Any] | None = None,
     ) -> Case:
         """Dispatch a case command: transition / change_priority / assign.
 

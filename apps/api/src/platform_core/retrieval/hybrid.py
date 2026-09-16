@@ -12,7 +12,7 @@ retrievable (docs/domain-model.md knowledge rule).
 import struct
 import uuid
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,11 +47,11 @@ class RetrievedChunk:
     chunk_id: uuid.UUID
     document_version_id: uuid.UUID
     title: str
-    section_path: list
+    section_path: list[str]
     excerpt: str
     source_uri: str
     score: float
-    ranking: dict = field(default_factory=dict)
+    ranking: dict[str, float] = field(default_factory=dict)
 
 
 def _vector_literal(vec: list[float]) -> str:
@@ -153,7 +153,7 @@ async def hybrid_search(
     active_embedder: Embedder = embedder or DeterministicEmbedder()
     vec = await active_embedder.embed_query(query)
     space_filter = ""
-    params: dict = {
+    params: dict[str, Any] = {
         "tid": str(tenant_id),
         "q": query,
         "vec": _vector_literal(vec),
@@ -234,7 +234,8 @@ async def hybrid_search(
     vec_rows = (await session.execute(vec_sql, params)).mappings().all()
 
     # Reciprocal rank fusion over the two ranked lists.
-    scores: dict[uuid.UUID, dict] = {}
+    # chunk id -> {source_name: rank_or_score}; accumulated across sources
+    scores: dict[uuid.UUID, dict[str, Any]] = {}
     for rank, row in enumerate(fts_rows):
         cid = row["id"]
         entry = scores.setdefault(

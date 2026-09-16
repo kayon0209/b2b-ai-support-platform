@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 import jwt
 from jwt import PyJWKClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from platform_core.identity.tenant_context import TenantContext
 
@@ -102,7 +103,7 @@ class MembershipResolver:
     matching identity row yields no context (fail closed).
     """
 
-    def __init__(self, session_factory) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
     async def resolve(self, claims: dict[str, Any]) -> ResolvedIdentity | None:
@@ -185,4 +186,5 @@ def fetch_realm_metadata(issuer: str) -> dict[str, Any]:
         timeout=5.0,
     )
     resp.raise_for_status()
-    return resp.json()
+    payload: dict[str, Any] = resp.json()
+    return payload

@@ -77,7 +77,8 @@ class TraceContext:
             if key in ALLOWED_LOG_FIELDS:
                 fields[key] = value
             # Non-allowlisted keys are dropped silently: allowlist policy.
-        return redact_value(fields)
+        redacted: dict[str, Any] = redact_value(fields)
+        return redacted
 
 
 class JsonLogger:

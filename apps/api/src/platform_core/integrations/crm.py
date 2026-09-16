@@ -39,10 +39,18 @@ class CrmContactSummary:
     fetched_at: int
 
 
-class CacheEntry:
+class CacheEntry[T]:
+    """TTL cache slot.
+
+    Generic in the cached value so `get_account` can return
+    `CrmAccountSummary | None` without a cast: the cache is shared by
+    several lookup methods with different value types, and an `Any` slot
+    erases the type at exactly the boundary where it matters.
+    """
+
     __slots__ = ("value", "expires_at", "fetched_at")
 
-    def __init__(self, value: Any, ttl_seconds: int) -> None:
+    def __init__(self, value: T, ttl_seconds: int) -> None:
         self.value = value
         self.fetched_at = int(time.time())
         self.expires_at = self.fetched_at + ttl_seconds
@@ -66,7 +74,9 @@ class CrmReadAdapter(ConnectorAdapter):
 
     def __init__(self, context: ConnectorContext, *, cache_ttl_seconds: int = 300) -> None:
         super().__init__(context)
-        self._cache: dict[str, CacheEntry] = {}
+        # Only account summaries are cached today; the entry is generic so a
+        # second cached projection keeps its type instead of decaying to Any.
+        self._cache: dict[str, CacheEntry[CrmAccountSummary]] = {}
         self._ttl = cache_ttl_seconds
 
     async def health_check(self) -> bool:
@@ -78,13 +88,13 @@ class CrmReadAdapter(ConnectorAdapter):
 
     async def fetch(
         self, resource: str, cursor: str | None = None
-    ) -> tuple[list[dict[str, Any]], str | None]:
+    ) -> tuple[list[Any], str | None]:
         raise NotImplementedError("CRM pilot is lookup-based, not sync-based")
 
     async def get_account(self, external_ref: str) -> CrmAccountSummary | None:
         cached = self._cache.get(f"account:{external_ref}")
         if cached and cached.fresh():
-            return cached.value  # type: ignore[return-value]
+            return cached.value
 
         base = self.context.configuration.get("base_url", "")
         path_tpl = self.context.configuration.get("accounts_path", "/accounts/{id}")

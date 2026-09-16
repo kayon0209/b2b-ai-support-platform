@@ -57,7 +57,14 @@ class JiraAdapter(ConnectorAdapter):
 
     async def fetch(
         self, resource: str, cursor: str | None = None
-    ) -> tuple[list[dict[str, Any]], str | None]:
+    ) -> tuple[list[JiraIssueSummary], str | None]:
+        """Return (canonical issue projections, next_cursor).
+
+        The base class declares `list[dict[str, Any]]`, but docs/api-contracts.md
+        is explicit that "domain modules consume canonical models" - so the
+        adapter projects provider payloads into `JiraIssueSummary` at this
+        boundary rather than leaking a dict whose shape only the adapter knows.
+        """
         if resource != "issues":
             return [], None
         jql = cursor or f"project = {self._project} ORDER BY updated ASC"
