@@ -93,6 +93,55 @@ class AbstentionDecision:
 
 MIN_EXCERPT_OVERLAP = 0.12
 
+# Two sources are treated as competing when their relevance scores are this
+# close. The scores are retrieval rankings, not calibrated confidence
+# (docs/agent.md), so a strict equality test would miss the common case
+# where one source merely ranks a hair higher for an unrelated reason.
+CONFLICT_SCORE_MARGIN = 0.05
+
+# Numbers and percentages are the part of a policy answer a customer acts
+# on. When two sources that both look relevant state *different* figures for
+# the same question, picking the higher-ranked one is a coin flip dressed up
+# as an answer.
+_NUMERIC_TOKEN = re.compile(r"\d+(?:\.\d+)?%?")
+
+
+def _numeric_tokens(excerpt: str) -> set[str]:
+    """Distinct figures in a passage, normalised for comparison."""
+    return set(_NUMERIC_TOKEN.findall(excerpt))
+
+
+def _sources_compete(
+    query: str,
+    evidence: list[RetrievedChunk],
+    *,
+    margin: float = CONFLICT_SCORE_MARGIN,
+) -> bool:
+    """True when the top two relevant sources disagree on the figures.
+
+    Deliberately narrow: it requires both passages to actually be about the
+    query (so two unrelated documents never trigger it), comparable ranking,
+    and a *different* set of numbers. When they agree, or when only one is
+    on-topic, there is nothing to reconcile and answering is correct.
+    """
+    on_topic = [c for c in evidence if _term_overlap(query, c.excerpt) >= MIN_EXCERPT_OVERLAP][:2]
+    if len(on_topic) < 2:
+        return False
+    first, second = on_topic
+    if abs(first.score - second.score) > margin:
+        # A clear winner is not a conflict; the lower one is just weaker.
+        return False
+    left = _numeric_tokens(first.excerpt)
+    right = _numeric_tokens(second.excerpt)
+    if not left or not right:
+        return False
+    # Not `left & right`: two policy passages share boilerplate figures
+    # ("10% of monthly fees") while disagreeing on the one that matters
+    # (the 30% vs 15% cap). What signals a real conflict is each source
+    # stating a figure the other does not.
+    return bool(left - right) and bool(right - left)
+
+
 # Function words carry no topical signal. Without this list a query such as
 # "who won the world cup in 1998?" scores against any excerpt containing
 # "the", which would let an unrelated question clear the abstention gate and
@@ -257,6 +306,11 @@ def decide_abstention(
         return AbstentionDecision(abstain=True, reason_code=ABSTAIN_NO_EVIDENCE, handoff=True)
     if len(evidence) < min_results:
         return AbstentionDecision(abstain=True, reason_code=ABSTAIN_NO_EVIDENCE, handoff=False)
+    if _sources_compete(query, evidence):
+        # Surface the disagreement to a human rather than silently picking
+        # whichever source happened to rank first. A confident wrong number
+        # about a contractual term is worse than a handoff.
+        return AbstentionDecision(abstain=True, reason_code=ABSTAIN_CONFLICT, handoff=True)
     best_overlap = max(_term_overlap(query, c.excerpt) for c in evidence)
     if best_overlap < min_overlap:
         return AbstentionDecision(abstain=True, reason_code=ABSTAIN_LOW_RELEVANCE, handoff=True)

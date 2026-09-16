@@ -50,11 +50,12 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["apps/api/tests", "packages/contracts/tests"]
+testpaths = ["apps/api/tests", "packages/contracts/tests", "tests/evals"]
 addopts = "-q --strict-markers"
 markers = [
     "integration: requires docker-compose services",
     "contract: schema contract tests",
+    "eval: LLM evaluation dataset and release gates",
 ]
 
 [build-system]

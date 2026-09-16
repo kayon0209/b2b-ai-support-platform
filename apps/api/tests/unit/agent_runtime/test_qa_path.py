@@ -3,6 +3,7 @@
 import uuid
 
 from platform_core.agent_runtime.qa_path import (
+    ABSTAIN_CONFLICT,
     ABSTAIN_LOW_RELEVANCE,
     ABSTAIN_NO_EVIDENCE,
     ABSTAIN_RESTRICTED,
@@ -165,3 +166,98 @@ def test_content_terms_drops_stopwords_and_short_tokens() -> None:
     assert "the" not in terms
     assert "what" not in terms
     assert "is" not in terms
+
+
+# --- Conflicting-sources abstention (docs/testing-and-evaluation.md) ---
+#
+# `ABSTAIN_CONFLICT` was declared and never emitted, so a question whose
+# answer differs between two active sources was answered from whichever
+# ranked first. These tests pin the behaviour and, as importantly, the
+# cases where it must NOT fire.
+
+
+def _scored(text: str, score: float) -> RetrievedChunk:
+    chunk = _chunk(text)
+    chunk.score = score
+    return chunk
+
+
+def test_conflicting_figures_across_equally_ranked_sources_abstain() -> None:
+    """Two on-topic sources stating different caps must not be reconciled
+    by picking the higher-ranked one."""
+    query = "What is the maximum service credit percentage?"
+    enterprise = _scored(
+        "Enterprise customers receive a 99.95% uptime commitment. Service credits "
+        "are 10% of monthly fees per 0.1% below the commitment, capped at 30%.",
+        0.4,
+    )
+    standard = _scored(
+        "Standard customers receive a 99.5% uptime commitment. Service credits "
+        "are 10% of monthly fees per 0.5% below the commitment, capped at 15%.",
+        0.4,
+    )
+    decision = decide_abstention(query, [enterprise, standard])
+    assert decision.abstain is True
+    assert decision.reason_code == ABSTAIN_CONFLICT
+    assert decision.handoff is True, "a conflict needs a human, not just silence"
+
+
+def test_agreeing_sources_do_not_abstain() -> None:
+    """A conflict is about disagreement, not about having two sources."""
+    query = "How long is the refund window?"
+    left = _scored("The refund window is 30 days for annual plans.", 0.5)
+    right = _scored("Refunds are accepted within 30 days of purchase.", 0.5)
+    decision = decide_abstention(query, [left, right])
+    assert decision.abstain is False
+
+
+def test_a_clearly_ranked_winner_is_not_a_conflict() -> None:
+    """If one source is decisively more relevant, the weaker one is not
+    competing - it is just noise, and answering is correct."""
+    query = "How long is the refund window?"
+    strong = _scored("The refund window is 30 days for annual plans.", 0.9)
+    weak = _scored("The refund window is 90 days for legacy contracts.", 0.2)
+    decision = decide_abstention(query, [strong, weak])
+    assert decision.abstain is False, "a decisive ranking must not be treated as a tie"
+
+
+def test_off_topic_second_source_does_not_trigger_a_conflict() -> None:
+    """Both sources must be about the query, or unrelated numbers would
+    look like a contradiction."""
+    query = "How long is the refund window?"
+    relevant = _scored("The refund window is 30 days for annual plans.", 0.5)
+    unrelated = _scored("Data is encrypted at rest with AES-256 and TLS 1.2.", 0.5)
+    decision = decide_abstention(query, [relevant, unrelated])
+    assert decision.abstain is False
+
+
+def test_sources_without_figures_do_not_conflict() -> None:
+    """The rule is grounded in numbers, the part a customer acts on. Two
+    prose passages with no figures cannot be compared this way."""
+    query = "Who can request a refund?"
+    left = _scored("Any workspace administrator can request a refund.", 0.5)
+    right = _scored("Only the billing owner can request a refund.", 0.5)
+    decision = decide_abstention(query, [left, right])
+    assert decision.abstain is False, "no figures means no conflict signal, not a guess"
+
+
+def test_shared_boilerplate_figures_still_conflict_on_the_deciding_one() -> None:
+    """Both passages share '10%' but differ on the cap. Intersection-based
+    comparison would call these agreeing; the rule must not."""
+    query = "What is the maximum service credit percentage?"
+    left = _scored("Credits are 10% per 0.1%, capped at 30% of monthly fees.", 0.5)
+    right = _scored("Credits are 10% per 0.5%, capped at 15% of monthly fees.", 0.5)
+    decision = decide_abstention(query, [left, right])
+    assert decision.abstain is True
+    assert decision.reason_code == ABSTAIN_CONFLICT
+
+
+def test_restricted_request_short_circuits_before_conflict() -> None:
+    """Ordering matters: authorization is checked first, so a restricted
+    request reports RESTRICTED_REQUEST even when the evidence also
+    conflicts."""
+    query = "What is the maximum service credit percentage?"
+    left = _scored("Credits capped at 30% of monthly fees.", 0.5)
+    right = _scored("Credits capped at 15% of monthly fees.", 0.5)
+    decision = decide_abstention(query, [left, right], restricted_query=True)
+    assert decision.reason_code == ABSTAIN_RESTRICTED
