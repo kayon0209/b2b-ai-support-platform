@@ -21,6 +21,7 @@ from platform_core.db import session_scope
 from platform_core.evaluation.queues import PriorityQueueManager, Queue, QueueConfig
 from worker.inbox_consumer import drain_once
 from worker.outbox_relay import OutboxRelay, OutboxWorker, build_default_relay
+from worker.wiring import audit_wiring, build_interactive_deps
 
 logger = JsonLogger("platform.worker")
 
@@ -108,27 +109,24 @@ def main() -> None:
     """
     import sys
 
-    from platform_core.config import get_settings
-
     outbox_only = "--outbox-only" in sys.argv
 
     if outbox_only:
         asyncio.run(_run_outbox_only())
         return
 
-    from platform_core.llm import GiteeAiClient
+    # Real collaborators, assembled in one place. `build_interactive_deps`
+    # raises when the chat provider is missing, so the worker fails to start
+    # rather than claiming messages and silently never replying.
+    deps = build_interactive_deps()
+    wiring = audit_wiring(deps)
+    logger.info("worker_wiring", **wiring.as_dict())
+    if not wiring.can_send:
+        # Not fatal, but loud: a run that cannot send still records its
+        # outcome, and an operator must not read that as "the customer was
+        # answered".
+        logger.warning("worker_cannot_send", reason_code="NO_CHATWOOT_TOKEN")
 
-    settings = get_settings()
-    if settings.llm_api_key is None:
-        raise SystemExit("APP_LLM_API_KEY is required to run the interactive worker")
-
-    client = GiteeAiClient()
-    deps = OrchestratorDeps(
-        embedder=None,
-        generator=None,
-        sender=None,
-        extra={"chat": client},
-    )
     asyncio.run(_run_both(deps))
 
 
@@ -167,7 +165,9 @@ __all__ = [
     "OutboxRelay",
     "OutboxWorker",
     "WorkerConfig",
+    "audit_wiring",
     "build_default_relay",
+    "build_interactive_deps",
     "install_signal_handlers",
     "main",
 ]
