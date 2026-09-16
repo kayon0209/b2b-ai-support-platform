@@ -185,6 +185,59 @@ async def test_executor_is_cached_within_a_resolver() -> None:
     assert len(built) == 1
 
 
+@pytest.mark.asyncio
+async def test_two_resolvers_for_one_tenant_do_not_share_adapters() -> None:
+    """Adapter instances are request-scoped, never process-global.
+
+    Adapters hold per-tenant credentials and an instance-level response
+    cache (`CrmReadAdapter._cache` keys on the external ref alone, not on
+    the tenant). Sharing one instance between tenants would let tenant B
+    read tenant A's cached account summary. Two resolvers for the same
+    tenant must therefore still build their own adapters.
+    """
+    built: list[ConnectorContext] = []
+    session = _FakeSession([_connector("jira", ["create_issue"], ConnectorStatus.ACTIVE.value)])
+    factories = _factories(built)
+
+    first = ConnectorExecutorResolver(session, tenant_id=TENANT, factories=factories)
+    second = ConnectorExecutorResolver(session, tenant_id=TENANT, factories=factories)
+    await first.executors_for(["jira.create_issue"])
+    await second.executors_for(["jira.create_issue"])
+
+    assert len(built) == 2, "each resolver must get its own adapter instance"
+
+
+@pytest.mark.asyncio
+async def test_resolver_query_is_tenant_scoped_in_sql() -> None:
+    """The connector lookup must filter by tenant in the query itself.
+
+    Filtering the rows after loading them would still pull another
+    tenant's credential reference into this process, which is the thing
+    the tenant boundary exists to prevent. `_FakeSession` ignores the
+    WHERE clause, so this test inspects the compiled statement instead of
+    trusting the fake.
+    """
+    captured: list[Any] = []
+
+    class _CapturingSession:
+        async def execute(self, stmt: Any) -> _FakeResult:
+            captured.append(stmt)
+            return _FakeResult([])
+
+    resolver = ConnectorExecutorResolver(
+        _CapturingSession(), tenant_id=TENANT, factories=_factories([])  # type: ignore[arg-type]
+    )
+    await resolver.executors_for(["jira.create_issue"])
+
+    assert captured, "the resolver must query for connectors"
+    compiled = captured[0].compile()
+    sql = str(compiled)
+    assert "connectors.tenant_id" in sql, sql
+    # The bound parameter carries this tenant's id, so the filter is real
+    # rather than a placeholder that a caller forgot to populate.
+    assert any(str(TENANT) in str(v) for v in compiled.params.values()), compiled.params
+
+
 def test_tool_vocabulary_is_fully_declared() -> None:
     """Every mapped provider has a capability and vice versa.
 
