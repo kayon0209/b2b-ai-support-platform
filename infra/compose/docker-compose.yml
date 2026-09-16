@@ -126,6 +126,25 @@ services:
       ai-redis:
         condition: service_healthy
 
+  # Relays committed outbox events to their consumers. Runs without an LLM
+  # key because delivering business events is independent of the AI path --
+  # that is why it is its own service rather than bundled with the worker.
+  ai-worker-outbox:
+    build:
+      context: ../..
+      dockerfile: infra/compose/api.Dockerfile
+    command: ["python", "-m", "worker.runner", "--outbox-only"]
+    environment:
+      APP_ENVIRONMENT: local
+      APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
+      APP_REDIS_URL: redis://ai-redis:6379/0
+      APP_SECRET_KEY: local-dev-secret
+    depends_on:
+      ai-postgres:
+        condition: service_healthy
+      ai-redis:
+        condition: service_healthy
+
   # --- Chatwoot support kernel (upstream, separate storage) ---
   chatwoot-postgres:
     image: docker.1ms.run/pgvector/pgvector:pg16

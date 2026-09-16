@@ -199,3 +199,80 @@ alembic      0011_tool_gateway 已应用 ✅
 2. **本次已修**：端口默认值、lint、格式化（已完成，可直接提交）。
 3. **启动 M1**：按上述依赖链推进——LLM 边界 → worker → 编排器（含租约重检）→ 路由接线 → 补测试。
 4. **并行可选**：修正 mypy 配置，让 strict 类型检查真正生效。
+
+---
+
+## 七、进度更新（后续轮次）
+
+本节记录本文档写成之后实际完成的开发，供后续接手者对齐。
+
+### 已完成
+
+| 提交 | 内容 | 效果 |
+|---|---|---|
+| `11519e5` | 建立 git 基线 | 锁定 158 全绿状态 |
+| `586a5ce` | **M1 垂直切片**：Gitee AI（`qwen3.8-flash`）接入、答案生成器、真实 embedding + reranker、编排器（**含发送前租约重检**）、worker（SKIP LOCKED 幂等） | 打通"客户消息 → 有引用回答 → 回发"闭环；关闭**安全红线缺口 A6** |
+| `868b673` | `.env` 模板与 gitignore、真实供应商冒烟脚本、role 序列化修复 | 凭据不入库；`ProviderRole` 序列化正确 |
+| `3b57cd9` | **M2 HTTP 接口层**：`cases` / `retrieval` / `agent_runtime` / `tool_gateway` 四组路由 + `api.py` 共享信封与策略闸门 | 12 个 endpoint，`main.py` 挂载 6 个 router |
+| `6709499` | **工具执行器注册**：从租户 `connectors` 解析适配器 | 关闭"确认式写入永远执行不了"缺口 |
+
+### M1 阶段发现并修复的真实缺陷
+
+**弃用词击败弃答闸门。** `qa_path._term_overlap` 把虚词也计入重叠度，
+只要片段含 "the" 就能越过 `MIN_EXCERPT_OVERLAP = 0.12`，
+使无关问题带着不相关证据进入模型。修复后：
+
+| 查询 | 修复前 | 修复后 |
+|---|---|---|
+| "how long is the refund window?"（相关） | 0.600 | **0.667** |
+| "who won the world cup in 1998?"（无关） | 0.167 通过 ❌ | **0.000** ✅ |
+| "what is the capital of the moon?"（无关） | 0.250 通过 ❌ | **0.000** ✅ |
+| "the the the the"（退化） | 1.000 通过 ❌ | **0.000** ✅ |
+
+### M2 阶段发现并修复的真实缺陷
+
+1. **policy 表缺 `TOOL_WRITE_CONFIRMED`** —— `support_admin` 未被授予该 action，
+   导致确认式写入对所有非 `tenant_owner` 角色**完全不可达**，
+   确认闸门形同虚设。已在 `RBAC_TABLE.support_admin` 补上
+   （`TOOL_HUMAN_APPROVAL` 仍保留给 `tenant_owner`）。
+2. **`CrmReadAdapter` 不满足 `ToolExecutor` 协议** —— 其继承基类的
+   `execute(command, parameters, idempotency_key) -> ExecutionResult` 与
+   `verify_postcondition(execution: ExecutionResult)` 与协议要求的签名
+   **完全不同**；一旦注册，首次执行必然 `TypeError`。
+   已从注册表与工具词表中同步移除 `crm.update_account`，
+   并新增双向一致性回归测试。（由 mypy strict 发现）
+
+### 当前测试基线
+
+```
+232 passed（M0 基线 158 → M1 199 → M2 232）
+ruff check / ruff format  全绿
+mypy strict              新增模块全绿；47 个历史遗留错误集中在老 ORM 模型
+                         （裸 dict/list 缺类型参数），非本次引入
+```
+
+### 真实供应商实测结论（`scripts/smoke_gitee_ai.py`，5/5 通过）
+
+```
+[1] chat     qwen3.8-flash       -> OK
+[2] embed    dims=1536           -> 与 chunks.embedding vector(1536) 一致，无需迁移
+[3] rerank   bge-reranker-v2-m3  -> 相关文档排第一（0.409 vs 0.0/0.0）
+[4] cite     有据问题            -> 1 条 claim 引用真实 chunk UUID，validate=True
+[5] abstain  无法回答的问题      -> 0 条 claim，validate=False (NO_CLAIMS)
+```
+
+关键结论：**Qwen3-Embedding-8B 原生 1024 维，但会遵从 `dimensions: 1536` 请求**，
+故现有向量列无需迁移。第 4、5 项共同证明"模型无法通过本流水线发布无支撑答案"。
+
+### 仍未完成（下一轮候选）
+
+| 优先级 | 项 | 说明 |
+|---|---|---|
+| **高** | `outbox` 消费者 | worker 只消费 inbox；事务性 outbox 已写入但无消费者，下游事件（`case.created` 等）不会真正投递 |
+| **高** | 对话转人工的**真实回发链路** | 编排器已具备发送能力，但回发 Chatwoot 的端到端演练尚未在真实会话中跑通 |
+| 中 | `admin-web` | React/Vite 目录仍为空 |
+| 中 | CRM 写入适配器 | `CrmReadAdapter` 只读；如需 CRM 写入工具，需实现符合 `ToolExecutor` 协议的适配器 |
+| 中 | `packages/contracts` | 目录仍为空，OpenAPI/事件 schema 生成客户端未落地 |
+| 中 | mypy 历史欠债 | 47 个 ORM 模型类型参数缺失，建议按模块分批清理 |
+| 低 | 知识缺口队列、PII 策略、评估门禁 | 见第四节 P3 |
+

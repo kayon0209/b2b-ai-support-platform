@@ -1,10 +1,11 @@
 """Worker entrypoint and job loop (ticket 7, docs/architecture.md).
 
-Two worker classes per docs/deployment-and-operations.md:
+Worker classes per docs/deployment-and-operations.md:
 - interactive: customer-visible AI work (inbox events -> agent runs)
 - ingestion:   parsing/chunking/embedding (bulk, lowest priority)
+- outbox:      relays committed business events to their consumers
 
-Both share the admission and priority logic in evaluation.queues, so
+All share the admission and priority logic in evaluation.queues, so
 backpressure and starvation guarantees are identical to the tested
 in-process model. Redis is the broker in a full deployment; the loop here
 is deliberately transport-agnostic so the same code runs in tests.
@@ -19,6 +20,7 @@ from platform_core.agent_runtime.orchestrator import OrchestratorDeps
 from platform_core.db import session_scope
 from platform_core.evaluation.queues import PriorityQueueManager, Queue, QueueConfig
 from worker.inbox_consumer import drain_once
+from worker.outbox_relay import OutboxRelay, OutboxWorker, build_default_relay
 
 logger = JsonLogger("platform.worker")
 
@@ -94,13 +96,31 @@ def install_signal_handlers(worker: InboxWorker, loop: asyncio.AbstractEventLoop
 
 
 def main() -> None:
-    """Local entrypoint: run the interactive worker with settings-derived deps."""
+    """Local entrypoint: run the interactive worker + outbox relay together.
+
+    Both loops run in one process because they are lightweight pollers and
+    the outbox relay has no reason to be its own deployment unit until it
+    becomes a throughput bottleneck. Either can be run alone by importing
+    its class directly.
+
+    `--outbox-only` is useful when the AI path is intentionally disabled
+    (no LLM key) but business events still need to reach their consumers.
+    """
+    import sys
+
     from platform_core.config import get_settings
+
+    outbox_only = "--outbox-only" in sys.argv
+
+    if outbox_only:
+        asyncio.run(_run_outbox_only())
+        return
+
     from platform_core.llm import GiteeAiClient
 
     settings = get_settings()
     if settings.llm_api_key is None:
-        raise SystemExit("APP_LLM_API_KEY is required to run the worker")
+        raise SystemExit("APP_LLM_API_KEY is required to run the interactive worker")
 
     client = GiteeAiClient()
     deps = OrchestratorDeps(
@@ -109,11 +129,48 @@ def main() -> None:
         sender=None,
         extra={"chat": client},
     )
-    worker = InboxWorker(deps)
+    asyncio.run(_run_both(deps))
+
+
+async def _run_both(deps: OrchestratorDeps) -> None:
+    """Run the inbox worker and the outbox relay concurrently.
+
+    Either loop failing must not take the other down: they own independent
+    units of work, and a relay fault should not stop customer replies.
+    """
+    inbox = InboxWorker(deps)
+    relay_worker = OutboxWorker(build_default_relay())
+
+    loop = asyncio.get_running_loop()
+    for worker in (inbox, relay_worker):
+        install_signal_handlers(worker, loop)  # type: ignore[arg-type]
+
     try:
-        asyncio.run(worker.run_forever())
+        await asyncio.gather(inbox.run_forever(), relay_worker.run_forever())
     except KeyboardInterrupt:  # pragma: no cover - interactive stop
+        inbox.request_stop()
+        relay_worker.request_stop()
         logger.info("worker_interrupted")
+
+
+async def _run_outbox_only() -> None:
+    relay_worker = OutboxWorker(build_default_relay())
+    try:
+        await relay_worker.run_forever()
+    except KeyboardInterrupt:  # pragma: no cover - interactive stop
+        relay_worker.request_stop()
+        logger.info("worker_interrupted")
+
+
+__all__ = [
+    "InboxWorker",
+    "OutboxRelay",
+    "OutboxWorker",
+    "WorkerConfig",
+    "build_default_relay",
+    "install_signal_handlers",
+    "main",
+]
 
 
 if __name__ == "__main__":  # pragma: no cover - process entrypoint
