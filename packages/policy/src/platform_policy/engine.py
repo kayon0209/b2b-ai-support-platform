@@ -42,6 +42,12 @@ class Action(StrEnum):
     # quality blast radius, not a security-configuration change.
     PROMPT_READ = "prompt.read"
     PROMPT_RELEASE = "prompt.release"
+    # Feature flag vocabulary. FLAG_READ is separate from FLAG_WRITE because
+    # "what is currently rolled out?" is incident-analysis information that
+    # security staff and auditors need, while moving a rollout is a
+    # production change reserved for the tenant owner.
+    FLAG_READ = "flag.read"
+    FLAG_WRITE = "flag.write"
     # Tools vocabulary
     TOOL_READ = "tool.read"
     TOOL_WRITE_LOW = "tool.write.low"
@@ -59,6 +65,7 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
             Action.CASE_READ,
             Action.KNOWLEDGE_READ,
             Action.PROMPT_READ,
+            Action.FLAG_READ,
         }
     ),
     "support_admin": frozenset(
@@ -97,7 +104,9 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
     ),
     "support_viewer": frozenset({Action.CASE_READ, Action.KNOWLEDGE_READ}),
     "integration_service": frozenset({Action.TOOL_READ, Action.TOOL_WRITE_LOW}),
-    "auditor": frozenset({Action.AUDIT_READ, Action.CASE_READ, Action.PROMPT_READ}),
+    "auditor": frozenset(
+        {Action.AUDIT_READ, Action.CASE_READ, Action.PROMPT_READ, Action.FLAG_READ}
+    ),
 }
 
 
