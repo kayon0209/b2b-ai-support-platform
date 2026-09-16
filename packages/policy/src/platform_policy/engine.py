@@ -36,6 +36,12 @@ class Action(StrEnum):
     TENANT_ADMIN = "tenant.admin"
     SECURITY_ADMIN = "security.admin"
     AUDIT_READ = "audit.read"
+    # Prompt/model configuration release (docs/development-plan.md Phase 4).
+    # Separate from SECURITY_ADMIN because promoting a prompt changes what
+    # every customer-visible answer says - it is a production change with a
+    # quality blast radius, not a security-configuration change.
+    PROMPT_READ = "prompt.read"
+    PROMPT_RELEASE = "prompt.release"
     # Tools vocabulary
     TOOL_READ = "tool.read"
     TOOL_WRITE_LOW = "tool.write.low"
@@ -52,6 +58,7 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
             Action.AUDIT_READ,
             Action.CASE_READ,
             Action.KNOWLEDGE_READ,
+            Action.PROMPT_READ,
         }
     ),
     "support_admin": frozenset(
@@ -90,7 +97,7 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
     ),
     "support_viewer": frozenset({Action.CASE_READ, Action.KNOWLEDGE_READ}),
     "integration_service": frozenset({Action.TOOL_READ, Action.TOOL_WRITE_LOW}),
-    "auditor": frozenset({Action.AUDIT_READ, Action.CASE_READ}),
+    "auditor": frozenset({Action.AUDIT_READ, Action.CASE_READ, Action.PROMPT_READ}),
 }
 
 

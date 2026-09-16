@@ -26,6 +26,7 @@ if sys.platform == "win32":
 from fastapi import FastAPI
 
 from platform_core import db
+from platform_core.agent_runtime.prompt_router import router as prompt_router
 from platform_core.agent_runtime.router import router as agent_runtime_router
 from platform_core.audit.router import router as audit_router
 from platform_core.cases.router import router as cases_router
@@ -47,6 +48,7 @@ app.include_router(retrieval_router)
 app.include_router(agent_runtime_router)
 app.include_router(tool_gateway_router)
 app.include_router(quality_router)
+app.include_router(prompt_router)
 app.add_middleware(TenantContextMiddleware, resolver=bootstrap_token_resolver)
 
 
