@@ -62,22 +62,6 @@ async def persist_inbox_event(
     return IngestResult(tenant_id=tenant_id, event_id=row, duplicate=False)
 
 
-async def mark_processing(session: AsyncSession, event_id: uuid.UUID) -> None:
-    await session.execute(
-        pg_insert(InboxEvent)
-        .values()  # placeholder to satisfy typing; real update below
-        .on_conflict_do_nothing(constraint="uq_inbox_delivery")
-    )
-    # Simple status transition; idempotent.
-    from sqlalchemy import update
-
-    await session.execute(
-        update(InboxEvent)
-        .where(InboxEvent.id == event_id, InboxEvent.status == InboxEventStatus.RECEIVED.value)
-        .values(status=InboxEventStatus.PROCESSING.value)
-    )
-
-
 async def get_event(
     session: AsyncSession, tenant_id: uuid.UUID, delivery_id: str
 ) -> InboxEvent | None:

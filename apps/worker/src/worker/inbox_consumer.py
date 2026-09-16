@@ -11,11 +11,19 @@ Idempotency contract (docs/architecture.md consistency model):
   workers cannot process the same row.
 - The run's outbound command id is derived from the InboxEvent id, so even
   a reprocessed row maps to the same Chatwoot send.
+
+Stuck-claim recovery: a row claimed as PROCESSING by a worker that then
+died would otherwise never be retried, because nothing transitions it back.
+`reclaim_stale_processing` returns such rows to RECEIVED after a timeout.
+This is safe precisely because the outbound command id is derived from the
+event id: a re-run of the same event cannot produce a second customer
+message.
 """
 
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +36,13 @@ from platform_core.retrieval.hybrid import PrincipalScope
 from platform_core.support_bridge.models import InboxEvent, InboxEventStatus
 
 logger = JsonLogger("platform.worker")
+
+# How long a claimed row may sit in PROCESSING before another worker may
+# take it. Must comfortably exceed the slowest realistic run: a knowledge
+# answer with retrieval measured ~30 s end to end, so 10 minutes leaves a
+# wide margin while still bounding how long a question can go unanswered
+# after a crash.
+STALE_PROCESSING_SECONDS = 600
 
 # Events the AI should act on. Everything else is recorded and acked so the
 # inbox does not grow unbounded on conversation-lifecycle chatter.
@@ -61,7 +76,7 @@ class ClaimedEvent:
     tenant_id: uuid.UUID
     delivery_id: str
     event_type: str
-    minimized_payload: dict = field(default_factory=dict)
+    minimized_payload: dict[str, Any] = field(default_factory=dict)
 
 
 async def claim_events(session: AsyncSession, *, batch: int = 20) -> list[ClaimedEvent]:
@@ -115,6 +130,35 @@ async def mark_failed(session: AsyncSession, event_id: uuid.UUID, error: str) ->
             last_error=error[:2000],
         )
     )
+
+
+async def reclaim_stale_processing(
+    session: AsyncSession, *, timeout_seconds: int = STALE_PROCESSING_SECONDS
+) -> int:
+    """Return rows abandoned in PROCESSING to RECEIVED. Returns the count.
+
+    A worker that claims a row and then dies leaves it PROCESSING forever
+    — nothing else ever transitions it. Without this, a crash mid-run
+    silently drops the customer's question, which is the failure mode the
+    whole inbox design exists to prevent.
+
+    Re-running is safe because the outbound command id is derived from the
+    event id, so a duplicate send for the same event is suppressed by
+    Chatwoot-side idempotency rather than reaching the customer twice.
+
+    `received_at` is left untouched: it is the FIFO ordering key, and a
+    reclaimed question should keep its original place in the queue.
+    """
+    cutoff = int(time.time()) - timeout_seconds
+    result = await session.execute(
+        update(InboxEvent)
+        .where(
+            InboxEvent.status == InboxEventStatus.PROCESSING.value,
+            InboxEvent.received_at < cutoff,
+        )
+        .values(status=InboxEventStatus.RECEIVED.value)
+    )
+    return result.rowcount or 0  # type: ignore[attr-defined]
 
 
 def _conversation_ref(event: ClaimedEvent) -> uuid.UUID | None:
@@ -239,6 +283,7 @@ async def drain_once(
     *,
     deps: OrchestratorDeps,
     batch: int = 20,
+    reclaim_timeout_seconds: int = STALE_PROCESSING_SECONDS,
 ) -> int:
     """Claim and process one batch. Returns the number of rows finalised.
 
@@ -246,6 +291,12 @@ async def drain_once(
     recorded and the batch continues, so one poison payload cannot stall
     the queue.
     """
+    reclaimed = await reclaim_stale_processing(session, timeout_seconds=reclaim_timeout_seconds)
+    if reclaimed:
+        # Worth a log line: a nonzero count means a previous worker died
+        # mid-run and real questions went unanswered until now.
+        logger.warning("stale_claims_reclaimed", count=reclaimed)
+
     events = await claim_events(session, batch=batch)
     processed = 0
     for event in events:

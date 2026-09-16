@@ -188,6 +188,36 @@ def test_required_sender_fails_closed_when_token_absent(
     assert "CHATWOOT" in str(excinfo.value).upper()
 
 
+def test_blank_chatwoot_token_is_treated_as_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty token must not bind a client that 401s on every send.
+
+    `compose` passes `${APP_CHATWOOT_API_TOKEN:-}`, so the variable is
+    always *set* — often to "". Checking only for None would bind a
+    sender that cannot authenticate, and the run would look answered
+    right up until the customer noticed nobody replied.
+    """
+    import worker.wiring as wiring
+
+    monkeypatch.setattr(
+        wiring,
+        "get_model_bundle",
+        lambda: ConcreteModelBundle(
+            chat=_StubChat(),  # type: ignore[arg-type]
+            embedding=_StubChat(),  # type: ignore[arg-type]
+            rerank=_StubChat(),  # type: ignore[arg-type]
+            breaker=CircuitBreaker(),
+        ),
+    )
+    monkeypatch.setattr(wiring.get_settings(), "chatwoot_api_token", SecretStr(""), raising=False)
+
+    deps = build_interactive_deps()
+
+    assert deps.sender is None
+    assert audit_wiring(deps).can_send is False
+
+
 def test_audit_reports_generation_from_generator_not_bundle() -> None:
     """`has_chat` must track the generator, which is what the orchestrator needs.
 

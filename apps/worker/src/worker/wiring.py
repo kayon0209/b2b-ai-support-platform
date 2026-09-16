@@ -27,6 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import SecretStr
+
 from platform_core.agent_runtime.orchestrator import OrchestratorDeps
 from platform_core.config import get_settings
 from platform_core.llm.factory import get_model_bundle
@@ -40,6 +42,20 @@ class WorkerConfigurationError(SystemExit):
     message instead of a traceback, which is what an operator needs when a
     container fails to start.
     """
+
+
+def _has_chatwoot_token(token: SecretStr | None) -> bool:
+    """True only for a token that could actually authenticate.
+
+    Compose injects `APP_CHATWOOT_API_TOKEN: ${APP_CHATWOOT_API_TOKEN:-}`,
+    so the variable being *set* proves nothing — an unset host variable
+    becomes an empty string, which is `not None` and would bind a client
+    whose every request 401s. Treating blank as absent keeps the outbound
+    path honest: a token that cannot authenticate is not a sender.
+    """
+    if token is None:
+        return False
+    return bool(token.get_secret_value().strip())
 
 
 @dataclass(frozen=True)
@@ -101,7 +117,7 @@ def build_interactive_deps(
 
     sender: Any = None
     reader: Any = None
-    if settings.chatwoot_api_token is not None:
+    if _has_chatwoot_token(settings.chatwoot_api_token):
         from platform_core.support_bridge.chatwoot_client import ChatwootClient
 
         # One client, two roles: both share connection config and the

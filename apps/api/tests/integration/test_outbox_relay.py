@@ -55,6 +55,7 @@ def _isolate_rows() -> None:
     """
     admin = create_engine(ADMIN_URL)
     _cleanup(admin)
+    _assert_no_live_relay(admin)
     with admin.begin() as conn:
         conn.execute(
             text(
@@ -74,6 +75,56 @@ def _cleanup(admin: Any) -> None:
     with admin.begin() as conn:
         conn.execute(text("DELETE FROM outbox_events WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(text("DELETE FROM tenants WHERE slug = :s"), {"s": SLUG})
+
+
+def _assert_no_live_relay(admin: Any) -> None:
+    """Fail loudly if a running worker is draining the outbox.
+
+    The relay scans the outbox globally, which is correct in production but
+    means a `docker compose up` worker will claim rows this suite just
+    seeded. The symptom is a bewildering `claimed == 1` instead of 3, which
+    reads like a code bug. Check the precondition first and say what it is.
+
+    Detection is empirical rather than connection-based: a sentinel row is
+    seeded and we watch whether it disappears. `client_addr` is NULL for
+    local connections (which on Windows includes the test process itself),
+    so there is no reliable way to tell the two apart from the catalog.
+    """
+    probe = uuid.uuid4()
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO outbox_events (id, tenant_id, event_id, event_type, "
+                "event_version, aggregate_type, aggregate_id, payload, status, "
+                "created_at, attempts, trace_id) VALUES "
+                "(:id, :t, :e, 'relay.probe', 1, 'case', :agg, "
+                "'{}'::jsonb, 'queued', :now, 0, 'probe')"
+            ),
+            {
+                "id": str(probe),
+                "t": TENANT,
+                "e": str(uuid.uuid4()),
+                "agg": str(uuid.uuid4()),
+                "now": int(time.time()),
+            },
+        )
+    time.sleep(2.0)
+    with admin.connect() as conn:
+        remaining = conn.execute(
+            text("SELECT count(*) FROM outbox_events WHERE id = :id"), {"id": str(probe)}
+        ).scalar_one()
+        still_queued = conn.execute(
+            text("SELECT status FROM outbox_events WHERE id = :id"), {"id": str(probe)}
+        ).scalar_one_or_none()
+    with admin.begin() as conn:
+        conn.execute(text("DELETE FROM outbox_events WHERE id = :id"), {"id": str(probe)})
+
+    if remaining == 0 or still_queued != OutboxStatus.QUEUED.value:
+        pytest.skip(
+            "a live worker/relay is consuming outbox rows; "
+            "`docker compose stop ai-worker-interactive ai-worker-outbox` "
+            "before running this suite"
+        )
 
 
 def _seed_event(

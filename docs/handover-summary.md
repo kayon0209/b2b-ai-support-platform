@@ -242,12 +242,52 @@ alembic      0011_tool_gateway 已应用 ✅
    已从注册表与工具词表中同步移除 `crm.update_account`，
    并新增双向一致性回归测试。（由 mypy strict 发现）
 
+### M3 阶段：真实端到端验证发现并修复的缺陷
+
+这一轮第一次把 worker 接到**真实 Chatwoot** 上跑通全链路，发现的都不是单测能发现的
+问题——前三个都是"单测全绿但线上一定出事"的类型。
+
+1. **worker 组装了 4 个 `None` 的 `OrchestratorDeps`（静默空转，最高严重级）** ——
+   `runner.main()` 构造 `OrchestratorDeps(embedder=None, generator=None, sender=None)`。
+   编排器把「无 generator」当 abstain、把「无 sender」当**"没发出去但不是失败"**
+   （`_dispatch`: `if self._deps.sender is None: return ""`）。
+   后果：worker 领走真实客户消息 → 标 COMPLETED → **一个回复都不发**，
+   且任何日志/指标都显示成功。新增 `worker/wiring.py` 作为唯一组装点，
+   缺 LLM key 直接 fail closed（`SystemExit` 子类，容器非 0 退出）。
+   另有 **空 token 陷阱**：compose 写 `${APP_CHATWOOT_API_TOKEN:-}`，
+   变量永远"已设置"（常为空串），只判 `is not None` 会绑一个每次 401 的 client。
+
+2. **AI 回复自己的回复 → 无限循环（严重）** ——
+   Chatwoot 对 **outbound 消息同样发 `message_created` webhook**，
+   而 `inbox_consumer` 只检查 `event_type`，**从不检查消息方向**。
+   实测证据：**一条**客户提问使 agent_runs 一路写到 message id **17**，
+   payload 里 `message_type=outgoing`、`sender_type=user` 明明都有，但没人看。
+   修复：`CUSTOMER_MESSAGE_TYPES = {"incoming"}` + `is_customer_message()`，
+   非客户消息记 `event_skipped_not_customer` 并 ack。
+   方向判定刻意**不对称**：只有显式 `incoming` 才答，缺失/未知一律不答
+   （漏答可由人工补救，回复循环不可挽回）；同时兼容 REST 的整数编码
+   （0=incoming, 1=outgoing）与 webhook 的字符串编码。
+
+3. **崩溃后 `PROCESSING` 行永久卡死** —— 没有任何代码把它转回 `RECEIVED`，
+   一次 worker 崩溃会**静默丢单**。新增 `reclaim_stale_processing()`（默认 600s），
+   在 `drain_once` 每轮开头执行。重跑安全的前提是**出站 command_id 由 event id 派生**，
+   同事件重跑不会产生第二条客户可见消息。
+
+4. **`support_bridge/inbox.py::mark_processing` 是坏的死代码** ——
+   内部先做一次 `.values()` 为空的 `pg_insert`（注释自称 "placeholder"），
+   编译出来是 `INSERT INTO inbox_events (minimized_payload, status, id) VALUES
+   (NULL, NULL, NULL)`，一旦被调用必触发 NOT NULL 违约。全仓库无调用点，已删除。
+
+5. **测试可重复性**：`test_outbox_relay.py` 全部 8 例会被**正在运行的 worker 抢走**
+   outbox 行，表现为莫名其妙的 `claimed == 1`（期望 3）。新增哨兵行探针
+   `_assert_no_live_relay()`，改为带明确指引的 skip。
+
 ### 当前测试基线
 
 ```
-232 passed（M0 基线 158 → M1 199 → M2 232）
+263 passed（M0 基线 158 → M1 199 → M2 232 → M3 263）
 ruff check / ruff format  全绿
-mypy strict              新增模块全绿；47 个历史遗留错误集中在老 ORM 模型
+mypy strict              新增/改动模块全绿；历史遗留错误集中在老 ORM 模型
                          （裸 dict/list 缺类型参数），非本次引入
 ```
 
@@ -264,15 +304,35 @@ mypy strict              新增模块全绿；47 个历史遗留错误集中在�
 关键结论：**Qwen3-Embedding-8B 原生 1024 维，但会遵从 `dimensions: 1536` 请求**，
 故现有向量列无需迁移。第 4、5 项共同证明"模型无法通过本流水线发布无支撑答案"。
 
+### 真实 Chatwoot 端到端实测结论（本轮首次跑通）
+
+环境：compose 的 Chatwoot（account 1 `E2E Tenant`，API Inbox 1，
+contact 1 `E2E Customer`）。token 通过
+`docker compose exec chatwoot-web bundle exec rails runner "puts User.first.access_token.token"` 获取。
+
+```
+✅ 收：webhook → inbox_events 落库（minimized_payload 含 message_id /
+      chatwoot_account_id / conversation_id / message_type，且不含 content）
+✅ 生成：worker 日志 run_completed route=knowledge_qa status=completed
+        chunk_count=1 latency_ms=15039
+✅ 发：Chatwoot 会话中出现真实 AI 回复（message_type=1）
+✅ 引用门禁：无支撑答案被判 NO_CLAIMS 并 abstain，未发出
+✅ 控制租约：人类接管后（QUEUED_FOR_HUMAN）发送被拦，
+  日志 send_blocked_lease_conflict reason_code="owner is queue"
+✅ 自回环防护：outbound 事件被 event_skipped_not_customer 拦截
+```
+
 ### 仍未完成（下一轮候选）
 
 | 优先级 | 项 | 说明 |
 |---|---|---|
-| **高** | `outbox` 消费者 | worker 只消费 inbox；事务性 outbox 已写入但无消费者，下游事件（`case.created` 等）不会真正投递 |
-| **高** | 对话转人工的**真实回发链路** | 编排器已具备发送能力，但回发 Chatwoot 的端到端演练尚未在真实会话中跑通 |
 | 中 | `admin-web` | React/Vite 目录仍为空 |
 | 中 | CRM 写入适配器 | `CrmReadAdapter` 只读；如需 CRM 写入工具，需实现符合 `ToolExecutor` 协议的适配器 |
 | 中 | `packages/contracts` | 目录仍为空，OpenAPI/事件 schema 生成客户端未落地 |
-| 中 | mypy 历史欠债 | 47 个 ORM 模型类型参数缺失，建议按模块分批清理 |
-| 低 | 知识缺口队列、PII 策略、评估门禁 | 见第四节 P3 |
+| 中 | E2E 关键旅程 #5–#8 | CRM 读取→有据回答、确认写入→一次执行+验证、越权→拒绝并审计、工单 SLA→升级→重开 |
+| 中 | 跨租户负向测试扩充 | 现有套件未覆盖 缓存命中 / 文件下载 URL / 后台任务 / 导出看板 |
+| 中 | LLM 评估数据集 + 指标 + 发布门禁 | `docs/testing-and-evaluation.md` 规定 12 类，尚未落地 |
+| 中 | 故障注入 | 工具执行中杀 worker / 轮换凭据 / Redis 中断 / 模型超时 / 含糊成功 / 引用文档过期 / 流式输出中转人工 |
+| 中 | mypy 历史欠债 | 老 ORM 模型类型参数缺失，建议按模块分批清理 |
+| 低 | 知识缺口队列、PII 策略、迁移测试、性能测试 | 见第四节 P3 |
 
