@@ -426,6 +426,12 @@ class AgentOrchestrator:
             )
         try:
             draft = await self._generate_with_telemetry(ctx, question, evidence)
+            # Record the provider's token accounting on the run. The generator
+            # boundary used to drop it, so `token_usage` was always `{}` even
+            # though ChatResult carries it (and a malformed model response
+            # still spends tokens, so this is set before validation).
+            if draft.usage:
+                run.token_usage = dict(draft.usage)
         except ModelError as exc:
             # Provider down: queue/handoff, never fabricate (availability table).
             logger.error("model_failed", ctx, error_code=exc.code)
@@ -615,10 +621,9 @@ class AgentOrchestrator:
             raise
         else:
             elapsed = time.monotonic() - started
-            # Token counts live on the generator's ChatResult, which the
-            # AnswerGenerator Protocol does not expose; we record what is
-            # observable here and leave token accounting to the provider
-            # client, which already persists usage on the AgentRun.
+            # Token counts are carried on the DraftAnswer (see `_usage_of` in
+            # the generator) and persisted onto the run right after
+            # generation, so this only records the model-call telemetry.
             metrics.observe_model_call(operation="generate", outcome="ok", latency_seconds=elapsed)
             span.set_attributes(latency_ms=int(elapsed * 1000))
             span.end()

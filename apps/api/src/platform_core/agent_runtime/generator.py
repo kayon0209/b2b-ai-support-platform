@@ -24,7 +24,7 @@ from platform_core.agent_runtime.prompts import (
 )
 from platform_core.agent_runtime.qa_path import DraftAnswer
 from platform_core.evaluation.pii import redact_text
-from platform_core.llm.provider import ChatMessage, ChatProvider, ProviderRole
+from platform_core.llm.provider import ChatMessage, ChatProvider, ChatResult, ProviderRole
 from platform_core.retrieval.hybrid import RetrievedChunk
 
 # Per-excerpt and total budgets keep the prompt inside provider limits and
@@ -123,13 +123,16 @@ class LlmAnswerGenerator:
             temperature=0.0,
         )
 
+        # Computed before parsing: a malformed response still spent tokens.
+        usage = self._usage_of(result)
+
         parsed = _extract_json_object(result.text)
         if parsed is None:
-            return DraftAnswer(text="", claims={}, route="knowledge_qa")
+            return DraftAnswer(text="", claims={}, route="knowledge_qa", usage=usage)
 
         raw_claims = parsed.get("claims")
         if not isinstance(raw_claims, list):
-            return DraftAnswer(text="", claims={}, route="knowledge_qa")
+            return DraftAnswer(text="", claims={}, route="knowledge_qa", usage=usage)
 
         claim_texts: list[str] = []
         claims: dict[int, list[uuid.UUID]] = {}
@@ -159,4 +162,22 @@ class LlmAnswerGenerator:
             text="\n".join(claim_texts),
             claims=claims,
             route="knowledge_qa",
+            usage=usage,
         )
+
+    @staticmethod
+    def _usage_of(result: ChatResult) -> dict[str, Any]:
+        """Token accounting for the AgentRun.
+
+        Carried through `DraftAnswer` because the AnswerGenerator protocol
+        returns only a DraftAnswer. Without it the run's `token_usage` stayed
+        `{}` even though the provider reported usage on every call.
+        """
+        usage: dict[str, Any] = {
+            "model": result.model,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+        }
+        if result.raw_usage:
+            usage["raw"] = result.raw_usage
+        return usage

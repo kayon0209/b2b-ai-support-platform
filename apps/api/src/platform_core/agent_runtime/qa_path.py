@@ -13,7 +13,7 @@ import hashlib
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 from platform_core.retrieval.hybrid import RetrievedChunk
 
@@ -30,6 +30,10 @@ class DraftAnswer:
     # claim_index -> referenced chunk ids
     claims: dict[int, list[uuid.UUID]] = field(default_factory=dict)
     route: str = "knowledge_qa"
+    # Token accounting from the provider, carried through this boundary so the
+    # caller can persist it on the AgentRun. Empty when no model call happened
+    # (e.g. no evidence at all).
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

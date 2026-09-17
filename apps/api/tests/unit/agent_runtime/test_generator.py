@@ -32,15 +32,31 @@ def _chunk(excerpt: str, chunk_id: uuid.UUID | None = None) -> RetrievedChunk:
 class _FakeChat:
     """ChatProvider stub returning a canned body and recording the prompt."""
 
-    def __init__(self, body: str) -> None:
+    def __init__(
+        self,
+        body: str,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        raw_usage: dict | None = None,
+    ) -> None:
         self._body = body
+        self._prompt_tokens = prompt_tokens
+        self._completion_tokens = completion_tokens
+        self._raw_usage = raw_usage or {}
         self.last_prompt = ""
         self.last_messages: list = []
 
     async def complete(self, messages, *, max_tokens=1024, temperature=0.0, model=None):
         self.last_messages = list(messages)
         self.last_prompt = "\n".join(m.content for m in messages)
-        return ChatResult(text=self._body, model="fake")
+        return ChatResult(
+            text=self._body,
+            model="fake",
+            prompt_tokens=self._prompt_tokens,
+            completion_tokens=self._completion_tokens,
+            raw_usage=self._raw_usage,
+        )
 
 
 async def test_grounded_claims_resolve_to_real_chunk_ids() -> None:
@@ -151,3 +167,34 @@ async def test_generator_exposes_template_for_run_lineage() -> None:
     gen = LlmAnswerGenerator(_FakeChat('{"claims": []}'))
     assert gen.template.name == KNOWLEDGE_QA_TEMPLATE_NAME
     assert gen.template.version >= 1
+
+
+async def test_provider_token_usage_is_carried_on_the_draft() -> None:
+    """ChatResult carries usage; the DraftAnswer boundary must not drop it.
+
+    `AgentRun.token_usage` is populated from this, and it was always `{}`
+    because the generator discarded the provider's accounting.
+    """
+    chunk = _chunk("Refunds within 30 days.")
+    body = (
+        f'{{"claims": [{{"text": "Refunds within 30 days.", "citations": ["{chunk.chunk_id}"]}}]}}'
+    )
+    gen = LlmAnswerGenerator(
+        _FakeChat(body, prompt_tokens=120, completion_tokens=34, raw_usage={"total": 154})
+    )
+    draft = await gen.generate("refund?", [chunk])
+
+    assert draft.usage["prompt_tokens"] == 120
+    assert draft.usage["completion_tokens"] == 34
+    assert draft.usage["model"] == "fake"
+    assert draft.usage["raw"] == {"total": 154}
+
+
+async def test_malformed_output_still_reports_the_tokens_it_spent() -> None:
+    """A response that fails to parse still cost tokens; the run must show it."""
+    chunk = _chunk("Refunds within 30 days.")
+    gen = LlmAnswerGenerator(_FakeChat("not json at all", prompt_tokens=10, completion_tokens=1))
+    draft = await gen.generate("refund?", [chunk])
+
+    assert draft.claims == {}
+    assert draft.usage["prompt_tokens"] == 10
