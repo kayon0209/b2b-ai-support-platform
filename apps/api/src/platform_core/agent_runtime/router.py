@@ -17,6 +17,7 @@ Contract notes:
   dispatch, because the lease can move between queueing and sending.
 """
 
+import time
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
@@ -118,6 +119,10 @@ async def create_agent_run(request: Request, conversation_ref: str, body: AgentR
             conversation_ref_id=conversation_ref_id,
             route="knowledge_qa",
             status=RunStatus.QUEUED.value,
+            # `started_at` is the quality dashboard's window column. Leaving it
+            # unset made every run invisible to `/v1/quality/metrics`
+            # (total_runs 0, everything counted as untimed).
+            started_at=int(time.time()),
             model_config={"mode": body.mode},
             retrieval_config={},
             policy_version="v1",

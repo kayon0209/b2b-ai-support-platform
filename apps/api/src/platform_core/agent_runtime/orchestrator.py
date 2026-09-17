@@ -337,6 +337,9 @@ class AgentOrchestrator:
             conversation_ref_id=conversation_ref_id,
             route=route,
             status=RunStatus.RUNNING.value,
+            # The quality dashboard windows over `started_at`; a run without it
+            # is invisible to every metric and only shows up in `untimed_runs`.
+            started_at=int(time.time()),
             model_config=self._model_config(),
             retrieval_config=self._retrieval_config(),
             policy_version=self._policy_version,

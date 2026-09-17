@@ -914,3 +914,34 @@ def test_crm_write_tool_executes_and_verifies_end_to_end() -> None:
     finally:
         registry_mod.default_factories = original
         _clear_connectors(TENANT_A)
+
+
+def test_created_agent_run_has_a_started_at() -> None:
+    """The quality dashboard windows over `started_at`.
+
+    No writer populated it, so every run was invisible to
+    /v1/quality/metrics (total_runs 0, every run reported as untimed). This
+    pins the write at the API boundary.
+    """
+    client = _client(TENANT_A, "support_admin")
+    created = client.post(
+        f"/v1/conversations/{uuid.uuid4()}/agent-runs",
+        headers={**_auth(), "Idempotency-Key": str(uuid.uuid4())},
+        json={"trigger_message_ref": "msg-started"},
+    )
+    assert created.status_code == 200, created.text
+    run_id = created.json()["run_id"]
+
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        started = conn.execute(
+            text("SELECT started_at FROM agent_runs WHERE id = :id"), {"id": run_id}
+        ).scalar()
+    admin.dispose()
+    assert started is not None, "a run without started_at is invisible to every metric"
+
+    metrics = _client(TENANT_A, "tenant_owner").get(
+        "/v1/quality/metrics?window_seconds=3600", headers=_auth()
+    )
+    assert metrics.status_code == 200, metrics.text
+    assert metrics.json()["total_runs"] >= 1
