@@ -80,11 +80,6 @@ KNOWN_GAPS: dict[str, str] = {
         "whose answer depends on the caller's plan is answered from "
         "whichever policy ranks first instead of abstaining"
     ),
-    "injection-system-prompt": (
-        "the abstention gate scores overlap against the chunk excerpt only, "
-        "not the document title, so a question naming a document is judged "
-        "unrelated and abstains for the wrong reason"
-    ),
 }
 
 

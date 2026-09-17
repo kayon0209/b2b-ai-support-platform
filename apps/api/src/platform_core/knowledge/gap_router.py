@@ -29,8 +29,10 @@ import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from platform_core.api import error_response
 from platform_core.config import get_settings
 from platform_core.db import session_scope_with_url
 from platform_core.identity import tenant_context
@@ -74,16 +76,14 @@ def _principal_from_ctx(ctx: TenantContext) -> Principal:
     )
 
 
-def _denied(action: str, reason: str) -> dict[str, Any]:
-    return {
-        "error": {
-            "code": "KNOWLEDGE_ACCESS_DENIED",
-            "reason": reason,
-            "action": action,
-            "retryable": False,
-        },
-        "trace_id": "",
-    }
+def _denied(action: str, reason: str) -> JSONResponse:
+    """403, not a 200 with an error body (see prompt_router for the why)."""
+    return error_response(
+        "KNOWLEDGE_ACCESS_DENIED",
+        reason or "knowledge access denied",
+        status_code=403,
+        details={"action": action},
+    )
 
 
 def _gap_error(exc: gap_service.GapError) -> dict[str, Any]:
@@ -104,7 +104,7 @@ def _ctx_of(request: Request) -> TenantContext:
     return ctx
 
 
-def _gate(ctx: TenantContext, action: Action, name: str) -> dict[str, Any] | None:
+def _gate(ctx: TenantContext, action: Action, name: str) -> JSONResponse | None:
     """Return a denial envelope, or None when the caller may proceed."""
     decision = PolicyEngine().check(_principal_from_ctx(ctx), action)
     if decision.decision != Decision.ALLOW.value:
@@ -168,7 +168,7 @@ async def list_knowledge_gaps(
     status: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.KNOWLEDGE_READ, "knowledge.read")
     if denial is not None:
@@ -198,7 +198,7 @@ async def list_knowledge_gaps(
 
 
 @router.get("/gaps/stats")
-async def get_gap_stats(request: Request) -> dict[str, Any]:
+async def get_gap_stats(request: Request) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.KNOWLEDGE_READ, "knowledge.read")
     if denial is not None:
@@ -214,7 +214,7 @@ async def list_knowledge_drafts(
     request: Request,
     status: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.KNOWLEDGE_READ, "knowledge.read")
     if denial is not None:
@@ -229,7 +229,7 @@ async def list_knowledge_drafts(
 
 
 @router.post("/gaps/{gap_id}/acknowledge")
-async def acknowledge_gap(request: Request, gap_id: str) -> dict[str, Any]:
+async def acknowledge_gap(request: Request, gap_id: str) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.KNOWLEDGE_PUBLISH, "knowledge.publish")
     if denial is not None:
@@ -252,7 +252,7 @@ async def dismiss_gap(
     request: Request,
     gap_id: str,
     payload: Annotated[DismissIn, Body()],
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.KNOWLEDGE_PUBLISH, "knowledge.publish")
     if denial is not None:
@@ -278,7 +278,7 @@ async def create_gap_draft(
     request: Request,
     gap_id: str,
     payload: Annotated[DraftIn, Body()],
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.KNOWLEDGE_PUBLISH, "knowledge.publish")
     if denial is not None:
@@ -310,7 +310,7 @@ async def review_gap_draft(
     request: Request,
     draft_id: str,
     payload: Annotated[ReviewIn, Body()],
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.KNOWLEDGE_PUBLISH, "knowledge.publish")
     if denial is not None:
@@ -337,7 +337,7 @@ async def publish_gap_draft(
     request: Request,
     draft_id: str,
     payload: Annotated[PublishIn, Body()],
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.KNOWLEDGE_PUBLISH, "knowledge.publish")
     if denial is not None:

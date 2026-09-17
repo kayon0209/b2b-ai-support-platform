@@ -220,28 +220,27 @@ def test_empty_tenant_reports_zeros_not_an_error() -> None:
 
 
 @pytest.mark.parametrize("path", ["/v1/quality/metrics", "/v1/quality/routes"])
-def test_support_agent_cannot_read_quality(path: str) -> None:
+def test_support_agent_cannot_read_quality(path: str, assert_denied) -> None:
     """Quality telemetry is not part of the agent's job."""
     _insert(_new_run())
 
     resp = _client(TENANT_A, "support_agent").get(path, headers=_headers())
 
-    assert resp.status_code == 200
-    assert resp.json()["error"]["code"] == "QUALITY_ACCESS_DENIED"
+    assert_denied(resp, "QUALITY_ACCESS_DENIED")
 
 
-def test_unknown_role_fails_closed() -> None:
+def test_unknown_role_fails_closed(assert_denied) -> None:
     """Deny-by-default: an unrecognized role is not an implicit allow."""
     resp = _client(TENANT_A, "no_such_role").get("/v1/quality/metrics", headers=_headers())
 
-    assert resp.json()["error"]["code"] == "QUALITY_ACCESS_DENIED"
+    assert_denied(resp, "QUALITY_ACCESS_DENIED")
 
 
-def test_support_viewer_cannot_read_quality() -> None:
+def test_support_viewer_cannot_read_quality(assert_denied) -> None:
     """Read access to cases does not imply access to tenant-wide metrics."""
     resp = _client(TENANT_A, "support_viewer").get("/v1/quality/metrics", headers=_headers())
 
-    assert resp.json()["error"]["code"] == "QUALITY_ACCESS_DENIED"
+    assert_denied(resp, "QUALITY_ACCESS_DENIED")
 
 
 def test_denial_leaks_no_counts() -> None:

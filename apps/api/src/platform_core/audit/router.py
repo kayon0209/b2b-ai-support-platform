@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from platform_core.api import error_response
 from platform_core.audit.models import AuditEvent
 from platform_core.config import get_settings
 from platform_core.db import session_scope_with_url
@@ -78,7 +79,7 @@ async def list_audit_events(
     action: str | None = Query(default=None, max_length=127),
     decision: str | None = Query(default=None, max_length=31),
     since: int | None = Query(default=None),
-) -> dict[str, Any]:
+) -> Any:
     ctx = getattr(request.state, "tenant_context", None)
     if ctx is None:
         ctx = tenant_context.get_tenant_context()
@@ -88,14 +89,13 @@ async def list_audit_events(
     principal = _principal_from_ctx(ctx)
     gate = engine.check(principal, Action.AUDIT_READ)
     if gate.decision != Decision.ALLOW.value:
-        return {
-            "error": {
-                "code": "AUDIT_ACCESS_DENIED",
-                "reason": gate.reason_code,
-                "retryable": False,
-            },
-            "trace_id": "",
-        }
+        # 403, not a 200 with an error body: a denial carrying a success
+        # status is read as success by any client that branches on it.
+        return error_response(
+            "AUDIT_ACCESS_DENIED",
+            gate.reason_code or "audit access denied",
+            status_code=403,
+        )
 
     settings = get_settings()
     app_url = settings.database_url.replace("platform:platform@", "platform_app:platform_app@")

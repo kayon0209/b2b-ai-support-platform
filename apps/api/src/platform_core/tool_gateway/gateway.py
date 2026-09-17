@@ -11,7 +11,9 @@ but never bypass:
    same actor, tool version and action hash, with expiry.
 3. execute: idempotent by (tenant_id, idempotency_key); the DB unique
    constraint plus the executor's short-circuit make duplicate commands
-   single-execution.
+   single-execution. The short-circuit applies to *terminal* executions
+   only - a row left in EXECUTING by a killed worker is retried, because
+   returning it as a result is indistinguishable from returning success.
 4. verify: postcondition check through a read or provider receipt. An
    execution is successful only after verification; transport success is
    insufficient. Ambiguous outcomes stay UNKNOWN.
@@ -244,7 +246,13 @@ class ToolGateway:
             if confirmation.expires_at < int(time.time()):
                 raise ToolGatewayError("CONFIRMATION_EXPIRED")
 
-        # Idempotency: existing execution short-circuits (no second call).
+        # Idempotency: an execution that reached a terminal state short-circuits
+        # (no second adapter call). A row still in EXECUTING is the debris a
+        # killed worker leaves behind - the process died between committing the
+        # row and recording the outcome - and must NOT be returned as a result:
+        # the caller cannot tell it apart from a completed one, and the two call
+        # for opposite handling. Discard it and run the tool again; the
+        # executor's own idempotency key keeps the external side effect single.
         existing = (
             await self._session.execute(
                 select(ToolExecution).where(
@@ -253,8 +261,11 @@ class ToolGateway:
                 )
             )
         ).scalar_one_or_none()
-        if existing is not None:
+        if existing is not None and existing.status != ProposalStatus.EXECUTING.value:
             return existing
+        if existing is not None:
+            await self._session.delete(existing)
+            await self._session.flush()
 
         executor = self._executors.get(tool.name)
         if executor is None:

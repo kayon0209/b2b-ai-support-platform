@@ -476,22 +476,22 @@ def _create_via_http(client: TestClient, body: str = "http body") -> dict:
     return resp.json()
 
 
-def test_http_list_requires_prompt_read() -> None:
+def test_http_list_requires_prompt_read(assert_denied) -> None:
     """A support agent can read cases but not prompt internals."""
     resp = _client(TENANT, "support_agent").get(
         "/v1/prompts", params={"template_name": TEMPLATE}, headers=_headers()
     )
-    assert resp.json()["error"]["code"] == "PROMPT_ACCESS_DENIED"
+    assert_denied(resp, "PROMPT_ACCESS_DENIED")
 
 
-def test_http_release_denied_for_security_admin() -> None:
+def test_http_release_denied_for_security_admin(assert_denied) -> None:
     """security_admin may read prompts but must not put one live."""
     resp = _client(TENANT, "security_admin").post(
         "/v1/prompts",
         json={"template_name": TEMPLATE, "body": "x", "notes": ""},
         headers=_headers(),
     )
-    assert resp.json()["error"]["code"] == "PROMPT_ACCESS_DENIED"
+    assert_denied(resp, "PROMPT_ACCESS_DENIED")
 
 
 def test_http_draft_then_promote_flow() -> None:

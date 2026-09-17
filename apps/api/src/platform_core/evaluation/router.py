@@ -20,9 +20,11 @@ properties matter here and both are enforced:
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from platform_core.api import error_response
 from platform_core.config import get_settings
 from platform_core.db import session_scope_with_url
 from platform_core.evaluation.metrics import aggregate_quality_metrics
@@ -83,25 +85,27 @@ async def _aggregate(
     )
 
 
+def _denied(reason: str) -> JSONResponse:
+    """403, not a 200 with an error body (see prompt_router for the why)."""
+    return error_response(
+        "QUALITY_ACCESS_DENIED",
+        reason or "quality access denied",
+        status_code=403,
+    )
+
+
 @router.get("/metrics")
 async def get_quality_metrics(
     request: Request,
     window_seconds: int = Query(default=3600, ge=60, le=MAX_WINDOW_SECONDS),
-) -> dict[str, Any]:
+) -> Any:
     ctx = getattr(request.state, "tenant_context", None)
     if ctx is None:
         ctx = tenant_context.get_tenant_context()
 
     gate = PolicyEngine().check(_principal_from_ctx(ctx), Action.AUDIT_READ)
     if gate.decision != Decision.ALLOW.value:
-        return {
-            "error": {
-                "code": "QUALITY_ACCESS_DENIED",
-                "reason": gate.reason_code,
-                "retryable": False,
-            },
-            "trace_id": "",
-        }
+        return _denied(gate.reason_code)
 
     settings = get_settings()
     app_url = settings.database_url.replace("platform:platform@", "platform_app:platform_app@")
@@ -115,7 +119,7 @@ async def get_quality_metrics(
 async def get_route_distribution(
     request: Request,
     window_seconds: int = Query(default=3600, ge=60, le=MAX_WINDOW_SECONDS),
-) -> dict[str, Any]:
+) -> Any:
     """Route mix on its own.
 
     Split out because answering "did traffic shift from knowledge_qa to
@@ -129,14 +133,7 @@ async def get_route_distribution(
 
     gate = PolicyEngine().check(_principal_from_ctx(ctx), Action.AUDIT_READ)
     if gate.decision != Decision.ALLOW.value:
-        return {
-            "error": {
-                "code": "QUALITY_ACCESS_DENIED",
-                "reason": gate.reason_code,
-                "retryable": False,
-            },
-            "trace_id": "",
-        }
+        return _denied(gate.reason_code)
 
     settings = get_settings()
     app_url = settings.database_url.replace("platform:platform@", "platform_app:platform_app@")

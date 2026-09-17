@@ -465,7 +465,7 @@ class TestHttpSurface:
         ).json()
         assert moved["rollout_percent"] == 50
 
-    def test_auditor_can_read_but_not_change(self) -> None:
+    def test_auditor_can_read_but_not_change(self, assert_denied) -> None:
         _define("audited")
         auditor = _client(TENANT, "auditor")
 
@@ -475,13 +475,13 @@ class TestHttpSurface:
 
         denied = auditor.post(
             "/v1/flags/audited/rollout", json={"rollout_percent": 100}, headers=_headers()
-        ).json()
-        assert denied["error"]["code"] == "FLAG_ACCESS_DENIED"
+        )
+        assert_denied(denied, "FLAG_ACCESS_DENIED")
 
-    def test_unknown_role_is_denied(self) -> None:
+    def test_unknown_role_is_denied(self, assert_denied) -> None:
         nobody = _client(TENANT, "no_such_role")
-        resp = nobody.get("/v1/flags", headers=_headers()).json()
-        assert resp["error"]["code"] == "FLAG_ACCESS_DENIED"
+        resp = nobody.get("/v1/flags", headers=_headers())
+        assert_denied(resp, "FLAG_ACCESS_DENIED")
 
     def test_denial_leaks_no_flag_names(self) -> None:
         # Flag names can themselves be sensitive (unannounced features).

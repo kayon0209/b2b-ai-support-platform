@@ -639,7 +639,7 @@ class TestTenantIsolation:
 
 
 class TestHttpSurface:
-    def test_reader_can_list_but_not_dismiss(self) -> None:
+    def test_reader_can_list_but_not_dismiss(self, assert_denied) -> None:
         _record("How do I enable SSO?")
         agent = _client(TENANT, "support_agent")
 
@@ -654,7 +654,7 @@ class TestHttpSurface:
             json={"reason": "not needed"},
             headers=_headers(),
         )
-        assert denied.json()["error"]["code"] == "KNOWLEDGE_ACCESS_DENIED"
+        assert_denied(denied, "KNOWLEDGE_ACCESS_DENIED")
 
     def test_knowledge_manager_can_run_the_workflow(self) -> None:
         rec = _record("How do I enable SSO?")
@@ -666,10 +666,10 @@ class TestHttpSurface:
         assert acked.status_code == 200
         assert acked.json()["status"] == GapStatus.ACKNOWLEDGED.value
 
-    def test_unknown_role_is_denied_outright(self) -> None:
+    def test_unknown_role_is_denied_outright(self, assert_denied) -> None:
         nobody = _client(TENANT, "no_such_role")
         resp = nobody.get("/v1/knowledge/gaps", headers=_headers())
-        assert resp.json()["error"]["code"] == "KNOWLEDGE_ACCESS_DENIED"
+        assert_denied(resp, "KNOWLEDGE_ACCESS_DENIED")
 
     def test_denial_does_not_leak_counts(self) -> None:
         _record("How do I enable SSO?")

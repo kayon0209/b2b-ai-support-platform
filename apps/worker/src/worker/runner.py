@@ -36,6 +36,16 @@ class WorkerConfig:
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
     batch: int = DEFAULT_BATCH
     queue_config: dict[Queue, QueueConfig] | None = None
+    # Consecutive failed cycles tolerated before the loop gives up. Without a
+    # ceiling a persistent fault (unreachable database, revoked credential)
+    # spins at full speed logging forever while the backlog grows - a green
+    # process and an unbounded queue, which is the one combination no alert
+    # fires on. The counter resets on any successful cycle, so transient
+    # blips hours apart never accumulate into a shutdown.
+    max_consecutive_failures: int = 10
+    # Upper bound on the backoff applied between failed cycles, so recovery
+    # is still noticed promptly once the dependency returns.
+    max_backoff_seconds: float = 30.0
 
 
 class InboxWorker:
@@ -71,18 +81,50 @@ class InboxWorker:
 
     async def run_forever(self) -> None:
         """Poll until stopped. Sleeps only when the queue was empty so
-        backlog drains at full speed."""
+        backlog drains at full speed.
+
+        A failing cycle is survivable: the durable queue is a database
+        table, so nothing admitted is lost while a dependency is down, and
+        the loop retries with exponential backoff. `max_consecutive_failures`
+        bounds that tolerance - a fault that never clears must stop the
+        worker loudly instead of spinning (see WorkerConfig).
+        """
         logger.info("worker_started", queue=Queue.INTERACTIVE.value)
+        consecutive_failures = 0
         while not self._stopping:
             try:
                 processed = await self.run_once()
-            except Exception as exc:  # noqa: BLE001 - keep the loop alive
-                logger.error("worker_cycle_failed", error_code=type(exc).__name__)
-                await asyncio.sleep(self._config.poll_interval_seconds)
+            except Exception as exc:  # noqa: BLE001 - classify below
+                consecutive_failures += 1
+                logger.error(
+                    "worker_cycle_failed",
+                    error_code=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                )
+                if consecutive_failures >= self._config.max_consecutive_failures:
+                    logger.error(
+                        "worker_giving_up",
+                        consecutive_failures=consecutive_failures,
+                    )
+                    raise
+                await asyncio.sleep(self._backoff(consecutive_failures))
                 continue
+            consecutive_failures = 0
             if processed == 0:
                 await asyncio.sleep(self._config.poll_interval_seconds)
         logger.info("worker_stopped", queue=Queue.INTERACTIVE.value)
+
+    def _backoff(self, consecutive_failures: int) -> float:
+        """Exponential backoff, capped so recovery stays responsive.
+
+        `int ** int` is typed `Any` because the result depends on the sign of
+        the exponent, so the multiplier is converted explicitly instead of
+        letting `Any` flow into the declared `float` return.
+        """
+        base = float(self._config.poll_interval_seconds)
+        cap = float(self._config.max_backoff_seconds)
+        multiplier = float(2 ** (consecutive_failures - 1))
+        return min(base * multiplier, cap)
 
 
 def install_signal_handlers(worker: InboxWorker, loop: asyncio.AbstractEventLoop) -> None:

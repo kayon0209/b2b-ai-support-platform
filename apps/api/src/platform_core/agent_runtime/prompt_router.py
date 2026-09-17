@@ -25,6 +25,7 @@ import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from platform_core.agent_runtime.prompt_release import (
@@ -40,6 +41,7 @@ from platform_core.agent_runtime.prompt_release import (
     rollback,
     submit_candidate,
 )
+from platform_core.api import error_response
 from platform_core.config import get_settings
 from platform_core.db import session_scope_with_url
 from platform_core.identity import tenant_context
@@ -101,16 +103,20 @@ def _principal_from_ctx(ctx: TenantContext) -> Principal:
     )
 
 
-def _denied(action: str, reason: str) -> dict[str, Any]:
-    return {
-        "error": {
-            "code": "PROMPT_ACCESS_DENIED",
-            "reason": reason,
-            "action": action,
-            "retryable": False,
-        },
-        "trace_id": "",
-    }
+def _denied(action: str, reason: str) -> JSONResponse:
+    """403, not a 200 with an error body.
+
+    A denial that arrives with a success status is worse than useless: any
+    client that branches on the status code - a retry wrapper, a dashboard,
+    an integration test - reads "denied" as "here is your data". The body
+    code alone is not a contract when the transport disagrees with it.
+    """
+    return error_response(
+        "PROMPT_ACCESS_DENIED",
+        reason or "prompt access denied",
+        status_code=403,
+        details={"action": action},
+    )
 
 
 def _release_error(exc: ReleaseError) -> dict[str, Any]:
@@ -131,7 +137,7 @@ def _ctx_of(request: Request) -> TenantContext:
     return ctx
 
 
-def _gate(ctx: TenantContext, action: Action, name: str) -> dict[str, Any] | None:
+def _gate(ctx: TenantContext, action: Action, name: str) -> JSONResponse | None:
     """Return a denial envelope, or None when the caller may proceed."""
     decision = PolicyEngine().check(_principal_from_ctx(ctx), action)
     if decision.decision != Decision.ALLOW.value:
@@ -200,7 +206,7 @@ def _version_out(row: Any) -> dict[str, Any]:
 async def list_prompt_versions(
     request: Request,
     template_name: str = Query(..., min_length=1, max_length=127),
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.PROMPT_READ, "prompt.read")
     if denial is not None:
@@ -216,7 +222,7 @@ async def list_prompt_versions(
 async def get_active_prompt(
     request: Request,
     template_name: str = Query(..., min_length=1, max_length=127),
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.PROMPT_READ, "prompt.read")
     if denial is not None:
@@ -234,7 +240,7 @@ async def get_active_prompt(
 async def create_prompt_draft(
     request: Request,
     payload: Annotated[DraftIn, Body()],
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.PROMPT_RELEASE, "prompt.release")
     if denial is not None:
@@ -257,7 +263,7 @@ async def create_prompt_draft(
 
 
 @router.post("/{version_id}/candidate")
-async def submit_prompt_candidate(request: Request, version_id: str) -> dict[str, Any]:
+async def submit_prompt_candidate(request: Request, version_id: str) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.PROMPT_RELEASE, "prompt.release")
     if denial is not None:
@@ -278,7 +284,7 @@ async def promote_prompt_version(
     request: Request,
     version_id: str,
     payload: Annotated[EvidenceIn | None, Body()] = None,
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.PROMPT_RELEASE, "prompt.release")
     if denial is not None:
@@ -305,7 +311,7 @@ async def reject_prompt_version(
     request: Request,
     version_id: str,
     payload: Annotated[RejectIn, Body()],
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.PROMPT_RELEASE, "prompt.release")
     if denial is not None:
@@ -327,7 +333,7 @@ async def reject_prompt_version(
 async def rollback_prompt_version(
     request: Request,
     payload: Annotated[RollbackIn, Body()],
-) -> dict[str, Any]:
+) -> Any:
     ctx = _ctx_of(request)
     denial = _gate(ctx, Action.PROMPT_RELEASE, "prompt.release")
     if denial is not None:

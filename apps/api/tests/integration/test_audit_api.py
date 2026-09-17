@@ -77,8 +77,11 @@ def _token(slug: str, role_hint: str = "") -> dict[str, str]:
 
 
 def test_audit_api_denies_without_role(client: TestClient) -> None:
+    # 403, not 200: previously this asserted a 200 carrying an error body,
+    # which meant any client branching on the status code saw a denied
+    # request as a successful one. The body code alone is not the contract.
     resp = client.get("/v1/audit-events", headers=_token("aud-a"))
-    assert resp.status_code == 200
+    assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "AUDIT_ACCESS_DENIED"
 
 

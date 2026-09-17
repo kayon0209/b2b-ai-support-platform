@@ -434,3 +434,127 @@ def test_adapter_crash_marks_execution_failed(gateway_env) -> None:
             await engine.dispose()
 
     assert _run(scenario()) == "failed-cleanly"
+
+
+# --- Worker termination mid-execution (pilot failure-injection gate) ---
+#
+# `execute` creates the ToolExecution row with status EXECUTING and *then*
+# calls the adapter. If the worker is killed inside that call - the classic
+# OOM/SIGKILL/deploy case - the row survives with no completed_at and no
+# output. Replaying the same idempotency key must not present that corpse as
+# a result, because the caller cannot distinguish "already done" from
+# "died half way", and the safe answer differs: one is a no-op, the other
+# needs a human or a bounded retry.
+
+
+def _crashed_execution(session, proposal, idempotency_key):
+    """The row a killed worker leaves behind: EXECUTING, never completed."""
+    from platform_core.tool_gateway.models import ToolExecution
+
+    return ToolExecution(
+        tenant_id=TENANT,
+        proposal_id=proposal.id,
+        actor_id=ACTOR,
+        tool_definition_id=proposal.tool_definition_id,
+        status="executing",
+        idempotency_key=idempotency_key,
+        sanitized_input={"account_ref": "a1"},
+        started_at=0,
+        completed_at=None,
+    )
+
+
+def test_replay_of_a_crashed_execution_is_not_reported_as_a_result(gateway_env) -> None:
+    async def scenario() -> tuple[str, int]:
+        executor = FakeExecutor()
+        gw, session, engine = await gateway_env(executor)
+        proposal = await gw.propose(
+            tenant_id=TENANT,
+            actor_id=ACTOR,
+            tool_name="crm.tag_account",
+            arguments={"account_ref": "a1"},
+            role="support_admin",
+            idempotency_key="crash-1",
+            permission_allowed=True,
+        )
+        session.add(_crashed_execution(session, proposal, "crash-1"))
+        await session.commit()
+        try:
+            execution = await gw.execute(
+                tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id
+            )
+            # If the corpse is returned as a result, status is 'executing' -
+            # neither success nor failure, and the adapter was never called.
+            return execution.status, len(executor.calls)
+        finally:
+            await session.close()
+            await engine.dispose()
+
+    status, calls = _run(scenario())
+    assert status != "executing", (
+        "a replay of an interrupted execution returned the half-finished row "
+        "as though it were a result; the caller cannot tell it apart from a "
+        "completed one"
+    )
+    assert status in {"executed", "failed", "unknown"}
+
+
+def test_crashed_execution_does_not_invent_success(gateway_env) -> None:
+    """Running the replay must re-invoke the adapter, not silently succeed."""
+
+    async def scenario() -> tuple[str, int]:
+        executor = FakeExecutor(output={"done": True})
+        gw, session, engine = await gateway_env(executor)
+        proposal = await gw.propose(
+            tenant_id=TENANT,
+            actor_id=ACTOR,
+            tool_name="crm.tag_account",
+            arguments={"account_ref": "a1"},
+            role="support_admin",
+            idempotency_key="crash-2",
+            permission_allowed=True,
+        )
+        session.add(_crashed_execution(session, proposal, "crash-2"))
+        await session.commit()
+        try:
+            execution = await gw.execute(
+                tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id
+            )
+            return execution.status, len(executor.calls)
+        finally:
+            await session.close()
+            await engine.dispose()
+
+    status, calls = _run(scenario())
+    assert calls == 1, "the interrupted execution was never retried"
+    assert status == "executed"
+
+
+def test_completed_execution_still_short_circuits(gateway_env) -> None:
+    """The normal idempotency guarantee must survive the crash fix."""
+
+    async def scenario() -> tuple[str, int]:
+        executor = FakeExecutor()
+        gw, session, engine = await gateway_env(executor)
+        proposal = await gw.propose(
+            tenant_id=TENANT,
+            actor_id=ACTOR,
+            tool_name="crm.tag_account",
+            arguments={"account_ref": "a1"},
+            role="support_admin",
+            idempotency_key="ok-1",
+            permission_allowed=True,
+        )
+        try:
+            first = await gw.execute(tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id)
+            second = await gw.execute(tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id)
+            # The replay must hand back the *same* execution, not a new row.
+            assert first.id == second.id
+            return first.status, len(executor.calls)
+        finally:
+            await session.close()
+            await engine.dispose()
+
+    status, calls = _run(scenario())
+    assert status == "executed"
+    assert calls == 1, "a completed execution was executed twice"
