@@ -16,7 +16,7 @@ and would look like a working login that silently cannot do anything.
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -41,6 +41,13 @@ EXEMPT_PATHS = {
     # Webhook authenticates via HMAC signature and resolves tenant from
     # trusted connector configuration, not bearer tokens.
     "/v1/webhooks/chatwoot",
+    # Invite acceptance is how someone *joins* a tenant, so the caller has no
+    # membership and therefore no bearer token yet. The single-use token in
+    # the request body is the credential: the handler resolves the tenant from
+    # it through a SECURITY DEFINER function and grants only the invited role.
+    # Without this exemption accept is unreachable in the real app (401 before
+    # the handler runs) even though the handler is correct.
+    "/v1/identity/members/accept",
 }
 
 
@@ -191,7 +198,9 @@ async def oidc_token_resolver(request: Request) -> TenantContext:
         raise PermissionError("token verification failed") from exc
 
     try:
-        return await resolver.tenant_context(claims)
+        # `resolver` is imported lazily (Any); the resolver contract is
+        # tenant_context(claims) -> TenantContext.
+        return cast(TenantContext, await resolver.tenant_context(claims))
     except PermissionError:
         raise
     except Exception as exc:
@@ -206,7 +215,7 @@ def _oidc_dependencies() -> tuple[Any, Any]:
     """Build (verifier, membership resolver) once, on first use."""
     global _oidc_cache
     if _oidc_cache is not None:
-        return _oidc_cache  # type: ignore[return-value]
+        return _oidc_cache
 
     from sqlalchemy.ext.asyncio import async_sessionmaker
 

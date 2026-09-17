@@ -341,7 +341,7 @@ def test_migrations_apply_and_are_reversible_on_fresh_database(
 
 
 @pytest.fixture()
-def perf_tenant() -> str:
+def perf_tenant() -> Iterator[str]:
     admin = create_engine(ADMIN_URL)
     tid = str(uuid.uuid4())
     with admin.begin() as conn:
@@ -354,7 +354,17 @@ def perf_tenant() -> str:
             {"id": tid, "s": f"perf-{tid[:8]}"},
         )
     admin.dispose()
-    return tid
+    try:
+        yield tid
+    finally:
+        # Leave no trace: without this the benchmark accumulates one tenant
+        # per run in the shared database. inbox_events references the tenant,
+        # so delete the children first.
+        cleanup = create_engine(ADMIN_URL)
+        with cleanup.begin() as conn:
+            conn.execute(text("DELETE FROM inbox_events WHERE tenant_id = :t"), {"t": tid})
+            conn.execute(text("DELETE FROM tenants WHERE id = :t"), {"t": tid})
+        cleanup.dispose()
 
 
 def test_100_concurrent_ingest_p95(perf_tenant: str) -> None:

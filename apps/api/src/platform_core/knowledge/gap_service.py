@@ -381,7 +381,8 @@ async def publish_draft(
     # the draft body through the same storage path as a normal upload. The row
     # is committed before the object: a row without an object is recoverable,
     # an object without a row is an orphan that no listing would ever clean up.
-    from platform_core.knowledge.service import ObjectKey, upload_object
+    from platform_core.knowledge.service import upload_object
+    from platform_core.knowledge.storage import ObjectKey
 
     key = ObjectKey(
         tenant_id=str(ctx.tenant_id),

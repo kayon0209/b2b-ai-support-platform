@@ -108,9 +108,7 @@ def _member_out(user: User, membership: Membership) -> MemberOut:
 
 def _app_role_url() -> str:
     """Swap the bootstrap owner for the non-bypass application role."""
-    return get_settings().database_url.replace(
-        "platform:platform@", "platform_app:platform_app@"
-    )
+    return get_settings().database_url.replace("platform:platform@", "platform_app:platform_app@")
 
 
 async def _list_members(session: AsyncSession, tenant_id: uuid.UUID) -> list[MemberOut]:
@@ -313,21 +311,23 @@ async def accept_invite(request: Request, body: AcceptInviteIn) -> Any:
 
     async with session_scope_with_url(_app_role_url()) as session:
         row = (
-            await session.execute(
-                text(
-                    "SELECT id, tenant_id, email, role, status, expires_at "
-                    "FROM resolve_invitation_by_token(:t)"
-                ),
-                {"t": str(body.token)},
+            (
+                await session.execute(
+                    text(
+                        "SELECT id, tenant_id, email, role, status, expires_at "
+                        "FROM resolve_invitation_by_token(:t)"
+                    ),
+                    {"t": str(body.token)},
+                )
             )
-        ).mappings().one_or_none()
+            .mappings()
+            .one_or_none()
+        )
 
         # A wrong token, or a token presented with the wrong email, is a 404
         # in both cases so the endpoint is not an invitation-existence oracle.
         if row is None or row["email"].lower() != body.email.lower():
-            return error_response(
-                "INVITATION_NOT_FOUND", "invitation not found", status_code=404
-            )
+            return error_response("INVITATION_NOT_FOUND", "invitation not found", status_code=404)
         if row["status"] == InvitationStatus.ACCEPTED.value:
             return error_response(
                 "INVITATION_ALREADY_USED",
@@ -381,9 +381,7 @@ async def accept_invite(request: Request, body: AcceptInviteIn) -> Any:
             )
         ).scalar_one_or_none()
         if invitation is None:  # pragma: no cover - resolver returned it above
-            return error_response(
-                "INVITATION_NOT_FOUND", "invitation not found", status_code=404
-            )
+            return error_response("INVITATION_NOT_FOUND", "invitation not found", status_code=404)
         invitation.status = InvitationStatus.ACCEPTED.value
         invitation.accepted_at = now
 
@@ -448,9 +446,7 @@ async def update_member_role(request: Request, member_id: str, body: RoleUpdateI
     async with tenant_session(ctx) as session:
         membership = await session.get(Membership, mid)
         if membership is None:
-            return error_response(
-                "MEMBERSHIP_NOT_FOUND", "membership not found", status_code=404
-            )
+            return error_response("MEMBERSHIP_NOT_FOUND", "membership not found", status_code=404)
         before_role = _role_value(membership.role)
         membership.role = MembershipRole(body.role)
         await audit_service.record(
@@ -492,9 +488,7 @@ async def remove_member(request: Request, member_id: str) -> Any:
     async with tenant_session(ctx) as session:
         membership = await session.get(Membership, mid)
         if membership is None:
-            return error_response(
-                "MEMBERSHIP_NOT_FOUND", "membership not found", status_code=404
-            )
+            return error_response("MEMBERSHIP_NOT_FOUND", "membership not found", status_code=404)
 
         if _role_value(membership.role) == MembershipRole.TENANT_OWNER.value:
             owner_count = (

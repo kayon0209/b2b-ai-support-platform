@@ -52,6 +52,14 @@ ignore_missing_imports = true
 module = ["jsonschema.*", "uuid6.*"]
 ignore_missing_imports = true
 
+# OpenTelemetry is an optional runtime extra (imported lazily and guarded by
+# try/except ImportError in observability_tracing). It is not installed in the
+# dev/test environment, so its stubs cannot be resolved; treat the imports as
+# Any rather than failing the type gate on an optional dependency.
+[[tool.mypy.overrides]]
+module = ["opentelemetry.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # Source roots for the modular monolith. Declared here rather than relying on

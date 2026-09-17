@@ -300,6 +300,36 @@ class TestAcceptInvite:
         )
         assert second.status_code == 409
 
+    def test_accept_is_reachable_without_a_bearer_token(self) -> None:
+        """The invitee has no membership yet, so accept must be reachable
+        unauthenticated. This drives the REAL middleware (platform_core.main);
+        the other accept tests use a middleware-less app and so cannot catch a
+        missing auth exemption."""
+        import importlib
+
+        main_mod = importlib.import_module("platform_core.main")
+
+        invite_client = _client(TENANT, "tenant_owner")
+        resp = invite_client.post(
+            "/v1/identity/members/invite",
+            headers=_headers(str(uuid.uuid4())),
+            json={"email": "reachable@ident-test.com", "role": "support_agent"},
+        )
+        token = resp.json()["invitation_token"]
+
+        real = TestClient(main_mod.app, raise_server_exceptions=False)
+        out = real.post(
+            "/v1/identity/members/accept",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            json={
+                "token": token,
+                "email": "reachable@ident-test.com",
+                "display_name": "Reachable",
+            },
+        )
+        assert out.status_code == 200, out.text
+        assert out.json()["role"] == "support_agent"
+
 
 # --- Update / Remove -------------------------------------------------------
 

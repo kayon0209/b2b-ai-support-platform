@@ -102,12 +102,18 @@ def run() -> None:
     its loop before the app is imported, so nothing the app sets at import
     time can influence it.
     """
-    import asyncio
     import os
 
     import uvicorn
 
-    loop_factory = asyncio.SelectorEventLoop if sys.platform == "win32" else asyncio.new_event_loop
+    # uvicorn's `loop` takes a LoopFactoryType string or a dotted import path
+    # ("module:attr") for a custom loop factory. A dotted string keeps the
+    # declared type honest; passing the class object also happens to work only
+    # because uvicorn's importer passes non-strings through unchanged, which is
+    # an undocumented accident we should not depend on.
+    loop_factory = (
+        "asyncio:SelectorEventLoop" if sys.platform == "win32" else "asyncio:new_event_loop"
+    )
     # Bind address is configurable because "all interfaces" is right inside a
     # container behind a service mesh and wrong on a developer laptop: on the
     # latter it exposes the API to the local network.
