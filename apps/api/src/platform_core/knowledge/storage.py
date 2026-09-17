@@ -177,10 +177,16 @@ class MinioStorage:
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         region, service = "us-east-1", "s3"
         scope = f"{date_stamp}/{region}/{service}/aws4_request"
-        credential = quote(f"{self.access_key}/{scope}", safe="-._~")
 
         expires = str(max(60, min(expires_seconds, 3600)))
         canonical_uri = f"/{self.bucket}/{quote(key, safe='/-._~')}"
+        # NOT quoted here. `canonical_query` below URL-encodes every value, so
+        # pre-quoting the credential double-encodes the "/" separators into
+        # "%252F" and the server rejects the request with
+        # AuthorizationQueryParametersError. Signing must use the *unencoded*
+        # value (the canonical query string is defined over the decoded form),
+        # and encoding happens exactly once, at assembly time.
+        credential = f"{self.access_key}/{scope}"
         query = {
             "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
             "X-Amz-Credential": credential,

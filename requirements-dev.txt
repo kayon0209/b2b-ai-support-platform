@@ -19,6 +19,10 @@ fastapi>=0.115
 uvicorn[standard]>=0.32
 pydantic>=2.9
 pydantic-settings>=2.6
+# Required by FastAPI to parse multipart/form-data, which the knowledge
+# document upload uses. Without it every Form/File route raises at import
+# time, so it is a runtime dependency, not an optional extra.
+python-multipart>=0.0.9
 
 # --- Persistence -----------------------------------------------------------
 sqlalchemy>=2.0.36

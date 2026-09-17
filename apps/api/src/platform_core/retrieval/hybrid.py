@@ -171,23 +171,16 @@ async def hybrid_search(
     if principal is not None:
         # Fail closed: any resource carrying ACL entries must include a
         # principal match. Resources without entries remain accessible.
+        #
+        # The predicate itself lives in `knowledge/acl_service.py`, because the
+        # document download path evaluates the same rule for a single document.
+        # Two copies would drift, and a document that is invisible to search
+        # but downloadable is still a leak.
+        from platform_core.knowledge.acl_service import acl_filter_fragment
+
         params["p_types"] = list(principal.principal_types)
         params["p_ids"] = list(principal.principal_ids)
-        acl = """
-          AND NOT EXISTS (
-            SELECT 1 FROM knowledge_acls a
-            WHERE a.tenant_id = CAST(:tid AS uuid)
-              AND (
-                (a.resource_type = 'space' AND a.resource_id = d.space_id)
-                OR (a.resource_type = 'document' AND a.resource_id = d.id)
-                OR (a.resource_type = 'version' AND a.resource_id = dv.id)
-              )
-              AND NOT (
-                a.principal_type = ANY(CAST(:p_types AS text[]))
-                AND a.principal_id = ANY(CAST(:p_ids AS text[]))
-              )
-          )
-        """
+        acl = acl_filter_fragment()
     else:
         acl = ""
 

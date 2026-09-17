@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     # Retrieval reranker deadline; on breach we fall back to fused order.
     rerank_timeout_seconds: float = 2.0
 
+    # Object storage (MinIO/S3) for immutable document originals.
+    # Client-facing access is always a short-lived pre-signed URL
+    # (docs/security.md), generated server-side - the API never proxies bytes
+    # and never hands out a public path.
+    object_storage_endpoint: str = "localhost:9000"
+    object_storage_access_key: SecretStr | None = None
+    object_storage_secret_key: SecretStr | None = None
+    object_storage_bucket: str = "documents"
+    object_storage_secure: bool = False
+    # Lifetime of a download URL. Short by design: the URL is a bearer
+    # credential for the object, so its value is that it stops working.
+    presign_expiry_seconds: int = 300
+
 
 @lru_cache
 def get_settings() -> Settings:
