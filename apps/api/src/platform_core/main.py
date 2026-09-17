@@ -23,6 +23,9 @@ if sys.platform == "win32":
 
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from platform_core import db
@@ -39,7 +42,22 @@ from platform_core.retrieval.router import router as retrieval_router
 from platform_core.support_bridge.router import router as support_bridge_router
 from platform_core.tool_gateway.router import router as tool_gateway_router
 
-app = FastAPI(title="B2B AI Support Platform", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Release the connection pool on shutdown.
+
+    Replaces `@app.on_event("shutdown")`, which Starlette deprecated in favour
+    of lifespan handlers. Behaviour is unchanged - the engine is disposed once,
+    after the server stops accepting requests - but the deprecation warning is
+    gone, and lifespan runs under every server (uvicorn, TestClient, ASGI
+    runners) rather than only the ones that emit the legacy events.
+    """
+    yield
+    await db.dispose_engine()
+
+
+app = FastAPI(title="B2B AI Support Platform", version="0.1.0", lifespan=lifespan)
 app.include_router(support_bridge_router)
 app.include_router(audit_router)
 app.include_router(cases_router)
@@ -57,11 +75,6 @@ app.add_middleware(TenantContextMiddleware, resolver=build_resolver())
 def healthz() -> dict[str, str]:
     settings: Settings = get_settings()
     return {"status": "ok", "environment": settings.environment}
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    await db.dispose_engine()
 
 
 def run() -> None:

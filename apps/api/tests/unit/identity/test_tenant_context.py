@@ -164,3 +164,45 @@ def test_malformed_tokens_rejected() -> None:
     for token in ("", "Bearer garbage", "Bearer xx_yy", "Bearer pt__not-a-uuid"):
         resp = client.get("/anything", headers={"Authorization": token} if token else {})
         assert resp.status_code == 401, f"token {token!r} should be rejected"
+
+
+def test_app_shutdown_disposes_the_engine_via_lifespan() -> None:
+    """The app must release its connection pool, and must not use on_event.
+
+    `@app.on_event("shutdown")` is deprecated by Starlette; the replacement is
+    a lifespan handler. This asserts the behaviour (dispose runs) rather than
+    the mechanism, and separately pins that the deprecated decorator is gone -
+    a regression there reintroduces a warning on every startup, which is how
+    it was noticed.
+
+    Called with a fake engine so no database is required: the unit is the
+    wiring, not the pool.
+    """
+    import asyncio
+
+    from platform_core import db
+    from platform_core.main import app, lifespan
+
+    calls = {"n": 0}
+
+    async def fake_dispose() -> None:
+        calls["n"] += 1
+
+    original = db.dispose_engine
+    db.dispose_engine = fake_dispose  # type: ignore[assignment]
+    try:
+
+        async def drive() -> None:
+            async with lifespan(app):
+                pass
+
+        asyncio.run(drive(), loop_factory=asyncio.SelectorEventLoop)
+    finally:
+        db.dispose_engine = original  # type: ignore[assignment]
+
+    assert calls["n"] == 1, "shutdown must dispose the engine exactly once"
+
+    # `on_event("shutdown")` registers into `app.router.on_shutdown`, so an
+    # empty list means no legacy handler remains.
+    legacy = getattr(app.router, "on_shutdown", [])
+    assert not legacy, f"on_event('shutdown') is deprecated; still registered: {legacy}"
