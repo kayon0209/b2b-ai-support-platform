@@ -35,6 +35,25 @@ export async function apiPost<T>(
   return unwrap<T>(res);
 }
 
+export async function apiPut<T>(
+  path: string,
+  body: unknown,
+  idempotencyKey?: string,
+): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    ...authHeader(),
+  };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  const res = await fetch(`${BASE}${path}`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify(body),
+  });
+  return unwrap<T>(res);
+}
+
 export async function apiDelete<T>(path: string, idempotencyKey?: string): Promise<T> {
   const headers: Record<string, string> = {
     Accept: "application/json",

@@ -187,6 +187,29 @@ A proposal freezes:
 
 Execution requires the same action hash. Any material argument change invalidates confirmation.
 
+## Tenant branding
+
+```text
+GET /v1/tenant/branding
+PUT /v1/tenant/branding
+```
+
+```json
+{
+  "display_name": "Acme Support",
+  "logo_url": "https://cdn.example.com/logo.png",
+  "primary_color": "#1a2b3c",
+  "support_email": "help@acme.example"
+}
+```
+
+Both routes act on the caller's server-resolved tenant; there is no route that
+takes a tenant id from the client. Reading needs only an authenticated member,
+because branding is public-facing. Writing needs `tenant.admin` and an
+`Idempotency-Key`, and is audited. `PUT` replaces the whole object: an omitted
+field is cleared. `primary_color` must be a hex colour and `logo_url` must be
+http(s), because the admin UI renders both.
+
 ## Outbound Chatwoot command
 
 The internal command includes:

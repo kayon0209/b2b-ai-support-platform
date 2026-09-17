@@ -122,6 +122,15 @@ export interface InviteResult {
   role?: string;
 }
 
+export interface TenantBranding {
+  tenant_id: string;
+  slug: string;
+  display_name: string | null;
+  logo_url: string | null;
+  primary_color: string | null;
+  support_email: string | null;
+}
+
 export interface ListEnvelope<T> {
   items: T[];
   total: number;

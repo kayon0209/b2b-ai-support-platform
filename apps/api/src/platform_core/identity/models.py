@@ -38,6 +38,12 @@ class Tenant(Base, PkMixin):
     default_timezone: Mapped[str] = mapped_column(String(63), default="UTC")
     data_region: Mapped[str] = mapped_column(String(31), default="cn-north-1")
 
+    # Branding (Phase 5). Nullable: unset means "use the platform default".
+    brand_display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    brand_logo_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    brand_primary_color: Mapped[str | None] = mapped_column(String(31), nullable=True)
+    support_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
 
 class User(Base, PkMixin):
     __tablename__ = "users"

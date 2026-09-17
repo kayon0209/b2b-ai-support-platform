@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { createBrowserRouter, Navigate, RouterProvider } from "react-router-dom";
 
 import { Layout } from "./components/Layout";
+import { Branding } from "./pages/Branding";
 import { Cases } from "./pages/Cases";
 import { FeatureFlags } from "./pages/FeatureFlags";
 import { GapQueue } from "./pages/GapQueue";
@@ -28,6 +29,7 @@ const router = createBrowserRouter([
       { path: "flags", element: <FeatureFlags /> },
       { path: "cases", element: <Cases /> },
       { path: "members", element: <Members /> },
+      { path: "branding", element: <Branding /> },
       { path: "*", element: <Navigate to="/quality" replace /> },
     ],
   },

@@ -7,6 +7,7 @@ const NAV = [
   { to: "/flags", label: "Feature Flags", icon: "🚩" },
   { to: "/cases", label: "Cases & SLA", icon: "🎫" },
   { to: "/members", label: "Members", icon: "👥" },
+  { to: "/branding", label: "Branding", icon: "🎨" },
 ];
 
 export function Layout() {
