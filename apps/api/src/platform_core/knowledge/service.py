@@ -310,7 +310,8 @@ def presign_for(key: str, *, expires_seconds: int, settings: Any | None = None) 
     """
     from platform_core.config import get_settings
 
-    return _storage(settings or get_settings()).presign_get(key, expires_seconds=expires_seconds)
+    url = _storage(settings or get_settings()).presign_get(key, expires_seconds=expires_seconds)
+    return str(url)
 
 
 def _secret(value: Any) -> str | None:
@@ -337,4 +338,17 @@ def upload_object(key: str, data: bytes, content_type: str) -> str:
     retried without re-registering the document."""
     from platform_core.config import get_settings
 
-    return _storage(get_settings()).put_object(key, data, content_type)
+    return str(_storage(get_settings()).put_object(key, data, content_type))
+
+
+def get_object(key: str) -> bytes:
+    """Read an object's bytes for the ingestion pipeline.
+
+    Sync, like `put_object`: the storage client is httpx-sync, and the
+    worker's caller already runs it off the event loop's critical path. Kept
+    here rather than in the worker so the bucket and credentials are resolved
+    in exactly one place - the same reason `presign_for` is wrapped.
+    """
+    from platform_core.config import get_settings
+
+    return bytes(_storage(get_settings()).get_object(key))

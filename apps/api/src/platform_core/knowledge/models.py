@@ -20,6 +20,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import (
+    text as sa_text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import UserDefinedType
@@ -116,6 +119,55 @@ class DocumentVersion(Base, PkMixin, TenantMixin):
     object_uri: Mapped[str] = mapped_column(Text, nullable=False)
     parser_version: Mapped[str] = mapped_column(String(63), nullable=False, default="v1")
     ingestion_status: Mapped[str] = mapped_column(String(31), nullable=False, default="uploaded")
+    # Both timestamps are bigint epoch seconds and are owned by the database
+    # (migration 0017 installs INSERT/UPDATE triggers that stamp them).
+    #
+    # - `created_at` is the FIFO ordering key for the ingestion claim. It is
+    #   declared nullable in Python because the value is assigned by the
+    #   trigger during INSERT, not by the ORM.
+    # - `updated_at` answers "when did this row enter its current state",
+    #   which `created_at` cannot. Stale-claim recovery depends on it: a
+    #   document uploaded yesterday and claimed a second ago is not stale, and
+    #   reclaiming it would let a second worker ingest the same version
+    #   concurrently.
+    #
+    # Neither is written from Python: a caller that forgot to stamp one would
+    # make recovery reclaim a row that is actively being processed. The
+    # database owns the invariant instead.
+    #
+    # The `server_default` here is load-bearing, and getting it wrong is a
+    # 503 on every upload. Without a server-side default in the ORM's own
+    # metadata, SQLAlchemy emits the column in the INSERT as an explicit
+    # NULL - and an explicit NULL overrides the table's own DEFAULT, so the
+    # NOT NULL constraint fires. Measured: the upload endpoint returned
+    # `IntegrityError: null value in column "updated_at"` until this was
+    # declared. The trigger cannot save it, because the trigger runs after
+    # the row reaches the table and the value is already NULL by then.
+    #
+    # It must be a **dialect-neutral literal**, not `EXTRACT(EPOCH FROM
+    # now())`. The PostgreSQL expression is the honest default and is what
+    # migration 0017 uses, but ORM metadata is not Postgres-only: unit tests
+    # build the schema with `Base.metadata.create_all` against SQLite, which
+    # cannot parse `EXTRACT(...)` and fails at DDL time. Measured: all 13
+    # tool_gateway tests failed with
+    # `sqlite3.OperationalError` when this was the Postgres expression.
+    #
+    # `0` is the right neutral placeholder because on PostgreSQL it is never
+    # reached: the trigger in migration 0017 overwrites it on every INSERT
+    # and UPDATE, so the real value is always the true epoch second. The
+    # column is a monotonic "when did this row last change" marker, so a
+    # SQLite fixture that leaves it at 0 is simply a row that has never been
+    # touched - which is exactly what a freshly created fixture row is.
+    created_at: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=sa_text("0"),
+    )
+    updated_at: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=sa_text("0"),
+    )
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default="{}"
     )

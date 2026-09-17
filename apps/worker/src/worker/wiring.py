@@ -44,6 +44,22 @@ class WorkerConfigurationError(SystemExit):
     """
 
 
+@dataclass(frozen=True)
+class IngestionDeps:
+    """Capabilities the ingestion pipeline needs. Deliberately narrow.
+
+    A separate container from `OrchestratorDeps` so the ingestion worker
+    cannot accidentally reach for a chat provider or a Chatwoot sender:
+    parsing, chunking and embedding have no business sending anything.
+    """
+
+    embedder: Any
+
+    @property
+    def can_embed(self) -> bool:
+        return self.embedder is not None
+
+
 def _has_chatwoot_token(token: SecretStr | None) -> bool:
     """True only for a token that could actually authenticate.
 
@@ -153,6 +169,52 @@ def build_interactive_deps(
     )
 
 
+def app_role_url() -> str:
+    """The non-bypass database URL.
+
+    The bootstrap owner (`platform`) is a superuser, so a session opened with
+    it bypasses RLS entirely - every tenant filter would be enforced by
+    application code alone, and the documented third defence layer would be
+    absent exactly where it matters most (a background job with no request
+    context to derive a tenant from). `platform_app` has NOBYPASSRLS, which
+    makes a missing `app.tenant_id` setting return zero rows instead of
+    every tenant's rows.
+
+    Derived from the configured URL rather than a second setting so the two
+    can never disagree: a deployment that points `APP_DATABASE_URL` at its
+    own host does not also have to remember to update an app-role override.
+    """
+    settings = get_settings()
+    return settings.database_url.replace("platform:platform@", "platform_app:platform_app@")
+
+
+def build_ingestion_deps(*, require_embedding: bool = True) -> IngestionDeps:
+    """Assemble the collaborators for the ingestion worker.
+
+    The ingestion path needs exactly one model capability - embeddings - and
+    must not be assembled from the interactive bundle, because that bundle
+    requires a chat provider. Requiring an LLM key to index documents would
+    mean a deployment that only wants retrieval-from-uploads cannot start,
+    and a chat outage would stop ingestion.
+
+    `require_embedding` defaults to True, and that is deliberate rather than
+    convenient. Without an embedder the pipeline would still write chunks and
+    mark the version READY, so `hybrid_search` would return lexical matches
+    and the vector half of the fusion would silently contribute nothing -
+    the exact "looks indexed, is half indexed" state the state machine exists
+    to prevent. Failing at startup makes the misconfiguration visible.
+    """
+    bundle = get_model_bundle()
+    if bundle is None or bundle.embedding is None:
+        if require_embedding:
+            raise WorkerConfigurationError(
+                "APP_LLM_API_KEY is required to run the ingestion worker: "
+                "documents must be embedded before retrieval can return them"
+            )
+        return IngestionDeps(embedder=None)
+    return IngestionDeps(embedder=bundle.embedding)
+
+
 def audit_wiring(deps: OrchestratorDeps) -> WorkerWiring:
     """Report what a deps object can actually do.
 
@@ -173,8 +235,11 @@ def audit_wiring(deps: OrchestratorDeps) -> WorkerWiring:
 
 
 __all__ = [
+    "IngestionDeps",
     "WorkerConfigurationError",
     "WorkerWiring",
+    "app_role_url",
     "audit_wiring",
+    "build_ingestion_deps",
     "build_interactive_deps",
 ]

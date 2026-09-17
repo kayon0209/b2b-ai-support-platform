@@ -9,24 +9,56 @@ All share the admission and priority logic in evaluation.queues, so
 backpressure and starvation guarantees are identical to the tested
 in-process model. Redis is the broker in a full deployment; the loop here
 is deliberately transport-agnostic so the same code runs in tests.
+
+Selection is by `APP_WORKER_QUEUE`. Before that variable was read, compose
+declared an `ai-worker-ingestion` service with `APP_WORKER_QUEUE: ingestion`
+and the process ignored it: the container came up, ran the *interactive*
+worker, and no document was ever indexed. A misconfigured deployment that
+starts cleanly and silently does the wrong job is the failure shape this
+module exists to prevent, so an unknown queue name is fatal rather than a
+fallback to the default.
 """
 
 import asyncio
+import os
 import signal
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from observability import JsonLogger
 from platform_core.agent_runtime.orchestrator import OrchestratorDeps
 from platform_core.db import session_scope
 from platform_core.evaluation.queues import PriorityQueueManager, Queue, QueueConfig
 from worker.inbox_consumer import drain_once
+from worker.ingestion_consumer import drain_ingestion_once
 from worker.outbox_relay import OutboxRelay, OutboxWorker, build_default_relay
-from worker.wiring import audit_wiring, build_interactive_deps
+from worker.wiring import (
+    IngestionDeps,
+    WorkerConfigurationError,
+    audit_wiring,
+    build_ingestion_deps,
+    build_interactive_deps,
+)
 
 logger = JsonLogger("platform.worker")
 
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_BATCH = 20
+
+# Environment variable selecting which worker class this process runs.
+QUEUE_ENV_VAR = "APP_WORKER_QUEUE"
+
+# The three worker roles this process can take. `interactive` and `ingestion`
+# are also `evaluation.queues.Queue` members (they are admission-control
+# queues); `outbox` is not - the relay is a poller over a table, not a
+# priority-admitted queue - so the role names are stated here rather than
+# borrowed from that enum. Spelling them out also means the dispatch table is
+# readable without knowing the queue package.
+ROLE_INTERACTIVE = "interactive"
+ROLE_INGESTION = "ingestion"
+ROLE_OUTBOX = "outbox"
+WORKER_ROLES = (ROLE_INTERACTIVE, ROLE_INGESTION, ROLE_OUTBOX)
 
 
 @dataclass
@@ -46,6 +78,70 @@ class WorkerConfig:
     # Upper bound on the backoff applied between failed cycles, so recovery
     # is still noticed promptly once the dependency returns.
     max_backoff_seconds: float = 30.0
+
+
+def _backoff_seconds(config: WorkerConfig, consecutive_failures: int) -> float:
+    """Exponential backoff, capped so recovery stays responsive.
+
+    `int ** int` is typed `Any` because the result depends on the sign of
+    the exponent, so the multiplier is converted explicitly instead of
+    letting `Any` flow into the declared `float` return.
+    """
+    base = float(config.poll_interval_seconds)
+    cap = float(config.max_backoff_seconds)
+    multiplier = float(2 ** (consecutive_failures - 1))
+    return min(base * multiplier, cap)
+
+
+async def _run_poll_loop(
+    *,
+    name: str,
+    cycle: Callable[[], Awaitable[int]],
+    config: WorkerConfig,
+    stopping: Callable[[], bool],
+) -> None:
+    """Shared poll/backoff/drain loop for every worker class.
+
+    Extracted so the failure policy is identical everywhere instead of
+    reimplemented per worker and drifting. The contract each cycle must
+    satisfy: return the number of items processed, or raise.
+
+    Two properties, both load-bearing:
+
+    - **Sleep only when idle.** A non-empty backlog drains at full speed;
+      a fixed sleep would cap throughput at `batch / interval` regardless of
+      how much work is queued.
+    - **A bounded failure budget.** A persistent fault (unreachable database,
+      revoked credential) would otherwise spin at full speed logging forever
+      while the backlog grows - a green process and an unbounded queue, the
+      one combination no alert fires on. `max_consecutive_failures` turns
+      that into a loud exit. The counter resets on any successful cycle, so
+      transient blips hours apart never accumulate into a shutdown.
+    """
+    logger.info("worker_started", queue=name)
+    consecutive_failures = 0
+    while not stopping():
+        try:
+            processed = await cycle()
+        except Exception as exc:  # noqa: BLE001 - classified below
+            consecutive_failures += 1
+            logger.error(
+                "worker_cycle_failed",
+                queue=name,
+                error_code=type(exc).__name__,
+                consecutive_failures=consecutive_failures,
+            )
+            if consecutive_failures >= config.max_consecutive_failures:
+                logger.error(
+                    "worker_giving_up", queue=name, consecutive_failures=consecutive_failures
+                )
+                raise
+            await asyncio.sleep(_backoff_seconds(config, consecutive_failures))
+            continue
+        consecutive_failures = 0
+        if processed == 0:
+            await asyncio.sleep(config.poll_interval_seconds)
+    logger.info("worker_stopped", queue=name)
 
 
 class InboxWorker:
@@ -80,54 +176,72 @@ class InboxWorker:
             return await drain_once(session, deps=self._deps, batch=self._config.batch)
 
     async def run_forever(self) -> None:
-        """Poll until stopped. Sleeps only when the queue was empty so
-        backlog drains at full speed.
-
-        A failing cycle is survivable: the durable queue is a database
-        table, so nothing admitted is lost while a dependency is down, and
-        the loop retries with exponential backoff. `max_consecutive_failures`
-        bounds that tolerance - a fault that never clears must stop the
-        worker loudly instead of spinning (see WorkerConfig).
-        """
-        logger.info("worker_started", queue=Queue.INTERACTIVE.value)
-        consecutive_failures = 0
-        while not self._stopping:
-            try:
-                processed = await self.run_once()
-            except Exception as exc:  # noqa: BLE001 - classify below
-                consecutive_failures += 1
-                logger.error(
-                    "worker_cycle_failed",
-                    error_code=type(exc).__name__,
-                    consecutive_failures=consecutive_failures,
-                )
-                if consecutive_failures >= self._config.max_consecutive_failures:
-                    logger.error(
-                        "worker_giving_up",
-                        consecutive_failures=consecutive_failures,
-                    )
-                    raise
-                await asyncio.sleep(self._backoff(consecutive_failures))
-                continue
-            consecutive_failures = 0
-            if processed == 0:
-                await asyncio.sleep(self._config.poll_interval_seconds)
-        logger.info("worker_stopped", queue=Queue.INTERACTIVE.value)
-
-    def _backoff(self, consecutive_failures: int) -> float:
-        """Exponential backoff, capped so recovery stays responsive.
-
-        `int ** int` is typed `Any` because the result depends on the sign of
-        the exponent, so the multiplier is converted explicitly instead of
-        letting `Any` flow into the declared `float` return.
-        """
-        base = float(self._config.poll_interval_seconds)
-        cap = float(self._config.max_backoff_seconds)
-        multiplier = float(2 ** (consecutive_failures - 1))
-        return min(base * multiplier, cap)
+        """Poll until stopped, with the shared drain/backoff policy."""
+        await _run_poll_loop(
+            name=ROLE_INTERACTIVE,
+            cycle=self.run_once,
+            config=self._config,
+            stopping=lambda: self._stopping,
+        )
 
 
-def install_signal_handlers(worker: InboxWorker, loop: asyncio.AbstractEventLoop) -> None:
+class IngestionWorker:
+    """Polls `document_versions` and runs the ingestion pipeline.
+
+    Same durable-queue shape as `InboxWorker`: the queue is the table, the
+    claim is a committed row write, and a crash mid-ingest is recovered by
+    `reclaim_stale_ingestion` rather than by an in-memory retry.
+
+    Batch size defaults lower than the inbox worker's because ingestion is
+    the bulk, lowest-priority class (docs/deployment-and-operations.md):
+    each claimed document costs an external storage read and one or more
+    embedding calls, so a large batch would hold a worker for minutes and
+    delay the interactive path's ability to make progress.
+    """
+
+    def __init__(self, deps: IngestionDeps, config: WorkerConfig | None = None) -> None:
+        self._deps = deps
+        self._config = config or WorkerConfig(batch=5)
+        self._stopping = False
+
+    def request_stop(self) -> None:
+        self._stopping = True
+
+    @property
+    def stopping(self) -> bool:
+        return self._stopping
+
+    async def run_once(self) -> int:
+        from platform_core.db import session_scope_with_url
+        from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
+        from worker.wiring import app_role_url
+
+        # The app (non-bypass) role, so RLS is a real boundary on this path
+        # rather than decoration. The worker has no tenant of its own - it
+        # discovers one from each row it claims - so the RLS setting is
+        # applied per claimed version inside `drain_ingestion_once`, and the
+        # claim query itself runs before any tenant is set.
+        del TenantContext, apply_rls_tenant  # applied per claimed version
+        async with session_scope_with_url(app_role_url()) as session:
+            stats = await drain_ingestion_once(
+                session,
+                embedder=self._deps.embedder,
+                batch=self._config.batch,
+            )
+            if stats.reclaimed:
+                logger.warning("ingestion_reclaimed", count=stats.reclaimed)
+            return stats.processed
+
+    async def run_forever(self) -> None:
+        await _run_poll_loop(
+            name=ROLE_INGESTION,
+            cycle=self.run_once,
+            config=self._config,
+            stopping=lambda: self._stopping,
+        )
+
+
+def install_signal_handlers(worker: Any, loop: asyncio.AbstractEventLoop) -> None:
     """Graceful shutdown on SIGTERM/SIGINT where supported (POSIX)."""
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -138,38 +252,69 @@ def install_signal_handlers(worker: InboxWorker, loop: asyncio.AbstractEventLoop
             continue
 
 
+def resolve_queue(argv: list[str] | None = None) -> str:
+    """Which worker class this process should run.
+
+    `--outbox-only` wins over the environment because it is the more
+    specific instruction (a one-shot operational run), and it predates the
+    env var. An unknown value is fatal: a typo in a deployment manifest must
+    not silently downgrade to the interactive worker, which would consume
+    customer messages instead of indexing documents.
+    """
+    args = argv if argv is not None else []
+    if "--outbox-only" in args:
+        return ROLE_OUTBOX
+    raw = (os.environ.get(QUEUE_ENV_VAR) or "").strip().lower()
+    if not raw:
+        return ROLE_INTERACTIVE
+    if raw not in WORKER_ROLES:
+        raise WorkerConfigurationError(
+            f"{QUEUE_ENV_VAR}={raw!r} is not a known worker queue; "
+            f"expected one of: {', '.join(WORKER_ROLES)}"
+        )
+    return raw
+
+
 def main() -> None:
-    """Local entrypoint: run the interactive worker + outbox relay together.
+    """Local entrypoint, dispatched by `APP_WORKER_QUEUE`.
 
-    Both loops run in one process because they are lightweight pollers and
-    the outbox relay has no reason to be its own deployment unit until it
-    becomes a throughput bottleneck. Either can be run alone by importing
-    its class directly.
-
-    `--outbox-only` is useful when the AI path is intentionally disabled
-    (no LLM key) but business events still need to reach their consumers.
+    The interactive worker and the outbox relay share one process because
+    both are lightweight pollers and the relay has no reason to be its own
+    deployment unit until it becomes a throughput bottleneck. Ingestion is
+    its own process: it is bulk work whose batches would otherwise compete
+    with customer-facing runs for the same event loop.
     """
     import sys
 
-    outbox_only = "--outbox-only" in sys.argv
+    try:
+        queue = resolve_queue(sys.argv[1:])
+    except WorkerConfigurationError as exc:
+        logger.error("worker_misconfigured", detail=str(exc))
+        raise
 
-    if outbox_only:
+    if queue == ROLE_OUTBOX:
         asyncio.run(_run_outbox_only())
+        return
+
+    if queue == ROLE_INGESTION:
+        ingestion_deps = build_ingestion_deps()
+        logger.info("worker_wiring", queue=queue, has_embedding=ingestion_deps.can_embed)
+        asyncio.run(_run_ingestion_only(ingestion_deps))
         return
 
     # Real collaborators, assembled in one place. `build_interactive_deps`
     # raises when the chat provider is missing, so the worker fails to start
     # rather than claiming messages and silently never replying.
-    deps = build_interactive_deps()
-    wiring = audit_wiring(deps)
-    logger.info("worker_wiring", **wiring.as_dict())
+    interactive_deps = build_interactive_deps()
+    wiring = audit_wiring(interactive_deps)
+    logger.info("worker_wiring", queue=queue, **wiring.as_dict())
     if not wiring.can_send:
         # Not fatal, but loud: a run that cannot send still records its
         # outcome, and an operator must not read that as "the customer was
         # answered".
         logger.warning("worker_cannot_send", reason_code="NO_CHATWOOT_TOKEN")
 
-    asyncio.run(_run_both(deps))
+    asyncio.run(_run_both(interactive_deps))
 
 
 async def _run_both(deps: OrchestratorDeps) -> None:
@@ -183,7 +328,7 @@ async def _run_both(deps: OrchestratorDeps) -> None:
 
     loop = asyncio.get_running_loop()
     for worker in (inbox, relay_worker):
-        install_signal_handlers(worker, loop)  # type: ignore[arg-type]
+        install_signal_handlers(worker, loop)
 
     try:
         await asyncio.gather(inbox.run_forever(), relay_worker.run_forever())
@@ -191,6 +336,17 @@ async def _run_both(deps: OrchestratorDeps) -> None:
         inbox.request_stop()
         relay_worker.request_stop()
         logger.info("worker_interrupted")
+
+
+async def _run_ingestion_only(deps: IngestionDeps) -> None:
+    worker = IngestionWorker(deps)
+    loop = asyncio.get_running_loop()
+    install_signal_handlers(worker, loop)
+    try:
+        await worker.run_forever()
+    except KeyboardInterrupt:  # pragma: no cover - interactive stop
+        worker.request_stop()
+        logger.info("worker_interrupted", queue=ROLE_INGESTION)
 
 
 async def _run_outbox_only() -> None:
@@ -203,15 +359,19 @@ async def _run_outbox_only() -> None:
 
 
 __all__ = [
+    "IngestionWorker",
     "InboxWorker",
     "OutboxRelay",
     "OutboxWorker",
     "WorkerConfig",
     "audit_wiring",
     "build_default_relay",
+    "build_ingestion_deps",
     "build_interactive_deps",
     "install_signal_handlers",
+    "resolve_queue",
     "main",
+    "resolve_queue",
 ]
 
 
