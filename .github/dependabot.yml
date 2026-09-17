@@ -1,0 +1,40 @@
+# Dependency updates.
+#
+# Grouped so a reviewer sees one PR per ecosystem rather than one per package.
+# The Python ecosystem is grouped narrowly (`minor-patch`) because a major
+# bump of SQLAlchemy, FastAPI or pydantic is never a drive-by change: it
+# needs the migration chain and the RLS tests re-run by a human, not merged
+# because the bot said so.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+    # Majors stay ungrouped and unloved-by-default: they still open a PR, but
+    # one per package, so an incompatible bump cannot hide inside a bundle.
+    ignore:
+      # Pinned deliberately: ruff's rule set changes between minors, and a
+      # silent change in lint output is worse than a stale linter.
+      - dependency-name: ruff
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: npm
+    directory: "/apps/admin-web"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly

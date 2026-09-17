@@ -44,6 +44,35 @@ jobs:
           print("No secrets found")
           EOF
 
+  dependency-scan:
+    # Known-vulnerability scan. Deliberately a *gate*: a new advisory on a
+    # pinned dependency should stop the pipeline, not appear as a warning
+    # nobody reads. `--strict` makes pip-audit fail on any advisory,
+    # including ones with no fix available, so a transitive CVE cannot be
+    # silently inherited.
+    #
+    # Audits the *installed* environment rather than `-r requirements.txt`.
+    # Both work, but `-r` makes pip-audit re-resolve the whole dependency
+    # graph against PyPI on every run, which is slow and - measured locally -
+    # can hang indefinitely behind a slow index. Auditing what was actually
+    # installed is faster and is also the stronger statement: it covers
+    # transitive dependencies that no manifest names.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Audit Python dependencies
+        run: |
+          pip install pip-audit
+          pip-audit --strict --progress-spinner off --desc
+      - name: Audit admin-web dependencies
+        working-directory: apps/admin-web
+        run: npm audit --audit-level=high
+
   admin-web:
     runs-on: ubuntu-latest
     defaults:
