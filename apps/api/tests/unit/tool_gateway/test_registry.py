@@ -263,3 +263,31 @@ def test_every_declared_tool_has_a_registered_adapter() -> None:
     factories = default_factories()
     for tool_name, provider in TOOL_PROVIDER.items():
         assert provider in factories, f"{tool_name} maps to unregistered provider {provider}"
+
+
+@pytest.mark.asyncio
+async def test_crm_write_tool_resolves_for_a_write_capable_connector() -> None:
+    """A CRM connector that claims `update_account` becomes an executor."""
+    built: list[ConnectorContext] = []
+    session = _FakeSession(
+        [_connector("crm", ["read_account", "update_account"], ConnectorStatus.ACTIVE.value)]
+    )
+    resolver = ConnectorExecutorResolver(session, tenant_id=TENANT, factories=_factories(built))
+
+    executors = await resolver.executors_for(["crm.update_account"])
+
+    assert set(executors) == {"crm.update_account"}
+    assert built[0].configuration["base_url"] == "https://crm.example"
+
+
+@pytest.mark.asyncio
+async def test_lookup_only_crm_is_not_a_write_path() -> None:
+    """Connecting a CRM for lookups must not authorize crm.update_account."""
+    built: list[ConnectorContext] = []
+    session = _FakeSession(
+        [_connector("crm", ["read_account", "read_contact"], ConnectorStatus.ACTIVE.value)]
+    )
+    resolver = ConnectorExecutorResolver(session, tenant_id=TENANT, factories=_factories(built))
+
+    assert await resolver.executors_for(["crm.update_account"]) == {}
+    assert built == []

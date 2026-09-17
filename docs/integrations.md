@@ -58,6 +58,22 @@ RecentActivitySummary
 
 Cache only fields needed for support, with TTL and source timestamp. Live-sensitive facts must state freshness.
 
+### Controlled write: `crm.update_account`
+
+The one CRM write tool, registered in the Tool Gateway as a
+`confirmed_write` (propose -> human confirm -> execute -> verify).
+
+- The tenant's CRM connector must claim `update_account`. A connector that
+  only reads never becomes a write path; the resolver refuses to build an
+  executor, and the gateway reports `TOOL_EXECUTOR_MISSING`.
+- The writable set is closed (`tier`, `contract_status`). An unknown field is
+  refused rather than forwarded, so a prompt injection cannot rewrite
+  arbitrary account state.
+- The postcondition is verified by re-reading the account, not by trusting
+  the PATCH response. The read cache is invalidated first, otherwise the
+  verification would compare against the pre-update projection and report a
+  false failure.
+
 ## Issue trackers
 
 Supported pattern for Jira/Linear:

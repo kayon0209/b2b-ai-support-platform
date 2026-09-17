@@ -53,6 +53,9 @@ LOW_RISK_TOOL = "m2_test_add_note"
 # The platform tool that has a real adapter behind it. The connector-backed
 # tests below use this name so `resolve_executors` finds a provider mapping.
 JIRA_TOOL = "jira.create_issue"
+# The CRM write tool: also connector-backed, but the connector must claim
+# `update_account` before the resolver will build an executor.
+CRM_TOOL = "crm.update_account"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -108,6 +111,16 @@ def seed_tenants_and_tools() -> None:
                     '"required":["title"]}',
                     "reqconf": True,
                 },
+                {
+                    # The CRM write tool, seeded for the same reason as the
+                    # Jira one: the connector-backed test needs a catalog row.
+                    "name": CRM_TOOL,
+                    "risk": "confirmed_write",
+                    "inschema": '{"type":"object","properties":{"account_ref":{"type":"string"},'
+                    '"tier":{"type":"string"},"contract_status":{"type":"string"}},'
+                    '"required":["account_ref"]}',
+                    "reqconf": True,
+                },
             ],
         )
     yield
@@ -123,7 +136,7 @@ def _cleanup(admin: Any) -> None:
     proposal still points at it.
     """
     with admin.begin() as conn:
-        names = (CONFIRMED_TOOL, LOW_RISK_TOOL, JIRA_TOOL)
+        names = (CONFIRMED_TOOL, LOW_RISK_TOOL, JIRA_TOOL, CRM_TOOL)
         conn.execute(
             text(
                 "DELETE FROM tool_executions WHERE proposal_id IN ("
@@ -777,6 +790,116 @@ def test_execute_is_idempotent_under_retry() -> None:
         )
         # The adapter ran exactly once.
         assert len(calls) == 1
+    finally:
+        registry_mod.default_factories = original
+        _clear_connectors(TENANT_A)
+
+
+def test_crm_connector_without_update_capability_cannot_execute() -> None:
+    """A lookup-only CRM must not become a write path.
+
+    The tenant holds a CRM connector that claims only read capabilities, so a
+    confirmed `crm.update_account` proposal still cannot execute.
+    """
+    _clear_connectors(TENANT_A)
+    _seed_connector(TENANT_A, "crm", ["read_account", "read_contact"])
+    try:
+        client = _client(TENANT_A, "support_admin")
+        proposed = client.post(
+            "/v1/tool-proposals",
+            headers={**_auth(), "Idempotency-Key": "crm-cap-1"},
+            json={"tool_name": CRM_TOOL, "arguments": {"account_ref": "A1", "tier": "gold"}},
+        )
+        assert proposed.status_code == 200, proposed.text
+        proposal_id = proposed.json()["proposal"]["proposal_id"]
+
+        client.post(f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={})
+        resp = client.post(
+            f"/v1/tool-proposals/{proposal_id}/execute",
+            headers={**_auth(), "Idempotency-Key": "crm-cap-exec"},
+            json={},
+        )
+        assert resp.status_code == 501
+        assert resp.json()["error"]["code"] == "TOOL_EXECUTOR_MISSING"
+    finally:
+        _clear_connectors(TENANT_A)
+
+
+def test_crm_write_tool_executes_and_verifies_end_to_end() -> None:
+    """The CRM write path: propose -> confirm -> execute -> verified.
+
+    Same chain as the Jira case, but the executor is resolved from a CRM
+    connector that claims `update_account`. The adapter is stubbed at the
+    factory boundary so the test never touches the network.
+    """
+    import importlib
+
+    from platform_core.integrations.sdk import ConnectorContext
+    from platform_core.tool_gateway import registry as registry_mod
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _StubCrm:
+        def __init__(self, context: ConnectorContext) -> None:
+            self.context = context
+
+        async def execute(
+            self, tool_name: str, parameters: dict[str, Any], idempotency_key: str
+        ) -> dict[str, Any] | None:
+            calls.append((tool_name, parameters))
+            return {
+                "ok": True,
+                "account_ref": parameters.get("account_ref"),
+                "updated": {"tier": parameters.get("tier")},
+            }
+
+        async def verify_postcondition(
+            self,
+            tool_name: str,
+            parameters: dict[str, Any],
+            output: dict[str, Any] | None,
+        ) -> bool | None:
+            return True
+
+    _clear_connectors(TENANT_A)
+    _seed_connector(TENANT_A, "crm", ["update_account"])
+
+    original = registry_mod.default_factories
+
+    def _patched() -> dict[str, registry_mod.AdapterFactory]:
+        patched = dict(original())
+        patched["crm"] = registry_mod.AdapterFactory(provider="crm", build=_StubCrm)
+        return patched
+
+    registry_mod.default_factories = _patched
+    try:
+        importlib.import_module("platform_core.main")
+
+        client = _client(TENANT_A, "support_admin")
+        proposed = client.post(
+            "/v1/tool-proposals",
+            headers={**_auth(), "Idempotency-Key": "crm-ok-1"},
+            json={"tool_name": CRM_TOOL, "arguments": {"account_ref": "A1", "tier": "gold"}},
+        )
+        assert proposed.status_code == 200, proposed.text
+        proposal_id = proposed.json()["proposal"]["proposal_id"]
+
+        confirmed = client.post(
+            f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={}
+        )
+        assert confirmed.status_code == 200, confirmed.text
+
+        executed = client.post(
+            f"/v1/tool-proposals/{proposal_id}/execute",
+            headers={**_auth(), "Idempotency-Key": "crm-ok-exec"},
+            json={},
+        )
+        assert executed.status_code == 200, executed.text
+        body = executed.json()
+        assert body["execution"]["status"] == "executed"
+        assert body["execution"]["verification_status"] == "verified"
+        assert body["proposal"]["status"] == "verified"
+        assert calls == [(CRM_TOOL, {"account_ref": "A1", "tier": "gold"})]
     finally:
         registry_mod.default_factories = original
         _clear_connectors(TENANT_A)

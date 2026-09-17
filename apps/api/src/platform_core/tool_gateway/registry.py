@@ -46,11 +46,13 @@ from platform_core.tool_gateway.gateway import ToolExecutor
 # a wiring omission into a runtime `TOOL_EXECUTOR_MISSING` at execute time.
 TOOL_CAPABILITY: dict[str, str] = {
     "jira.create_issue": "create_issue",
+    "crm.update_account": "update_account",
 }
 
 # tool name -> the connector provider that can serve it.
 TOOL_PROVIDER: dict[str, str] = {
     "jira.create_issue": "jira",
+    "crm.update_account": "crm",
 }
 
 
@@ -177,11 +179,10 @@ def default_factories() -> dict[str, AdapterFactory]:
     service that never connects Jira does not pay its import cost.
 
     Only adapters that actually implement the `ToolExecutor` protocol are
-    registered. `CrmReadAdapter` is deliberately absent: it is a read
-    adapter whose inherited `execute` takes an `ExecutionResult` and
-    returns one, which does not satisfy the protocol. Registering it here
-    would produce a `TypeError` at execute time; leaving it out makes the
-    gateway report `TOOL_EXECUTOR_MISSING`, which is honest.
+    registered. `CrmReadAdapter` on its own is deliberately absent: it is a
+    read adapter with no write surface, so mapping `crm.update_account` to it
+    would produce a `TypeError` at execute time. `CrmWriteAdapter` extends it
+    with `execute` / `verify_postcondition` and is registered instead.
     """
 
     def _build_jira(context: ConnectorContext) -> ToolExecutor:
@@ -191,8 +192,16 @@ def default_factories() -> dict[str, AdapterFactory]:
         # ToolExecutor protocol (`execute` / `verify_postcondition`).
         return JiraAdapter(context)
 
+    def _build_crm(context: ConnectorContext) -> ToolExecutor:
+        from platform_core.integrations.crm import CrmWriteAdapter
+
+        # Write-capable: the resolver only builds it when the connector
+        # claims `update_account`, so a lookup-only CRM stays read-only.
+        return CrmWriteAdapter(context)
+
     return {
         "jira": AdapterFactory(provider="jira", build=_build_jira),
+        "crm": AdapterFactory(provider="crm", build=_build_crm),
     }
 
 

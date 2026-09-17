@@ -23,7 +23,7 @@ import hashlib
 import json
 import time
 import uuid
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from jsonschema import ValidationError
 from jsonschema import validate as jsonschema_validate
@@ -50,8 +50,14 @@ class ToolDenied(ToolGatewayError):
     pass
 
 
+@runtime_checkable
 class ToolExecutor(Protocol):
-    """Adapter-backed executor registered per tool name."""
+    """Adapter-backed executor registered per tool name.
+
+    `runtime_checkable` so an adapter (or a test) can assert conformance at
+    runtime; it checks method presence only, not signatures -- the signature
+    match is enforced by mypy where the factory is typed `-> ToolExecutor`.
+    """
 
     async def execute(
         self, tool_name: str, parameters: dict[str, Any], idempotency_key: str

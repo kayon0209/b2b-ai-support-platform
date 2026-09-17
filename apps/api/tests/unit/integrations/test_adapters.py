@@ -5,7 +5,7 @@ import asyncio
 
 import httpx
 
-from platform_core.integrations.crm import CrmReadAdapter
+from platform_core.integrations.crm import CrmReadAdapter, CrmWriteAdapter
 from platform_core.integrations.im import ImNotificationAdapter
 from platform_core.integrations.jira import JiraAdapter
 from platform_core.integrations.resilience import retry_delays
@@ -246,3 +246,127 @@ def test_im_not_configured_fails_cleanly() -> None:
     result = _run(adapter.send_notification(title="x", body_text="y"))
     assert result["ok"] is False
     assert result["error_code"] == "IM_NOT_CONFIGURED"
+
+
+# --- CRM write adapter (crm.update_account) ---
+
+
+def test_crm_write_patches_only_the_named_fields(monkeypatch) -> None:
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["method"] = req.method
+        seen["url"] = str(req.url)
+        seen["body"] = req.content.decode()
+        return httpx.Response(200, json={"name": "Acme", "tier": "gold"})
+
+    _patch_transport(monkeypatch, handler)
+    adapter = CrmWriteAdapter(_ctx({"base_url": "http://crm.test"}))
+    out = _run(
+        adapter.execute("crm.update_account", {"account_ref": "A1", "tier": "gold"}, "idem-1")
+    )
+
+    assert out is not None and out["ok"] is True
+    assert seen["method"] == "PATCH"
+    assert seen["url"].endswith("/accounts/A1")
+    assert "gold" in seen["body"]
+    assert out["updated"] == {"tier": "gold"}
+
+
+def test_crm_write_rejects_fields_outside_the_writable_set(monkeypatch) -> None:
+    """The writable set is closed: an unknown field is refused, not sent."""
+    adapter = CrmWriteAdapter(_ctx({"base_url": "http://crm.test"}))
+    out = _run(
+        adapter.execute("crm.update_account", {"account_ref": "A1", "is_admin": True}, "idem-1")
+    )
+    assert out == {"ok": False, "error_code": "TOOL_ARGS_INVALID", "unknown": ["is_admin"]}
+
+
+def test_crm_write_requires_at_least_one_field(monkeypatch) -> None:
+    adapter = CrmWriteAdapter(_ctx({"base_url": "http://crm.test"}))
+    out = _run(adapter.execute("crm.update_account", {"account_ref": "A1"}, "idem-1"))
+    assert out is not None and out["ok"] is False
+    assert out["error_code"] == "TOOL_ARGS_INVALID"
+
+
+def test_crm_write_ignores_other_tools(monkeypatch) -> None:
+    adapter = CrmWriteAdapter(_ctx({"base_url": "http://crm.test"}))
+    assert _run(adapter.execute("jira.create_issue", {}, "idem-1")) is None
+
+
+def test_crm_postcondition_verifies_by_rereading(monkeypatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PATCH":
+            return httpx.Response(200, json={"name": "Acme"})
+        return httpx.Response(200, json={"name": "Acme", "tier": "gold"})
+
+    _patch_transport(monkeypatch, handler)
+    adapter = CrmWriteAdapter(_ctx({"base_url": "http://crm.test"}))
+    out = _run(
+        adapter.execute("crm.update_account", {"account_ref": "A1", "tier": "gold"}, "idem-1")
+    )
+    assert _run(adapter.verify_postcondition("crm.update_account", {}, out)) is True
+
+
+def test_crm_postcondition_fails_when_the_change_did_not_land(monkeypatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PATCH":
+            return httpx.Response(200, json={"name": "Acme"})
+        return httpx.Response(200, json={"name": "Acme", "tier": "silver"})
+
+    _patch_transport(monkeypatch, handler)
+    adapter = CrmWriteAdapter(_ctx({"base_url": "http://crm.test"}))
+    out = _run(
+        adapter.execute("crm.update_account", {"account_ref": "A1", "tier": "gold"}, "idem-1")
+    )
+    assert _run(adapter.verify_postcondition("crm.update_account", {}, out)) is False
+
+
+def test_crm_write_invalidates_the_read_cache(monkeypatch) -> None:
+    """The postcondition re-read must not be served the pre-update cache."""
+    calls: list[str] = []
+    state = {"patched": False}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req.method)
+        if req.method == "PATCH":
+            state["patched"] = True
+            return httpx.Response(200, json={"name": "Acme"})
+        tier = "gold" if state["patched"] else None
+        return httpx.Response(200, json={"name": "Acme", "tier": tier})
+
+    _patch_transport(monkeypatch, handler)
+    adapter = CrmWriteAdapter(_ctx({"base_url": "http://crm.test"}))
+
+    first = _run(adapter.get_account("A1"))  # warm the cache with tier=None
+    assert first is not None and first.tier is None
+
+    out = _run(
+        adapter.execute("crm.update_account", {"account_ref": "A1", "tier": "gold"}, "idem-1")
+    )
+    assert _run(adapter.verify_postcondition("crm.update_account", {}, out)) is True
+    # GET (warm), PATCH, GET (fresh, not a cache hit).
+    assert calls == ["GET", "PATCH", "GET"]
+
+
+def test_crm_ambiguous_write_is_unknown_not_failed(monkeypatch) -> None:
+    """A transport that dies mid-PATCH cannot be reported as a clean failure."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    _patch_transport(monkeypatch, handler)
+    adapter = CrmWriteAdapter(_ctx({"base_url": "http://crm.test"}))
+    out = _run(
+        adapter.execute("crm.update_account", {"account_ref": "A1", "tier": "gold"}, "idem-1")
+    )
+    assert out is not None and out["ok"] is False and out.get("ambiguous") is True
+    assert _run(adapter.verify_postcondition("crm.update_account", {}, out)) is None
+
+
+def test_crm_write_adapter_satisfies_the_tool_executor_protocol() -> None:
+    """Structural check: the registry types the factory as ToolExecutor."""
+    from platform_core.tool_gateway.gateway import ToolExecutor
+
+    adapter = CrmWriteAdapter(_ctx({"base_url": "http://crm.test"}))
+    assert isinstance(adapter, ToolExecutor)  # runtime_checkable Protocol
