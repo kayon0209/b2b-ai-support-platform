@@ -35,10 +35,12 @@ from platform_core.audit.router import router as audit_router
 from platform_core.cases.router import router as cases_router
 from platform_core.config import Settings, get_settings
 from platform_core.evaluation.router import router as quality_router
+from platform_core.http_metrics import HttpMetricsMiddleware
 from platform_core.identity.middleware import TenantContextMiddleware, build_resolver
 from platform_core.knowledge.flag_router import router as feature_flag_router
 from platform_core.knowledge.gap_router import router as knowledge_gap_router
 from platform_core.knowledge.router import router as knowledge_router
+from platform_core.observability_router import router as observability_router
 from platform_core.retrieval.router import router as retrieval_router
 from platform_core.support_bridge.router import router as support_bridge_router
 from platform_core.tool_gateway.router import router as tool_gateway_router
@@ -70,7 +72,16 @@ app.include_router(prompt_router)
 app.include_router(knowledge_gap_router)
 app.include_router(knowledge_router)
 app.include_router(feature_flag_router)
+# Observability last: /metrics is an unauthenticated infrastructure endpoint
+# and its own guard is inside the router (see observability_router).
+app.include_router(observability_router)
+# Middleware runs in reverse registration order, so HttpMetricsMiddleware
+# (registered last) wraps the auth middleware and therefore observes every
+# request including ones auth rejects with 401. Registering them the other
+# way round would hide authentication failures from the request rate, which
+# is precisely the signal worth alerting on.
 app.add_middleware(TenantContextMiddleware, resolver=build_resolver())
+app.add_middleware(HttpMetricsMiddleware)
 
 
 @app.get("/healthz")

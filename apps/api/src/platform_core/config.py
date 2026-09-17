@@ -77,6 +77,17 @@ class Settings(BaseSettings):
     # credential for the object, so its value is that it stops working.
     presign_expiry_seconds: int = 300
 
+    # --- Observability -------------------------------------------------------
+    # Whether /metrics is served. This is an EXPOSURE decision, not a security
+    # control: the endpoint is unauthenticated by design so Prometheus can
+    # scrape it, and its payload is safe only because no metric carries a
+    # tenant-identifying label. What remains visible is business volume, so
+    # the default keeps it on where a developer and CI need it and off in
+    # deployed environments unless an operator opts in.
+    #
+    # None means "decide from the environment"; see observability_router.
+    metrics_enabled: bool | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:

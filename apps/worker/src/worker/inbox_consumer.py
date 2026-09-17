@@ -29,6 +29,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger, new_trace_context
+from observability_metrics import get_metrics
 from platform_core.agent_runtime.models import RunStatus
 from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
@@ -77,6 +78,12 @@ class ClaimedEvent:
     delivery_id: str
     event_type: str
     minimized_payload: dict[str, Any] = field(default_factory=dict)
+    # Wall-clock seconds when the row was received. Carried so the consumer
+    # can measure queue age (received -> run start), which is the signal
+    # docs/deployment-and-operations.md makes a P1 alert. A run can be fast
+    # and the customer can still wait minutes, so run latency alone does not
+    # describe the experience.
+    received_at: int = 0
 
 
 async def claim_events(session: AsyncSession, *, batch: int = 20) -> list[ClaimedEvent]:
@@ -107,6 +114,7 @@ async def claim_events(session: AsyncSession, *, batch: int = 20) -> list[Claime
             delivery_id=row.delivery_id,
             event_type=row.event_type,
             minimized_payload=row.minimized_payload or {},
+            received_at=int(row.received_at or 0),
         )
         for row in rows
     ]
@@ -228,6 +236,7 @@ async def process_event(
     but deliberately not actioned.
     """
     if event.event_type not in ACTIONABLE_EVENT_TYPES:
+        get_metrics().inbox_events_total.labels(result="ignored").inc()
         return None
 
     if not is_customer_message(event):
@@ -238,6 +247,10 @@ async def process_event(
             delivery_id=event.delivery_id,
             message_type=str(event.minimized_payload.get("message_type")),
         )
+        # A separate label from "ignored": a non-zero count here is the
+        # self-reply-loop signal, and it must be alertable on its own rather
+        # than hidden inside general lifecycle chatter.
+        get_metrics().inbox_events_total.labels(result="skipped_not_customer").inc()
         return None
 
     # The inbox row may legitimately lack routing fields (e.g. non-message
@@ -255,7 +268,11 @@ async def process_event(
     ctx = TenantContext(tenant_id=event.tenant_id, actor_id=None, actor_kind="system")
     await apply_rls_tenant(session, ctx)
 
-    trace = new_trace_context()
+    trace = new_trace_context(service_name="worker")
+    metrics = get_metrics()
+    if event.received_at:
+        metrics.inbox_claim_age_seconds.observe(max(0.0, time.time() - event.received_at))
+
     orchestrator = AgentOrchestrator(session, deps)
     outcome = await orchestrator.run(
         tenant_id=event.tenant_id,
@@ -266,6 +283,7 @@ async def process_event(
         chatwoot_account_id=str(event.minimized_payload.get("chatwoot_account_id") or ""),
         chatwoot_conversation_id=str(event.minimized_payload.get("conversation_id") or ""),
     )
+    metrics.inbox_events_total.labels(result=outcome.status.value).inc()
     logger.info(
         "event_processed",
         trace,
@@ -296,6 +314,7 @@ async def drain_once(
         # Worth a log line: a nonzero count means a previous worker died
         # mid-run and real questions went unanswered until now.
         logger.warning("stale_claims_reclaimed", count=reclaimed)
+        get_metrics().stale_claims_reclaimed_total.inc(reclaimed)
 
     events = await claim_events(session, batch=batch)
     processed = 0
@@ -309,6 +328,7 @@ async def drain_once(
                 error_code=type(exc).__name__,
                 delivery_id=event.delivery_id,
             )
+            get_metrics().inbox_events_total.labels(result="failed").inc()
         else:
             await mark_completed(session, event.event_id)
         processed += 1

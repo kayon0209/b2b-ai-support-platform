@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger, TraceContext, new_trace_context
+from observability_metrics import get_metrics
 from platform_core.agent_runtime.generator import LlmAnswerGenerator
 from platform_core.agent_runtime.models import (
     AgentRun,
@@ -126,20 +127,42 @@ async def retrieve_evidence(
     principal: PrincipalScope,
     embedder: Embedder | None,
     top_k: int = 8,
+    trace: TraceContext | None = None,
 ) -> list[RetrievedChunk]:
     """Authorized retrieval. Evidence never crosses tenants: the tenant
     filter and ACL narrowing are applied inside hybrid_search before any
     candidate is scored."""
     from platform_core.retrieval.hybrid import hybrid_search
 
-    return await hybrid_search(
-        session,
-        tenant_id=tenant_id,
-        query=query,
-        top_k=top_k,
-        principal=principal,
-        embedder=embedder,
-    )
+    started = time.monotonic()
+    span = trace.span("retrieval", **{"span.kind": "internal"}) if trace else None
+    try:
+        chunks = await hybrid_search(
+            session,
+            tenant_id=tenant_id,
+            query=query,
+            top_k=top_k,
+            principal=principal,
+            embedder=embedder,
+        )
+    except Exception as exc:
+        # Retrieval failure is measured as well as logged: "how often is
+        # retrieval unavailable" is an operational fact that must not have
+        # to be reconstructed from error logs.
+        if span is not None:
+            span.record_exception(exc)
+        raise
+    else:
+        elapsed = time.monotonic() - started
+        get_metrics().observe_retrieval(latency_seconds=elapsed, candidate_count=len(chunks))
+        if span is not None:
+            span.set_attributes(
+                latency_ms=int(elapsed * 1000), **{"retrieval.candidates": len(chunks)}
+            )
+        return chunks
+    finally:
+        if span is not None:
+            span.end()
 
 
 async def _get_or_create_prompt(
@@ -248,6 +271,56 @@ class AgentOrchestrator:
         """
         started = time.monotonic()
         ctx = trace or new_trace_context()
+        # One root span per run. Everything the pipeline does hangs off it, so
+        # a trace shows the whole journey rather than a scatter of spans that
+        # have to be stitched together by timestamp.
+        run_span = ctx.span("agent_run", **{"span.kind": "server"})
+        try:
+            outcome = await self._run_pipeline(
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                question=question,
+                principal=principal,
+                ctx=ctx,
+                started=started,
+                run_span=run_span,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+                expected_lease_version=expected_lease_version,
+                restricted_query=restricted_query,
+            )
+        except Exception as exc:
+            # An unexpected failure still has to be visible in metrics and in
+            # the trace: an unmeasured crash is indistinguishable from no
+            # traffic at all.
+            elapsed = time.monotonic() - started
+            run_span.record_exception(exc)
+            get_metrics().observe_run(
+                outcome="failed", route="knowledge_qa", latency_seconds=elapsed
+            )
+            raise
+        else:
+            run_span.set_attributes(status=outcome.status.value)
+            if outcome.status is RunStatus.ABSTAINED:
+                run_span.set_status("ok", outcome.abstain_reason)
+            run_span.end()
+            return outcome
+
+    async def _run_pipeline(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        conversation_ref_id: uuid.UUID,
+        question: str,
+        principal: PrincipalScope,
+        ctx: TraceContext,
+        started: float,
+        run_span: Any,
+        chatwoot_account_id: str | None,
+        chatwoot_conversation_id: str | None,
+        expected_lease_version: int | None,
+        restricted_query: bool,
+    ) -> RunOutcome:
 
         # --- 1. Acquire/observe the control lease. ---
         lease = await lease_service.acquire_or_get(
@@ -257,6 +330,7 @@ class AgentOrchestrator:
             expected_lease_version = int(lease.lease_version)
 
         route = classify_route(question)
+        run_span.set_attributes(route=route, **{"lease.version": expected_lease_version})
 
         run = AgentRun(
             tenant_id=tenant_id,
@@ -301,6 +375,7 @@ class AgentOrchestrator:
                 query=question,
                 principal=principal,
                 embedder=self._deps.embedder,
+                trace=ctx,
             )
         except Exception as exc:  # noqa: BLE001 - degradation is a policy choice
             # Retrieval unavailable: never answer enterprise facts; hand off.
@@ -347,7 +422,7 @@ class AgentOrchestrator:
                 question=question,
             )
         try:
-            draft = await self._deps.generator.generate(question, evidence)
+            draft = await self._generate_with_telemetry(ctx, question, evidence)
         except ModelError as exc:
             # Provider down: queue/handoff, never fabricate (availability table).
             logger.error("model_failed", ctx, error_code=exc.code)
@@ -366,6 +441,9 @@ class AgentOrchestrator:
 
         # --- 6. Validate citations. Unsupported output is not publishable. ---
         validation = validate_citations(draft, evidence)
+        get_metrics().citation_validation_total.labels(
+            status="supported" if validation.ok else "unsupported"
+        ).inc()
         if not validation.ok:
             return await self._finish_abstain(
                 run=run,
@@ -405,6 +483,17 @@ class AgentOrchestrator:
             run.latency_ms = int((time.monotonic() - started) * 1000)
             await self._session.flush()
             logger.warning("send_blocked_lease_conflict", ctx, reason_code=str(exc))
+            # This counter is the P0-adjacent signal from
+            # docs/deployment-and-operations.md: "sustained duplicate reply
+            # signal". A rising rate here means humans and the AI are
+            # repeatedly racing, which is a control problem, not a model one.
+            get_metrics().lease_conflicts_total.inc()
+            get_metrics().observe_run(
+                outcome="handed_off",
+                route=route,
+                latency_seconds=run.latency_ms / 1000.0,
+                citation_count=citation_count,
+            )
             return RunOutcome(
                 run_id=run.id,
                 status=RunStatus.HANDED_OFF,
@@ -430,6 +519,12 @@ class AgentOrchestrator:
             run.status = RunStatus.FAILED.value
             run.latency_ms = int((time.monotonic() - started) * 1000)
             await self._session.flush()
+            get_metrics().observe_run(
+                outcome="failed",
+                route=route,
+                latency_seconds=run.latency_ms / 1000.0,
+                citation_count=citation_count,
+            )
             return RunOutcome(
                 run_id=run.id,
                 status=RunStatus.FAILED,
@@ -469,6 +564,12 @@ class AgentOrchestrator:
             latency_ms=run.latency_ms,
             chunk_count=citation_count,
         )
+        get_metrics().observe_run(
+            outcome="completed",
+            route=route,
+            latency_seconds=run.latency_ms / 1000.0,
+            citation_count=citation_count,
+        )
         return RunOutcome(
             run_id=run.id,
             status=RunStatus.COMPLETED,
@@ -478,6 +579,47 @@ class AgentOrchestrator:
             latency_ms=run.latency_ms,
             trace_id=ctx.trace_id,
         )
+
+    async def _generate_with_telemetry(
+        self, ctx: TraceContext, question: str, evidence: list[RetrievedChunk]
+    ) -> DraftAnswer:
+        """Wrap the model call with a span and latency/token/error metrics.
+
+        Kept separate from `run()` so the model boundary is measurable
+        without threading timing variables through the pipeline body.
+
+        Note on "first-token latency": the provider surface
+        (`ChatProvider.complete`) is non-streaming, so there is no first
+        token to timestamp - only a total. We therefore record the total
+        model latency and label it as such, rather than reporting a
+        first-token P95 that would in fact be a total-latency P95 under a
+        metric name that documents a different promise.
+        """
+        assert self._deps.generator is not None  # guarded by the caller
+        metrics = get_metrics()
+        started = time.monotonic()
+        span = ctx.span("model.generate", **{"span.kind": "client"})
+        try:
+            draft = await self._deps.generator.generate(question, evidence)
+        except ModelError as exc:
+            elapsed = time.monotonic() - started
+            metrics.observe_model_call(
+                operation="generate", outcome="error", latency_seconds=elapsed, error_code=exc.code
+            )
+            span.set_attributes(error_code=exc.code)
+            span.set_status("error", exc.code)
+            span.end()
+            raise
+        else:
+            elapsed = time.monotonic() - started
+            # Token counts live on the generator's ChatResult, which the
+            # AnswerGenerator Protocol does not expose; we record what is
+            # observable here and leave token accounting to the provider
+            # client, which already persists usage on the AgentRun.
+            metrics.observe_model_call(operation="generate", outcome="ok", latency_seconds=elapsed)
+            span.set_attributes(latency_ms=int(elapsed * 1000))
+            span.end()
+            return draft
 
     async def _finish_abstain(
         self,
@@ -522,6 +664,12 @@ class AgentOrchestrator:
             route=run.route,
             status=run.status,
             reason_code=decision.reason_code,
+        )
+        get_metrics().observe_run(
+            outcome="handed_off" if decision.handoff else "abstained",
+            route=run.route,
+            latency_seconds=run.latency_ms / 1000.0,
+            abstain_reason=decision.reason_code,
         )
         return RunOutcome(
             run_id=run.id,
