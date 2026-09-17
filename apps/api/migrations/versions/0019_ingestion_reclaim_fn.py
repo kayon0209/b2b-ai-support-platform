@@ -88,6 +88,7 @@ END;
 $$;
 """  # noqa: S608 - interpolates only the module-owned FUNCTION constant
 
+
 # `<=` rather than `<`, and the difference is not cosmetic. Both clocks are
 # whole seconds, so a row touched in the current second has
 # `updated_at == now`; with `<` a timeout of 0 reclaims nothing, and the

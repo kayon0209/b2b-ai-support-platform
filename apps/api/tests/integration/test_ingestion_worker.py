@@ -219,8 +219,7 @@ def _read_version(version_id: str) -> dict:
         row = (
             conn.execute(
                 text(
-                    "SELECT ingestion_status, status, metadata FROM document_versions "
-                    "WHERE id = :v"
+                    "SELECT ingestion_status, status, metadata FROM document_versions WHERE id = :v"
                 ),
                 {"v": version_id},
             )
@@ -232,8 +231,12 @@ def _read_version(version_id: str) -> dict:
             {"v": version_id},
         ).scalar_one()
     admin.dispose()
-    return {"status": row["ingestion_status"], "doc_status": row["status"],
-            "metadata": row["metadata"], "chunks": int(chunk_count)}
+    return {
+        "status": row["ingestion_status"],
+        "doc_status": row["status"],
+        "metadata": row["metadata"],
+        "chunks": int(chunk_count),
+    }
 
 
 def _session_factory(url: str) -> tuple[object, object]:
@@ -370,8 +373,7 @@ def test_embeddings_are_written_so_the_vector_half_of_fusion_works(
     with admin.connect() as conn:
         missing = conn.execute(
             text(
-                "SELECT count(*) FROM chunks WHERE document_version_id = :v "
-                "AND embedding IS NULL"
+                "SELECT count(*) FROM chunks WHERE document_version_id = :v AND embedding IS NULL"
             ),
             {"v": version_id},
         ).scalar_one()

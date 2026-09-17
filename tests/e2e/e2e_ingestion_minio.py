@@ -163,13 +163,15 @@ async def main() -> None:
             s, TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="system")
         )
         row = (
-            await s.execute(
-                text(
-                    "SELECT ingestion_status, status FROM document_versions WHERE id = :v"
-                ),
-                {"v": created.version_id},
+            (
+                await s.execute(
+                    text("SELECT ingestion_status, status FROM document_versions WHERE id = :v"),
+                    {"v": created.version_id},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         n_chunks = (
             await s.execute(
                 text("SELECT count(*) FROM chunks WHERE document_version_id = :v"),
@@ -195,9 +197,7 @@ async def main() -> None:
             tenant_id=tenant_id,
             query="refund eligibility window",
             top_k=5,
-            principal=PrincipalScope(
-                principal_types=("tenant",), principal_ids=(str(tenant_id),)
-            ),
+            principal=PrincipalScope(principal_types=("tenant",), principal_ids=(str(tenant_id),)),
             embedder=DeterministicEmbedder(),
         )
         print(f"hybrid_search hits={len(hits)}")

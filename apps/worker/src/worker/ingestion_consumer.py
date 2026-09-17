@@ -168,11 +168,15 @@ async def claim_versions(session: AsyncSession, *, batch: int = 5) -> list[Claim
     of losing the document.
     """
     rows = (
-        await session.execute(
-            text("SELECT * FROM claim_ingestion_versions(CAST(:batch AS integer))"),
-            {"batch": batch},
+        (
+            await session.execute(
+                text("SELECT * FROM claim_ingestion_versions(CAST(:batch AS integer))"),
+                {"batch": batch},
+            )
         )
-    ).mappings().all()
+        .mappings()
+        .all()
+    )
     if not rows:
         return []
 
@@ -419,7 +423,6 @@ async def _write_embeddings(
     response, which is external data.
     """
     from sqlalchemy import bindparam, text
-
 
     for ordinal, vector in embeddings:
         literal = "[" + ",".join(f"{x:.6f}" for x in vector) + "]"
