@@ -37,6 +37,7 @@ from platform_core.config import Settings, get_settings
 from platform_core.evaluation.router import router as quality_router
 from platform_core.http_metrics import HttpMetricsMiddleware
 from platform_core.identity.middleware import TenantContextMiddleware, build_resolver
+from platform_core.identity.router import router as identity_router
 from platform_core.knowledge.flag_router import router as feature_flag_router
 from platform_core.knowledge.gap_router import router as knowledge_gap_router
 from platform_core.knowledge.router import router as knowledge_router
@@ -74,6 +75,7 @@ app.include_router(knowledge_router)
 app.include_router(feature_flag_router)
 # Observability last: /metrics is an unauthenticated infrastructure endpoint
 # and its own guard is inside the router (see observability_router).
+app.include_router(identity_router)
 app.include_router(observability_router)
 # Middleware runs in reverse registration order, so HttpMetricsMiddleware
 # (registered last) wraps the auth middleware and therefore observes every

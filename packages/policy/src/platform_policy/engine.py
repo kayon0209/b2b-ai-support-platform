@@ -61,6 +61,10 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
     "security_admin": frozenset(
         {
             Action.SECURITY_ADMIN,
+            # Tenant identity administration (invite/manage members) sits with
+            # the security role alongside tenant_owner, per the identity API's
+            # documented authorization.
+            Action.TENANT_ADMIN,
             Action.AUDIT_READ,
             Action.CASE_READ,
             Action.KNOWLEDGE_READ,

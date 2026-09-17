@@ -3,7 +3,7 @@
 import enum
 import uuid
 
-from sqlalchemy import Boolean, Enum, ForeignKey, String, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Enum, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from platform_core.orm_base import Base, PkMixin, TenantMixin
@@ -86,3 +86,46 @@ class ExternalIdentity(Base, PkMixin, TenantMixin):
     system: Mapped[str] = mapped_column(String(255), nullable=False)
     subject: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+
+
+class InvitationStatus(enum.StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+
+
+class MembershipInvitation(Base, PkMixin, TenantMixin):
+    """Single-use invitation token for tenant self-service (Phase 5).
+
+    A tenant_owner or security_admin invites an email address; the invitee
+    receives an opaque token (delivered via their chosen side channel in
+    production, returned directly in local/test) and consumes it to create a
+    User + Membership in the tenant.
+
+    The token is single-use and expires. Consumed tokens are marked
+    ACCEPTED, never deleted, so the audit trail shows who was invited and
+    when -- even if the invitee never accepted.
+    """
+
+    __tablename__ = "membership_invitations"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "email", name="uq_invite_per_tenant_email"),
+        UniqueConstraint("tenant_id", "token", name="uq_invite_per_tenant_token"),
+    )
+
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[MembershipRole] = mapped_column(
+        Enum(
+            MembershipRole, native_enum=False, values_callable=lambda e: [str(m.value) for m in e]
+        ),
+        nullable=False,
+    )
+    token: Mapped[uuid.UUID] = mapped_column(nullable=False, unique=True, index=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    accepted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(31), nullable=False, default=InvitationStatus.PENDING.value
+    )

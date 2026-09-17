@@ -78,6 +78,7 @@ TENANT_TABLES = (
     "knowledge_gaps",
     "knowledge_sources",
     "knowledge_spaces",
+    "membership_invitations",
     "memberships",
     "outbox_events",
     "prompt_versions",
@@ -91,7 +92,7 @@ TENANT_TABLES = (
 # migration chain is exercised end-to-end here (down to base and back up on a
 # fresh database), and a new revision that is not reversible fails this test
 # rather than surfacing during a production rollback.
-EXPECTED_MIGRATIONS = 19
+EXPECTED_MIGRATIONS = 21
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection
