@@ -58,6 +58,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from observability import JsonLogger
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
 from platform_core.knowledge import ingest
+from platform_core.knowledge.ingest import IngestionError
 from platform_core.knowledge.models import Chunk, DocumentVersion, IngestionStatus
 
 logger = JsonLogger("platform.worker")
@@ -108,15 +109,12 @@ class _Retryable(Exception):
     """
 
 
-class IngestionError(Exception):
-    """A fault attributable to the document itself: bad bytes, bad markup."""
-
-
 @dataclass
 class ClaimedVersion:
     version_id: uuid.UUID
     tenant_id: uuid.UUID
     object_uri: str
+    content_type: str
     from_status: str
     # The state the claim moved the row to (PARSING). Carried so `_advance`
     # knows what the row currently holds without re-reading it, and so the
@@ -193,6 +191,7 @@ async def claim_versions(session: AsyncSession, *, batch: int = 5) -> list[Claim
                 version_id=row["version_id"],
                 tenant_id=row["tenant_id"],
                 object_uri=str(row["object_uri"]),
+                content_type=str(row["content_type"] or ""),
                 from_status=str(row["ingestion_status"]),
                 claimed_status=target,
             )
@@ -301,25 +300,6 @@ async def _embed_chunks(texts: list[str], embedder: Any) -> list[list[float]]:
     return vectors
 
 
-def _decode(raw: bytes) -> str:
-    """Decode an uploaded object as text.
-
-    The pilot's ingestible formats are text-shaped (markdown, plain text,
-    JSON). A binary PDF raises rather than being decoded with replacement
-    characters, because a mangled extraction that embeds as plausible-looking
-    text is undetectable downstream while a hard failure is not. PDF parsing
-    is a real feature with a real dependency; it is not this function.
-    """
-    for encoding in ("utf-8", "utf-8-sig"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    raise IngestionError(
-        "object is not decodable text (binary format not supported by this pipeline)"
-    )
-
-
 async def ingest_version(
     session: AsyncSession,
     version: ClaimedVersion,
@@ -348,7 +328,7 @@ async def ingest_version(
     except Exception as exc:  # noqa: BLE001 - storage boundary
         raise _Retryable(f"object storage unavailable: {type(exc).__name__}") from exc
 
-    text = _decode(raw)
+    text = ingest.parse_document(version.content_type, raw)
     sections = ingest.parse_markdown_sections(text)
     if not sections:
         raise IngestionError("no sections found in the document")

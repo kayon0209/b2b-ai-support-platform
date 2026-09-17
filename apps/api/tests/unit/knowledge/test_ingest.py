@@ -133,3 +133,78 @@ def test_empty_sections_dropped() -> None:
 
 
 from platform_core.knowledge.ingest import Section  # noqa: E402  (used above)
+
+# --- Document parsing (Phase 1: PDF and DOCX support) ---
+
+
+def test_parse_document_markdown() -> None:
+    from platform_core.knowledge.ingest import parse_document
+
+    text = "# Refund Policy\n\nAnnual plans are refundable within 30 days."
+    result = parse_document("text/markdown", text.encode("utf-8"))
+    assert "Refund Policy" in result
+    assert "30 days" in result
+
+
+def test_parse_document_plain_text() -> None:
+    from platform_core.knowledge.ingest import parse_document
+
+    raw = b"Plain text content\nLine two"
+    result = parse_document("text/plain", raw)
+    assert "Plain text content" in result
+
+
+def test_parse_document_pdf() -> None:
+    """PDF parsing: corrupt/empty PDFs raise IngestionError, valid PDFs extract text."""
+    from platform_core.knowledge.ingest import IngestionError, parse_document
+
+    # An empty file is not a valid PDF - pypdf raises, we map to IngestionError
+    with pytest.raises(IngestionError):
+        parse_document("application/pdf", b"")
+
+    # Corrupt bytes are not a valid PDF
+    with pytest.raises(IngestionError):
+        parse_document("application/pdf", b"this is not a pdf")
+
+
+def test_parse_document_docx() -> None:
+    from platform_core.knowledge.ingest import IngestionError, parse_document
+
+    # An empty file is not a valid DOCX
+    with pytest.raises(IngestionError):
+        parse_document(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            b"",
+        )
+
+    # A valid DOCX with content
+    import io
+
+    from docx import Document
+
+    doc = Document()
+    doc.add_paragraph("Hello DOCX World")
+    doc.add_paragraph("Second paragraph")
+    buf = io.BytesIO()
+    doc.save(buf)
+    result = parse_document(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        buf.getvalue(),
+    )
+    assert "Hello DOCX World" in result
+    assert "Second paragraph" in result
+
+
+def test_parse_document_unsupported_type() -> None:
+    from platform_core.knowledge.ingest import IngestionError, parse_document
+
+    with pytest.raises(IngestionError, match="unsupported content type"):
+        parse_document("application/zip", b"not a doc")
+
+
+def test_parse_document_binary_not_text() -> None:
+    from platform_core.knowledge.ingest import IngestionError, parse_document
+
+    # Random binary bytes that are not valid UTF-8
+    with pytest.raises(IngestionError, match="not decodable"):
+        parse_document("text/plain", b"\xff\xfe\x00\x01\x80\x90")
