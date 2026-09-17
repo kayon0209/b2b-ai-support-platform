@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     # Local default matches infra/compose/docker-compose.yml (ai-postgres is
     # published on 5435 to avoid colliding with a host PostgreSQL on 5432).
     database_url: str = "postgresql+psycopg://platform:platform@localhost:5435/platform"
+    # Reserved. The durable work queue is a Postgres table (inbox_events /
+    # outbox_events claimed with SKIP LOCKED), not Redis, so nothing reads this
+    # today. It is kept, and kept separate from Chatwoot's Redis (6381), so
+    # that a future cache/rate-limit feature does not have to invent a setting
+    # or accidentally share Chatwoot's instance.
     redis_url: str = "redis://localhost:6380/0"
 
     # --- Authentication (docs/security.md) --------------------------------

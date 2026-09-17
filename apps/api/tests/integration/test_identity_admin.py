@@ -402,3 +402,60 @@ class TestMemberManagement:
         )
         assert resp.status_code == 400
         assert "last tenant_owner" in resp.json()["error"]["message"]
+
+
+# --- Auth success path through the real middleware --------------------------
+
+
+class TestBootstrapAuthThroughHttp:
+    """Drive the real middleware (platform_core.main), not a stub resolver.
+
+    A regression here once made *every* authenticated endpoint return 401 for
+    *every* user -- including tenant_owner -- while the unit tests stayed green
+    because they asserted actor_id round-trips and the integration tests
+    fabricated roles. This exercises slug -> tenant -> membership -> role for
+    real, over HTTP.
+    """
+
+    def _real_client(self):
+        import importlib
+
+        from fastapi.testclient import TestClient
+
+        main_mod = importlib.import_module("platform_core.main")
+        return TestClient(main_mod.app, raise_server_exceptions=False)
+
+    def test_valid_bootstrap_token_authenticates_and_carries_a_role(self) -> None:
+        from platform_core.config import get_settings
+
+        if not get_settings().allow_bootstrap_tokens:
+            pytest.skip("bootstrap tokens are disabled in this environment")
+
+        uid = _seed_member(TENANT, "boot@ident-test.com", role="auditor")
+        client = self._real_client()
+        resp = client.get(
+            "/v1/quality/metrics",
+            headers={"Authorization": f"Bearer pt_ident-t1_{uid}"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert "total_runs" in resp.json()
+
+    def test_unknown_slug_is_rejected(self) -> None:
+        uid = _seed_member(TENANT, "boot2@ident-test.com", role="auditor")
+        client = self._real_client()
+        resp = client.get(
+            "/v1/quality/metrics",
+            headers={"Authorization": f"Bearer pt_no-such-tenant_{uid}"},
+        )
+        assert resp.status_code == 401
+        assert resp.json()["error"]["code"] == "AUTH_UNRESOLVED"
+
+    def test_unknown_actor_is_rejected(self) -> None:
+        _seed_member(TENANT, "boot3@ident-test.com", role="auditor")
+        client = self._real_client()
+        stranger = uuid.uuid5(uuid.NAMESPACE_URL, "stranger@ident-test.com")
+        resp = client.get(
+            "/v1/quality/metrics",
+            headers={"Authorization": f"Bearer pt_ident-t1_{stranger}"},
+        )
+        assert resp.status_code == 401
