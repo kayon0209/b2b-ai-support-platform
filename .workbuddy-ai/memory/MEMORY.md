@@ -67,3 +67,104 @@ docker compose -f infra/compose/docker-compose.yml config --quiet
   older modules; do not add to them and do not fix them incidentally.
 - Architecture rules and prohibited shortcuts are in `AGENTS.md` — read it before
   changing module boundaries.
+
+## Integration test gotchas
+
+- **alembic `Config` + non-ASCII repo path**: `script_location = %(here)s` in
+  `alembic.ini` is read by `ConfigParser`, which **silently fails** when the
+  path contains Chinese chars (e.g. `360驱动大师目录`); `command.upgrade` then
+  dies with "No 'script_location' key found". Fix: call
+  `cfg.set_main_option("script_location", str(ALEMBIC_INI.parent))` after
+  `Config(...)`. Also, for a test under `apps/api/tests/integration/`,
+  `ALEMBIC_INI` is `Path(__file__).resolve().parents[4]` (the workspace is
+  `.../b2b-ai-support-plan/b2b-ai-support-plan/apps/...`, so `parents[3]` is the
+  inner `apps/` dir, not the repo root).
+- **psycopg async needs `SelectorEventLoop` on Windows**: a plain `asyncio.run`
+  uses `ProactorEventLoop`, which psycopg rejects. Run async DB benchmarks with
+  `asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)`.
+- **`alembic_version` is a single-row "current head" table** — `SELECT count(*)`
+  returns 1, NOT the migration count. Count migrations with
+  `len(list(ScriptDirectory.from_config(cfg).walk_revisions()))`; verify at-head
+  via `version_num IN ScriptDirectory(...).get_heads()`.
+- **`DROP`/`CREATE DATABASE` cannot run inside a transaction**: set
+  `create_engine(url).execution_options(isolation_level="AUTOCOMMIT")` on the
+  *engine* before connecting (not on a connection already inside `begin()`).
+- **local Postgres `max_connections=100` is tight**: size async pools well below
+  it (pool_size=30) for concurrency benchmarks, or connections get refused and
+  latency explodes.
+
+## Windows startup — the API must not be launched with bare uvicorn
+
+**Always start the API with `python -m platform_core.main`.** Never
+`uvicorn platform_core.main:app` on Windows.
+
+Reason: uvicorn's `uvicorn/loops/asyncio.py::asyncio_loop_factory` hardcodes
+`ProactorEventLoop` when `sys.platform == "win32" and not use_subprocess`, and
+uvicorn builds its loop **before** importing the app — so an import-time
+`set_event_loop_policy` in `main.py` cannot influence it. psycopg async refuses
+to run on a Proactor loop, so every DB-backed request dies at connect time.
+
+The failure mode was nasty: `TenantContextMiddleware.dispatch` caught the
+exception and returned a bare `401 AUTH_UNRESOLVED`, which is indistinguishable
+from a bad token. It looked like an auth bug for a long time.
+
+`platform_core.db.ensure_async_db_loop()` now raises a loud, actionable
+`RuntimeError` instead, so the diagnosis is immediate. `main.py::run()` passes
+`loop=asyncio.SelectorEventLoop` explicitly.
+
+## Migrations that read FORCE-RLS tables
+
+`memberships` is FORCE RLS, so its rows are invisible unless `app.tenant_id` is
+bound — but auth resolution is what *discovers* the tenant, so it logically runs
+before any binding exists. Migration `0015_membership_bootstrap` solves this with
+`resolve_active_membership(slug, user_id)`: a read-only `SECURITY DEFINER`
+function granting EXECUTE (never SELECT) back to `platform_app`.
+
+Do **not** "fix" a future variant of this by loosening the policy to
+`USING (app.tenant_id IS NULL OR ...)`. That grants table-wide read across every
+tenant and `test_cross_tenant_leak_surfaces.py` will (correctly) fail.
+
+`resolve_identity` (single probe, function-based) and `resolve_by_slug`
+(two-step: tenants → bind → memberships) are both live and must agree. Which to
+use: single probe when you only need identity, two-step when you also need tenant
+settings.
+
+**Enum columns are `String` in the migrations and hold lowercase enum *values*.**
+Any ORM `Enum(...)` must pass `values_callable=_enum_values`, or SQLAlchemy looks
+for member *names* (`ACTIVE`) and every read raises `LookupError`.
+
+**Auth failures are deliberately indistinguishable.** Unknown slug, suspended
+tenant, missing membership and inactive membership all raise the same
+`identity not found or inactive`. Splitting them would make login a tenant/user
+enumeration oracle. If a test wants to tell them apart, it must use the two-step
+path, not the single probe.
+
+## Changing the migration count
+
+`test_migration_and_performance.py::EXPECTED_MIGRATIONS` is a deliberate gate —
+it exercises the whole chain down to base and back up on a fresh database. Bump
+it when adding a revision; a non-reversible migration then fails in CI rather
+than during a production rollback.
+
+## The outbox is global — test suites that touch it must drain it
+
+`claim_pending` scans `outbox_events` with **no tenant filter**, which is correct
+in production (one relay drains everything). The consequence for tests: any
+queued row left by another suite is claimed by the relay suite's batch, and
+`stats.claimed == 1` style assertions then measure the wrong thing.
+
+This produces an **intermittent, ordering-dependent** failure that looks exactly
+like a bug in the relay. `test_outbox_relay.py::_cleanup` therefore also deletes
+rows with `status = 'queued'`. Rows in `sent` are inert.
+
+If you add a test that commits an outbox event, either clean up after yourself or
+accept that the relay suite depends on you doing so.
+
+## Local tooling
+
+- `scripts/seed_admin_demo.py` creates the `admin-demo` tenant + `tenant_owner`
+  user and prints a bootstrap token (`pt_admin-demo_<uuid>`). Use it to exercise
+  the API and admin-web by hand; it is throwaway local tooling, not product code.
+- Start the API with `python -m platform_core.main` (see Windows startup above),
+  Vite with `npx vite`. The Vite dev server proxies `/api` → `localhost:8000`.
+- `admin-web` `.env` needs `VITE_API_TOKEN`; `.env.example` is the template.

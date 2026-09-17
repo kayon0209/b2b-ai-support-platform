@@ -14,13 +14,26 @@ class TenantStatus(enum.StrEnum):
     SUSPENDED = "suspended"
 
 
+def _enum_values(enum_cls: type[enum.Enum]) -> list[str]:
+    """Persist enum *values*, not member names.
+
+    SQLAlchemy's Enum type defaults to storing member names (ACTIVE), but
+    every migration in this repo creates a plain String column seeded with
+    lowercase values ("active"). Without `values_callable` the ORM and the
+    schema disagree, and reads fail at result-processing time with
+    "LookupError: 'active' is not among the defined enum values".
+    """
+    return [str(member.value) for member in enum_cls]
+
+
 class Tenant(Base, PkMixin):
     __tablename__ = "tenants"
 
     slug: Mapped[str] = mapped_column(String(63), unique=True)
     name: Mapped[str] = mapped_column(String(255))
     status: Mapped[TenantStatus] = mapped_column(
-        Enum(TenantStatus, native_enum=False), default=TenantStatus.ACTIVE
+        Enum(TenantStatus, native_enum=False, values_callable=_enum_values),
+        default=TenantStatus.ACTIVE,
     )
     default_timezone: Mapped[str] = mapped_column(String(63), default="UTC")
     data_region: Mapped[str] = mapped_column(String(31), default="cn-north-1")
@@ -55,7 +68,7 @@ class Membership(Base, PkMixin, TenantMixin):
 
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     role: Mapped[MembershipRole] = mapped_column(
-        Enum(MembershipRole, native_enum=False), nullable=False
+        Enum(MembershipRole, native_enum=False, values_callable=_enum_values), nullable=False
     )
     status: Mapped[str] = mapped_column(String(31), default="active")
 

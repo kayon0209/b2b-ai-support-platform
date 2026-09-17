@@ -146,9 +146,7 @@ async def evaluate(
             rollout_percent=row.rollout_percent,
         )
 
-    inside = is_in_rollout(
-        flag_key=flag_key, tenant_id=tenant_id, percent=row.rollout_percent
-    )
+    inside = is_in_rollout(flag_key=flag_key, tenant_id=tenant_id, percent=row.rollout_percent)
     return FlagDecision(
         key=flag_key,
         enabled=inside,
@@ -204,9 +202,7 @@ async def evaluate_many(
                 rollout_percent=row.rollout_percent,
             )
             continue
-        inside = is_in_rollout(
-            flag_key=key, tenant_id=tenant_id, percent=row.rollout_percent
-        )
+        inside = is_in_rollout(flag_key=key, tenant_id=tenant_id, percent=row.rollout_percent)
         out[key] = FlagDecision(
             key=key,
             enabled=inside,
@@ -379,9 +375,7 @@ async def target_tenant(
 async def list_flags(session: AsyncSession, *, tenant_id: uuid.UUID) -> list[FeatureFlag]:
     rows = (
         await session.execute(
-            select(FeatureFlag)
-            .where(FeatureFlag.tenant_id == tenant_id)
-            .order_by(FeatureFlag.key)
+            select(FeatureFlag).where(FeatureFlag.tenant_id == tenant_id).order_by(FeatureFlag.key)
         )
     ).scalars()
     return list(rows)

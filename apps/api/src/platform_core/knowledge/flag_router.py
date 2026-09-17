@@ -245,9 +245,7 @@ async def set_feature_flag_enabled(
     async with session_scope_with_url(_app_url()) as session:
         await apply_rls_tenant(session, ctx)
         try:
-            row = await flag_service.set_enabled(
-                session, ctx=ctx, key=key, enabled=payload.enabled
-            )
+            row = await flag_service.set_enabled(session, ctx=ctx, key=key, enabled=payload.enabled)
         except flag_service.FlagError as exc:
             return _flag_error(exc)
         await session.commit()

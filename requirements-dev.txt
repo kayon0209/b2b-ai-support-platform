@@ -57,6 +57,6 @@ pytest-asyncio>=0.24
 # The tool_gateway unit suite runs against an in-memory async SQLite engine,
 # so the aiosqlite driver is a test-time requirement, not an optional extra.
 aiosqlite>=0.20
-ruff>=0.8
+ruff>=0.8,<0.9
 mypy>=1.13
 detect-secrets>=1.5

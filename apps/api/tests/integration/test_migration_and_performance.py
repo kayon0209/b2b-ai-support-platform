@@ -87,7 +87,11 @@ TENANT_TABLES = (
     "tool_proposals",
 )
 
-EXPECTED_MIGRATIONS = 14
+# Bump this when adding a migration. It is a deliberate speed bump: the
+# migration chain is exercised end-to-end here (down to base and back up on a
+# fresh database), and a new revision that is not reversible fails this test
+# rather than surfacing during a production rollback.
+EXPECTED_MIGRATIONS = 15
 
 
 def _write_artifact(name: str, payload: dict[str, Any]) -> None:
@@ -275,9 +279,7 @@ def test_migrations_apply_and_are_reversible_on_fresh_database(
 
     with engine.begin() as conn:
         cases_after = int(conn.execute(text("SELECT count(*) FROM cases")).scalar() or 0)
-        audit_after = int(
-            conn.execute(text("SELECT count(*) FROM audit_events")).scalar() or 0
-        )
+        audit_after = int(conn.execute(text("SELECT count(*) FROM audit_events")).scalar() or 0)
 
     # Full down-migration chain validity: downgrade all the way to base and
     # re-apply every migration from scratch. This proves every down migration
@@ -291,9 +293,7 @@ def test_migrations_apply_and_are_reversible_on_fresh_database(
     from_scratch_upgrade_seconds = time.perf_counter() - t_fs
 
     with engine.begin() as conn:
-        current_version = conn.execute(
-            text("SELECT version_num FROM alembic_version")
-        ).scalar()
+        current_version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
 
     engine.dispose()
 
@@ -323,17 +323,11 @@ def test_migrations_apply_and_are_reversible_on_fresh_database(
     assert not missing, f"declared tenant tables missing from schema: {missing}"
     assert not rls_broken, f"these tenant tables lack forced RLS: {rls_broken}"
     assert migration_count == EXPECTED_MIGRATIONS, (
-        f"expected {EXPECTED_MIGRATIONS} migrations registered, got "
-        f"{migration_count}"
+        f"expected {EXPECTED_MIGRATIONS} migrations registered, got {migration_count}"
     )
-    assert at_head, (
-        f"re-applying from base left the DB at {current_version}, "
-        f"expected head {heads}"
-    )
+    assert at_head, f"re-applying from base left the DB at {current_version}, expected head {heads}"
     assert cases_after == seed["cases"], "cases lost during one-step rollback"
-    assert audit_after == seed["audit_events"], (
-        "audit events lost during one-step rollback"
-    )
+    assert audit_after == seed["audit_events"], "audit events lost during one-step rollback"
 
 
 # --- 2. Performance testing --------------------------------------------------

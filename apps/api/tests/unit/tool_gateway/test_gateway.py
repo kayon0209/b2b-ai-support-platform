@@ -480,9 +480,7 @@ def test_replay_of_a_crashed_execution_is_not_reported_as_a_result(gateway_env) 
         session.add(_crashed_execution(session, proposal, "crash-1"))
         await session.commit()
         try:
-            execution = await gw.execute(
-                tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id
-            )
+            execution = await gw.execute(tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id)
             # If the corpse is returned as a result, status is 'executing' -
             # neither success nor failure, and the adapter was never called.
             return execution.status, len(executor.calls)
@@ -517,9 +515,7 @@ def test_crashed_execution_does_not_invent_success(gateway_env) -> None:
         session.add(_crashed_execution(session, proposal, "crash-2"))
         await session.commit()
         try:
-            execution = await gw.execute(
-                tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id
-            )
+            execution = await gw.execute(tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id)
             return execution.status, len(executor.calls)
         finally:
             await session.close()

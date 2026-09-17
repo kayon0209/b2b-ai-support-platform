@@ -104,9 +104,7 @@ class ConnectorAdapter(ABC):
     async def health_check(self) -> bool: ...
 
     @abstractmethod
-    async def fetch(
-        self, resource: str, cursor: str | None = None
-    ) -> tuple[list[Any], str | None]:
+    async def fetch(self, resource: str, cursor: str | None = None) -> tuple[list[Any], str | None]:
         """Return (canonical records, next_cursor).
 
         Records are the adapter's canonical projections, not raw provider

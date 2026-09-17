@@ -87,12 +87,8 @@ def upgrade() -> None:
         ),
         sa.UniqueConstraint("flag_id", "target_tenant_id", name="uq_flag_target"),
     )
-    op.create_index(
-        "ix_flag_targets_flag", "feature_flag_targets", ["flag_id"]
-    )
-    op.create_index(
-        "ix_flag_targets_tenant", "feature_flag_targets", ["target_tenant_id"]
-    )
+    op.create_index("ix_flag_targets_flag", "feature_flag_targets", ["flag_id"])
+    op.create_index("ix_flag_targets_tenant", "feature_flag_targets", ["target_tenant_id"])
 
     _tenant_rls("feature_flags")
     _tenant_rls("feature_flag_targets")

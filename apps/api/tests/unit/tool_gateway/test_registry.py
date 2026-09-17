@@ -225,7 +225,9 @@ async def test_resolver_query_is_tenant_scoped_in_sql() -> None:
             return _FakeResult([])
 
     resolver = ConnectorExecutorResolver(
-        _CapturingSession(), tenant_id=TENANT, factories=_factories([])  # type: ignore[arg-type]
+        _CapturingSession(),
+        tenant_id=TENANT,
+        factories=_factories([]),  # type: ignore[arg-type]
     )
     await resolver.executors_for(["jira.create_issue"])
 

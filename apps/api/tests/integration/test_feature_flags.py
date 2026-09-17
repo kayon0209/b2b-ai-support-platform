@@ -181,9 +181,7 @@ class TestDefinition:
     @pytest.mark.parametrize("bad", ["", "  ", "has spaces", "semi;colon", "x" * 200])
     def test_invalid_keys_are_refused(self, bad: str) -> None:
         async def _fn(session):
-            return await flag_service.define_flag(
-                session, ctx=_ctx(), key=bad, description=""
-            )
+            return await flag_service.define_flag(session, ctx=_ctx(), key=bad, description="")
 
         with pytest.raises(flag_service.FlagError):
             _run(_in_session(TENANT, _fn))

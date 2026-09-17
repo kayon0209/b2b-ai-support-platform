@@ -26,9 +26,7 @@ class ImNotificationAdapter(ConnectorAdapter):
     async def health_check(self) -> bool:
         return bool(self.context.configuration.get("webhook_url"))
 
-    async def fetch(
-        self, resource: str, cursor: str | None = None
-    ) -> tuple[list[Any], str | None]:
+    async def fetch(self, resource: str, cursor: str | None = None) -> tuple[list[Any], str | None]:
         return [], None  # notification-only adapter
 
     async def send_notification(

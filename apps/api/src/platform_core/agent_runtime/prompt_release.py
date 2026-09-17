@@ -296,9 +296,7 @@ async def promote(
     assert evidence is not None  # narrowed by check_release_gate
 
     row = await _load(session, ctx=ctx, version_id=version_id)
-    incumbent = await get_active(
-        session, tenant_id=ctx.tenant_id, template_name=row.template_name
-    )
+    incumbent = await get_active(session, tenant_id=ctx.tenant_id, template_name=row.template_name)
     if incumbent is not None and incumbent.id == row.id:
         raise ReleaseError("ALREADY_ACTIVE", "this version is already active")
 
@@ -455,9 +453,7 @@ async def archive_stale_duplicates(
 
     stale_ids = [row.id for row in actives[1:]]
     await session.execute(
-        update(PromptTemplate)
-        .where(PromptTemplate.id.in_(stale_ids))
-        .values(published=False)
+        update(PromptTemplate).where(PromptTemplate.id.in_(stale_ids)).values(published=False)
     )
     return len(stale_ids)
 

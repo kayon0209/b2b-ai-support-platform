@@ -56,9 +56,7 @@ class ToolDefinition(Base, PkMixin, TenantMixin):
     risk: Mapped[str] = mapped_column(String(31), nullable=False, default="read")
     input_schema: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     output_schema: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    required_permissions: Mapped[list[str]] = mapped_column(
-        JSONB, nullable=False, default=list
-    )
+    required_permissions: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     timeout_ms: Mapped[int] = mapped_column(nullable=False, default=10_000)
     idempotent: Mapped[bool] = mapped_column(nullable=False, default=True)
     requires_confirmation: Mapped[bool] = mapped_column(nullable=False, default=False)

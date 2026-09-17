@@ -46,12 +46,21 @@ EVENT_TYPE = "relay.test"
 
 @pytest.fixture(autouse=True)
 def _isolate_rows() -> None:
-    """Clear this suite's rows before each test.
+    """Make the outbox empty of claimable work before each test.
 
     The outbox is a global table the relay scans without a tenant filter
-    (that is the point — one relay drains everything). So a row left by an
-    earlier test in this module would be claimed by the next one, and any
-    assertion on claim counts would be measuring the wrong thing.
+    (that is the point - one relay drains everything). So any queued row
+    left behind by another suite is claimed in the same batch, and these
+    tests' assertions on claim/park/unhandled counts start measuring other
+    suites' rows instead of their own. That failure is intermittent and
+    ordering-dependent, which is the worst kind: it looks like a code bug in
+    the relay.
+
+    Deleting only this module's rows is not enough. `test_outbox.py` and the
+    case-lifecycle journey commit real `case.created` events, and a run that
+    is interrupted mid-suite leaves them queued. Draining the whole table is
+    safe here because these rows are test artefacts: production rows come
+    from real traffic, not from a pytest run.
     """
     admin = create_engine(ADMIN_URL)
     _cleanup(admin)
@@ -75,6 +84,10 @@ def _cleanup(admin: Any) -> None:
     with admin.begin() as conn:
         conn.execute(text("DELETE FROM outbox_events WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(text("DELETE FROM tenants WHERE slug = :s"), {"s": SLUG})
+        # Stray queued rows from other suites would be claimed by our relay.
+        # `sent` rows are inert (claim_pending filters on queued), so only the
+        # claimable ones have to go.
+        conn.execute(text("DELETE FROM outbox_events WHERE status = 'queued'"))
 
 
 def _assert_no_live_relay(admin: Any) -> None:
@@ -185,6 +198,8 @@ async def test_queued_event_is_delivered_and_marked_sent() -> None:
     event_id = _seed_event()
     relay = OutboxRelay(handlers={EVENT_TYPE: handler})
 
+    # The fixture drains the table of queued rows first, so this batch really
+    # does contain exactly the one event seeded here.
     async with session_scope() as session:
         stats = await relay.run_once(session)
 
@@ -192,9 +207,12 @@ async def test_queued_event_is_delivered_and_marked_sent() -> None:
     assert stats.sent == 1
     assert len(seen) == 1
 
+    mine = [e for e in seen if str(e.event_id) == str(event_id)]
+    assert len(mine) == 1, "our event must be the one delivered"
+
     # The handler saw the real tenant and trace, not a placeholder.
-    assert str(seen[0].tenant_id) == TENANT
-    assert seen[0].trace_id == "tr-relay"
+    assert str(mine[0].tenant_id) == TENANT
+    assert mine[0].trace_id == "tr-relay"
 
     status, attempts, _ = await _row_status(event_id)
     assert status == OutboxStatus.SENT.value

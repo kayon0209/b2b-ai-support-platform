@@ -362,6 +362,7 @@ def _query_terms(query: str) -> set[str]:
     """
     return {t for t in _content_terms(query) if t not in INSTRUCTION_FILLER}
 
+
 def _term_overlap(query: str, excerpt: str) -> float:
     """Cheap lexical overlap: fraction of query content terms in excerpt.
 

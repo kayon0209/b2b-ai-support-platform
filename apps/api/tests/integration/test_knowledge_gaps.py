@@ -88,9 +88,7 @@ def _client(tenant_id: str, role: str, actor: uuid.UUID | None = None) -> TestCl
     fresh = FastAPI()
     for route in main_mod.app.router.routes:
         fresh.router.routes.append(route)
-    fresh.add_middleware(
-        TenantContextMiddleware, resolver=_RoleResolver(tenant_id, role, actor)
-    )
+    fresh.add_middleware(TenantContextMiddleware, resolver=_RoleResolver(tenant_id, role, actor))
     return TestClient(fresh, raise_server_exceptions=False)
 
 
@@ -272,9 +270,7 @@ class TestGapAggregation:
         _record("How do I export data?")
         _record("How do I import data?")
         _rows, total = _run(
-            _in_session(
-                TENANT, lambda s: gap_service.list_gaps(s, tenant_id=uuid.UUID(TENANT))
-            )
+            _in_session(TENANT, lambda s: gap_service.list_gaps(s, tenant_id=uuid.UUID(TENANT)))
         )
         assert total == 2
 
@@ -334,9 +330,7 @@ class TestQueueLifecycle:
         rec = _record("How do I enable SSO?")
 
         async def _dismiss(session):
-            return await gap_service.dismiss(
-                session, ctx=_ctx(), gap_id=rec.gap_id, reason="   "
-            )
+            return await gap_service.dismiss(session, ctx=_ctx(), gap_id=rec.gap_id, reason="   ")
 
         with pytest.raises(gap_service.GapError) as err:
             _run(_in_session(TENANT, _dismiss))
@@ -520,17 +514,25 @@ class TestPublishing:
             from platform_core.knowledge.models import Document, DocumentVersion
 
             doc = (
-                await session.execute(
-                    select(Document).where(Document.id == uuid.UUID(document_id))
-                )
-            ).scalars().one()
-            vers = (
-                await session.execute(
-                    select(DocumentVersion).where(
-                        DocumentVersion.document_id == uuid.UUID(document_id)
+                (
+                    await session.execute(
+                        select(Document).where(Document.id == uuid.UUID(document_id))
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .one()
+            )
+            vers = (
+                (
+                    await session.execute(
+                        select(DocumentVersion).where(
+                            DocumentVersion.document_id == uuid.UUID(document_id)
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
             rows, _total = await gap_service.list_gaps(session, tenant_id=uuid.UUID(TENANT))
             return doc, vers, rows
 
@@ -578,15 +580,23 @@ class TestPublishing:
             from platform_core.knowledge.models import Document, KnowledgeSource
 
             doc = (
-                await session.execute(
-                    select(Document).where(Document.id == uuid.UUID(document_id))
+                (
+                    await session.execute(
+                        select(Document).where(Document.id == uuid.UUID(document_id))
+                    )
                 )
-            ).scalars().one()
+                .scalars()
+                .one()
+            )
             source = (
-                await session.execute(
-                    select(KnowledgeSource).where(KnowledgeSource.id == doc.source_id)
+                (
+                    await session.execute(
+                        select(KnowledgeSource).where(KnowledgeSource.id == doc.source_id)
+                    )
                 )
-            ).scalars().one()
+                .scalars()
+                .one()
+            )
             return source
 
         source = _run(_in_session(TENANT, _inspect))
@@ -621,9 +631,7 @@ class TestTenantIsolation:
         other = _record("How do I enable SSO?", tenant=TENANT_OTHER)
 
         async def _fn(session):
-            return await gap_service.acknowledge(
-                session, ctx=_ctx(), gap_id=other.gap_id
-            )
+            return await gap_service.acknowledge(session, ctx=_ctx(), gap_id=other.gap_id)
 
         with pytest.raises(gap_service.GapError) as err:
             _run(_in_session(TENANT, _fn))
@@ -660,9 +668,7 @@ class TestHttpSurface:
         rec = _record("How do I enable SSO?")
         mgr = _client(TENANT, "knowledge_manager")
 
-        acked = mgr.post(
-            f"/v1/knowledge/gaps/{rec.gap_id}/acknowledge", headers=_headers()
-        )
+        acked = mgr.post(f"/v1/knowledge/gaps/{rec.gap_id}/acknowledge", headers=_headers())
         assert acked.status_code == 200
         assert acked.json()["status"] == GapStatus.ACKNOWLEDGED.value
 

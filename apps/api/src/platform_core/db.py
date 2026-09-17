@@ -4,8 +4,16 @@
   must not have BYPASSRLS.
 - Tenant context is set per transaction from server-side resolution only
   (see identity.tenant_context).
+- psycopg's async mode cannot run on Windows' default ProactorEventLoop.
+  Setting the policy at import time is not enough: `uvicorn` creates its loop
+  before importing the app, so an already-running Proactor loop survives.
+  `ensure_async_db_loop()` is therefore called before every engine is made,
+  which converts a silent 401-on-every-request into either a working loop or
+  an explicit, immediately diagnosable error.
 """
 
+import asyncio
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -18,8 +26,40 @@ from sqlalchemy.ext.asyncio import (
 
 from platform_core.config import get_settings
 
+_UNSUPPORTED_LOOP = "ProactorEventLoop"
+
+
+def ensure_async_db_loop() -> None:
+    """Guarantee the running event loop can drive psycopg async.
+
+    Called once per engine creation. On non-Windows platforms this is a
+    no-op. On Windows it raises if a Proactor loop is already running,
+    because silently continuing would make every DB-backed request fail at
+    runtime with an auth-shaped 401 rather than a clear startup error.
+    """
+    if sys.platform != "win32":
+        return
+
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        # No loop running yet: the policy above governs the one that will be
+        # created.
+        return
+
+    if type(running).__name__ == _UNSUPPORTED_LOOP:
+        raise RuntimeError(
+            "psycopg async cannot run on a ProactorEventLoop. Start the API "
+            "with the platform entrypoint (which selects a selector loop), "
+            "e.g. `python -m platform_core.main`, instead of the bare "
+            "`uvicorn platform_core.main:app` command on Windows."
+        )
+
 
 def create_engine(database_url: str | None = None) -> AsyncEngine:
+    ensure_async_db_loop()
     url = database_url or get_settings().database_url
     return create_async_engine(url, pool_pre_ping=True, pool_size=10, max_overflow=10)
 

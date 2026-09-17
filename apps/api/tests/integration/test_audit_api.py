@@ -6,7 +6,6 @@ Verifies the two-layer access model:
 """
 
 import os
-import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -22,6 +21,18 @@ ADMIN_URL = os.environ.get(
 )
 TENANT_A = "01900000-0000-7000-8000-000000000001"
 TENANT_B = "01900000-0000-7000-8000-000000000002"
+
+# Real users + memberships for the tests that go through the bootstrap token
+# resolver. The role lives in the database, not in the token, so a test that
+# wants "a viewer" has to authenticate as a user whose row says viewer.
+_SEEDED = (
+    ("aud-a", "viewer", "01900000-0000-7000-8000-0000000a0010", "support_viewer"),
+    ("aud-a", "auditor", "01900000-0000-7000-8000-0000000a0011", "auditor"),
+    ("aud-a", "agent", "01900000-0000-7000-8000-0000000a0012", "support_agent"),
+    ("aud-a", "security", "01900000-0000-7000-8000-0000000a0013", "security_admin"),
+    ("aud-b", "auditor", "01900000-0000-7000-8000-0000000b0011", "auditor"),
+)
+SEEDED_USERS: dict[tuple[str, str], str] = {(s, h): u for s, h, u, _ in _SEEDED}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -46,10 +57,34 @@ def seed_audits() -> None:
                     ),
                     {"tid": tid, "i": i},
                 )
+        for slug, hint, uid, role in _SEEDED:
+            tid = TENANT_A if slug == "aud-a" else TENANT_B
+            conn.execute(
+                text(
+                    "INSERT INTO users (id, primary_email, display_name, is_service_account) "
+                    "VALUES (:id, :email, 'Aud User', false) "
+                    "ON CONFLICT (primary_email) DO NOTHING"
+                ),
+                {"id": uid, "email": f"{slug}-{hint}@example.com"},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO memberships (id, tenant_id, user_id, role, status) "
+                    "VALUES (gen_random_uuid(), :tid, :uid, :role, 'active') "
+                    "ON CONFLICT (tenant_id, user_id) DO NOTHING"
+                ),
+                {"tid": tid, "uid": uid, "role": role},
+            )
     yield
     with admin.begin() as conn:
         for tid in (TENANT_A, TENANT_B):
             conn.execute(text("DELETE FROM audit_events WHERE tenant_id = :t"), {"t": tid})
+            conn.execute(text("DELETE FROM memberships WHERE tenant_id = :t"), {"t": tid})
+        for slug, hint, _uid, _role in _SEEDED:
+            conn.execute(
+                text("DELETE FROM users WHERE primary_email = :e"),
+                {"e": f"{slug}-{hint}@example.com"},
+            )
         conn.execute(text("DELETE FROM tenants WHERE slug IN ('aud-a','aud-b')"))
     admin.dispose()
 
@@ -68,19 +103,30 @@ def client() -> TestClient:
 
 
 def _token(slug: str, role_hint: str = "") -> dict[str, str]:
-    # bootstrap token: pt_<slug>_<user>; role comes from context.role which
-    # the audit router checks. Bootstrap resolver leaves role None, so the
-    # middleware-level role is supplied via the resolver injection below in
-    # role-specific tests.
-    user = uuid.uuid5(uuid.NAMESPACE_URL, f"user:{slug}-{role_hint}")
+    """Build a bootstrap token for a real membership seeded by this module.
+
+    The token names a slug and a user id; the role is *not* in the token -
+    the resolver reads it from `memberships`. `role_hint` therefore selects
+    which seeded user to authenticate as, it is not a claim the server
+    honours. `test_audit_api_denies_without_role` needs a real row to exist,
+    so a membership is seeded below for it.
+    """
+    user = SEEDED_USERS.get((slug, role_hint)) or SEEDED_USERS.get((slug, ""))
+    assert user is not None, f"no seeded user for slug={slug!r} hint={role_hint!r}"
     return {"Authorization": f"Bearer pt_{slug}_{user}"}
 
 
 def test_audit_api_denies_without_role(client: TestClient) -> None:
-    # 403, not 200: previously this asserted a 200 carrying an error body,
-    # which meant any client branching on the status code saw a denied
-    # request as a successful one. The body code alone is not the contract.
-    resp = client.get("/v1/audit-events", headers=_token("aud-a"))
+    """A real, successfully-authenticated viewer is still denied audit read.
+
+    This is the policy gate under test, not the auth path: the token resolves
+    to a real membership (role `support_viewer`), so a 403 here proves the
+    router's role check is what stops the request. Previously this test used
+    a slug/user pair with no membership row at all and asserted 403 - which
+    stopped being true once resolution was fixed to actually read the
+    database, because an unresolvable token is a 401, before any policy runs.
+    """
+    resp = client.get("/v1/audit-events", headers=_token("aud-a", "viewer"))
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "AUDIT_ACCESS_DENIED"
 

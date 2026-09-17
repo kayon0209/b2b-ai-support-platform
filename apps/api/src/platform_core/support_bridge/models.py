@@ -65,9 +65,7 @@ class InboxEvent(Base, PkMixin, TenantMixin):
     event_type: Mapped[str] = mapped_column(String(127), nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(127), nullable=False)
     # Minimized payload: IDs, timestamps, content hash — no raw message body.
-    minimized_payload: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, default=dict
-    )
+    minimized_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[InboxEventStatus] = mapped_column(
         String(31), nullable=False, default=InboxEventStatus.RECEIVED.value
     )

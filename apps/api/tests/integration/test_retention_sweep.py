@@ -297,9 +297,12 @@ def test_setting_a_shorter_policy_expires_more() -> None:
     _insert_versions(_version_row(version_id, status="superseded", expires_at=NOW - 10 * DAY))
 
     assert _run(_sweep(now=NOW))["document_versions_expired"] == 0
-    assert _run(_sweep(now=NOW, policy=RetentionPolicy(superseded_version_days=5)))[
-        "document_versions_expired"
-    ] == 1
+    assert (
+        _run(_sweep(now=NOW, policy=RetentionPolicy(superseded_version_days=5)))[
+            "document_versions_expired"
+        ]
+        == 1
+    )
     assert _status_of(version_id) == "expired"
 
 

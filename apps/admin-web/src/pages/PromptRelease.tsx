@@ -1,0 +1,185 @@
+import { useState } from "react";
+import { apiGet, apiPost } from "../lib/api";
+import { useAsync } from "../lib/useAsync";
+import type { ActivePrompt, PromptVersion } from "../lib/types";
+import { Badge, Card, EmptyState, ErrorBanner, PageHeader, Spinner } from "../components/ui";
+
+export function PromptRelease() {
+  const [template, setTemplate] = useState("agent_qa");
+  const [draft, setDraft] = useState("");
+
+  const list = useAsync<{ items: PromptVersion[]; total: number }>(
+    () =>
+      apiGet<{ items: PromptVersion[]; total: number }>(
+        `/v1/prompts?template_name=${encodeURIComponent(template)}`,
+      ),
+    [template],
+  );
+  const active = useAsync<ActivePrompt>(
+    () =>
+      apiGet<ActivePrompt>(`/v1/prompts/active?template_name=${encodeURIComponent(template)}`),
+    [template],
+  );
+
+  async function act(path: string, body?: unknown, okMsg?: string) {
+    try {
+      await apiPost(path, body);
+      if (okMsg) alert(okMsg);
+    } catch (err) {
+      alert(`Action failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    list.reload();
+    active.reload();
+  }
+
+  const sorted = list.data
+    ? [...list.data.items].sort((a, b) => b.version - a.version)
+    : [];
+  const activeId = active.data?.active?.id ?? null;
+
+  return (
+    <div className="page">
+      <PageHeader
+        title="Prompt Release"
+        subtitle="Author, evaluate, and promote prompt template versions."
+        actions={
+          <div className="toolbar">
+            <input
+              className="text-input"
+              value={template}
+              onChange={(e) => setTemplate(e.target.value)}
+              placeholder="template_name"
+              list="prompt-templates"
+            />
+            <datalist id="prompt-templates">
+              <option value="agent_qa" />
+              <option value="summarise_case" />
+              <option value="handoff_summary" />
+            </datalist>
+          </div>
+        }
+      />
+
+      {active.data?.active ? (
+        <Card title="Currently serving">
+          <div className="serving">
+            <Badge tone="good">v{active.data.active.version}</Badge>
+            <code className="serving-body">{active.data.active.body.slice(0, 240)}</code>
+          </div>
+        </Card>
+      ) : null}
+
+      <Card title="New draft">
+        <textarea
+          className="text-area"
+          rows={4}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Paste the new prompt body…"
+        />
+        <div className="toolbar">
+          <button
+            className="btn btn-primary"
+            disabled={!draft.trim()}
+            onClick={() => {
+              if (!draft.trim()) return;
+              act(
+                "/v1/prompts",
+                { template_name: template, body: draft, notes: "" },
+                "Draft created",
+              ).then(() => setDraft(""));
+            }}
+          >
+            Create draft
+          </button>
+        </div>
+      </Card>
+
+      {list.error ? <ErrorBanner message={list.error} onRetry={list.reload} /> : null}
+      {list.loading ? <Spinner label="Loading versions…" /> : null}
+      {list.data && sorted.length === 0 ? (
+        <EmptyState message="No versions for this template yet." />
+      ) : null}
+
+      {sorted.length > 0 ? (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Version</th>
+              <th>State</th>
+              <th>Body</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((v) => (
+              <tr key={v.id}>
+                <td className="cell-strong">v{v.version}</td>
+                <td>
+                  {v.id === activeId ? (
+                    <Badge tone="good">serving</Badge>
+                  ) : v.published ? (
+                    <Badge tone="info">published</Badge>
+                  ) : (
+                    <Badge tone="neutral">draft</Badge>
+                  )}
+                </td>
+                <td>
+                  <code className="cell-code">{v.body.slice(0, 120)}</code>
+                </td>
+                <td className="row-actions">
+                  <button
+                    className="btn"
+                    disabled={v.published}
+                    onClick={() => act(`/v1/prompts/${v.id}/candidate`, undefined, "Submitted as candidate")}
+                  >
+                    Candidate
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    disabled={v.id === activeId}
+                    onClick={() => {
+                      if (window.confirm(`Promote v${v.version} to serving?`))
+                        act(`/v1/prompts/${v.id}/promote`, undefined, "Promoted");
+                    }}
+                  >
+                    Promote
+                  </button>
+                  <button
+                    className="btn"
+                    disabled={v.id === activeId}
+                    onClick={() => {
+                      const reason = window.prompt("Reject reason");
+                      if (reason) act(`/v1/prompts/${v.id}/reject`, { reason });
+                    }}
+                  >
+                    Reject
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : null}
+
+      {active.data?.active ? (
+        <div className="toolbar">
+          <button
+            className="btn"
+            onClick={() => {
+              const to_version_id = window.prompt("Roll back to version id");
+              if (to_version_id)
+                act("/v1/prompts/rollback", {
+                  template_name: template,
+                  to_version_id,
+                  reason: "manual rollback",
+                });
+            }}
+          >
+            Roll back to a previous version…
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}

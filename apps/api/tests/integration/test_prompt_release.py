@@ -221,9 +221,12 @@ def test_version_numbers_increment_per_template() -> None:
     async def _fn(session):
         from platform_core.agent_runtime.prompt_release import list_versions
 
-        return [r.version for r in await list_versions(
-            session, tenant_id=uuid.UUID(TENANT), template_name=TEMPLATE
-        )]
+        return [
+            r.version
+            for r in await list_versions(
+                session, tenant_id=uuid.UUID(TENANT), template_name=TEMPLATE
+            )
+        ]
 
     versions = _run(_in_session(TENANT, _fn))
     assert versions == [2, 1]
@@ -235,9 +238,7 @@ def test_promote_requires_evidence() -> None:
     draft = _make_draft()
 
     async def _fn(session):
-        return await promote(
-            session, ctx=_ctx(), version_id=uuid.UUID(draft), evidence=None
-        )
+        return await promote(session, ctx=_ctx(), version_id=uuid.UUID(draft), evidence=None)
 
     with pytest.raises(ReleaseError) as err:
         _run(_in_session(TENANT, _fn))
@@ -298,9 +299,7 @@ def test_p0_regression_blocks_promotion() -> None:
     )
 
     async def _fn(session):
-        return await promote(
-            session, ctx=_ctx(), version_id=uuid.UUID(draft), evidence=bad
-        )
+        return await promote(session, ctx=_ctx(), version_id=uuid.UUID(draft), evidence=bad)
 
     with pytest.raises(ReleaseError) as err:
         _run(_in_session(TENANT, _fn))
@@ -456,9 +455,7 @@ def test_active_lookup_is_tenant_scoped() -> None:
     _promote(draft)
 
     async def _other_active(session):
-        row = await get_active(
-            session, tenant_id=uuid.UUID(TENANT_OTHER), template_name=TEMPLATE
-        )
+        row = await get_active(session, tenant_id=uuid.UUID(TENANT_OTHER), template_name=TEMPLATE)
         return row
 
     assert _run(_in_session(TENANT_OTHER, _other_active)) is None

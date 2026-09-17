@@ -62,17 +62,13 @@ def upgrade() -> None:
         sa.Column("last_seen_at", sa.BigInteger(), nullable=False),
         sa.Column("acknowledged_at", sa.BigInteger(), nullable=True),
         sa.Column("target_space_id", sa.Uuid(), nullable=True),
-        sa.ForeignKeyConstraint(
-            ["target_space_id"], ["knowledge_spaces.id"], name="fk_gap_space"
-        ),
+        sa.ForeignKeyConstraint(["target_space_id"], ["knowledge_spaces.id"], name="fk_gap_space"),
         # Deduplication key: one record per normalised question per tenant.
         sa.UniqueConstraint("tenant_id", "question_hash", name="uq_gap_question"),
     )
     op.create_index("ix_knowledge_gaps_tenant_id", "knowledge_gaps", ["tenant_id"])
     op.create_index("ix_knowledge_gaps_last_seen_at", "knowledge_gaps", ["last_seen_at"])
-    op.create_index(
-        "ix_gaps_status_frequency", "knowledge_gaps", ["status", "frequency"]
-    )
+    op.create_index("ix_gaps_status_frequency", "knowledge_gaps", ["status", "frequency"])
     _tenant_rls("knowledge_gaps")
 
     op.create_table(
@@ -88,9 +84,7 @@ def upgrade() -> None:
         sa.Column("reviewed_at", sa.BigInteger(), nullable=True),
         sa.Column("review_notes", sa.Text(), nullable=False, server_default=""),
         sa.Column("published_document_id", sa.Uuid(), nullable=True),
-        sa.ForeignKeyConstraint(
-            ["gap_id"], ["knowledge_gaps.id"], name="fk_draft_gap"
-        ),
+        sa.ForeignKeyConstraint(["gap_id"], ["knowledge_gaps.id"], name="fk_draft_gap"),
         sa.ForeignKeyConstraint(
             ["published_document_id"], ["documents.id"], name="fk_draft_document"
         ),

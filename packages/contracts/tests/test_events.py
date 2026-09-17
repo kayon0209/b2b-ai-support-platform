@@ -58,9 +58,7 @@ def _envelope(event_type: str, payload: dict, **over) -> dict:
 
 
 def test_case_created_accepts_a_valid_payload() -> None:
-    env = validate_event(
-        _envelope("case.created", {"case_id": "c-1", "status": "new"})
-    )
+    env = validate_event(_envelope("case.created", {"case_id": "c-1", "status": "new"}))
     assert env.event_type == EventType.CASE_CREATED
 
 
@@ -105,9 +103,7 @@ def test_unknown_payload_key_is_rejected_not_ignored() -> None:
     silently trimmed - otherwise the consumer never learns about new fields.
     """
     with pytest.raises(ContractError) as exc:
-        validate_event(
-            _envelope("case.created", {"case_id": "c-1", "status": "new", "typo": 1})
-        )
+        validate_event(_envelope("case.created", {"case_id": "c-1", "status": "new", "typo": 1}))
     assert exc.value.code == "PAYLOAD_INVALID"
 
 
@@ -200,8 +196,7 @@ def test_every_emitted_event_type_is_registered() -> None:
     assert emitted, "no outbox enqueue() emissions found - has this scan stopped working?"
     unregistered = {k: v for k, v in emitted.items() if not is_known_event_type(k)}
     assert not unregistered, (
-        "these event types are emitted but have no payload schema: "
-        f"{unregistered}"
+        f"these event types are emitted but have no payload schema: {unregistered}"
     )
 
 
@@ -211,12 +206,9 @@ def test_every_inbound_event_type_is_registered() -> None:
     by an event nobody declared."""
     persisted = _emitted_near("persist_inbox_event")
     assert persisted, "no persist_inbox_event() sites found - has this scan stopped working?"
-    unregistered = {
-        k: v for k, v in persisted.items() if not is_known_inbound_event_type(k)
-    }
+    unregistered = {k: v for k, v in persisted.items() if not is_known_inbound_event_type(k)}
     assert not unregistered, (
-        "these inbound event types are persisted but not declared: "
-        f"{unregistered}"
+        f"these inbound event types are persisted but not declared: {unregistered}"
     )
 
 

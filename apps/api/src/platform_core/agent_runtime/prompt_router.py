@@ -297,9 +297,7 @@ async def promote_prompt_version(
     async with session_scope_with_url(_app_url()) as session:
         await apply_rls_tenant(session, ctx)
         try:
-            row = await promote(
-                session, ctx=ctx, version_id=_uuid(version_id), evidence=evidence
-            )
+            row = await promote(session, ctx=ctx, version_id=_uuid(version_id), evidence=evidence)
         except ReleaseError as exc:
             return _release_error(exc)
         await session.commit()

@@ -94,22 +94,16 @@ class TestMonotonicity:
 
 class TestEndpoints:
     def test_zero_percent_includes_nobody(self) -> None:
-        assert not any(
-            is_in_rollout(flag_key="f", tenant_id=t, percent=0) for t in TENANTS
-        )
+        assert not any(is_in_rollout(flag_key="f", tenant_id=t, percent=0) for t in TENANTS)
 
     def test_zero_percent_excludes_even_the_lowest_bucket(self) -> None:
         # The exact boundary. `stable_bucket` of this tenant is 0, which is the
         # only bucket a naive `bucket < percent * step` comparison could
         # wrongly include at 0%.
         assert stable_bucket(flag_key=BUCKET_ZERO_FLAG, tenant_id=BUCKET_ZERO_TENANT) == 0
-        assert not is_in_rollout(
-            flag_key=BUCKET_ZERO_FLAG, tenant_id=BUCKET_ZERO_TENANT, percent=0
-        )
+        assert not is_in_rollout(flag_key=BUCKET_ZERO_FLAG, tenant_id=BUCKET_ZERO_TENANT, percent=0)
         # And at the smallest non-zero percentage a bucket-0 tenant is in.
-        assert is_in_rollout(
-            flag_key=BUCKET_ZERO_FLAG, tenant_id=BUCKET_ZERO_TENANT, percent=1
-        )
+        assert is_in_rollout(flag_key=BUCKET_ZERO_FLAG, tenant_id=BUCKET_ZERO_TENANT, percent=1)
 
     def test_hundred_percent_includes_everybody(self) -> None:
         assert all(is_in_rollout(flag_key="f", tenant_id=t, percent=100) for t in TENANTS)

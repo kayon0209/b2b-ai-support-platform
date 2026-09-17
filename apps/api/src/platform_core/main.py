@@ -65,3 +65,37 @@ def healthz() -> dict[str, str]:
 @app.on_event("shutdown")
 async def shutdown() -> None:
     await db.dispose_engine()
+
+
+def run() -> None:
+    """Launch the API with a psycopg-compatible event loop.
+
+    `uvicorn platform_core.main:app` cannot be used on Windows: uvicorn's
+    asyncio loop factory hardcodes `ProactorEventLoop` there, and psycopg
+    async refuses to run on it - every DB-backed request would fail. Passing
+    an explicit loop factory is the only reliable fix, because uvicorn builds
+    its loop before the app is imported, so nothing the app sets at import
+    time can influence it.
+    """
+    import asyncio
+    import os
+
+    import uvicorn
+
+    loop_factory = asyncio.SelectorEventLoop if sys.platform == "win32" else asyncio.new_event_loop
+    # Bind address is configurable because "all interfaces" is right inside a
+    # container behind a service mesh and wrong on a developer laptop: on the
+    # latter it exposes the API to the local network.
+    host = os.environ.get("APP_API_HOST", "0.0.0.0")  # noqa: S104
+    port = int(os.environ.get("APP_API_PORT", "8000"))
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        loop=loop_factory,
+    )
+
+
+if __name__ == "__main__":
+    run()

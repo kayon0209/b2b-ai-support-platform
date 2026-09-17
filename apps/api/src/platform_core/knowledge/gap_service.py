@@ -428,9 +428,7 @@ async def list_drafts(
     stmt = select(KnowledgeDraft).where(KnowledgeDraft.tenant_id == tenant_id)
     if status is not None:
         stmt = stmt.where(KnowledgeDraft.status == status)
-    rows = (
-        await session.execute(stmt.order_by(KnowledgeDraft.id).limit(limit))
-    ).scalars()
+    rows = (await session.execute(stmt.order_by(KnowledgeDraft.id).limit(limit))).scalars()
     return list(rows)
 
 

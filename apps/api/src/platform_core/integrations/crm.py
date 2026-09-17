@@ -86,9 +86,7 @@ class CrmReadAdapter(ConnectorAdapter):
         result = await self.http_request("GET", f"{base}/health", max_retries=0)
         return result.ok
 
-    async def fetch(
-        self, resource: str, cursor: str | None = None
-    ) -> tuple[list[Any], str | None]:
+    async def fetch(self, resource: str, cursor: str | None = None) -> tuple[list[Any], str | None]:
         raise NotImplementedError("CRM pilot is lookup-based, not sync-based")
 
     async def get_account(self, external_ref: str) -> CrmAccountSummary | None:
