@@ -35,6 +35,16 @@ export async function apiPost<T>(
   return unwrap<T>(res);
 }
 
+export async function apiDelete<T>(path: string, idempotencyKey?: string): Promise<T> {
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    ...authHeader(),
+  };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  const res = await fetch(`${BASE}${path}`, { method: "DELETE", headers });
+  return unwrap<T>(res);
+}
+
 async function unwrap<T>(res: Response): Promise<T> {
   const text = await res.text();
   const data = text ? (JSON.parse(text) as unknown) : null;

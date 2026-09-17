@@ -6,6 +6,7 @@ const NAV = [
   { to: "/prompts", label: "Prompt Release", icon: "✍️" },
   { to: "/flags", label: "Feature Flags", icon: "🚩" },
   { to: "/cases", label: "Cases & SLA", icon: "🎫" },
+  { to: "/members", label: "Members", icon: "👥" },
 ];
 
 export function Layout() {

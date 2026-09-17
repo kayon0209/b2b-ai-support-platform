@@ -95,6 +95,33 @@ export interface Case {
   closed_at: number | null;
 }
 
+export type MemberRole =
+  | "tenant_owner"
+  | "security_admin"
+  | "support_admin"
+  | "knowledge_manager"
+  | "support_agent"
+  | "support_viewer"
+  | "integration_service"
+  | "auditor";
+
+export interface Member {
+  user_id: string;
+  email: string;
+  display_name: string;
+  role: string;
+  status: string;
+}
+
+/** Response of POST /v1/identity/members/invite (token is shown once). */
+export interface InviteResult {
+  invitation_token?: string;
+  status?: string;
+  message?: string;
+  user_id?: string;
+  role?: string;
+}
+
 export interface ListEnvelope<T> {
   items: T[];
   total: number;

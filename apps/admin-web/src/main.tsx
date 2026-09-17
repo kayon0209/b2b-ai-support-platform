@@ -6,6 +6,7 @@ import { Layout } from "./components/Layout";
 import { Cases } from "./pages/Cases";
 import { FeatureFlags } from "./pages/FeatureFlags";
 import { GapQueue } from "./pages/GapQueue";
+import { Members } from "./pages/Members";
 import { PromptRelease } from "./pages/PromptRelease";
 import { QualityDashboard } from "./pages/QualityDashboard";
 import "./styles.css";
@@ -26,6 +27,7 @@ const router = createBrowserRouter([
       { path: "prompts", element: <PromptRelease /> },
       { path: "flags", element: <FeatureFlags /> },
       { path: "cases", element: <Cases /> },
+      { path: "members", element: <Members /> },
       { path: "*", element: <Navigate to="/quality" replace /> },
     ],
   },
