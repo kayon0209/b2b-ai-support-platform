@@ -93,7 +93,12 @@ def _client(tenant_id: str, role: str, actor: uuid.UUID | None = None) -> TestCl
 
 
 def _headers() -> dict[str, str]:
-    return {"Authorization": "Bearer pt_bootstrap_test"}
+    # Every write requires an Idempotency-Key now; a fresh one per call keeps
+    # two separate writes in a test two separate writes.
+    return {
+        "Authorization": "Bearer pt_bootstrap_test",
+        "Idempotency-Key": str(uuid.uuid4()),
+    }
 
 
 @pytest.fixture(scope="module", autouse=True)

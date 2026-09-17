@@ -27,7 +27,7 @@ from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from platform_core.api import error_response
+from platform_core.api import error_response, require_write_idempotency
 from platform_core.config import get_settings
 from platform_core.db import session_scope_with_url
 from platform_core.identity import tenant_context
@@ -92,11 +92,16 @@ def _ctx_of(request: Request) -> TenantContext:
     return ctx
 
 
-def _gate(ctx: TenantContext, action: Action, name: str) -> JSONResponse | None:
+def _gate(request: Request, ctx: TenantContext, action: Action, name: str) -> JSONResponse | None:
+    """Return a denial envelope, or None when the caller may proceed.
+
+    A write action additionally requires an Idempotency-Key, so every write
+    endpoint in this router enforces it through this one gate.
+    """
     decision = PolicyEngine().check(_principal_from_ctx(ctx), action)
     if decision.decision != Decision.ALLOW.value:
         return _denied(name, decision.reason_code)
-    return None
+    return require_write_idempotency(request, action)
 
 
 def _app_url() -> str:
@@ -126,7 +131,7 @@ def _decision_out(decision: flag_service.FlagDecision) -> dict[str, Any]:
 @router.get("")
 async def list_feature_flags(request: Request) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.FLAG_READ, "flag.read")
+    denial = _gate(request, ctx, Action.FLAG_READ, "flag.read")
     if denial is not None:
         return denial
 
@@ -149,7 +154,7 @@ async def evaluate_feature_flag(
     feature-state oracle.
     """
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.FLAG_READ, "flag.read")
+    denial = _gate(request, ctx, Action.FLAG_READ, "flag.read")
     if denial is not None:
         return denial
 
@@ -169,7 +174,7 @@ async def preview_feature_flag(
 ) -> Any:
     """Whether this tenant would be inside a rollout at various percentages."""
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.FLAG_READ, "flag.read")
+    denial = _gate(request, ctx, Action.FLAG_READ, "flag.read")
     if denial is not None:
         return denial
 
@@ -192,7 +197,7 @@ async def define_feature_flag(
     payload: Annotated[DefineIn, Body()],
 ) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.FLAG_WRITE, "flag.write")
+    denial = _gate(request, ctx, Action.FLAG_WRITE, "flag.write")
     if denial is not None:
         return denial
 
@@ -215,7 +220,7 @@ async def set_feature_flag_rollout(
     payload: Annotated[RolloutIn, Body()],
 ) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.FLAG_WRITE, "flag.write")
+    denial = _gate(request, ctx, Action.FLAG_WRITE, "flag.write")
     if denial is not None:
         return denial
 
@@ -238,7 +243,7 @@ async def set_feature_flag_enabled(
     payload: Annotated[EnabledIn, Body()],
 ) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.FLAG_WRITE, "flag.write")
+    denial = _gate(request, ctx, Action.FLAG_WRITE, "flag.write")
     if denial is not None:
         return denial
 
@@ -259,7 +264,7 @@ async def target_feature_flag(
     payload: Annotated[TargetIn, Body()],
 ) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.FLAG_WRITE, "flag.write")
+    denial = _gate(request, ctx, Action.FLAG_WRITE, "flag.write")
     if denial is not None:
         return denial
 

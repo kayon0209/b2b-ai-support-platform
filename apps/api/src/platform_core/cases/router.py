@@ -36,6 +36,7 @@ from platform_core.api import (
     parse_uuid,
     require_idempotency_key,
     require_policy,
+    require_write_idempotency,
     tenant_session,
 )
 from platform_core.audit import service as audit_service
@@ -96,6 +97,13 @@ async def create_case(request: Request, body: CaseCreateIn) -> Any:
     denied = require_policy(ctx, Action.CASE_CREATE)
     if denied is not None:
         return denied
+
+    # Creating a case is a write: without an idempotency key a retry after a
+    # timeout creates a duplicate ticket. The commands endpoint below already
+    # requires one; create must be consistent with it.
+    missing_idem = require_write_idempotency(request, Action.CASE_CREATE)
+    if missing_idem is not None:
+        return missing_idem
 
     if body.priority not in VALID_PRIORITIES:
         return error_response(

@@ -35,7 +35,7 @@ from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from platform_core.api import error_response
+from platform_core.api import error_response, require_write_idempotency
 from platform_core.config import get_settings
 from platform_core.db import session_scope_with_url
 from platform_core.identity import tenant_context
@@ -79,11 +79,16 @@ def _ctx_of(request: Request) -> TenantContext:
     return ctx
 
 
-def _gate(ctx: TenantContext, action: Action, name: str) -> JSONResponse | None:
+def _gate(request: Request, ctx: TenantContext, action: Action, name: str) -> JSONResponse | None:
+    """Return a denial envelope, or None when the caller may proceed.
+
+    A write action additionally requires an Idempotency-Key, so every write
+    endpoint in this router enforces it through this one gate.
+    """
     decision = PolicyEngine().check(_principal_from_ctx(ctx), action)
     if decision.decision != Decision.ALLOW.value:
         return _denied(name, decision.reason_code)
-    return None
+    return require_write_idempotency(request, action)
 
 
 def _app_url() -> str:
@@ -160,7 +165,7 @@ async def upload_document(
     the API discover they are not allowed - after the object exists.
     """
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.KNOWLEDGE_UPLOAD, "knowledge.upload")
+    denial = _gate(request, ctx, Action.KNOWLEDGE_UPLOAD, "knowledge.upload")
     if denial is not None:
         return denial
 
@@ -217,7 +222,7 @@ async def upload_document(
 @router.get("/documents/{document_id}/versions")
 async def list_document_versions(request: Request, document_id: str) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.KNOWLEDGE_READ, "knowledge.read")
+    denial = _gate(request, ctx, Action.KNOWLEDGE_READ, "knowledge.read")
     if denial is not None:
         return denial
 
@@ -239,7 +244,7 @@ async def list_document_versions(request: Request, document_id: str) -> Any:
 @router.get("/versions/{version_id}")
 async def get_version(request: Request, version_id: str) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.KNOWLEDGE_READ, "knowledge.read")
+    denial = _gate(request, ctx, Action.KNOWLEDGE_READ, "knowledge.read")
     if denial is not None:
         return denial
 
@@ -270,7 +275,7 @@ async def mark_version_ready(request: Request, version_id: str, body: ReadyIn | 
     was.
     """
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.KNOWLEDGE_UPLOAD, "knowledge.upload")
+    denial = _gate(request, ctx, Action.KNOWLEDGE_UPLOAD, "knowledge.upload")
     if denial is not None:
         return denial
 
@@ -316,7 +321,7 @@ async def create_download_url(
     table advisory.
     """
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.KNOWLEDGE_READ, "knowledge.read")
+    denial = _gate(request, ctx, Action.KNOWLEDGE_READ, "knowledge.read")
     if denial is not None:
         return denial
 

@@ -77,7 +77,12 @@ def _client(tenant_id: str, role: str) -> TestClient:
 
 
 def _headers() -> dict[str, str]:
-    return {"Authorization": "Bearer pt_bootstrap_test"}
+    # Every write requires an Idempotency-Key now; a fresh one per call keeps
+    # two separate writes in a test two separate writes.
+    return {
+        "Authorization": "Bearer pt_bootstrap_test",
+        "Idempotency-Key": str(uuid.uuid4()),
+    }
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -529,3 +534,29 @@ class TestHttpSurface:
             "/v1/flags/schema-flag/rollout", json={"rollout_percent": 150}, headers=_headers()
         )
         assert resp.status_code == 422
+
+
+# --- Idempotency contract --------------------------------------------------
+
+
+def test_write_without_idempotency_key_is_refused() -> None:
+    """Every write command requires an Idempotency-Key (AGENTS.md).
+
+    Enforced centrally by the router's policy gate, so this covers prompts,
+    flags, knowledge gaps, knowledge uploads and case creation alike.
+    """
+    client = _client(TENANT, "tenant_owner")
+    resp = client.post(
+        "/v1/flags",
+        headers={"Authorization": "Bearer pt_bootstrap_test"},  # no Idempotency-Key
+        json={"key": "no-idem", "description": "x"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "IDEMPOTENCY_KEY_REQUIRED"
+
+
+def test_read_does_not_require_an_idempotency_key() -> None:
+    """Reads are exempt: they mutate nothing and a retry is harmless."""
+    client = _client(TENANT, "tenant_owner")
+    resp = client.get("/v1/flags", headers={"Authorization": "Bearer pt_bootstrap_test"})
+    assert resp.status_code == 200

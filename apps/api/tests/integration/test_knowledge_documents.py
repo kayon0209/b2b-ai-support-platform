@@ -151,7 +151,10 @@ def _cleanup(admin: object) -> None:
 
 
 def _token(user: str, slug: str = SLUG) -> dict[str, str]:
-    return {"Authorization": f"Bearer pt_{slug}_{user}"}
+    return {
+        "Authorization": f"Bearer pt_{slug}_{user}",
+        "Idempotency-Key": str(uuid.uuid4()),
+    }
 
 
 @pytest.fixture

@@ -41,7 +41,7 @@ from platform_core.agent_runtime.prompt_release import (
     rollback,
     submit_candidate,
 )
-from platform_core.api import error_response
+from platform_core.api import error_response, require_write_idempotency
 from platform_core.config import get_settings
 from platform_core.db import session_scope_with_url
 from platform_core.identity import tenant_context
@@ -137,12 +137,16 @@ def _ctx_of(request: Request) -> TenantContext:
     return ctx
 
 
-def _gate(ctx: TenantContext, action: Action, name: str) -> JSONResponse | None:
-    """Return a denial envelope, or None when the caller may proceed."""
+def _gate(request: Request, ctx: TenantContext, action: Action, name: str) -> JSONResponse | None:
+    """Return a denial envelope, or None when the caller may proceed.
+
+    A write action additionally requires an Idempotency-Key, so every write
+    endpoint in this router enforces it through this one gate.
+    """
     decision = PolicyEngine().check(_principal_from_ctx(ctx), action)
     if decision.decision != Decision.ALLOW.value:
         return _denied(name, decision.reason_code)
-    return None
+    return require_write_idempotency(request, action)
 
 
 def _app_url() -> str:
@@ -208,7 +212,7 @@ async def list_prompt_versions(
     template_name: str = Query(..., min_length=1, max_length=127),
 ) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.PROMPT_READ, "prompt.read")
+    denial = _gate(request, ctx, Action.PROMPT_READ, "prompt.read")
     if denial is not None:
         return denial
 
@@ -224,7 +228,7 @@ async def get_active_prompt(
     template_name: str = Query(..., min_length=1, max_length=127),
 ) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.PROMPT_READ, "prompt.read")
+    denial = _gate(request, ctx, Action.PROMPT_READ, "prompt.read")
     if denial is not None:
         return denial
 
@@ -242,7 +246,7 @@ async def create_prompt_draft(
     payload: Annotated[DraftIn, Body()],
 ) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.PROMPT_RELEASE, "prompt.release")
+    denial = _gate(request, ctx, Action.PROMPT_RELEASE, "prompt.release")
     if denial is not None:
         return denial
 
@@ -265,7 +269,7 @@ async def create_prompt_draft(
 @router.post("/{version_id}/candidate")
 async def submit_prompt_candidate(request: Request, version_id: str) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.PROMPT_RELEASE, "prompt.release")
+    denial = _gate(request, ctx, Action.PROMPT_RELEASE, "prompt.release")
     if denial is not None:
         return denial
 
@@ -286,7 +290,7 @@ async def promote_prompt_version(
     payload: Annotated[EvidenceIn | None, Body()] = None,
 ) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.PROMPT_RELEASE, "prompt.release")
+    denial = _gate(request, ctx, Action.PROMPT_RELEASE, "prompt.release")
     if denial is not None:
         return denial
 
@@ -311,7 +315,7 @@ async def reject_prompt_version(
     payload: Annotated[RejectIn, Body()],
 ) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.PROMPT_RELEASE, "prompt.release")
+    denial = _gate(request, ctx, Action.PROMPT_RELEASE, "prompt.release")
     if denial is not None:
         return denial
 
@@ -333,7 +337,7 @@ async def rollback_prompt_version(
     payload: Annotated[RollbackIn, Body()],
 ) -> Any:
     ctx = _ctx_of(request)
-    denial = _gate(ctx, Action.PROMPT_RELEASE, "prompt.release")
+    denial = _gate(request, ctx, Action.PROMPT_RELEASE, "prompt.release")
     if denial is not None:
         return denial
 

@@ -152,6 +152,41 @@ def require_idempotency_key(request: Request) -> str | None:
     return request.headers.get("Idempotency-Key") or None
 
 
+# Actions that do not mutate state. Everything else is a write, and a write
+# must carry an Idempotency-Key (AGENTS.md: "every inbound webhook and write
+# command requires an idempotency key"). Expressed as the read set because
+# reads are few and stable, so a newly added write action is covered by
+# default instead of being silently exempt.
+READ_ACTIONS: frozenset[Action] = frozenset(
+    {
+        Action.CASE_READ,
+        Action.KNOWLEDGE_READ,
+        Action.AUDIT_READ,
+        Action.PROMPT_READ,
+        Action.FLAG_READ,
+        Action.TOOL_READ,
+    }
+)
+
+
+def require_write_idempotency(request: Request, action: Action) -> JSONResponse | None:
+    """Return a 400 envelope when a write command lacks an Idempotency-Key.
+
+    A read never needs one. A write always does: without it a client retry
+    after a timeout is indistinguishable from a new command, which is how
+    duplicate cases, drafts and documents get created.
+    """
+    if action in READ_ACTIONS:
+        return None
+    if require_idempotency_key(request):
+        return None
+    return error_response(
+        IDEMPOTENCY_KEY_REQUIRED,
+        "every write command must carry an Idempotency-Key header",
+        status_code=400,
+    )
+
+
 @asynccontextmanager
 async def tenant_session(ctx: TenantContext) -> AsyncIterator[AsyncSession]:
     """Session bound to the non-bypass app role with RLS applied.

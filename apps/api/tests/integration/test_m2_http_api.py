@@ -232,6 +232,15 @@ def _auth() -> dict[str, str]:
     return {"Authorization": "Bearer pt_bootstrap_test"}
 
 
+def _write_auth() -> dict[str, str]:
+    """Auth plus a fresh Idempotency-Key, for endpoints that create state.
+
+    Kept separate from `_auth()` because several tests deliberately omit the
+    key to assert the 400 `IDEMPOTENCY_KEY_REQUIRED`.
+    """
+    return {**_auth(), "Idempotency-Key": str(uuid.uuid4())}
+
+
 # --- 1. Authentication -----------------------------------------------------
 
 
@@ -295,7 +304,7 @@ def test_case_command_without_idempotency_key_is_refused() -> None:
     client = _client(TENANT_A, "support_admin")
     case_resp = client.post(
         "/v1/cases",
-        headers=_auth(),
+        headers=_write_auth(),
         json={"subject": "idem guard", "priority": "p2"},
     )
     assert case_resp.status_code == 200
@@ -330,9 +339,9 @@ def test_agent_run_requires_idempotency_key() -> None:
 def test_cross_tenant_case_read_is_404() -> None:
     """Tenant B cannot see tenant A's case, even with a valid id."""
     a_client = _client(TENANT_A, "support_admin")
-    created = a_client.post("/v1/cases", headers=_auth(), json={"subject": "private to A"}).json()[
-        "case"
-    ]["case_id"]
+    created = a_client.post(
+        "/v1/cases", headers=_write_auth(), json={"subject": "private to A"}
+    ).json()["case"]["case_id"]
 
     b_resp = _client(TENANT_B, "support_admin").get(f"/v1/cases/{created}", headers=_auth())
     assert b_resp.status_code == 404
@@ -393,7 +402,9 @@ def test_stale_case_version_conflicts() -> None:
     """A command carrying an outdated expected_version is refused with 409."""
     client = _client(TENANT_A, "support_admin")
     case_id = client.post(
-        "/v1/cases", headers=_auth(), json={"subject": "concurrency", "priority": "p2"}
+        "/v1/cases",
+        headers=_write_auth(),
+        json={"subject": "concurrency", "priority": "p2"},
     ).json()["case"]["case_id"]
 
     first = client.post(
