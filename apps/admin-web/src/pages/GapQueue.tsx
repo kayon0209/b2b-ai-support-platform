@@ -5,7 +5,7 @@ import type { Draft, Gap, GapStats } from "../lib/types";
 import { Badge, Card, EmptyState, ErrorBanner, PageHeader, Spinner } from "../components/ui";
 import { dateFromEpochSeconds, int, titleCase } from "../lib/format";
 
-const STATUSES = ["open", "acknowledged", "drafted", "documented", "dismissed"];
+const STATUSES = ["open", "acknowledged", "drafted", "resolved", "dismissed"];
 
 function toneForStatus(status: string): "neutral" | "info" | "warn" | "good" | "bad" {
   switch (status) {
@@ -18,7 +18,7 @@ function toneForStatus(status: string): "neutral" | "info" | "warn" | "good" | "
       return "warn";
     case "drafted":
       return "info";
-    case "documented":
+    case "resolved":
       return "good";
     default:
       return "neutral";
@@ -141,7 +141,7 @@ export function GapQueue() {
                       </button>
                       <button
                         className="btn"
-                        disabled={g.status === "documented" || g.status === "dismissed"}
+                        disabled={g.status === "resolved" || g.status === "dismissed"}
                         onClick={() => {
                           const reason = window.prompt("Why dismiss this gap?");
                           if (reason) act(`/v1/knowledge/gaps/${g.id}/dismiss`, { reason });
@@ -151,7 +151,7 @@ export function GapQueue() {
                       </button>
                       <button
                         className="btn"
-                        disabled={g.status === "documented"}
+                        disabled={g.status === "resolved"}
                         onClick={() => {
                           const title = window.prompt("Draft title");
                           if (!title) return;
@@ -199,7 +199,7 @@ export function GapQueue() {
                     <td className="row-actions">
                       <button
                         className="btn"
-                        disabled={d.status !== "submitted"}
+                        disabled={d.status !== "pending"}
                         onClick={() => {
                           const notes = window.prompt("Review notes (optional)") ?? "";
                           act(`/v1/knowledge/drafts/${d.id}/review`, {
@@ -212,7 +212,7 @@ export function GapQueue() {
                       </button>
                       <button
                         className="btn"
-                        disabled={d.status !== "submitted"}
+                        disabled={d.status !== "pending"}
                         onClick={() => {
                           const notes = window.prompt("Reason for rejection") ?? "";
                           act(`/v1/knowledge/drafts/${d.id}/review`, {
