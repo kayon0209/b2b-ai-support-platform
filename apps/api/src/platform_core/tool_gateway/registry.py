@@ -31,9 +31,14 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from platform_core.integrations.credentials import resolve_credentials
 from platform_core.integrations.models import Connector, ConnectorStatus
 from platform_core.integrations.sdk import ConnectorContext
 from platform_core.tool_gateway.gateway import ToolExecutor
+
+# A credential reference -> credentials mapping. Injected rather than read
+# here, so this module never touches a secret itself.
+CredentialResolver = Callable[[str | None], dict[str, str]]
 
 # tool name -> the connector capability it requires.
 #
@@ -78,10 +83,15 @@ class ConnectorExecutorResolver:
         *,
         tenant_id: Any,
         factories: dict[str, AdapterFactory] | None = None,
+        credential_resolver: CredentialResolver | None = None,
     ) -> None:
         self._session = session
         self._tenant_id = tenant_id
         self._factories = factories if factories is not None else default_factories()
+        # Injected so the registry itself never reads a secret. The default
+        # resolves the pilot `env://` scheme; an unsupported reference yields
+        # no credentials, and the adapter then fails closed at call time.
+        self._credential_resolver = credential_resolver or resolve_credentials
         self._cache: dict[str, ToolExecutor] | None = None
 
     async def executors_for(self, tool_names: list[str]) -> dict[str, ToolExecutor]:
@@ -157,9 +167,10 @@ class ConnectorExecutorResolver:
         context = ConnectorContext(
             tenant_id=str(self._tenant_id),
             connector_id=str(connector.id),
-            # The reference is passed through, not dereferenced here: this
-            # module must not become a place where secrets are read.
-            credentials={},
+            # Resolved through the injected resolver, so this module never
+            # reads a secret itself. Without this every adapter received `{}`
+            # and no external call could authenticate.
+            credentials=self._credential_resolver(connector.credential_ref),
             configuration=dict(connector.configuration or {}),
         )
         try:
@@ -211,13 +222,19 @@ async def resolve_executors(
     tenant_id: Any,
     tool_names: list[str],
     factories: dict[str, AdapterFactory] | None = None,
+    credential_resolver: CredentialResolver | None = None,
 ) -> dict[str, ToolExecutor]:
     """Convenience entry point for routers.
 
     Returns only the executors this tenant can legitimately use; callers
     pass the result straight to `ToolGateway`.
     """
-    resolver = ConnectorExecutorResolver(session, tenant_id=tenant_id, factories=factories)
+    resolver = ConnectorExecutorResolver(
+        session,
+        tenant_id=tenant_id,
+        factories=factories,
+        credential_resolver=credential_resolver,
+    )
     return await resolver.executors_for(tool_names)
 
 

@@ -7,6 +7,29 @@
 - Read and write capabilities are separately authorized.
 - Credentials are secret references, not application fields.
 - Webhooks are signed, replay-protected and idempotent.
+
+### Credential resolution
+
+`credential_ref` is dereferenced by
+`integrations/credentials.py::resolve_credentials`, which the executor
+resolver calls through an injected function so the registry itself never
+reads a secret.
+
+The pilot supports one scheme:
+
+```text
+env://VAR_NAME
+```
+
+The variable holds either a JSON object used as the credentials mapping
+(`{"api_token": "...", "user_email": "..."}`) or a bare token, returned as
+`api_token`. Any other scheme — including `vault://` — resolves to **no**
+credentials, so an adapter sends no Authorization header and the call fails
+loudly instead of looking like a real attempt with an empty credential.
+
+Production replaces this one function with a secret-manager client; call
+sites do not change. Until then a connector with a `vault://` reference is
+readable and configurable but cannot authenticate.
 - Sync is incremental and resumable through cursors.
 - External failure is isolated and visible.
 

@@ -291,3 +291,38 @@ async def test_lookup_only_crm_is_not_a_write_path() -> None:
 
     assert await resolver.executors_for(["crm.update_account"]) == {}
     assert built == []
+
+
+@pytest.mark.asyncio
+async def test_credentials_are_resolved_through_the_injected_resolver() -> None:
+    """The adapter must receive real credentials, not an empty mapping.
+
+    Nothing dereferenced `credential_ref`, so every adapter got `{}` and no
+    external call could authenticate. The registry still must not read a
+    secret itself, so resolution is injected.
+    """
+    built: list[ConnectorContext] = []
+    session = _FakeSession([_connector("jira", ["create_issue"], ConnectorStatus.ACTIVE.value)])
+    resolver = ConnectorExecutorResolver(
+        session,
+        tenant_id=TENANT,
+        factories=_factories(built),
+        credential_resolver=lambda ref: {"api_token": f"tok:{ref}"},
+    )
+
+    await resolver.executors_for(["jira.create_issue"])
+
+    assert built[0].credentials == {"api_token": "tok:vault://kv/jira"}
+
+
+@pytest.mark.asyncio
+async def test_unsupported_credential_reference_yields_no_credentials() -> None:
+    """Fail closed: an unknown scheme must not produce a placeholder token."""
+    built: list[ConnectorContext] = []
+    session = _FakeSession([_connector("jira", ["create_issue"], ConnectorStatus.ACTIVE.value)])
+    resolver = ConnectorExecutorResolver(session, tenant_id=TENANT, factories=_factories(built))
+
+    await resolver.executors_for(["jira.create_issue"])
+
+    # `_connector` uses vault://, which the default resolver does not support.
+    assert built[0].credentials == {}
