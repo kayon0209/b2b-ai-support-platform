@@ -35,6 +35,9 @@ class EventType(enum.StrEnum):
 
     CASE_CREATED = "case.created"
     CASE_UPDATED = "case.updated"
+    # Emitted when an agent run reaches a terminal, billable outcome. Carries
+    # the metering facts (route, token counts) a billing consumer needs.
+    USAGE_RECORDED = "usage.recorded"
 
 
 class InboundEventType(enum.StrEnum):
@@ -53,6 +56,7 @@ class InboundEventType(enum.StrEnum):
 
 class AggregateType(enum.StrEnum):
     CASE = "case"
+    AGENT_RUN = "agent_run"
 
 
 class _Strict(BaseModel):
@@ -75,6 +79,20 @@ class CaseUpdatedPayload(_Strict):
     command: str = Field(min_length=1)
     status: str = Field(min_length=1)
     version: int = Field(ge=1)
+
+
+class UsageRecordedPayload(_Strict):
+    """One billable agent run reaching a terminal outcome.
+
+    `route` and the token counts are the metering facts: a consumer can bill
+    per run, per token, or both without re-reading the run row.
+    """
+
+    run_id: str = Field(min_length=1)
+    route: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    prompt_tokens: int = Field(default=0, ge=0)
+    completion_tokens: int = Field(default=0, ge=0)
 
 
 class EventEnvelope(BaseModel):
@@ -107,6 +125,7 @@ class EventEnvelope(BaseModel):
 PAYLOAD_SCHEMAS: dict[EventType, type[BaseModel]] = {
     EventType.CASE_CREATED: CaseCreatedPayload,
     EventType.CASE_UPDATED: CaseUpdatedPayload,
+    EventType.USAGE_RECORDED: UsageRecordedPayload,
 }
 
 
@@ -177,6 +196,7 @@ __all__ = [
     "CaseCreatedPayload",
     "CaseUpdatedPayload",
     "ContractError",
+    "UsageRecordedPayload",
     "EventEnvelope",
     "EventType",
     "InboundEventType",

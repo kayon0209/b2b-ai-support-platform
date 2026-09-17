@@ -44,6 +44,9 @@ class Tenant(Base, PkMixin):
     brand_primary_color: Mapped[str | None] = mapped_column(String(31), nullable=True)
     support_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # Agent runs allowed per calendar month. NULL means unlimited.
+    monthly_run_quota: Mapped[int | None] = mapped_column(nullable=True)
+
 
 class User(Base, PkMixin):
     __tablename__ = "users"

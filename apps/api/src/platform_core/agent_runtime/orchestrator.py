@@ -49,6 +49,7 @@ from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.llm.provider import ModelError
+from platform_core.outbox_service import enqueue
 from platform_core.retrieval.hybrid import Embedder, PrincipalScope, RetrievedChunk
 
 logger = JsonLogger("platform.agent_runtime")
@@ -562,6 +563,25 @@ class AgentOrchestrator:
                 "route": route,
                 "citation_count": citation_count,
                 "code_version": self._code_version,
+            },
+            trace_id=ctx.trace_id,
+        )
+        # Billing event: one terminal, billable outcome. Written in the same
+        # transaction as the run's final state, so a consumer can never see a
+        # billed run that did not complete (or a completed run that was not
+        # billed). `run.token_usage` is populated from the provider.
+        await enqueue(
+            self._session,
+            tenant_id=tenant_id,
+            event_type="usage.recorded",
+            aggregate_type="agent_run",
+            aggregate_id=str(run.id),
+            payload={
+                "run_id": str(run.id),
+                "route": route,
+                "status": run.status,
+                "prompt_tokens": int(run.token_usage.get("prompt_tokens", 0)),
+                "completion_tokens": int(run.token_usage.get("completion_tokens", 0)),
             },
             trace_id=ctx.trace_id,
         )

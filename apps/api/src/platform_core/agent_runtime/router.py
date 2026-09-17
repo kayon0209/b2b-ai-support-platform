@@ -38,6 +38,7 @@ from platform_core.api import (
     tenant_session,
 )
 from platform_core.audit import service as audit_service
+from platform_core.identity.usage import usage_snapshot
 from platform_core.support_bridge import inbox
 from platform_policy import Action
 
@@ -84,6 +85,18 @@ async def create_agent_run(request: Request, conversation_ref: str, body: AgentR
 
     trace_id = new_trace_id()
     async with tenant_session(ctx) as session:
+        # Quota gate. Refusing with 429 is deliberate: a caller must be able
+        # to tell "declined for capacity" from "no supporting evidence",
+        # which would otherwise look identical (no answer).
+        usage = await usage_snapshot(session, tenant_id=ctx.tenant_id)
+        if usage.over_quota:
+            return error_response(
+                "QUOTA_EXCEEDED",
+                f"monthly agent-run quota ({usage.quota}) is exhausted",
+                status_code=429,
+                details={"quota": usage.quota, "runs_used": usage.runs_used},
+            )
+
         # The inbox row is keyed by delivery id, which gives this endpoint
         # the same at-least-once + dedup semantics as a webhook delivery.
         result = await inbox.persist_inbox_event(

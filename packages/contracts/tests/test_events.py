@@ -217,3 +217,45 @@ def test_the_two_vocabularies_do_not_overlap() -> None:
     inbound event into the outbox and have it look legitimate."""
     overlap = {e.value for e in EventType} & {e.value for e in InboundEventType}
     assert not overlap, f"shared event names: {overlap}"
+
+
+def test_usage_recorded_accepts_a_valid_payload() -> None:
+    envelope = validate_event(
+        {
+            "event_id": "e-1",
+            "tenant_id": TENANT,
+            "event_type": "usage.recorded",
+            "aggregate_type": "agent_run",
+            "aggregate_id": "r-1",
+            "payload": {
+                "run_id": "r-1",
+                "route": "knowledge_qa",
+                "status": "completed",
+                "prompt_tokens": 120,
+                "completion_tokens": 34,
+            },
+        }
+    )
+    assert envelope.event_type == EventType.USAGE_RECORDED
+    assert envelope.aggregate_type == AggregateType.AGENT_RUN
+
+
+def test_usage_recorded_rejects_a_negative_token_count() -> None:
+    """Metering that cannot be negative must not be recorded as negative."""
+    with pytest.raises(ContractError) as exc:
+        validate_event(
+            {
+                "event_id": "e-2",
+                "tenant_id": TENANT,
+                "event_type": "usage.recorded",
+                "aggregate_type": "agent_run",
+                "aggregate_id": "r-2",
+                "payload": {
+                    "run_id": "r-2",
+                    "route": "knowledge_qa",
+                    "status": "completed",
+                    "prompt_tokens": -1,
+                },
+            }
+        )
+    assert exc.value.code == "PAYLOAD_INVALID"

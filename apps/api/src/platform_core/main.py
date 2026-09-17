@@ -39,6 +39,7 @@ from platform_core.http_metrics import HttpMetricsMiddleware
 from platform_core.identity.branding import router as tenant_branding_router
 from platform_core.identity.middleware import TenantContextMiddleware, build_resolver
 from platform_core.identity.router import router as identity_router
+from platform_core.identity.usage import router as tenant_usage_router
 from platform_core.knowledge.flag_router import router as feature_flag_router
 from platform_core.knowledge.gap_router import router as knowledge_gap_router
 from platform_core.knowledge.router import router as knowledge_router
@@ -78,6 +79,7 @@ app.include_router(feature_flag_router)
 # and its own guard is inside the router (see observability_router).
 app.include_router(identity_router)
 app.include_router(tenant_branding_router)
+app.include_router(tenant_usage_router)
 app.include_router(observability_router)
 # Middleware runs in reverse registration order, so HttpMetricsMiddleware
 # (registered last) wraps the auth middleware and therefore observes every

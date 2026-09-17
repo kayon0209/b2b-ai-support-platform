@@ -210,6 +210,39 @@ because branding is public-facing. Writing needs `tenant.admin` and an
 field is cleared. `primary_color` must be a hex colour and `logo_url` must be
 http(s), because the admin UI renders both.
 
+## Tenant usage and quota
+
+```text
+GET /v1/tenant/usage
+PUT /v1/tenant/quota
+```
+
+```json
+{
+  "usage": {
+    "period_start": 1780000000,
+    "period_end": 1782592000,
+    "runs_used": 42,
+    "prompt_tokens": 128000,
+    "completion_tokens": 9000,
+    "quota": 100,
+    "remaining": 58,
+    "over_quota": false
+  }
+}
+```
+
+Usage is per calendar month (UTC). `quota: null` means unlimited. Queuing an
+agent run (`POST /v1/conversations/{ref}/agent-runs`) returns
+`429 QUOTA_EXCEEDED` once the quota is exhausted, so a caller can tell
+"declined for capacity" from "no supporting evidence" — both otherwise look
+like "no answer". Setting the quota requires `tenant.admin` and an
+`Idempotency-Key`, and is audited.
+
+Completing a run emits the outbound event `usage.recorded`
+(`aggregate_type: agent_run`) with the run id, route, status and token
+counts, written in the same transaction as the run's final state.
+
 ## Outbound Chatwoot command
 
 The internal command includes:
