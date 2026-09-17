@@ -16,6 +16,7 @@ and would look like a working login that silently cannot do anything.
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -152,3 +153,101 @@ def _app_database_url(database_url: str) -> str:
     every request-path read uses the RLS-bound role.
     """
     return database_url.replace("platform:platform@", "platform_app:platform_app@")
+
+
+# --- Authentication strategy selection ------------------------------------
+#
+# Two implementations, one contract (Request -> TenantContext, or raise).
+# Selection happens once at startup so a misconfigured deployment fails on
+# boot rather than per request, and so an unsigned token can never be accepted
+# just because no realm happened to be reachable.
+
+
+async def oidc_token_resolver(request: Request) -> TenantContext:
+    """Verify a Keycloak access token and map it to a membership.
+
+    Signature, issuer, audience and expiry are all checked against the realm
+    JWKS before any database read. The tenant is then taken from
+    `external_identities` + `memberships`, never from the token, so a token
+    cannot select its own tenant.
+    """
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise PermissionError("missing bearer token")
+    token = auth.removeprefix("Bearer ").strip()
+
+    verifier, resolver = _oidc_dependencies()
+    try:
+        claims = verifier.verify(token)
+    except Exception as exc:
+        # Verification failure is a 401, not a 500. The reason is logged
+        # server-side; the client is not told which check failed.
+        logger.warning("oidc verification failed: %s", type(exc).__name__)
+        raise PermissionError("token verification failed") from exc
+
+    try:
+        return await resolver.tenant_context(claims)
+    except PermissionError:
+        raise
+    except Exception as exc:
+        logger.warning("oidc membership mapping failed: %s", type(exc).__name__)
+        raise PermissionError("membership unresolvable") from exc
+
+
+_oidc_cache: tuple[object, object] | None = None
+
+
+def _oidc_dependencies() -> tuple[Any, Any]:
+    """Build (verifier, membership resolver) once, on first use."""
+    global _oidc_cache
+    if _oidc_cache is not None:
+        return _oidc_cache  # type: ignore[return-value]
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from platform_core.config import get_settings
+    from platform_core.db import create_engine
+    from platform_core.identity.oidc import MembershipResolver, OidcVerifier
+
+    settings = get_settings()
+    if settings.oidc_issuer is None:  # pragma: no cover - guarded by build_resolver
+        raise PermissionError("oidc issuer not configured")
+
+    verifier = OidcVerifier(
+        issuer=settings.oidc_issuer,
+        audience=settings.oidc_audience,
+        jwks_cache_seconds=settings.oidc_jwks_cache_seconds,
+    )
+    # The app role (not the superuser) so RLS applies to the lookup.
+    engine = create_engine(_app_database_url(settings.database_url))
+    resolver = MembershipResolver(async_sessionmaker(engine, expire_on_commit=False))
+    _oidc_cache = (verifier, resolver)
+    return verifier, resolver
+
+
+def build_resolver() -> Callable[[Request], Awaitable[TenantContext]]:
+    """Choose the authentication path for this deployment.
+
+    OIDC wins whenever an issuer is configured. The bootstrap scheme is only
+    selected when it has been explicitly enabled (and `get_settings` has
+    already refused to start if that happened outside local/test), so the
+    insecure path cannot be reached by omission.
+    """
+    from platform_core.config import get_settings
+
+    settings = get_settings()
+    if settings.oidc_issuer:
+        logger.info("authentication: OIDC (issuer=%s)", settings.oidc_issuer)
+        return oidc_token_resolver
+
+    if settings.allow_bootstrap_tokens:
+        logger.warning(
+            "authentication: UNSIGNED bootstrap tokens are enabled "
+            "(environment=%s). This is a development-only path.",
+            settings.environment,
+        )
+        return bootstrap_token_resolver
+
+    # get_settings() rejects this combination, so reaching here means the
+    # settings were bypassed. Refuse rather than default to anything.
+    raise RuntimeError("no usable authentication strategy configured")

@@ -32,10 +32,7 @@ from platform_core.audit.router import router as audit_router
 from platform_core.cases.router import router as cases_router
 from platform_core.config import Settings, get_settings
 from platform_core.evaluation.router import router as quality_router
-from platform_core.identity.middleware import (
-    TenantContextMiddleware,
-    bootstrap_token_resolver,
-)
+from platform_core.identity.middleware import TenantContextMiddleware, build_resolver
 from platform_core.knowledge.flag_router import router as feature_flag_router
 from platform_core.knowledge.gap_router import router as knowledge_gap_router
 from platform_core.retrieval.router import router as retrieval_router
@@ -53,7 +50,7 @@ app.include_router(quality_router)
 app.include_router(prompt_router)
 app.include_router(knowledge_gap_router)
 app.include_router(feature_flag_router)
-app.add_middleware(TenantContextMiddleware, resolver=bootstrap_token_resolver)
+app.add_middleware(TenantContextMiddleware, resolver=build_resolver())
 
 
 @app.get("/healthz")

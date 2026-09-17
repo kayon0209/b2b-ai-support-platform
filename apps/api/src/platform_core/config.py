@@ -24,6 +24,22 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://platform:platform@localhost:5435/platform"
     redis_url: str = "redis://localhost:6380/0"
 
+    # --- Authentication (docs/security.md) --------------------------------
+    # Keycloak realm issuer, e.g. http://localhost:8081/realms/platform.
+    # When set, OIDC is the request authentication path.
+    oidc_issuer: str | None = None
+    oidc_audience: str = "platform-api"
+    oidc_jwks_cache_seconds: int = 300
+
+    # The bootstrap token scheme (`pt_<tenant-slug>_<user-uuid>`) is UNSIGNED:
+    # anyone who knows a slug and a user UUID can impersonate that user. It
+    # exists so the platform can be exercised locally before a realm is
+    # configured, and it must never be reachable in a deployed environment.
+    #
+    # Default is False, so the insecure path is opt-in rather than something
+    # you get by forgetting to configure OIDC.
+    allow_bootstrap_tokens: bool = False
+
     # Webhook replay protection (docs/api-contracts.md)
     webhook_timestamp_tolerance_seconds: int = 300
 
@@ -54,4 +70,38 @@ def get_settings() -> Settings:
     settings = Settings()
     if settings.environment in ("staging", "production") and settings.secret_key is None:
         raise RuntimeError("APP_SECRET_KEY is required in staging/production")
+    _assert_auth_is_configured(settings)
     return settings
+
+
+def _assert_auth_is_configured(settings: Settings) -> None:
+    """Refuse to start a deployed environment with an unusable auth setup.
+
+    Two failure modes are caught here rather than at request time, because at
+    request time both look like an ordinary 401 and would be debugged as a
+    token problem:
+
+    1. No OIDC issuer and bootstrap tokens disabled - every request would be
+       rejected and the platform would be unreachable, with no clue why.
+    2. Bootstrap tokens enabled outside local/test - the unsigned token scheme
+       would be a live impersonation path in a deployed environment.
+
+    `test` is included alongside `local` because the integration suite needs
+    to authenticate without standing up a realm; it is never a deployed
+    environment.
+    """
+    local_like = settings.environment in ("local", "test")
+
+    if settings.allow_bootstrap_tokens and not local_like:
+        raise RuntimeError(
+            "APP_ALLOW_BOOTSTRAP_TOKENS is set but bootstrap tokens are unsigned "
+            "and allow impersonation with a known slug + user id. It is only "
+            f"permitted in local/test, not {settings.environment!r}. Configure "
+            "APP_OIDC_ISSUER instead."
+        )
+
+    if settings.oidc_issuer is None and not settings.allow_bootstrap_tokens:
+        raise RuntimeError(
+            "no authentication configured: set APP_OIDC_ISSUER, or set "
+            "APP_ALLOW_BOOTSTRAP_TOKENS=true for local development"
+        )

@@ -101,15 +101,22 @@ class MembershipResolver:
 
     Only DB-resolved membership grants tenant context; a token with no
     matching identity row yields no context (fail closed).
+
+    The lookup goes through `resolve_oidc_identity` rather than selecting from
+    `external_identities` directly. That table is FORCE-RLS'd on
+    `tenant_id = current_setting('app.tenant_id')`, and the whole point of this
+    lookup is to *discover* the tenant - so a direct select is always empty and
+    OIDC could never authenticate anyone. See migration 0016 for the
+    measurement and for why the exception is a function rather than a policy
+    change.
     """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
     async def resolve(self, claims: dict[str, Any]) -> ResolvedIdentity | None:
-        from sqlalchemy import select
+        from sqlalchemy import select, text
 
-        from platform_core.identity.models import Membership
         from platform_core.identity.tenant_context import TenantContextError
 
         subject = str(claims.get("sub", ""))
@@ -122,47 +129,48 @@ class MembershipResolver:
             else "user"
         )
 
-        async with self._session_factory() as session:
-            from platform_core.identity.models import ExternalIdentity, TenantStatus
+        if not subject or not idp_system:
+            # A verifier that returns claims without `sub`/`iss` is
+            # misconfigured; treat it as unresolvable rather than querying
+            # with empty strings, which would match nothing but still cost a
+            # round trip and could match a malformed seeded row.
+            return None
 
-            identity = (
+        async with self._session_factory() as session:
+            # The function is SECURITY DEFINER and narrow: one equality lookup
+            # on the exact pair from a verified token, returning ids + role
+            # only. It joins memberships and tenants itself so the caller
+            # cannot widen it into a scan.
+            row = (
                 await session.execute(
-                    select(ExternalIdentity).where(
-                        ExternalIdentity.system == idp_system,
-                        ExternalIdentity.subject == subject,
-                    )
+                    text(
+                        "SELECT tenant_id, user_id, role FROM resolve_oidc_identity("
+                        ":system, :subject)"
+                    ),
+                    {"system": idp_system, "subject": subject},
                 )
-            ).scalar_one_or_none()
-            if identity is None:
+            ).first()
+
+            if row is None:
                 return None
 
-            membership = (
-                await session.execute(
-                    select(Membership).where(
-                        Membership.tenant_id == identity.tenant_id,
-                        Membership.user_id == identity.user_id,
-                        Membership.status == "active",
-                    )
-                )
-            ).scalar_one_or_none()
-            if membership is None:
-                raise TenantContextError("no active membership")
+            tenant_id, user_id, role = row
 
-            # Tenant row check: suspended tenants fail closed.
-            from platform_core.identity.models import Tenant
+            # Defense in depth: the function filters on tenant status, but a
+            # non-active tenant must never yield a context even if a future
+            # revision of the function forgets the join.
+            from platform_core.identity.models import Tenant, TenantStatus
 
             tenant = (
-                await session.execute(select(Tenant).where(Tenant.id == identity.tenant_id))
+                await session.execute(select(Tenant).where(Tenant.id == tenant_id))
             ).scalar_one_or_none()
             if tenant is None or tenant.status != TenantStatus.ACTIVE:
                 raise TenantContextError("tenant inactive")
 
             return ResolvedIdentity(
-                user_id=identity.user_id,
-                tenant_id=identity.tenant_id,
-                role=membership.role.value
-                if hasattr(membership.role, "value")
-                else str(membership.role),
+                user_id=user_id,
+                tenant_id=tenant_id,
+                role=str(role),
                 actor_kind=actor_kind,
             )
 
