@@ -21,6 +21,7 @@ agent's own guess the source it cites next time.
 """
 
 import hashlib
+import logging
 import time
 import uuid
 from dataclasses import dataclass
@@ -45,6 +46,8 @@ from platform_core.knowledge.models import (
     IngestionStatus,
     KnowledgeSource,
 )
+
+logger = logging.getLogger(__name__)
 
 # The gap queue is ordered by how often a question was asked. Past this many
 # occurrences a question stops being "popular" and starts being "someone's
@@ -339,6 +342,10 @@ async def publish_draft(
 
     source = await _ensure_gap_source(session, ctx=ctx, space_id=space_id)
 
+    # The canonical_uri is a logical identifier; the object_uri is the storage
+    # key. They must not be confused: the ingestion worker calls
+    # `service.get_object(version.object_uri)`, so object_uri must be a real
+    # MinIO key, not a gap:// URI.
     canonical_uri = f"gap://{gap.id}/{draft.id}"
     document = Document(
         tenant_id=ctx.tenant_id,
@@ -359,11 +366,53 @@ async def publish_draft(
         version_label=version_label,
         content_hash=content_hash,
         status=IngestionStatus.PROCESSING.value,
-        object_uri=canonical_uri,
+        object_uri="",  # filled in after the key is derived from version.id
         parser_version="gap-draft-v1",
         ingestion_status=IngestionStatus.UPLOADED.value,
+        metadata_json={
+            "content_type": "text/markdown",
+            "size_bytes": len(draft.body.encode("utf-8")),
+        },
     )
     session.add(version)
+    await session.flush()
+
+    # Derive the tenant-prefixed key from the database-assigned id, then upload
+    # the draft body through the same storage path as a normal upload. The row
+    # is committed before the object: a row without an object is recoverable,
+    # an object without a row is an orphan that no listing would ever clean up.
+    from platform_core.knowledge.service import ObjectKey, upload_object
+
+    key = ObjectKey(
+        tenant_id=str(ctx.tenant_id),
+        document_version_id=str(version.id),
+        filename=f"gap-draft-{draft.id}.md",
+    ).to_key()
+    version.object_uri = key
+    await session.flush()
+
+    # Upload is best-effort: if storage is unreachable the version row still
+    # exists with a correct object_uri, so the ingestion worker will pick it
+    # up and either succeed (if storage comes back) or fail the version to
+    # FAILED for operator retry. A row without an object is recoverable;
+    # aborting publish entirely on a storage blip would leave the gap
+    # unresolved and the draft unusable. (The normal upload path in the
+    # knowledge router uploads before returning, but publish_draft lives in
+    # the service layer where a storage outage must not be fatal.)
+    try:
+        upload_object(key, draft.body.encode("utf-8"), "text/markdown")
+    except Exception as exc:
+        logger.warning(
+            "gap_draft_upload_pending gap_id=%s version_id=%s error=%s",
+            str(gap.id),
+            str(version.id),
+            type(exc).__name__,
+        )
+        version.metadata_json = {
+            **version.metadata_json,
+            "upload_deferred": True,
+            "upload_error": type(exc).__name__,
+        }
 
     draft.published_document_id = document.id
     gap.status = GapStatus.RESOLVED.value
