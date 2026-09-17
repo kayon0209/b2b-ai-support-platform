@@ -247,3 +247,24 @@ uses which.
   `19000`, and MinIO credentials in `APP_OBJECT_STORAGE_*`):
   `./.venv/Scripts/python.exe tests/e2e/e2e_ingestion_minio.py`
   — uploads, runs the real worker, and asserts `hybrid_search` recall.
+
+## Auth middleware & the type gate
+
+- **Token-only endpoints must be in `identity/middleware.py::EXEMPT_PATHS`.**
+  The middleware 401s any path not exempt *before* the handler runs. An
+  endpoint whose caller cannot have a token yet (invite acceptance, webhooks)
+  is otherwise unreachable in the real app while a middleware-less
+  `TestClient(fresh_app)` test still passes. `TestClient(platform_core.main.app)`
+  is the only thing that proves reachability.
+- **`uvicorn.run(loop=...)` takes a string, not a class.** Use the dotted path
+  (`"asyncio:SelectorEventLoop"` on Windows, `"asyncio:new_event_loop"`
+  elsewhere). Passing the class only "works" because uvicorn's importer
+  passes non-strings through — an accident, and a mypy error.
+- **mypy strict is clean (0 errors / 98 files)** as of `18ce565`. Keep it that
+  way; `opentelemetry.*` is in `ignore_missing_imports` because the SDK is an
+  optional, lazily-imported extra.
+- **`users` is granted to `platform_app` by migration `0021`.** Before that no
+  migration granted it (only the live DB had it out-of-band), so a fresh
+  migration-built DB could not list members or create a user.
+- **Any test fixture that writes to the shared DB must clean up.** The perf
+  benchmark had leaked 78 `perf-*` tenants before its fixture grew a teardown.
