@@ -11,3 +11,6 @@ raw-scan.json
 .env
 .env.*
 !.env.example
+
+# Generated test reports (regenerated on every migration/perf run).
+tests/artifacts/
