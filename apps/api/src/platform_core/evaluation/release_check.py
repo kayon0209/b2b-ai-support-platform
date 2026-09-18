@@ -30,7 +30,7 @@ import argparse
 import asyncio
 import json
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from platform_core.evaluation.evidence import (
@@ -67,6 +67,63 @@ def _report_from_artifact(path: str) -> EvalReport | None:
         abstention_false=int(raw.get("abstention_false", 0)),
         citation_violations=int(raw.get("citation_violations", 0)),
         forbidden_claim_hits=int(raw.get("forbidden_claim_hits", 0)),
+        contradiction_candidates=int(raw.get("contradiction_candidates", 0)),
+    )
+
+
+# How many passes over the case set a release decision should rest on. The
+# model is stochastic: measured, the adversarial cases fail roughly one run in
+# three, so a single run cannot tell a regression from a bad sample.
+MIN_TRUSTED_SAMPLES = 3
+
+
+@dataclass(frozen=True)
+class ReportConfidence:
+    """Whether a report's result is stable enough to act on.
+
+    ADR 0005's finding: `forbidden_claim_rate` has a threshold of 0.02 over 23
+    cases, so one hit fails the gate - and a hit occurs about a quarter of the
+    time. Acting on one sample is a coin toss with a threshold. This makes the
+    sampling explicit instead of leaving an operator to rediscover it from a
+    flaky red build.
+    """
+
+    samples: int = 1
+    flaky_cases: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def trusted(self) -> bool:
+        return self.samples >= MIN_TRUSTED_SAMPLES
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "samples": self.samples,
+            "min_trusted_samples": MIN_TRUSTED_SAMPLES,
+            "trusted": self.trusted,
+            "flaky_cases": dict(self.flaky_cases),
+        }
+
+
+def _confidence_from_artifact(path: str) -> ReportConfidence:
+    """Read the sampling metadata `run_eval.py --samples N` records."""
+    import pathlib
+
+    target = pathlib.Path(path)
+    if not target.exists():
+        return ReportConfidence()
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    provenance = raw.get("provenance")
+    if not isinstance(provenance, dict):
+        return ReportConfidence()
+    samples = provenance.get("samples", 1)
+    flaky = provenance.get("flaky_cases", {})
+    if not isinstance(samples, int):
+        samples = 1
+    if not isinstance(flaky, dict):
+        flaky = {}
+    return ReportConfidence(
+        samples=max(1, samples),
+        flaky_cases={str(k): int(v) for k, v in flaky.items()},
     )
 
 
@@ -299,6 +356,11 @@ def main(argv: list[str] | None = None) -> int:
         gates = [*gates, p0_gate]
         allowed = allowed and p0_gate.passed
 
+    # Whether this result is stable enough to act on at all. A failing gate on
+    # a single sample is not a verdict: the model is stochastic, and measured
+    # over repeated runs the adversarial cases fail about one run in three.
+    confidence = _confidence_from_artifact(args.report)
+
     if args.json:
         print(
             json.dumps(
@@ -307,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
                     "gates": [asdict(g) for g in gates],
                     "security_counts": security,
                     "backing_tests": evidence.backing_tests,
+                    "confidence": confidence.as_dict(),
                 },
                 indent=2,
                 sort_keys=True,
@@ -322,7 +385,46 @@ def main(argv: list[str] | None = None) -> int:
         for name, n in sorted(evidence.backing_tests.items()):
             print(f"  {name}: {n} passing test(s)")
 
+        if not confidence.trusted and not allowed:
+            _print_low_confidence(confidence, args.report)
+
     return 0 if allowed else 1
+
+
+def _print_low_confidence(confidence: ReportConfidence, report_path: str) -> None:
+    """Say plainly that a failing gate may be sampling noise.
+
+    Without this an operator sees a red build and has no way to know whether
+    to investigate or re-run. ADR 0005 asks for exactly this: "a gate that
+    needs N runs to be stable should say so in the release process rather than
+    be discovered by a flaky red build."
+    """
+    print(
+        f"\nWARNING: this report comes from {confidence.samples} sample(s), below "
+        f"the {MIN_TRUSTED_SAMPLES} needed to trust a failing result.",
+        file=sys.stderr,
+    )
+    print(
+        "The model is stochastic; measured, the adversarial cases fail about one "
+        "run in three. Re-run with `run_eval.py --samples "
+        f"{MIN_TRUSTED_SAMPLES}` before treating this as a regression."
+        if confidence.samples == 1
+        else "Re-run with a higher --samples count before treating this as a regression.",
+        file=sys.stderr,
+    )
+    if confidence.flaky_cases:
+        print("\nknown-flaky cases in this report:", file=sys.stderr)
+        for case_id, failures in sorted(confidence.flaky_cases.items(), key=lambda kv: -kv[1]):
+            print(
+                f"  {case_id}: failed {failures} of {confidence.samples}",
+                file=sys.stderr,
+            )
+    else:
+        print(
+            f"(no flakiness was measurable - {report_path} recorded a single "
+            "run, so none could be.)",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
