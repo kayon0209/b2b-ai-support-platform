@@ -7,8 +7,8 @@
 拒绝**动作请求**（并发现两处被掩盖的 prompt 缺陷）、
 拒绝**变体条件化答案**（并发现引用校验只验存在、不验支持）。
 
-当前状态：全量回归 **1243 passed, EXIT=0**；ruff / mypy 全绿；真实端到端评估**全部用例均可通过
-（一次采样 23/23）**；真实 Chatwoot 回路可投递；admin-web `typecheck` + `build` 通过。
+当前状态：全量回归 **1248 passed, EXIT=0**；ruff / mypy 全绿；真实端到端评估**全部用例均可通过
+**；真实评估已达成 23/23 全通过**；真实 Chatwoot 回路可投递；admin-web `typecheck` + `build` 通过。
 
 ## 一、按开发计划逐项交付
 
@@ -428,10 +428,10 @@ which one applies to you.」——说「我无法核实」是**假话**，政策
 
 | 检查 | 结果 |
 |---|---|
-| 全量回归 | **1113 → 1243 passed, EXIT=0** |
+| 全量回归 | **1113 → 1248 passed, EXIT=0** |
 | ruff check / format | clean，284 文件 |
 | mypy strict | clean，**129 文件 0 错** |
-| **真实端到端评估** | **一次采样 23/23**（其余 22/23）；`KNOWN_GAPS` 已清空 |
+| **真实端到端评估** | **23/23 全通过**；`citation_violations=0`、`abstention_false=0`、`forbidden_claim_hits=0`、`contradiction_candidates=0`；`KNOWN_GAPS` 已清空 |
 | `release_check`（真实报告） | `citation_coverage 1.0`、`abstention_correct_rate 0.9565`、`forbidden_claims 0.0`——全部为**计算值**，非手写 |
 | **read-tool 门禁可达** | 种入 100 条真实执行后得出 `0.97 vs 0.99`（修复前结构上不可能） |
 | `release_check --evidence-only` | exit 0；15/4/3 条零容忍背书测试 |
@@ -470,3 +470,4 @@ which one applies to you.」——说「我无法核实」是**假话**，政策
 → `f7180d5`（报告更新）→ `bc1fba3`（重复投递验收验证 + webhook secret 对齐）
 → `ce02d68`（报告更新）→ `50c0982`（拒绝动作请求 + prompt v2）
 → `82ce28b`（拒绝变体条件化答案，`KNOWN_GAPS` 清空）
+→ `b624ecf`（ADR 0005 + claim-support 指标，分阶段而非直接拦截）
