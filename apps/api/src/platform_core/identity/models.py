@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -297,3 +298,87 @@ class Department(Base, PkMixin, TenantMixin):
     external_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class SamlConnection(Base, PkMixin, TenantMixin):
+    """A tenant's own identity provider.
+
+    Per tenant, not per deployment: an IdP signing certificate, entity id and
+    SSO URL belong to the tenant's identity provider, and two tenants using two
+    IdPs is the first thing an enterprise asks for.
+
+    `idp_certificate` holds a **public** certificate. The platform verifies with
+    it and has no use for a private key, so there is no column for one - a
+    private key here would be a liability with no feature attached.
+    """
+
+    __tablename__ = "saml_connections"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_saml_connection_name"),
+        UniqueConstraint("id", "tenant_id", name="uq_saml_connections_id_tenant"),
+    )
+
+    name: Mapped[str] = mapped_column(String(63), nullable=False)
+    idp_entity_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    idp_sso_url: Mapped[str] = mapped_column(String(1024), nullable=False)
+    idp_certificate: Mapped[str] = mapped_column(Text, nullable=False)
+    sp_entity_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    status: Mapped[str] = mapped_column(String(31), nullable=False, server_default="active")
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class SamlConsumedAssertion(Base, PkMixin, TenantMixin):
+    """The replay guard: one row per assertion this tenant has accepted.
+
+    `UNIQUE (connection_id, assertion_id)` makes a second presentation
+    unrepresentable rather than unlikely - the same mechanism as
+    `uq_inbox_delivery`, and for the same reason: a check-then-insert loses the
+    race, and a constraint does not.
+
+    Scoped by connection, not by tenant: assertion ids are the IdP's to
+    allocate, two IdPs may legitimately issue the same one, and a tenant-wide
+    key would reject a valid second IdP's assertion as a replay.
+    """
+
+    __tablename__ = "saml_consumed_assertions"
+    __table_args__ = (
+        UniqueConstraint("connection_id", "assertion_id", name="uq_saml_assertion_once"),
+        ForeignKeyConstraint(
+            ["connection_id", "tenant_id"],
+            ["saml_connections.id", "saml_connections.tenant_id"],
+            name="fk_saml_assertion_same_tenant",
+        ),
+    )
+
+    connection_id: Mapped[uuid.UUID] = mapped_column(nullable=False, index=True)
+    assertion_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    consumed_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class ScimToken(Base, PkMixin, TenantMixin):
+    """A provisioning bearer token, stored as a SHA-256 hash.
+
+    The token can create users and move them between departments, and it is
+    presented on every provisioning request - so a plaintext copy would sit in
+    every log and every backup.
+
+    SHA-256 rather than bcrypt: this is a high-entropy random string, not a
+    password, so there is nothing to slow a guess down for, and a per-request
+    KDF would put latency on the provisioning path for no security gain.
+
+    `revoked_at` is a timestamp rather than a delete, so "when did this stop
+    working" survives and a revoked token cannot be resurrected by re-inserting
+    the same hash.
+    """
+
+    __tablename__ = "scim_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_scim_token_hash"),
+        UniqueConstraint("tenant_id", "name", name="uq_scim_token_name"),
+    )
+
+    name: Mapped[str] = mapped_column(String(63), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    revoked_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

@@ -43,6 +43,12 @@ minio>=7.2
 # --- Security --------------------------------------------------------------
 pyjwt[crypto]>=2.10
 cryptography>=43
+# SAML response signature verification. A vetted XML-DSig implementation
+# rather than a hand-rolled one: getting canonicalisation or the
+# signature-wrapping defence subtly wrong is how a SAML SP accepts a
+# forged assertion, and that is not a bug a test suite reliably finds.
+signxml>=4
+lxml>=5
 
 # --- Observability ---------------------------------------------------------
 structlog>=24.4

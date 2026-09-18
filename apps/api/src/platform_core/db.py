@@ -118,3 +118,15 @@ async def dispose_engine() -> None:
         await engine.dispose()
         engine = None
         _session_factory = None
+
+
+def app_role_url() -> str:
+    """The non-bypass application role's URL.
+
+    The bootstrap owner is a superuser with `rolbypassrls`, so any code path
+    that connects with it silently stops enforcing row-level security. Every
+    request and worker path uses this; only migrations and test cleanup use the
+    owner. It lives here rather than in each caller because a second copy is how
+    one of them ends up pointing at the owner.
+    """
+    return get_settings().database_url.replace("platform:platform@", "platform_app:platform_app@")

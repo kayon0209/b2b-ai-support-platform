@@ -63,7 +63,20 @@ EXEMPT_PATHS = {
 # route there without one would create an unauthenticated endpoint. Stating
 # that here means whoever adds the next webhook route sees the obligation
 # instead of inheriting a silent grant.
-EXEMPT_PREFIXES = ("/v1/webhooks/",)
+# The SAML flow: `/v1/saml/{id}/login` and `/v1/saml/{id}/acs` are reached
+# by a browser with no bearer token, and they authenticate by assertion
+# signature. The tenant comes from the connection id resolved before any
+# binding exists - see migration 0030. Everything under this prefix must
+# verify a signature or establish identity itself; that obligation is
+# recorded here rather than left for the next person to infer.
+EXEMPT_PREFIXES = (
+    "/v1/saml/",
+    # SCIM authenticates with its own provisioning bearer token, which
+    # *establishes* the tenant rather than depending on one already being
+    # resolved - see `scim_router._authenticate`.
+    "/scim/v2/",
+    "/v1/webhooks/",
+)
 
 
 def is_exempt(path: str) -> bool:

@@ -204,8 +204,16 @@ async def tenant_session(ctx: TenantContext) -> AsyncIterator[AsyncSession]:
 
 
 def _app_role_url(database_url: str) -> str:
-    """Swap the bootstrap owner for the non-bypass application role."""
-    return database_url.replace("platform:platform@", "platform_app:platform_app@")
+    """Swap the bootstrap owner for the non-bypass application role.
+
+    Delegates to `db.app_role_url` so there is one statement of which role a
+    request connects as. A second copy here is how one path ends up on the
+    superuser.
+    """
+    del database_url  # the settings value is authoritative
+    from platform_core.db import app_role_url
+
+    return app_role_url()
 
 
 def parse_uuid(value: str, *, field: str) -> uuid.UUID:

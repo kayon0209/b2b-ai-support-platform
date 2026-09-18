@@ -47,6 +47,8 @@ from platform_core.identity.domain_router import (
 from platform_core.identity.middleware import TenantContextMiddleware, build_resolver
 from platform_core.identity.org_router import router as org_router
 from platform_core.identity.router import router as identity_router
+from platform_core.identity.saml_router import router as saml_router
+from platform_core.identity.scim_router import router as scim_router
 from platform_core.identity.usage import router as tenant_usage_router
 from platform_core.integrations.router import (
     dead_letter_router,
@@ -99,6 +101,10 @@ app.include_router(feature_flag_router)
 # Observability last: /metrics is an unauthenticated infrastructure endpoint
 # and its own guard is inside the router (see observability_router).
 app.include_router(identity_router)
+# Public by necessity: a browser arriving from an IdP has no bearer token.
+app.include_router(saml_router)
+# Authenticated by its own bearer token, not by a user's credential.
+app.include_router(scim_router)
 app.include_router(org_router)
 app.include_router(tenant_branding_router)
 app.include_router(tenant_usage_router)

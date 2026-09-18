@@ -60,6 +60,14 @@ ignore_missing_imports = true
 module = ["opentelemetry.*"]
 ignore_missing_imports = true
 
+# `lxml` and `signxml` ship no stubs. SILENCE TYPES HERE, NOT ERRORS: the
+# thing that proves the SAML verifier works is its test suite, which signs
+# real documents and asserts 20-odd refusals - not a type checker reading
+# untyped XML APIs and inferring nothing.
+[[tool.mypy.overrides]]
+module = ["lxml.*", "signxml.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # Source roots for the modular monolith. Declared here rather than relying on
