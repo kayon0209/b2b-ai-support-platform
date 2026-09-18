@@ -46,6 +46,7 @@ from platform_core.integrations.router import (
 from platform_core.integrations.router import (
     router as connectors_router,
 )
+from platform_core.integrations.webhook_router import router as connector_webhook_router
 from platform_core.knowledge.flag_router import router as feature_flag_router
 from platform_core.knowledge.gap_router import router as knowledge_gap_router
 from platform_core.knowledge.router import router as knowledge_router
@@ -88,6 +89,9 @@ app.include_router(tenant_branding_router)
 app.include_router(tenant_usage_router)
 app.include_router(connectors_router)
 app.include_router(dead_letter_router)
+# Provider-signed inbound webhooks. Authenticated by HMAC, not by a bearer
+# token, so the path is in the auth middleware's exempt list.
+app.include_router(connector_webhook_router)
 app.include_router(observability_router)
 # Middleware runs in reverse registration order, so HttpMetricsMiddleware
 # (registered last) wraps the auth middleware and therefore observes every

@@ -38,6 +38,10 @@ class Connector(Base, PkMixin, TenantMixin):
     configuration: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     # Secret manager reference (e.g. "vault://kv/crm/acme"), never credentials.
     credential_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Inbound webhook signing secret, a *different* secret from credential_ref:
+    # the provider signs with this one and the two rotate independently, so
+    # overloading one column would mean rotating either breaks the other.
+    webhook_secret_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Webhook endpoint signing secret reference for inbound deliveries.
     last_health_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 

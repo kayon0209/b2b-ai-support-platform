@@ -156,6 +156,29 @@ def test_exempt_paths_skip_resolution() -> None:
     assert resp.status_code == 200
 
 
+def test_a_webhook_path_with_an_id_is_exempt() -> None:
+    """Signed webhooks carry no bearer token, and the connector webhook's path
+    ends in a connector id - which exact matching cannot cover. If this
+    stopped working the endpoint would 401 before its handler ran, so the
+    signature could never be checked."""
+    from platform_core.identity.middleware import is_exempt
+
+    assert is_exempt("/v1/webhooks/connectors/0190d000-0000-7000-8000-000000000001")
+    assert is_exempt("/v1/webhooks/chatwoot")
+    assert is_exempt("/healthz")
+
+
+def test_the_webhook_prefix_does_not_exempt_ordinary_routes() -> None:
+    """The exemption is a prefix, so the boundary has to be pinned: a route
+    that merely looks similar must still require a token."""
+    from platform_core.identity.middleware import is_exempt
+
+    assert not is_exempt("/v1/connectors")
+    assert not is_exempt("/v1/webhooks")
+    assert not is_exempt("/v1/webhook/chatwoot")
+    assert not is_exempt("/v1/cases/0190d000-0000-7000-8000-000000000001")
+
+
 def test_malformed_tokens_rejected() -> None:
     app = FastAPI()
     app.add_middleware(TenantContextMiddleware, resolver=bootstrap_token_resolver)

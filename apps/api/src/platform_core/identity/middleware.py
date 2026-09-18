@@ -50,6 +50,22 @@ EXEMPT_PATHS = {
     "/v1/identity/members/accept",
 }
 
+# Prefix exemptions, for routes with a path parameter.
+#
+# A signed webhook carries no bearer token - the signature *is* the
+# authentication - and the connector webhook's path ends in the connector id,
+# which exact matching cannot cover. The prefix is deliberately narrow
+# (`/v1/webhooks/`): everything under it must verify a signature, and adding a
+# route there without one would create an unauthenticated endpoint. Stating
+# that here means whoever adds the next webhook route sees the obligation
+# instead of inheriting a silent grant.
+EXEMPT_PREFIXES = ("/v1/webhooks/",)
+
+
+def is_exempt(path: str) -> bool:
+    """Whether a path skips bearer-token resolution."""
+    return path in EXEMPT_PATHS or path.startswith(EXEMPT_PREFIXES)
+
 
 class TenantContextMiddleware(BaseHTTPMiddleware):
     """Resolve TenantContext before routing; reject requests that cannot be
@@ -64,7 +80,7 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        if request.url.path in EXEMPT_PATHS:
+        if is_exempt(request.url.path):
             tenant_context.clear_tenant_context()
             return await call_next(request)
 
