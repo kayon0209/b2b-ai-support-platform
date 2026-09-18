@@ -12,6 +12,15 @@ to LOWER priority queues are shed (rejected with a visible error) while
 interactive submissions are always admitted up to its own watermark.
 Interactive and tool queues have reserved capacity that bulk work cannot
 consume.
+
+**Not wired into the workers.** `worker.runner` used to construct a
+`PriorityQueueManager` and expose it, but no loop ever consulted it, so it
+implied backpressure that did not exist. The workers poll their own tables
+and claim batches with `FOR UPDATE SKIP LOCKED`, and bulk work runs in its
+own process — which is what actually keeps an ingestion backlog out of the
+interactive worker's batch. This module remains as a tested, self-contained
+model of the admission policy; wiring it in would mean a queue that only
+coordinates one process, which is not the deployment shape.
 """
 
 import time

@@ -4,11 +4,18 @@ Worker classes per docs/deployment-and-operations.md:
 - interactive: customer-visible AI work (inbox events -> agent runs)
 - ingestion:   parsing/chunking/embedding (bulk, lowest priority)
 - outbox:      relays committed business events to their consumers
+- retention:   periodic per-tenant data-lifecycle sweep
 
-All share the admission and priority logic in evaluation.queues, so
-backpressure and starvation guarantees are identical to the tested
-in-process model. Redis is the broker in a full deployment; the loop here
-is deliberately transport-agnostic so the same code runs in tests.
+Backpressure is structural rather than an in-process queue: each class polls
+its own table and claims a batch with `FOR UPDATE SKIP LOCKED`, and bulk work
+runs in its own process, so an ingestion backlog can never occupy the
+interactive worker's batch. Batch size and the idle-only backoff in the poll
+loop are the remaining knobs.
+
+`evaluation.queues` models an in-process priority queue and is unit-tested,
+but it is deliberately NOT wired in here: a queue in one process's memory
+cannot coordinate admission across worker processes, so the durable table is
+the real queue.
 
 Selection is by `APP_WORKER_QUEUE`. Before that variable was read, compose
 declared an `ai-worker-ingestion` service with `APP_WORKER_QUEUE: ingestion`
@@ -29,7 +36,6 @@ from typing import Any
 from observability import JsonLogger
 from platform_core.agent_runtime.orchestrator import OrchestratorDeps
 from platform_core.db import session_scope
-from platform_core.evaluation.queues import PriorityQueueManager, Queue, QueueConfig
 from worker.inbox_consumer import drain_once
 from worker.ingestion_consumer import drain_ingestion_once
 from worker.outbox_relay import OutboxRelay, OutboxWorker, build_default_relay
@@ -50,12 +56,10 @@ DEFAULT_BATCH = 20
 # Environment variable selecting which worker class this process runs.
 QUEUE_ENV_VAR = "APP_WORKER_QUEUE"
 
-# The worker roles this process can take. `interactive` and `ingestion`
-# are also `evaluation.queues.Queue` members (they are admission-control
-# queues); `outbox` is not - the relay is a poller over a table, not a
-# priority-admitted queue - so the role names are stated here rather than
-# borrowed from that enum. Spelling them out also means the dispatch table is
-# readable without knowing the queue package.
+# The worker roles this process can take. Spelled out here rather than
+# borrowed from an enum so the dispatch table is readable on its own, and so
+# an unknown value is fatal (see `resolve_queue`) instead of falling back to
+# a default role.
 ROLE_INTERACTIVE = "interactive"
 ROLE_INGESTION = "ingestion"
 ROLE_OUTBOX = "outbox"
@@ -72,7 +76,6 @@ class WorkerConfig:
 
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
     batch: int = DEFAULT_BATCH
-    queue_config: dict[Queue, QueueConfig] | None = None
     # Consecutive failed cycles tolerated before the loop gives up. Without a
     # ceiling a persistent fault (unreachable database, revoked credential)
     # spins at full speed logging forever while the backlog grows - a green
@@ -160,12 +163,7 @@ class InboxWorker:
     def __init__(self, deps: OrchestratorDeps, config: WorkerConfig | None = None) -> None:
         self._deps = deps
         self._config = config or WorkerConfig()
-        self._queues = PriorityQueueManager(self._config.queue_config or {})
         self._stopping = False
-
-    @property
-    def queues(self) -> PriorityQueueManager:
-        return self._queues
 
     def request_stop(self) -> None:
         """Cooperative shutdown: finish the current batch, then exit."""
