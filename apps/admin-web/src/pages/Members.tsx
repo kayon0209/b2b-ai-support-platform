@@ -2,7 +2,17 @@ import { useState } from "react";
 import { apiDelete, apiGet, apiPost } from "../lib/api";
 import { useAsync } from "../lib/useAsync";
 import type { InviteResult, Member } from "../lib/types";
-import { Badge, Card, EmptyState, ErrorBanner, PageHeader, Spinner } from "../components/ui";
+import {
+  ActionFeedback,
+  Badge,
+  Card,
+  EmptyState,
+  ErrorBanner,
+  PageHeader,
+  Spinner,
+} from "../components/ui";
+import { usePrompt } from "../components/Prompt";
+import { useAction } from "../lib/useAction";
 import { titleCase } from "../lib/format";
 
 // tenant_owner is the bootstrap role and cannot be assigned through an invite
@@ -25,24 +35,18 @@ export function Members() {
   const [email, setEmail] = useState("");
   const [role, setRole] = useState("support_agent");
   const [invite, setInvite] = useState<InviteResult | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const action = useAction();
+  const prompt = usePrompt();
 
   const members = useAsync<{ items: Member[]; total: number }>(
     () => apiGet<{ items: Member[]; total: number }>(`/v1/identity/members`),
     [],
   );
 
+  /** Server actions report through `action`, so a failure is not rendered as
+   *  plain muted text indistinguishable from a success. */
   async function run(fn: () => Promise<void>) {
-    setBusy(true);
-    setNotice(null);
-    try {
-      await fn();
-    } catch (err) {
-      setNotice(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
+    await action.run(fn);
   }
 
   const onInvite = () =>
@@ -66,7 +70,12 @@ export function Members() {
 
   const onRemove = (m: Member) =>
     run(async () => {
-      if (!window.confirm(`Remove ${m.email} from this tenant?`)) return;
+      const ok = await prompt.confirm(
+        `Remove ${m.email} from this tenant?`,
+        "Remove",
+        "They lose access immediately. Their account is not deleted.",
+      );
+      if (!ok) return;
       await apiDelete(`/v1/identity/members/${m.user_id}`, idem());
       members.reload();
     });
@@ -77,6 +86,8 @@ export function Members() {
         title="Members"
         subtitle="Invite and manage who can access this tenant."
       />
+
+      {prompt.element}
 
       <Card title="Invite a member">
         <div className="toolbar">
@@ -97,7 +108,7 @@ export function Members() {
               ))}
             </select>
           </label>
-          <button className="btn btn-primary" disabled={busy || !email.trim()} onClick={onInvite}>
+          <button className="btn btn-primary" disabled={action.busy || !email.trim()} onClick={onInvite}>
             Send invite
           </button>
         </div>
@@ -111,7 +122,7 @@ export function Members() {
                   className="btn btn-ghost"
                   onClick={() => {
                     void navigator.clipboard?.writeText(invite.invitation_token ?? "");
-                    setNotice("Token copied to clipboard.");
+                    action.succeed("Token copied to clipboard.");
                   }}
                 >
                   Copy
@@ -122,7 +133,7 @@ export function Members() {
             )}
           </div>
         ) : null}
-        {notice ? <p className="muted">{notice}</p> : null}
+        <ActionFeedback error={action.error} notice={action.notice} />
       </Card>
 
       {members.error ? <ErrorBanner message={members.error} onRetry={members.reload} /> : null}
@@ -154,7 +165,7 @@ export function Members() {
                   ) : (
                     <select
                       value={m.role}
-                      disabled={busy}
+                      disabled={action.busy}
                       onChange={(e) => onChangeRole(m, e.target.value)}
                     >
                       {ASSIGNABLE_ROLES.map((r) => (
@@ -173,7 +184,7 @@ export function Members() {
                 <td className="row-actions">
                   <button
                     className="btn"
-                    disabled={busy || m.role === "tenant_owner"}
+                    disabled={action.busy || m.role === "tenant_owner"}
                     onClick={() => onRemove(m)}
                   >
                     Remove

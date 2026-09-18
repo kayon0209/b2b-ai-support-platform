@@ -12,6 +12,7 @@ import {
   PageHeader,
   Spinner,
 } from "../components/ui";
+import { usePrompt } from "../components/Prompt";
 import { dateFromEpochSeconds } from "../lib/format";
 
 const PRIORITIES = ["p0", "p1", "p2", "p3"];
@@ -134,6 +135,7 @@ function CaseDetail({
   onCommand: (command: string, parameters?: Record<string, unknown>) => void;
   onClose: () => void;
 }) {
+  const prompt = usePrompt();
   return (
     <Card title={c.subject}>
       <div className="toolbar">
@@ -190,34 +192,59 @@ function CaseDetail({
       </ul>
 
       <h3 className="section-title">Commands</h3>
+      {prompt.element}
       <div className="toolbar wrap">
         <button className="btn" onClick={() => onCommand("record_first_response")}>
           Record first response
         </button>
         <button
           className="btn"
-          onClick={() => {
-            const target = window.prompt(`Target status: ${STATUSES.join(", ")}`);
-            if (target) onCommand("transition", { target });
+          onClick={async () => {
+            const values = await prompt.ask({
+              title: "Transition to which status?",
+              confirmLabel: "Transition",
+              fields: [
+                { name: "target", label: "Target status", options: STATUSES, required: true },
+              ],
+            });
+            if (values) onCommand("transition", { target: values.target });
           }}
         >
           Transition…
         </button>
         <button
           className="btn"
-          onClick={() => {
-            const priority = window.prompt(`Priority: ${PRIORITIES.join(", ")}`);
-            if (priority) onCommand("change_priority", { priority });
+          onClick={async () => {
+            const values = await prompt.ask({
+              title: "Change priority",
+              confirmLabel: "Change",
+              fields: [
+                { name: "priority", label: "Priority", options: PRIORITIES, required: true },
+              ],
+            });
+            if (values) onCommand("change_priority", { priority: values.priority });
           }}
         >
           Change priority…
         </button>
         <button
           className="btn"
-          onClick={() => {
-            const assignee_ref = window.prompt("Assignee ref (optional)");
-            const team_ref = window.prompt("Team ref (optional)");
-            onCommand("assign", { assignee_ref, team_ref });
+          onClick={async () => {
+            const values = await prompt.ask({
+              title: "Assign this case",
+              confirmLabel: "Assign",
+              detail: "Both fields are optional; leaving them empty unassigns.",
+              fields: [
+                { name: "assignee_ref", label: "Assignee ref", placeholder: "optional" },
+                { name: "team_ref", label: "Team ref", placeholder: "optional" },
+              ],
+            });
+            if (values) {
+              onCommand("assign", {
+                assignee_ref: values.assignee_ref || undefined,
+                team_ref: values.team_ref || undefined,
+              });
+            }
           }}
         >
           Assign…

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
 import { useAction } from "../lib/useAction";
+import { usePrompt } from "../components/Prompt";
 import { useAsync } from "../lib/useAsync";
 import type { ActivePrompt, PromptVersion } from "../lib/types";
 import {
@@ -17,6 +18,7 @@ export function PromptRelease() {
   const [template, setTemplate] = useState("agent_qa");
   const [draft, setDraft] = useState("");
   const action = useAction();
+  const prompt = usePrompt();
 
   const list = useAsync<{ items: PromptVersion[]; total: number }>(
     () =>
@@ -106,6 +108,7 @@ export function PromptRelease() {
       </Card>
 
       <ActionFeedback error={action.error} notice={action.notice} />
+      {prompt.element}
       {list.error ? <ErrorBanner message={list.error} onRetry={list.reload} /> : null}
       {list.loading ? <Spinner label="Loading versions…" /> : null}
       {list.data && sorted.length === 0 ? (
@@ -149,9 +152,13 @@ export function PromptRelease() {
                   <button
                     className="btn btn-primary"
                     disabled={v.id === activeId}
-                    onClick={() => {
-                      if (window.confirm(`Promote v${v.version} to serving?`))
-                        act(`/v1/prompts/${v.id}/promote`, undefined, "Promoted");
+                    onClick={async () => {
+                      const ok = await prompt.confirm(
+                        `Promote v${v.version} to serving?`,
+                        "Promote",
+                        "Every customer-visible answer changes from this moment.",
+                      );
+                      if (ok) act(`/v1/prompts/${v.id}/promote`, undefined, "Promoted");
                     }}
                   >
                     Promote
@@ -159,9 +166,13 @@ export function PromptRelease() {
                   <button
                     className="btn"
                     disabled={v.id === activeId}
-                    onClick={() => {
-                      const reason = window.prompt("Reject reason");
-                      if (reason) act(`/v1/prompts/${v.id}/reject`, { reason });
+                    onClick={async () => {
+                      const values = await prompt.ask({
+                        title: `Reject v${v.version}`,
+                        confirmLabel: "Reject",
+                        fields: [{ name: "reason", label: "Reject reason", required: true }],
+                      });
+                      if (values) act(`/v1/prompts/${v.id}/reject`, { reason: values.reason });
                     }}
                   >
                     Reject
@@ -177,14 +188,20 @@ export function PromptRelease() {
         <div className="toolbar">
           <button
             className="btn"
-            onClick={() => {
-              const to_version_id = window.prompt("Roll back to version id");
-              if (to_version_id)
+            onClick={async () => {
+              const values = await prompt.ask({
+                title: "Roll back to a previous version",
+                confirmLabel: "Roll back",
+                detail: "Enter the version id to restore. This takes effect immediately.",
+                fields: [{ name: "to_version_id", label: "Version id", required: true }],
+              });
+              if (values) {
                 act("/v1/prompts/rollback", {
                   template_name: template,
-                  to_version_id,
+                  to_version_id: values.to_version_id,
                   reason: "manual rollback",
                 });
+              }
             }}
           >
             Roll back to a previous version…

@@ -10,6 +10,8 @@ export interface ActionState {
   run: (fn: () => Promise<void>, successMessage?: string) => Promise<boolean>;
   /** Report a client-side refusal through the same channel as a server one. */
   fail: (message: string) => void;
+  /** Report a local success (a clipboard write, say) through the same channel. */
+  succeed: (message: string) => void;
   clear: () => void;
 }
 
@@ -53,10 +55,15 @@ export function useAction(): ActionState {
     setError(message);
   }, []);
 
+  const succeed = useCallback((message: string) => {
+    setError(null);
+    setNotice(message);
+  }, []);
+
   const clear = useCallback(() => {
     setError(null);
     setNotice(null);
   }, []);
 
-  return { error, notice, busy, run, fail, clear };
+  return { error, notice, busy, run, fail, succeed, clear };
 }

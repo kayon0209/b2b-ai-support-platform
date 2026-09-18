@@ -686,6 +686,51 @@ h3 {
   color: var(--good);
 }
 
+/* In-page prompt, replacing window.prompt / window.confirm. Inline rather than
+   modal: it appears where the page already is, so the operator keeps the
+   context they were reading. */
+.prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--accent, var(--border-strong));
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.prompt-head {
+  font-size: 13px;
+}
+
+.prompt-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.prompt-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+  min-width: 180px;
+}
+
+.prompt-error {
+  margin: 0;
+  font-size: 13px;
+  color: var(--bad);
+}
+
+.prompt-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .empty-state {
   padding: 22px;
   border: 1px dashed var(--border-strong);

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
 import { useAction } from "../lib/useAction";
+import { usePrompt } from "../components/Prompt";
 import { useAsync } from "../lib/useAsync";
 import type { FeatureFlag } from "../lib/types";
 import {
@@ -17,6 +18,7 @@ export function FeatureFlags() {
   const [newKey, setNewKey] = useState("");
   const [newDesc, setNewDesc] = useState("");
   const action = useAction();
+  const prompt = usePrompt();
 
   const flags = useAsync<{ items: FeatureFlag[]; total: number }>(
     () => apiGet<{ items: FeatureFlag[]; total: number }>(`/v1/flags?limit=100`),
@@ -74,6 +76,7 @@ export function FeatureFlags() {
       </Card>
 
       <ActionFeedback error={action.error} notice={action.notice} />
+      {prompt.element}
       {flags.error ? <ErrorBanner message={flags.error} onRetry={flags.reload} /> : null}
       {flags.loading ? <Spinner label="Loading flags…" /> : null}
       {flags.data && flags.data.items.length === 0 ? (
@@ -117,15 +120,29 @@ export function FeatureFlags() {
                   </button>
                   <button
                     className="btn"
-                    onClick={() => {
-                      const pctRaw = window.prompt("Rollout percent (0-100)", String(f.rollout_percent));
-                      if (pctRaw === null) return;
-                      const pctNum = Number(pctRaw);
-                      if (Number.isNaN(pctNum) || pctNum < 0 || pctNum > 100) {
-                        action.fail("Enter a number between 0 and 100.");
-                        return;
+                    onClick={async () => {
+                      const values = await prompt.ask({
+                        title: `Rollout percent for ${f.key}`,
+                        confirmLabel: "Set rollout",
+                        detail:
+                          "0 disables the flag for everyone; 100 enables it for the whole tenant.",
+                        fields: [
+                          {
+                            name: "rollout_percent",
+                            label: "Percent (0-100)",
+                            initial: String(f.rollout_percent),
+                            integer: true,
+                            min: 0,
+                            max: 100,
+                            required: true,
+                          },
+                        ],
+                      });
+                      if (values) {
+                        void act(`/v1/flags/${f.key}/rollout`, {
+                          rollout_percent: Number(values.rollout_percent),
+                        });
                       }
-                      void act(`/v1/flags/${f.key}/rollout`, { rollout_percent: pctNum });
                     }}
                   >
                     Set rollout

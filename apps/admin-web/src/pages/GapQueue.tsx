@@ -12,6 +12,7 @@ import {
   PageHeader,
   Spinner,
 } from "../components/ui";
+import { usePrompt } from "../components/Prompt";
 import { dateFromEpochSeconds, int, titleCase } from "../lib/format";
 
 const STATUSES = ["open", "acknowledged", "drafted", "resolved", "dismissed"];
@@ -51,6 +52,7 @@ export function GapQueue() {
   );
   const stats = useAsync<GapStats>(() => apiGet<GapStats>(`/v1/knowledge/gaps/stats`), []);
   const action = useAction();
+  const prompt = usePrompt();
 
   async function act(path: string, body?: unknown) {
     const ok = await action.run(() => apiPost(path, body).then(() => undefined));
@@ -85,6 +87,7 @@ export function GapQueue() {
       />
 
       <ActionFeedback error={action.error} notice={action.notice} />
+      {prompt.element}
 
       {stats.data ? (
         <div className="stat-grid stat-grid-sm">
@@ -152,9 +155,14 @@ export function GapQueue() {
                       <button
                         className="btn"
                         disabled={g.status === "resolved" || g.status === "dismissed"}
-                        onClick={() => {
-                          const reason = window.prompt("Why dismiss this gap?");
-                          if (reason) act(`/v1/knowledge/gaps/${g.id}/dismiss`, { reason });
+                        onClick={async () => {
+                          const values = await prompt.ask({
+                            title: "Dismiss this gap",
+                            confirmLabel: "Dismiss",
+                            detail: "The reason is recorded on the gap.",
+                            fields: [{ name: "reason", label: "Reason", required: true }],
+                          });
+                          if (values) act(`/v1/knowledge/gaps/${g.id}/dismiss`, { reason: values.reason });
                         }}
                       >
                         Dismiss
@@ -162,11 +170,21 @@ export function GapQueue() {
                       <button
                         className="btn"
                         disabled={g.status === "resolved"}
-                        onClick={() => {
-                          const title = window.prompt("Draft title");
-                          if (!title) return;
-                          const body = window.prompt("Draft answer");
-                          if (body) act(`/v1/knowledge/gaps/${g.id}/drafts`, { title, body });
+                        onClick={async () => {
+                          const values = await prompt.ask({
+                            title: "Draft an answer for this gap",
+                            confirmLabel: "Create draft",
+                            fields: [
+                              { name: "title", label: "Draft title", required: true },
+                              { name: "body", label: "Draft answer", required: true },
+                            ],
+                          });
+                          if (values) {
+                            act(`/v1/knowledge/gaps/${g.id}/drafts`, {
+                              title: values.title,
+                              body: values.body,
+                            });
+                          }
                         }}
                       >
                         Draft
@@ -210,12 +228,21 @@ export function GapQueue() {
                       <button
                         className="btn"
                         disabled={d.status !== "pending"}
-                        onClick={() => {
-                          const notes = window.prompt("Review notes (optional)") ?? "";
-                          act(`/v1/knowledge/drafts/${d.id}/review`, {
-                            approve: true,
-                            notes,
+                        onClick={async () => {
+                          const values = await prompt.ask({
+                            title: `Approve “${d.title}”`,
+                            confirmLabel: "Approve",
+                            detail: "Approving publishes this draft to the review queue.",
+                            fields: [
+                              { name: "notes", label: "Review notes", placeholder: "optional" },
+                            ],
                           });
+                          if (values) {
+                            act(`/v1/knowledge/drafts/${d.id}/review`, {
+                              approve: true,
+                              notes: values.notes ?? "",
+                            });
+                          }
                         }}
                       >
                         Approve
@@ -223,12 +250,18 @@ export function GapQueue() {
                       <button
                         className="btn"
                         disabled={d.status !== "pending"}
-                        onClick={() => {
-                          const notes = window.prompt("Reason for rejection") ?? "";
-                          act(`/v1/knowledge/drafts/${d.id}/review`, {
-                            approve: false,
-                            notes,
+                        onClick={async () => {
+                          const values = await prompt.ask({
+                            title: `Reject “${d.title}”`,
+                            confirmLabel: "Reject",
+                            fields: [{ name: "notes", label: "Reason for rejection" }],
                           });
+                          if (values) {
+                            act(`/v1/knowledge/drafts/${d.id}/review`, {
+                              approve: false,
+                              notes: values.notes ?? "",
+                            });
+                          }
                         }}
                       >
                         Reject
@@ -236,13 +269,24 @@ export function GapQueue() {
                       <button
                         className="btn"
                         disabled={d.status !== "approved"}
-                        onClick={() => {
-                          const space_id = window.prompt("Target knowledge space id");
-                          if (space_id)
+                        onClick={async () => {
+                          const values = await prompt.ask({
+                            title: `Publish “${d.title}”`,
+                            confirmLabel: "Publish",
+                            fields: [
+                              {
+                                name: "space_id",
+                                label: "Target knowledge space id",
+                                required: true,
+                              },
+                            ],
+                          });
+                          if (values) {
                             act(`/v1/knowledge/drafts/${d.id}/publish`, {
-                              space_id,
+                              space_id: values.space_id,
                               version_label: "v1",
                             });
+                          }
                         }}
                       >
                         Publish
