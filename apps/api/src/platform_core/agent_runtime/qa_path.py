@@ -703,6 +703,68 @@ def _is_action_request(query: str) -> bool:
     return _imperative_with_object(tokens, 0)
 
 
+# Contract variants a policy passage may branch on. The corpus states the same
+# predicate with different figures per variant ("Annual plans may be refunded
+# within 30 days. Monthly plans are refundable within 14 days."), and the
+# platform does not hold which variant a caller is on - `EnterpriseAccount.tier`
+# is a contract tier (strategic/enterprise/standard/basic), not a billing
+# period, and `Membership` has no link to an account at all.
+_VARIANT_WORDS = ("annual", "monthly", "quarterly", "yearly", "weekly")
+
+# How the question refers to the caller's own entitlement rather than to the
+# policy in general. Narrow on purpose: a broad "identity term" set was what
+# made the first two attempts at this gap wrong - "are" is in it, so the
+# general question "Are monthly plans refundable?" (which must be answered)
+# was flagged as identity-dependent.
+_SELF_REFERENTIAL_MARKERS = (
+    " am i ",
+    " do i ",
+    " can i ",
+    " i am ",
+    " we are ",
+    " my ",
+    " our ",
+    " for me ",
+    " my account ",
+    " my plan ",
+)
+
+
+def _asks_about_own_entitlement(query: str) -> bool:
+    """True when the question is about the caller's own situation."""
+    lowered = f" {query.lower()} "
+    return any(marker in lowered for marker in _SELF_REFERENTIAL_MARKERS)
+
+
+def _names_a_variant(query: str) -> bool:
+    """True when the question itself says which variant it means."""
+    lowered = query.lower()
+    return any(word in lowered for word in _VARIANT_WORDS)
+
+
+def _evidence_is_variant_conditional(evidence: list[RetrievedChunk]) -> bool:
+    """True when the top passage answers differently per contract variant.
+
+    A passage that gives one figure is a fact. A passage that gives *two*
+    figures under two named variants is a table, and reading a row out of it
+    for a caller whose variant is unknown is a guess - which `docs/agent.md`
+    forbids ("missing/conflicting/expired evidence -> abstain or handoff,
+    never guess").
+
+    This is the abstention half of the `ambiguous-refund-eligibility` fix. The
+    other half - resolving the caller's variant so the question can be answered
+    - needs schema the platform does not have (see `_VARIANT_WORDS`). Refusing
+    is the correct behaviour for an attribute we do not model; guessing one
+    row would be the defect.
+    """
+    for chunk in evidence[:1]:
+        text = chunk.excerpt.lower()
+        variants = {word for word in _VARIANT_WORDS if word in text}
+        if len(variants) >= 2 and len(_numeric_tokens(chunk.excerpt)) >= 2:
+            return True
+    return False
+
+
 def decide_abstention(
     query: str,
     evidence: list[RetrievedChunk],
@@ -734,6 +796,18 @@ def decide_abstention(
         # whichever source happened to rank first. A confident wrong number
         # about a contractual term is worse than a handoff.
         return AbstentionDecision(abstain=True, reason_code=ABSTAIN_CONFLICT, handoff=True)
+    if (
+        _asks_about_own_entitlement(query)
+        and not _names_a_variant(query)
+        and _evidence_is_variant_conditional(evidence)
+    ):
+        # The caller asked what applies to *them*, the evidence answers
+        # differently per contract variant, and the question did not say which
+        # one - so the platform would have to pick a row. It cannot: the
+        # variant is not in the domain model. Abstain rather than choose.
+        return AbstentionDecision(
+            abstain=True, reason_code=ABSTAIN_AMBIGUOUS_IDENTITY, handoff=True
+        )
     best_overlap = max(_chunk_overlap(query, c) for c in evidence)
     if best_overlap < min_overlap:
         return AbstentionDecision(abstain=True, reason_code=ABSTAIN_LOW_RELEVANCE, handoff=True)
@@ -755,6 +829,15 @@ def safe_abstention_text(reason_code: str) -> str:
         return (
             "I can't make changes to your account myself. Let me connect you "
             "with a human colleague who can action this for you."
+        )
+    if reason_code == ABSTAIN_AMBIGUOUS_IDENTITY:
+        # Says *why* it cannot answer - the terms differ by contract - and asks
+        # for the one detail that would resolve it. "I couldn't verify that"
+        # would be false here: the policy is right there, it just branches.
+        return (
+            "That depends on your contract, and I can't tell which one applies "
+            "to you. Let me connect you with a human colleague who can confirm "
+            "your terms."
         )
     return (
         "I couldn't verify an answer from our authorized knowledge base. "

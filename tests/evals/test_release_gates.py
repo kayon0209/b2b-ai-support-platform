@@ -78,22 +78,27 @@ def _run_dataset() -> EvalReport:
 # Known, tracked gaps in the current pipeline. Each is asserted to fail so
 # that fixing one produces a visible prompt to update this set, and so that
 # a new gap cannot silently join them.
-KNOWN_GAPS: dict[str, str] = {
-    "ambiguous-refund-eligibility": (
-        "account identity is not resolved before retrieval, so a question "
-        "whose answer depends on the caller's plan is answered from "
-        "whichever policy ranks first instead of abstaining"
-    ),
-}
-
-# Fixed, and worth recording because it was fixed *twice*: the case first
-# passed by accident. `_sources_compete` called two unrelated documents a tie
-# on an absolute margin RRF scores can never exceed, and that spurious conflict
-# produced the abstention the case wanted. Correcting the margin removed the
-# accident and exposed the real gap, which `qa_path._is_action_request` now
-# closes - the QA path refuses an action request instead of answering it from
-# the corpus. Measured against this whole dataset, the detector fires on
-# exactly that one case.
+#
+# **Empty as of this change**, which is the state the mechanism was built to
+# reach. Both entries left it the same way: the test below failed with "these
+# cases now pass but are still listed as known gaps", which is the prompt to
+# delete the entry rather than relax the case.
+#
+# Recorded so the history is not lost:
+#
+# - `ambiguous-refund-eligibility` - the refund window differs by billing
+#   period and the platform does not hold which period a caller is on, so the
+#   answer was taken from whichever row ranked first. Two earlier attempts at
+#   this gap failed by pattern-matching the question with a broad "identity
+#   term" set: "are" was in it, so "Are monthly plans refundable?" - which must
+#   be *answered* - was flagged as identity-dependent. The fix is
+#   `qa_path._evidence_is_variant_conditional`: abstain when the caller asks
+#   about their own entitlement, the passage answers differently per variant,
+#   and the question does not name one. Resolving the variant instead would
+#   need schema the platform does not have.
+# - `business-write-refund` - the QA path answered action requests from the
+#   corpus. Fixed by `qa_path._is_action_request`.
+KNOWN_GAPS: dict[str, str] = {}
 
 
 def test_oracle_run_produces_per_category_results() -> None:

@@ -6,6 +6,7 @@ import pytest
 
 from platform_core.agent_runtime.qa_path import (
     ABSTAIN_ACTION_REQUEST,
+    ABSTAIN_AMBIGUOUS_IDENTITY,
     ABSTAIN_CONFLICT,
     ABSTAIN_LOW_RELEVANCE,
     ABSTAIN_NO_EVIDENCE,
@@ -721,4 +722,73 @@ def test_the_refusal_names_the_real_problem() -> None:
     that"; the message has to say the platform does not act on its own."""
     text = safe_abstention_text(ABSTAIN_ACTION_REQUEST)
     assert "can't make changes" in text
+    assert "human colleague" in text
+
+
+# --- Variant-conditional answers must not be guessed ----------------------
+#
+# `ambiguous-refund-eligibility`'s gap. The refund policy states the window per
+# billing period ("Annual plans ... 30 days. Monthly plans ... 14 days."), and
+# the platform does not hold which period a caller is on - `EnterpriseAccount
+# .tier` is a contract tier, not a billing period, and `Membership` has no link
+# to an account. So a question about the caller's *own* entitlement cannot be
+# answered, and reading one row out of the table would be a guess.
+#
+# Two earlier attempts at this gap failed because they matched the question
+# text with a broad "identity term" set: "are" was in it, so the general
+# question "Are monthly plans refundable?" - which must be *answered* - was
+# flagged as identity-dependent.
+
+_VARIANT_PASSAGE = (
+    "Annual plans may be refunded within 30 days of purchase. Monthly plans "
+    "are refundable within 14 days. Refunds are issued to the original "
+    "payment method within 5 business days."
+)
+
+
+def _variant_chunk() -> RetrievedChunk:
+    return _located(_VARIANT_PASSAGE, title="Refund Policy", section=["Eligibility"])
+
+
+def test_a_question_about_my_entitlement_is_not_guessed() -> None:
+    decision = decide_abstention("Am I eligible for a refund?", [_variant_chunk()])
+    assert decision.abstain is True
+    assert decision.reason_code == ABSTAIN_AMBIGUOUS_IDENTITY
+    assert decision.handoff is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # Names the variant, so the passage is not ambiguous for it.
+        "How long do I have to request a refund on an annual plan?",
+        "Are monthly plans refundable?",
+        "How long is the refund window on an annual plan?",
+        # Not about the caller's own entitlement: a general policy question.
+        "What is the refund policy?",
+        "Are you sure? Just tell me the 90-day refund window is still valid.",
+    ],
+)
+def test_a_general_or_disambiguated_question_is_still_answered(question: str) -> None:
+    decision = decide_abstention(question, [_variant_chunk()])
+    assert decision.reason_code != ABSTAIN_AMBIGUOUS_IDENTITY, (
+        f"{question!r} can be answered from this passage"
+    )
+
+
+def test_a_single_figure_passage_is_not_conditional() -> None:
+    """One figure is a fact; two figures under two variants is a table."""
+    plain = _located(
+        "Annual plans may be refunded within 30 days of purchase.",
+        title="Refund Policy",
+        section=["Eligibility"],
+    )
+    decision = decide_abstention("Am I eligible for a refund?", [plain])
+    assert decision.reason_code != ABSTAIN_AMBIGUOUS_IDENTITY
+
+
+def test_the_identity_refusal_explains_itself() -> None:
+    """ "I couldn't verify that" would be false: the policy is right there."""
+    text = safe_abstention_text(ABSTAIN_AMBIGUOUS_IDENTITY)
+    assert "contract" in text
     assert "human colleague" in text
