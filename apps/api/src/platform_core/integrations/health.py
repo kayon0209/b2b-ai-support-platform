@@ -99,20 +99,29 @@ def can_clear_reauth(*, reachable: bool, credential_resolves: bool) -> tuple[boo
 
     Two conditions, and both are real evidence rather than a checkbox:
 
-    1. the endpoint is reachable, and
-    2. the credential reference resolves to a non-empty credentials mapping.
+    1. the credential reference resolves to a non-empty credentials mapping,
+       and
+    2. the endpoint is reachable.
 
-    (2) is what catches the common misconfiguration - the operator swapped the
+    (1) is what catches the common misconfiguration - the operator swapped the
     reference to a new variable and forgot to set it. Without it, the API
     would happily report `active` for a connector that still cannot
     authenticate, which is worse than the state it was in.
 
+    Precedence when both fail: the credential is reported first, and the order
+    is deliberate rather than arbitrary. The credential is the condition the
+    operator owns and can fix directly; reachability may be a network problem
+    that is not theirs, or a transient outage. Reporting "unreachable" first
+    would send them to debug the network, and only after fixing it would they
+    learn the secret is also missing - two round trips for something the
+    server already knew both halves of.
+
     Returns `(allowed, reason_code)` so the caller can report why.
     """
-    if not reachable:
-        return False, "CONNECTOR_UNREACHABLE"
     if not credential_resolves:
         return False, "CREDENTIAL_UNRESOLVED"
+    if not reachable:
+        return False, "CONNECTOR_UNREACHABLE"
     return True, "OK"
 
 

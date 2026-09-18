@@ -108,6 +108,19 @@ def test_reactivation_succeeds_with_both_conditions() -> None:
     assert health.can_clear_reauth(reachable=True, credential_resolves=True) == (True, "OK")
 
 
+def test_unresolved_credential_is_reported_before_unreachability() -> None:
+    """When both conditions fail, name the one the operator owns.
+
+    The credential is fixable by the operator; reachability may be a network
+    problem that is not theirs. Reporting the network first sends them to
+    debug connectivity, and they only learn about the missing secret after
+    fixing it - two round trips for something the server already knew.
+    """
+    allowed, reason = health.can_clear_reauth(reachable=False, credential_resolves=False)
+    assert allowed is False
+    assert reason == "CREDENTIAL_UNRESOLVED"
+
+
 # --- credential_is_present -------------------------------------------------
 
 
