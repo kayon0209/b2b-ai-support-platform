@@ -185,6 +185,28 @@ Scale independently:
 
 Do not autoscale solely on CPU; queue age and external rate limits are primary signals.
 
+## Production templates
+
+`infra/kubernetes/` holds the high-availability manifests: namespace with an
+enforced `restricted` Pod Security Standard, ConfigMap and a Secret shape, a
+migration Job, the API Deployment (three replicas, PodDisruptionBudget,
+zone spread, HPA, startup/readiness/liveness probes), all five worker roles, a
+default-deny NetworkPolicy set, and an Ingress.
+
+Its `README.md` states which checks were actually run. Two are worth repeating
+here because they change how a rollout is performed:
+
+- `kubectl apply --dry-run=client` cannot be used as a gate: it needs API
+  discovery and therefore a cluster. The substitute is
+  `apps/api/tests/unit/test_kubernetes_manifests.py`, which asserts the HA
+  properties directly (probes, security contexts, no inlined credentials, grace
+  periods above poll intervals) so a manifest edit that removes one fails the
+  suite rather than the rollout.
+- **Migrations are applied before the code, by a Job with `backoffLimit: 0`.**
+  Several API replicas running `alembic upgrade head` concurrently is a race the
+  tooling does not arbitrate, and a migration that fails and is retried
+  automatically is one whose partial application nobody looked at.
+
 ## Runbooks
 
 ### LLM provider unavailable

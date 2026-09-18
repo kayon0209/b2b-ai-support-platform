@@ -1,0 +1,427 @@
+# The five worker roles, one Deployment each.
+#
+# They share an image with the API and differ only in `APP_WORKER_QUEUE`, which
+# is what keeps API and worker from drifting apart - but they are separate
+# Deployments because they have different scaling and failure characteristics:
+#
+#   interactive  customer-visible agent runs. Scales out; a lost pod delays
+#                replies, so it gets a PDB and a graceful window.
+#   ingestion    parsing/chunking/embedding. Bulk and lowest priority; one
+#                replica because the provider's embedding API and the database
+#                are the bottleneck, not the loop.
+#   outbox       relays committed business events. One replica; the claim is
+#                `FOR UPDATE SKIP LOCKED`, so more would be safe but pointless.
+#   retention    hourly per-tenant sweep. Idempotent, so replicas are safe;
+#                one replica because a second one only makes the logs harder to
+#                read.
+#   sla          per-minute breach scan. Same reasoning; its idempotency is a
+#                unique key rather than a claim.
+#
+# Every worker gets `terminationGracePeriodSeconds` greater than its poll
+# interval, so SIGTERM arrives between cycles rather than mid-cycle. The runner
+# already finishes the cycle in progress and stops.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-worker-interactive
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: worker-interactive
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform
+      app.kubernetes.io/component: worker-interactive
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform
+        app.kubernetes.io/component: worker-interactive
+    spec:
+      serviceAccountName: platform
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: registry.example.com/b2b-support/platform:REPLACE_ME_TAG
+          command: ["python", "-m", "worker.runner"]
+          envFrom:
+            - configMapRef:
+                name: platform-config
+          env:
+            - name: APP_WORKER_QUEUE
+              value: "interactive"
+            - name: APP_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_PASSWORD
+            - name: APP_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_SECRET_KEY
+            - name: APP_CHATWOOT_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_CHATWOOT_API_TOKEN
+            - name: APP_LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_LLM_API_KEY
+          # No HTTP probes: this process exposes no port. A probe here would be
+          # either a fiction or would force the worker to run a web server it
+          # does not need. Liveness comes from the process exiting on a fatal
+          # error, and the idle-only backoff in the poll loop keeps it cheap
+          # when there is no work.
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: platform-worker-interactive
+  namespace: b2b-support
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform
+      app.kubernetes.io/component: worker-interactive
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-worker-ingestion
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: worker-ingestion
+spec:
+  # Bulk work, lowest priority. One replica: the embedding API and the database
+  # are the constraint, and a second replica would take the same timeout budget
+  # away from customer-facing runs for no throughput gain. Scale this on queue
+  # depth (a custom metric), not CPU - an idle poller uses almost none, so a
+  # CPU-based HPA would scale a backlog down to one pod.
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform
+      app.kubernetes.io/component: worker-ingestion
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform
+        app.kubernetes.io/component: worker-ingestion
+    spec:
+      serviceAccountName: platform
+      # Ingestion batches are long: a 200-page document spends minutes in
+      # chunking and embedding, and the drain finishes the batch in progress.
+      terminationGracePeriodSeconds: 300
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: registry.example.com/b2b-support/platform:REPLACE_ME_TAG
+          command: ["python", "-m", "worker.runner"]
+          envFrom:
+            - configMapRef:
+                name: platform-config
+          env:
+            - name: APP_WORKER_QUEUE
+              value: "ingestion"
+            - name: APP_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_PASSWORD
+            - name: APP_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_SECRET_KEY
+            - name: APP_LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_LLM_API_KEY
+            - name: APP_OBJECT_STORAGE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_OBJECT_STORAGE_ACCESS_KEY
+            - name: APP_OBJECT_STORAGE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_OBJECT_STORAGE_SECRET_KEY
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-worker-outbox
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: worker-outbox
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform
+      app.kubernetes.io/component: worker-outbox
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform
+        app.kubernetes.io/component: worker-outbox
+    spec:
+      serviceAccountName: platform
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: registry.example.com/b2b-support/platform:REPLACE_ME_TAG
+          # `--outbox-only` rather than the queue variable: the flag is the more
+          # specific instruction and predates the env var, so it also documents
+          # that this pod's only job is relaying.
+          command: ["python", "-m", "worker.runner", "--outbox-only"]
+          envFrom:
+            - configMapRef:
+                name: platform-config
+          env:
+            - name: APP_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_PASSWORD
+            - name: APP_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_SECRET_KEY
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-worker-retention
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: worker-retention
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform
+      app.kubernetes.io/component: worker-retention
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform
+        app.kubernetes.io/component: worker-retention
+    spec:
+      serviceAccountName: platform
+      terminationGracePeriodSeconds: 300
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: registry.example.com/b2b-support/platform:REPLACE_ME_TAG
+          command: ["python", "-m", "worker.runner"]
+          envFrom:
+            - configMapRef:
+                name: platform-config
+          env:
+            - name: APP_WORKER_QUEUE
+              value: "retention"
+            - name: APP_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_PASSWORD
+            - name: APP_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_SECRET_KEY
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-worker-sla
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: worker-sla
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform
+      app.kubernetes.io/component: worker-sla
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform
+        app.kubernetes.io/component: worker-sla
+    spec:
+      serviceAccountName: platform
+      # Above the 60-second sweep interval, so a rollout does not interrupt a
+      # sweep halfway and leave a tenant unswept until the next cycle.
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: registry.example.com/b2b-support/platform:REPLACE_ME_TAG
+          command: ["python", "-m", "worker.runner"]
+          envFrom:
+            - configMapRef:
+                name: platform-config
+          env:
+            - name: APP_WORKER_QUEUE
+              value: "sla"
+            - name: APP_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_PASSWORD
+            - name: APP_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_SECRET_KEY
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

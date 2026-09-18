@@ -1,0 +1,37 @@
+# Non-secret configuration, shared by the API and every worker.
+#
+# What is deliberately NOT here, and why: `APP_ALLOW_BOOTSTRAP_TOKENS` is
+# absent on purpose. Its default is false and `get_settings()` refuses to
+# enable it outside local/test, so leaving it out means a production pod cannot
+# accept an unsigned token even if someone edits this ConfigMap by mistake.
+# A setting whose absence is the safe state does not belong in a file people
+# edit casually.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-config
+  namespace: b2b-support
+data:
+  APP_ENVIRONMENT: "production"
+  # Inside the cluster, so the in-cluster Service names. The API connects as
+  # the non-bypass role (`platform_app`), never as the migration owner: the
+  # migration owner is a superuser and would bypass row-level security.
+  APP_DATABASE_URL: "postgresql+psycopg://platform_app:CHANGE_ME@postgres-primary.b2b-support.svc.cluster.local:5432/platform"
+  APP_REDIS_URL: "redis://redis.b2b-support.svc.cluster.local:6379/0"
+  APP_CHATWOOT_BASE_URL: "https://support.example.com"
+  APP_LLM_BASE_URL: "https://ai.gitee.com/v1"
+  APP_LLM_MODEL: "qwen3.8-flash"
+  APP_LLM_EMBEDDING_MODEL: "Qwen3-Embedding-8B"
+  APP_LLM_EMBEDDING_DIMENSIONS: "1536"
+  # Object storage is external (S3-compatible), not a pod: a MinIO container
+  # co-located with the API would make every document a single-node failure.
+  APP_OBJECT_STORAGE_ENDPOINT: "s3.cn-north-1.amazonaws.com.cn"
+  APP_OBJECT_STORAGE_BUCKET: "b2b-support-documents"
+  APP_OBJECT_STORAGE_SECURE: "true"
+  # Metrics are scraped from inside the cluster; the endpoint carries no
+  # tenant-identifying labels, but it is still not exposed through the Ingress.
+  APP_METRICS_ENABLED: "true"
+  # OIDC is the production identity path. `APP_ALLOW_BOOTSTRAP_TOKENS` is
+  # intentionally absent - see the header.
+  APP_OIDC_ISSUER: "https://sso.example.com/realms/platform"
+  APP_OIDC_AUDIENCE: "platform-api"

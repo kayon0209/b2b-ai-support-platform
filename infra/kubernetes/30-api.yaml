@@ -1,0 +1,244 @@
+# The API: stateless, horizontally scaled, and the only workload behind the Ingress.
+#
+# Availability decisions that are not defaults, each for a reason:
+#
+# - **3 replicas with a PodDisruptionBudget of 2.** A single replica makes every
+#   node drain an outage; two replicas with a budget of one survives a drain but
+#   not a second failure during it.
+# - **`topologySpreadConstraints` across zones, `ScheduleAnyway`.** `DoNotSchedule`
+#   would leave replicas Pending forever in a single-zone cluster - which is
+#   exactly the cluster most first deployments have - so the soft form is used
+#   and the intent is recorded rather than enforced.
+# - **`maxUnavailable: 0` with `maxSurge: 1`.** A rollout must not remove
+#   capacity before the replacement is ready.
+# - **`terminationGracePeriodSeconds: 60`.** The API holds in-flight agent runs
+#   that call the model provider for seconds at a time; the 30-second default
+#   would cut them off mid-generation and the run would be recorded as failed
+#   even though the customer was eventually answered.
+# - **No `/metrics` on the Ingress.** It is scraped in-cluster; publishing it
+#   would expose operational detail to the internet for no benefit.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-api
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: api
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: platform
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: platform
+              app.kubernetes.io/component: api
+      containers:
+        - name: api
+          image: registry.example.com/b2b-support/platform:REPLACE_ME_TAG
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: platform-config
+          env:
+            - name: APP_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_PASSWORD
+            - name: APP_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_SECRET_KEY
+            - name: APP_CHATWOOT_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_CHATWOOT_API_TOKEN
+            - name: APP_CHATWOOT_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_CHATWOOT_WEBHOOK_SECRET
+            - name: APP_LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_LLM_API_KEY
+            - name: APP_OBJECT_STORAGE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_OBJECT_STORAGE_ACCESS_KEY
+            - name: APP_OBJECT_STORAGE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_OBJECT_STORAGE_SECRET_KEY
+          # `/healthz` answers without touching the database, so a slow
+          # dependency does not make Kubernetes kill a healthy process and
+          # replace it with another one that is equally slow. Readiness is
+          # where dependency health belongs, and even there the check is the
+          # process's own ability to serve, not the provider's.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              # No CPU limit: a CFS quota makes a bursty request-handler
+              # slower under load and the kernel throttles it while it holds a
+              # connection. The request is what scheduling and the HPA use.
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform-api
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# The scrape target for Prometheus. A separate Service rather than adding a
+# port to the API Service, so a scrape cannot be accidentally exposed by an
+# Ingress that selects `platform-api` and forwards every port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform-api-metrics
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: api
+  annotations:
+    # The endpoint carries no tenant-identifying labels; this annotation just
+    # documents the scrape path for whoever wires the ServiceMonitor.
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "8000"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: api
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: platform-api
+  namespace: b2b-support
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform
+      app.kubernetes.io/component: api
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: platform-api
+  namespace: b2b-support
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: platform-api
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Slow to shrink: capacity removed while a burst is still draining makes
+      # the next burst worse than the one it just survived.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30

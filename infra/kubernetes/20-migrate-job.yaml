@@ -1,0 +1,83 @@
+# Schema migration, run as its own Job before the rollout.
+#
+# Why not an initContainer or a startup step in the API Deployment: the API runs
+# several replicas, and several replicas running `alembic upgrade head`
+# concurrently is a race the tools do not arbitrate. A Job runs once, and the
+# rollout waits for it.
+#
+# Why a Job and not a Helm hook: hooks are Helm's, and this directory is plain
+# manifests so it can be applied with `kubectl apply -k` by a deployment that
+# does not use Helm. The ordering guarantee is `kubectl wait` in the README
+# rather than an implicit one.
+#
+# `backoffLimit: 0` is deliberate. A migration that fails and is retried
+# automatically is a migration whose partial application nobody looked at; the
+# failure must stop the rollout and page someone.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: platform-migrate
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 0
+  # Cleaned up automatically, so a re-apply does not fail on an immutable Job.
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: platform
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          # Same image as the API: a migration applied from a different build
+          # than the code that expects it is how a schema and its reader drift.
+          image: registry.example.com/b2b-support/platform:REPLACE_ME_TAG
+          command: ["python", "-m", "alembic"]
+          args:
+            - "-c"
+            - "apps/api/migrations/alembic.ini"
+            - "upgrade"
+            - "head"
+          envFrom:
+            - configMapRef:
+                name: platform-config
+          env:
+            # The owner URL comes from the migration-only Secret: this is the
+            # superuser role, and `platform_app` cannot create tables or
+            # policies.
+            - name: APP_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: platform-migration-owner
+                  key: APP_ADMIN_DATABASE_URL
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

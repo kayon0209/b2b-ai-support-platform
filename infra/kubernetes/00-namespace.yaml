@@ -1,0 +1,32 @@
+# Namespace, and the workload-identity boundary around it.
+#
+# A dedicated namespace rather than `default`: the NetworkPolicies below are
+# namespace-scoped, and "deny by default" is only meaningful if the namespace
+# contains nothing but this platform.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: b2b-support
+  labels:
+    # Enforced (not just audited): a pod that does not satisfy these is
+    # rejected at admission rather than reported. `restricted` is the strictest
+    # of the three Pod Security Standards and the platform's containers meet it
+    # - non-root, no privilege escalation, all capabilities dropped, seccomp
+    # RuntimeDefault - so there is no reason to run with a weaker profile.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# A dedicated ServiceAccount with no RBAC bindings.
+#
+# `automountServiceAccountToken: false` is the point: none of these containers
+# calls the Kubernetes API, so a token in the pod is a credential with no
+# purpose that would be readable by anything that managed to execute code in
+# it. The default ServiceAccount mounts one whether you want it or not.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform
+  namespace: b2b-support
+automountServiceAccountToken: false

@@ -1,0 +1,29 @@
+# Kustomization: apply order and the files that are not applied.
+#
+# `kubectl apply -k` sorts by kind, which already puts Namespace before
+# workloads, but `dependsOn` in Kustomize does not survive into the manifests
+# and kubectl apply has no readiness concept. So the ordering that actually
+# matters - the migration Job completes before the Deployments roll - is
+# enforced by the apply procedure in the README, not by this file. Saying that
+# here is better than a comment claiming an ordering guarantee this file does
+# not provide.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: b2b-support
+resources:
+  - 00-namespace.yaml
+  - 10-configmap.yaml
+  - 20-migrate-job.yaml
+  - 30-api.yaml
+  - 40-workers.yaml
+  - 50-networkpolicy.yaml
+  - 60-ingress.yaml
+# `11-secret.example.yaml` is intentionally absent: it holds placeholders, and
+# applying it would create a Secret whose values look configured. Create the
+# real Secret from your secret manager first.
+#
+# The image tag is pinned here rather than left to `latest`: a rollout must be
+# a decision, and `kubectl set image` is what makes one.
+images:
+  - name: registry.example.com/b2b-support/platform
+    newTag: REPLACE_ME_TAG

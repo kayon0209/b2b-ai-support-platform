@@ -1,0 +1,119 @@
+# Default-deny ingress, with the specific flows the platform needs.
+#
+# `podSelector: {}` matches every pod in the namespace, so this is a
+# namespace-wide deny rather than a per-workload one: it also covers a pod that
+# is added later and forgets to bring its own policy. The consequence is
+# deliberate - a new workload that needs to be reachable must add a rule, and
+# "I forgot" fails closed instead of open.
+#
+# Egress is denied too, then selectively allowed. What that buys: a compromised
+# pod cannot reach the metadata service (169.254.169.254) to steal the node's
+# credentials. On a managed cluster that single rule is worth more than the rest
+# of this file.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: b2b-support
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+# The Ingress controller may reach the API. Scoped to the api component rather
+# than the whole namespace, so no worker is reachable from outside the cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-from-ingress
+  namespace: b2b-support
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: api
+  policyTypes: ["Ingress"]
+  ingress:
+    # Only the ingress controller's namespace, and only on the HTTP port.
+    # Metrics are on the same port, which is why the metrics Service exists
+    # separately: the rule below admits the scraper, not the world.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+# Prometheus scrapes the API's metrics endpoint.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-metrics-scrape
+  namespace: b2b-support
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: api
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+# Egress: DNS, Postgres, Redis, the Chatwoot host, the LLM provider, object
+# storage, and the OIDC issuer. Each entry is a dependency the code actually
+# calls; anything not listed is not reachable, so a new outbound call fails
+# loudly at the first request rather than silently working in a dev cluster
+# whose policies are looser.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-dependencies
+  namespace: b2b-support
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    # DNS. Without this every name resolution fails and the symptom looks like
+    # a database outage.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # External dependencies by port only. An ipBlock with the provider's
+    # published ranges would be tighter and would also break whenever they
+    # change it; these are recorded as a known weakening rather than presented
+    # as tight.
+    #   443 -> Chatwoot, the LLM provider, object storage, the OIDC issuer.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # The link-local metadata range. Excluded explicitly so the
+              # rule cannot be read as "genuinely everything is allowed".
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

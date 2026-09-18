@@ -1,0 +1,48 @@
+# Ingress for the API, and a note on what is not routed.
+#
+# The webhook paths are public by necessity - Chatwoot and the connector
+# providers call them - and they authenticate by HMAC signature rather than by
+# a bearer token, so they must not be behind an auth proxy that expects one.
+# Streaming and long-polling endpoints need a read timeout above the model
+# provider's, or a slow generation is cut at the proxy and recorded as a
+# failure.
+#
+# NOT routed, each deliberately:
+#   /metrics              scraped in-cluster; publishing it exposes operational
+#                         detail for no benefit.
+#   /docs, /openapi.json  the schema is useful to an attacker and useless to a
+#                         customer; disable them in production instead.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: platform-api
+  namespace: b2b-support
+  annotations:
+    # Generation calls the model provider for seconds at a time. A 30-second
+    # proxy timeout turns a slow answer into a failed run that the platform
+    # then reports as an error the customer caused.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    # A webhook body is a bounded JSON payload; 1 MB is generous and refuses a
+    # document upload aimed at the webhook path.
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    # Rate limiting is enforced in the application, per tenant, in
+    # `rate_limit.py` - where the tenant is known. A second limit here would be
+    # per-IP and would punish a tenant whose agents share a NAT address.
+    nginx.ingress.kubernetes.io/enable-access-log: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["api.example.com"]
+      secretName: platform-api-tls
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: platform-api
+                port:
+                  name: http
