@@ -272,7 +272,30 @@ async def _cleanup(platform, *, tenant_id: uuid.UUID, slug: str) -> None:
         await s.commit()
 
 
-def _write_report(report: EvalReport, *, tenant_id: uuid.UUID, elapsed: float) -> None:
+def _flake_summary(runs: list[EvalReport], cases: list) -> dict[str, int]:
+    """Cases whose result differed between runs: passed N, failed M.
+
+    Only cases with `0 < failures < len(runs)` are flaky. A case that failed
+    every run is a real failure, and one that passed every run is fine - the
+    interesting population is the one a single run cannot classify.
+    """
+    failures: dict[str, int] = {}
+    for report in runs:
+        for result in report.results:
+            if not result.passed:
+                failures[result.case_id] = failures.get(result.case_id, 0) + 1
+    total = len(runs)
+    return {cid: n for cid, n in sorted(failures.items()) if 0 < n < total}
+
+
+def _write_report(
+    report: EvalReport,
+    *,
+    tenant_id: uuid.UUID,
+    elapsed: float,
+    samples: int = 1,
+    flaky: dict[str, int] | None = None,
+) -> None:
     """Serialize in the shape `release_check._report_from_artifact` reads.
 
     The per-case results are kept as well: the aggregate is what the gate
@@ -304,6 +327,10 @@ def _write_report(report: EvalReport, *, tenant_id: uuid.UUID, elapsed: float) -
             "embedding_model": get_settings().llm_embedding_model,
             "retrieval": "hybrid_search (real ACL + status filters)",
             "note": "real tenant corpus, real embeddings, live model",
+            "samples": samples,
+            # ADR 0005: the model is stochastic, so a single run cannot tell a
+            # fixed case from a lucky one. Reported, never gated.
+            "flaky_cases": flaky or {},
         },
         "results": [asdict(r) for r in report.results],
     }
@@ -314,6 +341,14 @@ async def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--keep-tenant", action="store_true", help="do not clean up")
     parser.add_argument("--limit", type=int, default=0, help="run only the first N cases")
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=1,
+        help="run the case set this many times and report flakiness. The model is "
+        "stochastic, so one run cannot tell a fixed case from a lucky one; ADR 0005 "
+        "records a P0 gate that flips with sampling, and this measures it.",
+    )
     args = parser.parse_args(argv)
 
     if not get_settings().llm_api_key:
@@ -368,11 +403,24 @@ async def main(argv: list[str] | None = None) -> int:
         cases = all_cases()
         if args.limit:
             cases = cases[: args.limit]
-        print(f"running {len(cases)} cases against {get_settings().llm_model}…")
-        report = await EvaluationRunner(answer, retrieve).run(cases)
+        samples = max(1, args.samples)
+        repeat = f" x{samples} samples" if samples > 1 else ""
+        print(f"running {len(cases)} cases against {get_settings().llm_model}{repeat}…")
+
+        report: EvalReport | None = None
+        runs: list[EvalReport] = []
+        for sample_index in range(samples):
+            if samples > 1:
+                print(f"  sample {sample_index + 1}/{samples}…")
+            report = await EvaluationRunner(answer, retrieve).run(cases)
+            runs.append(report)
+
+        assert report is not None
+
+        flaky = _flake_summary(runs, cases)
 
         elapsed = time.monotonic() - started
-        _write_report(report, tenant_id=tenant_id, elapsed=elapsed)
+        _write_report(report, tenant_id=tenant_id, elapsed=elapsed, samples=samples, flaky=flaky)
         print(
             f"\n{report.passed}/{report.total} passed, "
             f"citation_violations={report.citation_violations}, "
@@ -384,6 +432,13 @@ async def main(argv: list[str] | None = None) -> int:
         for result in report.results:
             if not result.passed:
                 print(f"  FAILED {result.case_id}: {result.reason_codes}")
+        if samples > 1:
+            if flaky:
+                print(f"\nflaky ({samples} samples) - passed some runs, failed others:")
+                for case_id, failures in sorted(flaky.items(), key=lambda kv: -kv[1]):
+                    print(f"  {case_id}: failed {failures} of {samples}")
+            else:
+                print(f"\nno flakiness: every case gave the same result across {samples} samples")
         return 0
     finally:
         if tenant_id is not None and not args.keep_tenant:
