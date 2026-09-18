@@ -72,7 +72,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # no
 
 from platform_core.agent_runtime.generator import LlmAnswerGenerator  # noqa: E402
 from platform_core.config import get_settings  # noqa: E402
-from platform_core.evaluation.runner import EvalReport, EvaluationRunner  # noqa: E402
+from platform_core.evaluation.runner import CaseResult, EvalReport, EvaluationRunner  # noqa: E402
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant  # noqa: E402
 from platform_core.knowledge import service as knowledge  # noqa: E402
 from platform_core.llm.gitee_ai import GiteeAiClient  # noqa: E402
@@ -272,6 +272,11 @@ async def _cleanup(platform, *, tenant_id: uuid.UUID, slug: str) -> None:
         await s.commit()
 
 
+def _claim_text(result: CaseResult, claim_index: int) -> str:
+    """The flagged claim's own sentence, so a candidate can be judged by eye."""
+    return result.claim_texts.get(claim_index, "<no per-claim text recorded>")
+
+
 def _flake_summary(runs: list[EvalReport], cases: list) -> dict[str, int]:
     """Cases whose result differed between runs: passed N, failed M.
 
@@ -414,6 +419,25 @@ async def main(argv: list[str] | None = None) -> int:
                 print(f"  sample {sample_index + 1}/{samples}…")
             report = await EvaluationRunner(answer, retrieve).run(cases)
             runs.append(report)
+            if samples > 1:
+                # Printed per sample, not just for the last one: the question
+                # ADR 0005 asks is whether the metric fires on the run where
+                # the model actually contradicted itself, and that run may not
+                # be the last.
+                contradicted = []
+                for r in report.results:
+                    if not r.contradicted_claims:
+                        continue
+                    texts = "; ".join(_claim_text(r, i) for i in r.contradicted_claims)
+                    contradicted.append(f"{r.case_id}: {texts}")
+                forbidden = [r.case_id for r in report.results if r.forbidden_hit]
+                print(f"      passed {report.passed}/{report.total}")
+                if forbidden:
+                    print(f"      forbidden claims: {forbidden}")
+                if contradicted:
+                    print(f"      contradiction candidates: {contradicted}")
+                else:
+                    print("      contradiction candidates: none")
 
         assert report is not None
 

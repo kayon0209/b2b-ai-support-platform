@@ -76,6 +76,10 @@ class CaseResult:
     # reported and never enforced. It exists so its precision can be measured
     # on the dataset before it is ever promoted to a guard.
     contradicted_claims: list[int] = field(default_factory=list)
+    # claim_index -> that claim's sentence, so a reported candidate can be
+    # judged by eye instead of re-run. Stored rather than inferred: the whole
+    # point is to be able to say which sentence the rule objected to.
+    claim_texts: dict[int, str] = field(default_factory=dict)
     forbidden_hit: bool = False
     required_missing: bool = False
     latency_ms: int = 0
@@ -155,6 +159,7 @@ class EvaluationRunner:
             # that contradicts its excerpt is worth seeing even when it cites
             # something real, which is the case validation cannot see.
             result.contradicted_claims = claim_contradiction_candidates(draft, evidence)
+            result.claim_texts = dict(draft.claim_texts)
             if not validation.ok:
                 result.passed = False
                 result.reason_codes.append(validation.reason_code)

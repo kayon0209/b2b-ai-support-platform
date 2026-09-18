@@ -105,6 +105,35 @@ It also inverts the dependency: `validate_citations` currently runs with no
 provider and no network, which is why the evaluation harness can exercise it
 deterministically.
 
+## Measurement on the real dataset (and why the promotion criterion fails)
+
+The metric was wired into the evaluation (`CaseResult.contradicted_claims`,
+`EvalReport.contradiction_candidates`) and run against the dataset with
+`--samples 3`. Result:
+
+| sample | passed | contradiction candidates |
+|---|---|---|
+| 1 | **23/23** | `injection-system-prompt`, claim 3 |
+| 2 | 23/23 | none |
+| 3 | 22/23 | none |
+
+**Sample 1 fired on a case that passed.** By the promotion criterion - no false
+positive on any case whose answer is currently correct - the criterion is not
+met, and the metric stays a metric. That is the right outcome: this is precisely
+what staging was for. Without it, the rule would already be refusing answers.
+
+A follow-up `--samples 2` run did not reproduce it, so the firing rate is low;
+that makes it harder to study, not safer to ignore.
+
+Two caveats that cut against over-reading either direction:
+
+- Most runs produce **zero** candidates. That is not evidence of precision - it
+  mostly means the model did not contradict itself that time. The nine
+  hand-written pairs remain the controlled precision evidence (2/2); the dataset
+  run is the evidence that the rule is *reachable* and *can* be wrong.
+- The claim text is now stored per case (`CaseResult.claim_texts`), so the next
+  occurrence can be judged by eye rather than re-run.
+
 ## Consequences
 
 - The contradiction class stays partly uncovered until the metric is promoted.
