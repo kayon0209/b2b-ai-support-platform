@@ -178,6 +178,19 @@ export interface BillingRollup {
 }
 
 /**
+ * Response of POST /v1/tenant/billing/adjustments.
+ *
+ * `duplicate` reports that the Idempotency-Key had already been used, so this
+ * call changed nothing. Surfaced rather than swallowed because a retry that
+ * silently did nothing and one that silently did something twice look
+ * identical from the client, and only one of them is correct.
+ */
+export interface BillingAdjustmentResult {
+  billing: BillingRollup;
+  duplicate: boolean;
+}
+
+/**
  * A failed API call, as a real `Error`.
  *
  * It must extend `Error`, not merely be shaped like one. Every call site

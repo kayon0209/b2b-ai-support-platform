@@ -20,6 +20,7 @@ from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.config import get_settings
@@ -187,6 +188,38 @@ def require_write_idempotency(request: Request, action: Action) -> JSONResponse 
     )
 
 
+def _bind_tenant_on_every_transaction(session: AsyncSession, ctx: TenantContext) -> None:
+    """Re-apply the RLS binding whenever a new transaction begins.
+
+    `set_config('app.tenant_id', ..., true)` is **transaction-scoped**: it does
+    not survive a `COMMIT`. A handler that commits mid-request - which every
+    write handler does, so the row is durable before it is reported - therefore
+    loses the binding, and every subsequent read returns **zero rows with no
+    error**. The failure is indistinguishable from "this tenant has no data",
+    which is why it is worth removing structurally rather than remembering.
+
+    Two handlers had already been written the broken way:
+
+    - `PUT /v1/tenant/quota` committed the new quota and then read the usage
+      snapshot, so the response reported zero consumption for a tenant that
+      had some;
+    - `POST /v1/tenant/billing/adjustments` committed the correction and then
+      read the rollup, reporting an empty ledger.
+
+    Binding at `after_begin` fixes both and every future call site, instead of
+    asking each author to re-apply it after each commit - a rule that has
+    already been forgotten twice.
+    """
+    tenant_id = str(ctx.tenant_id)
+
+    @event.listens_for(session.sync_session, "after_begin")
+    def _rebind(_session: object, _transaction: object, connection: object) -> None:
+        connection.execute(  # type: ignore[attr-defined]
+            text("SELECT set_config('app.tenant_id', :tid, true)"),
+            {"tid": tenant_id},
+        )
+
+
 @asynccontextmanager
 async def tenant_session(ctx: TenantContext) -> AsyncIterator[AsyncSession]:
     """Session bound to the non-bypass app role with RLS applied.
@@ -195,10 +228,18 @@ async def tenant_session(ctx: TenantContext) -> AsyncIterator[AsyncSession]:
     so request handling always connects as `platform_app`. The tenant is
     bound per transaction as additional defence on top of the query
     filters.
+
+    The binding is re-applied at the start of every transaction, not once per
+    session, so a handler that commits mid-request keeps it - see
+    `_bind_tenant_on_every_transaction`.
     """
     settings = get_settings()
     app_url = _app_role_url(settings.database_url)
     async with session_scope_with_url(app_url) as session:
+        _bind_tenant_on_every_transaction(session, ctx)
+        # Bind before the caller's first statement. `apply_rls_tenant` opens a
+        # transaction, which the listener above has already covered, so this is
+        # belt-and-braces for a session handed out with no transaction yet.
         await apply_rls_tenant(session, ctx)
         yield session
 

@@ -587,3 +587,31 @@ def test_read_tool_outcomes_are_tenant_scoped(read_tool: str) -> None:
     b = _run(_read_tools(TENANT_B))
     assert (a.succeeded, a.failed) == (1, 0)
     assert (b.succeeded, b.failed) == (0, 1)
+
+
+def test_the_release_check_caller_sees_real_read_tool_telemetry(read_tool: str) -> None:
+    """The regression the aggregation tests could not catch.
+
+    `aggregate_read_tool_outcomes` is exercised above with the tenant bound by
+    the test helper itself. The only *real* caller - `release_check` - did not
+    bind it, and `tool_executions` is FORCE RLS, so that path read zero rows
+    with no error: the read-tool release gate could never pass, for a reason
+    that had nothing to do with read tools.
+
+    Measured against the live database, with a row committed in the same
+    transaction: `unbound_rows=0`, `bound_rows=1`.
+
+    So this test goes through the caller, not the function. It is the
+    difference between "the aggregation works" and "anything reaches it".
+    """
+    from platform_core.evaluation.release_check import _read_tool_outcomes
+
+    _insert_execution(tenant=TENANT_A, tool_id=read_tool, status="verified")
+
+    outcome = _run(_read_tool_outcomes(TENANT_A))
+    assert outcome is not None
+    assert outcome.succeeded == 1, (
+        "the caller must bind app.tenant_id before reading a FORCE-RLS table; "
+        "without it RLS returns zero rows and reports them as 'no telemetry'"
+    )
+    assert outcome.counted == 1

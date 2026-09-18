@@ -35,11 +35,10 @@ from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from platform_core.api import error_response, require_write_idempotency
+from platform_core.api import error_response, require_write_idempotency, tenant_session
 from platform_core.config import get_settings
-from platform_core.db import session_scope_with_url
 from platform_core.identity import tenant_context
-from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
+from platform_core.identity.tenant_context import TenantContext
 from platform_core.knowledge import service
 from platform_policy import Action, Decision, PolicyEngine, Principal
 
@@ -89,11 +88,6 @@ def _gate(request: Request, ctx: TenantContext, action: Action, name: str) -> JS
     if decision.decision != Decision.ALLOW.value:
         return _denied(name, decision.reason_code)
     return require_write_idempotency(request, action)
-
-
-def _app_url() -> str:
-    settings = get_settings()
-    return settings.database_url.replace("platform:platform@", "platform_app:platform_app@")
 
 
 # Status per error code. A malformed id, a foreign id, and a nonexistent id all
@@ -176,8 +170,7 @@ async def upload_document(
 
     data = await file.read()
     try:
-        async with session_scope_with_url(_app_url()) as session:
-            await apply_rls_tenant(session, ctx)
+        async with tenant_session(ctx) as session:
             created = await service.create_document(
                 session,
                 tenant_id=ctx.tenant_id,
@@ -231,8 +224,7 @@ async def list_document_versions(request: Request, document_id: str) -> Any:
     except service.KnowledgeError as exc:
         return _error(exc)
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         rows = await service.list_versions(session, tenant_id=ctx.tenant_id, document_id=doc_uuid)
         if not rows:
             # No versions means either no such document or one owned by another
@@ -253,8 +245,7 @@ async def get_version(request: Request, version_id: str) -> Any:
     except service.KnowledgeError as exc:
         return _error(exc)
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await service.get_version(session, tenant_id=ctx.tenant_id, version_id=vid)
         except service.KnowledgeError as exc:
@@ -284,8 +275,7 @@ async def mark_version_ready(request: Request, version_id: str, body: ReadyIn | 
     except service.KnowledgeError as exc:
         return _error(exc)
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await service.mark_ready(session, tenant_id=ctx.tenant_id, version_id=vid)
         except service.KnowledgeError as exc:
@@ -334,8 +324,7 @@ async def create_download_url(
         expires_seconds if expires_seconds is not None else (body.expires_seconds if body else 300)
     )
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             key, url = await service.authorize_download(
                 session,

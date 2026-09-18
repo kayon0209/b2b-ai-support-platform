@@ -50,6 +50,24 @@ class QuotaIn(BaseModel):
     monthly_run_quota: int | None = Field(default=None, ge=0)
 
 
+class AdjustmentIn(BaseModel):
+    """A correction against the billing ledger.
+
+    The deltas are signed at this boundary and stored unsigned with
+    `entry_kind='adjustment'`, because a negative token column would make
+    "how much did we consume" unanswerable. A negative delta is therefore a
+    credit and a positive one an extra charge.
+    """
+
+    run_id: uuid.UUID
+    prompt_tokens_delta: int = 0
+    completion_tokens_delta: int = 0
+    reason: str = Field(default="", max_length=500)
+
+    def is_empty(self) -> bool:
+        return self.prompt_tokens_delta == 0 and self.completion_tokens_delta == 0
+
+
 @dataclass(frozen=True)
 class UsageSnapshot:
     period_start: int
@@ -217,6 +235,81 @@ async def set_quota(request: Request, body: QuotaIn) -> Any:
         snapshot = await usage_snapshot(session, tenant_id=ctx.tenant_id)
 
     return ok_response({"usage": snapshot.as_dict()}, trace_id=trace_id)
+
+
+@router.post("/billing/adjustments")
+async def record_billing_adjustment(request: Request, body: AdjustmentIn) -> Any:
+    """Correct a tenant's billed consumption.
+
+    The ledger is append-only (the app role holds no UPDATE or DELETE), so a
+    correction is a **new** row rather than an edit. That is the whole point:
+    the record of what a customer consumed cannot be quietly rewritten, and an
+    adjustment is visible as an adjustment.
+
+    Reserved for `tenant_owner` (BILLING_ADJUST). Crediting an account is a
+    financial statement about a customer, not an administrative convenience.
+
+    Idempotent on the request's `Idempotency-Key`, which is required here even
+    though `record_adjustment` can key on the timestamp instead: a client
+    retry after a timeout must not credit or debit twice, and a timestamp key
+    cannot tell a retry from a deliberate second correction.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return _unresolved()
+
+    denied = require_policy(ctx, Action.BILLING_ADJUST)
+    if denied is not None:
+        return denied
+    missing_idem = require_write_idempotency(request, Action.BILLING_ADJUST)
+    if missing_idem is not None:
+        return missing_idem
+
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if body.is_empty():
+        # A zero adjustment would append a row that changes no total. Refuse
+        # rather than let the ledger accumulate entries that mean nothing.
+        return error_response(
+            "ADJUSTMENT_EMPTY",
+            "an adjustment must change at least one token count",
+            status_code=400,
+        )
+
+    from platform_core.billing import monthly_rollup, record_adjustment
+
+    trace_id = new_trace_id()
+    async with tenant_session(ctx) as session:
+        outcome = await record_adjustment(
+            session,
+            tenant_id=ctx.tenant_id,
+            run_id=body.run_id,
+            prompt_tokens_delta=body.prompt_tokens_delta,
+            completion_tokens_delta=body.completion_tokens_delta,
+            idempotency_key=idempotency_key,
+        )
+        # Audit only a write that happened. A redelivery is a no-op, and an
+        # audit row per retry would report activity that never occurred.
+        if not outcome.duplicate:
+            await audit_service.record(
+                session,
+                ctx=ctx,
+                action="billing.adjustment.recorded",
+                resource_type="billing_entry",
+                resource_id=outcome.entry_id,
+                after={
+                    "run_id": str(body.run_id),
+                    "prompt_tokens_delta": body.prompt_tokens_delta,
+                    "completion_tokens_delta": body.completion_tokens_delta,
+                    "reason": body.reason,
+                },
+                trace_id=trace_id,
+            )
+        await session.commit()
+        rollup = await monthly_rollup(session, tenant_id=ctx.tenant_id)
+
+    return ok_response(
+        {"billing": rollup.as_dict(), "duplicate": outcome.duplicate}, trace_id=trace_id
+    )
 
 
 __all__ = ["UsageSnapshot", "period_bounds", "router", "usage_snapshot"]

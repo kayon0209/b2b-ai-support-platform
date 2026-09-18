@@ -43,7 +43,6 @@ from platform_core.api import (
     tenant_session,
 )
 from platform_core.audit import service as audit_service
-from platform_core.config import get_settings
 from platform_core.db import session_scope_with_url
 from platform_core.identity import org
 from platform_core.identity.models import (
@@ -112,8 +111,16 @@ def _member_out(user: User, membership: Membership) -> MemberOut:
 
 
 def _app_role_url() -> str:
-    """Swap the bootstrap owner for the non-bypass application role."""
-    return get_settings().database_url.replace("platform:platform@", "platform_app:platform_app@")
+    """The non-bypass application role's URL.
+
+    Delegates to `db.app_role_url`, which is the single statement of which role
+    a request connects as. This module used to compute it independently, and so
+    did three others - five copies of the one expression whose duplication the
+    function's own docstring warns about.
+    """
+    from platform_core.db import app_role_url
+
+    return app_role_url()
 
 
 async def _list_members(session: AsyncSession, tenant_id: uuid.UUID) -> list[MemberOut]:

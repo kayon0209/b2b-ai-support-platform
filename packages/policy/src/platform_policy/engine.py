@@ -69,6 +69,14 @@ class Action(StrEnum):
     # CASE_READ, so it confers no access a role did not have - asserted in
     # the policy tests rather than left as an intention.
     COMPLIANCE_EXPORT = "compliance.export"
+    # Billing correction (migration 0031's ledger). Its own action rather than
+    # reusing TENANT_ADMIN: the ledger is append-only, so a correction is a
+    # permanent, auditable financial statement about what a customer consumed,
+    # and it must not be reachable by every role that happens to administer the
+    # tenant. `tenant_owner` holds it by construction (frozenset(Action)); no
+    # other role is granted it, so crediting an account stays with the party
+    # that owns the commercial relationship.
+    BILLING_ADJUST = "billing.adjust"
 
 
 # Role -> allowed actions (docs/security.md recommended roles).

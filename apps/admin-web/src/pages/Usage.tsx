@@ -1,8 +1,21 @@
 import { useState } from "react";
-import { apiGet, apiPut } from "../lib/api";
+import { apiGet, apiPost, apiPut } from "../lib/api";
+import { useAction } from "../lib/useAction";
 import { useAsync } from "../lib/useAsync";
-import { type BillingRollup, type UsageSnapshot } from "../lib/types";
-import { Badge, Card, ErrorBanner, PageHeader, Spinner, Stat } from "../components/ui";
+import {
+  type BillingAdjustmentResult,
+  type BillingRollup,
+  type UsageSnapshot,
+} from "../lib/types";
+import {
+  ActionFeedback,
+  Badge,
+  Card,
+  ErrorBanner,
+  PageHeader,
+  Spinner,
+  Stat,
+} from "../components/ui";
 import { dateFromEpochSeconds, int, pct } from "../lib/format";
 
 /**
@@ -26,6 +39,17 @@ export function Usage() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const action = useAction();
+
+  // Correction form. The ledger is append-only, so this is the only way to fix
+  // a billing error without a database console.
+  const [correcting, setCorrecting] = useState(false);
+  const [correction, setCorrection] = useState({
+    run_id: "",
+    prompt_tokens_delta: "",
+    completion_tokens_delta: "",
+    reason: "",
+  });
 
   const usage = useAsync<{ usage: UsageSnapshot }>(
     () => apiGet<{ usage: UsageSnapshot }>("/v1/tenant/usage"),
@@ -39,8 +63,49 @@ export function Usage() {
   const snapshot = usage.data?.usage;
   const ledger = billing.data?.billing;
   // 403 is a permission boundary, not a failure: the page is fine, this
-  // viewer may not read commercial data.
+  // viewer may not read commercial data. Adjusting is stricter still - only
+  // the tenant owner holds BILLING_ADJUST.
   const billingForbidden = billing.errorStatus === 403;
+
+  async function submitCorrection() {
+    const promptDelta = Number(correction.prompt_tokens_delta || "0");
+    const completionDelta = Number(correction.completion_tokens_delta || "0");
+    if (!Number.isInteger(promptDelta) || !Number.isInteger(completionDelta)) {
+      action.fail("Token deltas must be whole numbers.");
+      return;
+    }
+    if (promptDelta === 0 && completionDelta === 0) {
+      action.fail("A correction must change at least one token count.");
+      return;
+    }
+    const ok = await action.run(
+      async () => {
+        const result = await apiPost<BillingAdjustmentResult>(
+          "/v1/tenant/billing/adjustments",
+          {
+            run_id: correction.run_id.trim(),
+            prompt_tokens_delta: promptDelta,
+            completion_tokens_delta: completionDelta,
+            reason: correction.reason.trim(),
+          },
+          crypto.randomUUID(),
+        );
+        if (result.duplicate) {
+          // A duplicate means the key was reused, so nothing changed. Say so
+          // rather than reporting a success the ledger did not record.
+          throw new Error(
+            "This correction was already recorded (the request key was reused), so nothing changed.",
+          );
+        }
+      },
+      "Correction recorded.",
+    );
+    if (ok) {
+      setCorrecting(false);
+      setCorrection({ run_id: "", prompt_tokens_delta: "", completion_tokens_delta: "", reason: "" });
+      billing.reload();
+    }
+  }
 
   function startEdit() {
     setDraft(snapshot?.quota === null || snapshot?.quota === undefined ? "" : String(snapshot.quota));
@@ -120,6 +185,7 @@ export function Usage() {
 
       {usage.error ? <ErrorBanner message={usage.error} onRetry={usage.reload} /> : null}
       {saveError ? <ErrorBanner message={saveError} onRetry={save} /> : null}
+      <ActionFeedback error={action.error} notice={action.notice} />
       {notice ? <div className="banner banner-ok">{notice}</div> : null}
 
       {usage.loading && !snapshot ? <Spinner label="Loading usage…" /> : null}
@@ -233,6 +299,59 @@ export function Usage() {
               adjustment entry, never an edit — which is why adjustments can differ from the live
               run count above.
             </p>
+
+            {correcting ? (
+              <div className="toolbar">
+                <input
+                  className="text-input"
+                  value={correction.run_id}
+                  onChange={(e) => setCorrection({ ...correction, run_id: e.target.value })}
+                  placeholder="run id (uuid)"
+                  aria-label="Run id"
+                />
+                <input
+                  className="text-input"
+                  inputMode="numeric"
+                  value={correction.prompt_tokens_delta}
+                  onChange={(e) =>
+                    setCorrection({ ...correction, prompt_tokens_delta: e.target.value })
+                  }
+                  placeholder="prompt tokens (e.g. -200)"
+                  aria-label="Prompt tokens delta"
+                />
+                <input
+                  className="text-input"
+                  inputMode="numeric"
+                  value={correction.completion_tokens_delta}
+                  onChange={(e) =>
+                    setCorrection({ ...correction, completion_tokens_delta: e.target.value })
+                  }
+                  placeholder="completion tokens"
+                  aria-label="Completion tokens delta"
+                />
+                <input
+                  className="text-input"
+                  value={correction.reason}
+                  onChange={(e) => setCorrection({ ...correction, reason: e.target.value })}
+                  placeholder="reason (recorded in the audit trail)"
+                  aria-label="Reason"
+                />
+                <button className="btn btn-primary" onClick={submitCorrection} disabled={action.busy}>
+                  {action.busy ? "Recording…" : "Record correction"}
+                </button>
+                <button
+                  className="btn"
+                  onClick={() => setCorrecting(false)}
+                  disabled={action.busy}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button className="btn" onClick={() => setCorrecting(true)} disabled={billingForbidden}>
+                Record a correction
+              </button>
+            )}
           </>
         ) : null}
       </Card>

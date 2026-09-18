@@ -27,11 +27,13 @@ from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from platform_core.api import error_response, require_write_idempotency
-from platform_core.config import get_settings
-from platform_core.db import session_scope_with_url
+from platform_core.api import (
+    error_response,
+    require_write_idempotency,
+    tenant_session,
+)
 from platform_core.identity import tenant_context
-from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
+from platform_core.identity.tenant_context import TenantContext
 from platform_core.knowledge import flag_service
 from platform_policy import Action, Decision, PolicyEngine, Principal
 
@@ -104,11 +106,6 @@ def _gate(request: Request, ctx: TenantContext, action: Action, name: str) -> JS
     return require_write_idempotency(request, action)
 
 
-def _app_url() -> str:
-    settings = get_settings()
-    return settings.database_url.replace("platform:platform@", "platform_app:platform_app@")
-
-
 def _flag_out(row: Any) -> dict[str, Any]:
     return {
         "key": row.key,
@@ -135,8 +132,7 @@ async def list_feature_flags(request: Request) -> Any:
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         rows = await flag_service.list_flags(session, tenant_id=ctx.tenant_id)
         return {"items": [_flag_out(r) for r in rows], "total": len(rows)}
 
@@ -158,8 +154,7 @@ async def evaluate_feature_flag(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         decision = await flag_service.evaluate(
             session, flag_key=key, tenant_id=ctx.tenant_id, default=default
         )
@@ -183,8 +178,7 @@ async def preview_feature_flag(
             flag_service.FlagError("INVALID_PERCENT", "rollout must be between 0 and 100")
         )
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         rows = await flag_service.rollout_preview(
             session, tenant_id=ctx.tenant_id, key=key, percents=percents
         )
@@ -201,8 +195,7 @@ async def define_feature_flag(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await flag_service.define_flag(
                 session, ctx=ctx, key=payload.key, description=payload.description
@@ -224,8 +217,7 @@ async def set_feature_flag_rollout(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await flag_service.set_rollout(
                 session, ctx=ctx, key=key, rollout_percent=payload.rollout_percent
@@ -247,8 +239,7 @@ async def set_feature_flag_enabled(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await flag_service.set_enabled(session, ctx=ctx, key=key, enabled=payload.enabled)
         except flag_service.FlagError as exc:
@@ -273,8 +264,7 @@ async def target_feature_flag(
     except flag_service.FlagError as exc:
         return _flag_error(exc)
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await flag_service.target_tenant(
                 session,

@@ -41,11 +41,13 @@ from platform_core.agent_runtime.prompt_release import (
     rollback,
     submit_candidate,
 )
-from platform_core.api import error_response, require_write_idempotency
-from platform_core.config import get_settings
-from platform_core.db import session_scope_with_url
+from platform_core.api import (
+    error_response,
+    require_write_idempotency,
+    tenant_session,
+)
 from platform_core.identity import tenant_context
-from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
+from platform_core.identity.tenant_context import TenantContext
 from platform_policy import Action, Decision, PolicyEngine, Principal
 
 router = APIRouter(prefix="/v1/prompts", tags=["prompts"])
@@ -149,11 +151,6 @@ def _gate(request: Request, ctx: TenantContext, action: Action, name: str) -> JS
     return require_write_idempotency(request, action)
 
 
-def _app_url() -> str:
-    settings = get_settings()
-    return settings.database_url.replace("platform:platform@", "platform_app:platform_app@")
-
-
 def _to_evidence(payload: EvidenceIn | None) -> EvaluationEvidence | None:
     if payload is None:
         return None
@@ -216,8 +213,7 @@ async def list_prompt_versions(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         rows = await list_versions(session, tenant_id=ctx.tenant_id, template_name=template_name)
         return {"items": [_version_out(r) for r in rows], "total": len(rows)}
 
@@ -232,8 +228,7 @@ async def get_active_prompt(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         row = await get_active(session, tenant_id=ctx.tenant_id, template_name=template_name)
         if row is None:
             return {"active": None, "template_name": template_name}
@@ -250,8 +245,7 @@ async def create_prompt_draft(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await create_draft(
                 session,
@@ -273,8 +267,7 @@ async def submit_prompt_candidate(request: Request, version_id: str) -> Any:
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await submit_candidate(session, ctx=ctx, version_id=_uuid(version_id))
         except ReleaseError as exc:
@@ -298,8 +291,7 @@ async def promote_prompt_version(
     if evidence is not None:
         evidence = _mark_p0(evidence)
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await promote(session, ctx=ctx, version_id=_uuid(version_id), evidence=evidence)
         except ReleaseError as exc:
@@ -319,8 +311,7 @@ async def reject_prompt_version(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await reject(
                 session, ctx=ctx, version_id=_uuid(version_id), reason=payload.reason
@@ -341,8 +332,7 @@ async def rollback_prompt_version(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await rollback(
                 session,

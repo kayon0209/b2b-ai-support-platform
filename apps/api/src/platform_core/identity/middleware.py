@@ -192,12 +192,19 @@ async def resolve_membership(tenant_slug: str, user_id: uuid.UUID) -> TenantCont
 
 
 def _app_database_url(database_url: str) -> str:
-    """Swap the bootstrap superuser for the non-bypass application role.
+    """The non-bypass application role's URL.
 
-    The bootstrap owner is a superuser and would silently bypass RLS, so
-    every request-path read uses the RLS-bound role.
+    Delegates to `db.app_role_url`, which is the single statement of which role
+    a request connects as. This module used to compute it independently - and so
+    did four others - which is exactly the duplication that function's own
+    docstring warns about ("a second copy is how one of them ends up pointing at
+    the owner"). `database_url` is accepted and ignored to keep the call sites
+    readable; the settings value is authoritative.
     """
-    return database_url.replace("platform:platform@", "platform_app:platform_app@")
+    del database_url
+    from platform_core.db import app_role_url
+
+    return app_role_url()
 
 
 # --- Authentication strategy selection ------------------------------------

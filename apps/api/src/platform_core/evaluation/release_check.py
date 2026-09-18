@@ -95,20 +95,36 @@ def _empty_report(reason: str) -> EvalReport:
 
 
 async def _read_tool_outcomes(tenant_id: str | None) -> ReadToolOutcome | None:
-    from platform_core.config import get_settings
-    from platform_core.db import session_scope_with_url
+    """Read-tool success for one tenant, from real executions.
 
-    settings = get_settings()
-    url = settings.database_url.replace("platform:platform@", "platform_app:platform_app@")
-    if tenant_id is None:
-        return None
+    **The tenant must be bound before the query.** `tool_executions` is FORCE
+    RLS, so an unbound `platform_app` read returns zero rows with no error -
+    measured, with a row committed in the same transaction: `unbound_rows=0`,
+    `bound_rows=1`. Without the binding this function could never observe any
+    telemetry, so the read-tool gate failed on every run for a reason that had
+    nothing to do with read tools.
+
+    The function it calls was never the problem: its integration tests bind the
+    tenant themselves, so it is tested under conditions this caller never
+    provided. That gap is the whole defect - the test proved the aggregation
+    works, not that anything reaches it.
+    """
     import uuid as _uuid
 
+    from platform_core.db import app_role_url, session_scope_with_url
     from platform_core.evaluation.metrics import aggregate_read_tool_outcomes
+    from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
 
-    async with session_scope_with_url(url) as session:
+    if tenant_id is None:
+        return None
+    tid = _uuid.UUID(tenant_id)
+
+    async with session_scope_with_url(app_role_url()) as session:
+        await apply_rls_tenant(
+            session, TenantContext(tenant_id=tid, actor_id=None, actor_kind="system")
+        )
         return await aggregate_read_tool_outcomes(
-            session, tenant_id=_uuid.UUID(tenant_id), window_seconds=7 * 24 * 3600
+            session, tenant_id=tid, window_seconds=7 * 24 * 3600
         )
 
 

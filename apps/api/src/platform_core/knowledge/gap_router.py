@@ -32,11 +32,13 @@ from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from platform_core.api import error_response, require_write_idempotency
-from platform_core.config import get_settings
-from platform_core.db import session_scope_with_url
+from platform_core.api import (
+    error_response,
+    require_write_idempotency,
+    tenant_session,
+)
 from platform_core.identity import tenant_context
-from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
+from platform_core.identity.tenant_context import TenantContext
 from platform_core.knowledge import gap_service
 from platform_core.knowledge.gap_models import GapStatus
 from platform_policy import Action, Decision, PolicyEngine, Principal
@@ -116,11 +118,6 @@ def _gate(request: Request, ctx: TenantContext, action: Action, name: str) -> JS
     return require_write_idempotency(request, action)
 
 
-def _app_url() -> str:
-    settings = get_settings()
-    return settings.database_url.replace("platform:platform@", "platform_app:platform_app@")
-
-
 def _uuid(raw: str, what: str) -> uuid.UUID:
     """Parse a path id, mapping malformed input to a gap error.
 
@@ -189,8 +186,7 @@ async def list_knowledge_gaps(
             )
         )
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         rows, total = await gap_service.list_gaps(
             session,
             tenant_id=ctx.tenant_id,
@@ -208,8 +204,7 @@ async def get_gap_stats(request: Request) -> Any:
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         return await gap_service.gap_stats(session, tenant_id=ctx.tenant_id)
 
 
@@ -224,8 +219,7 @@ async def list_knowledge_drafts(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         rows = await gap_service.list_drafts(
             session, tenant_id=ctx.tenant_id, status=status, limit=limit
         )
@@ -239,8 +233,7 @@ async def acknowledge_gap(request: Request, gap_id: str) -> Any:
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await gap_service.acknowledge(
                 session, ctx=ctx, gap_id=_uuid(gap_id, "knowledge gap")
@@ -262,8 +255,7 @@ async def dismiss_gap(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await gap_service.dismiss(
                 session,
@@ -288,8 +280,7 @@ async def create_gap_draft(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await gap_service.create_draft(
                 session,
@@ -320,8 +311,7 @@ async def review_gap_draft(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             row = await gap_service.review_draft(
                 session,
@@ -347,8 +337,7 @@ async def publish_gap_draft(
     if denial is not None:
         return denial
 
-    async with session_scope_with_url(_app_url()) as session:
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         try:
             version = await gap_service.publish_draft(
                 session,

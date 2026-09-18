@@ -14,12 +14,10 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_core.api import error_response
+from platform_core.api import error_response, tenant_session
 from platform_core.audit.models import AuditEvent
-from platform_core.config import get_settings
-from platform_core.db import session_scope_with_url
 from platform_core.identity import tenant_context
-from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
+from platform_core.identity.tenant_context import TenantContext
 from platform_policy import Action, Decision, PolicyEngine, Principal
 
 router = APIRouter(prefix="/v1/audit-events", tags=["audit"])
@@ -97,11 +95,7 @@ async def list_audit_events(
             status_code=403,
         )
 
-    settings = get_settings()
-    app_url = settings.database_url.replace("platform:platform@", "platform_app:platform_app@")
-    async with session_scope_with_url(app_url) as session:
-        # Policy gate 2: RLS tenant binding.
-        await apply_rls_tenant(session, ctx)
+    async with tenant_session(ctx) as session:
         rows, total = await _query_events(
             session,
             limit=limit,

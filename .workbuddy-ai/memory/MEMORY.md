@@ -76,7 +76,16 @@ like a pipeline bug. **Never leave probe rows in the database.**
 
 - **`set_config('app.tenant_id', ..., true)` is transaction-scoped** — it does
   not survive `COMMIT`. Re-apply after a commit or RLS returns zero rows →
-  `NoResultFound`, indistinguishable from "never written".
+  `NoResultFound`, indistinguishable from "never written". **`tenant_session`
+  now rebinds on `after_begin`**, so a handler that commits mid-request keeps
+  the binding; that is the fix, not a rule to remember. Every tenant-scoped
+  handler must use `tenant_session(ctx)` — 22 sites used to open
+  `session_scope_with_url(...)` + `apply_rls_tenant(...)` by hand and none of
+  them rebound.
+- **`db.app_role_url()` is the only place the app-role URL is computed.** Five
+  modules used to derive it independently, including the auth middleware and
+  the worker wiring. Its docstring: *"a second copy is how one of them ends up
+  pointing at the owner."*
 - **A failed flush poisons the session.** `await session.rollback()` before
   raising, or the router's `commit()` raises `PendingRollbackError` and a
   clean 409 becomes a 500. `begin_nested()` does **not** help. Prefer
@@ -188,6 +197,12 @@ real one before trusting the constant.
 
 `scripts/run_eval.py` is what found it - and is the only thing that can, because
 it is the only path that runs the real pipeline end to end.
+
+**The same shape, once more, in the read-tool gate**: its integration tests
+bound `app.tenant_id` in the test helper, but the only real caller never did.
+The function was tested under conditions the caller never provided, so it read
+zero rows forever. **Test the caller, not just the function** - "the
+aggregation works" and "anything reaches it" are different claims.
 
 ## Release gates
 

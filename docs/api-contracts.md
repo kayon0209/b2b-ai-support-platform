@@ -213,8 +213,10 @@ http(s), because the admin UI renders both.
 ## Tenant usage and quota
 
 ```text
-GET /v1/tenant/usage
-PUT /v1/tenant/quota
+GET  /v1/tenant/usage
+PUT  /v1/tenant/quota
+GET  /v1/tenant/billing
+POST /v1/tenant/billing/adjustments
 ```
 
 ```json
@@ -242,6 +244,53 @@ like "no answer". Setting the quota requires `tenant.admin` and an
 Completing a run emits the outbound event `usage.recorded`
 (`aggregate_type: agent_run`) with the run id, route, status and token
 counts, written in the same transaction as the run's final state.
+
+### Billing ledger
+
+`GET /v1/tenant/billing` returns the month's ledger rollup, which is what an
+invoice is computed from. It is fed by the same `usage.recorded` event as the
+usage snapshot, but keyed on the event id so an outbox redelivery collapses
+instead of double-billing. Requires `audit.read`: commercial totals are not
+part of the support role.
+
+```json
+{
+  "billing": {
+    "period_start": 1780000000,
+    "period_end": 1782592000,
+    "entries": 43,
+    "usage_entries": 42,
+    "adjustment_entries": 1,
+    "prompt_tokens": 127800,
+    "completion_tokens": 9000,
+    "total_tokens": 136800
+  }
+}
+```
+
+The ledger is **append-only** — the application role holds `SELECT` and
+`INSERT` and no `UPDATE` or `DELETE` — so a correction is a new row, never an
+edit, and shows up as an `adjustment`:
+
+```text
+POST /v1/tenant/billing/adjustments
+Idempotency-Key: <uuid>
+
+{ "run_id": "...", "prompt_tokens_delta": -200,
+  "completion_tokens_delta": 0, "reason": "duplicate run" }
+```
+
+A negative delta credits, a positive one charges. Adjustments subtract in the
+rollup, and the total floors at zero so an over-applied correction is a
+visible data problem rather than negative consumption. Requires
+`billing.adjust`, held by `tenant_owner` only: crediting an account is a
+financial statement about a customer, not an administrative convenience.
+
+The `Idempotency-Key` is what makes a retry safe. A redelivery returns
+`{"duplicate": true}` and changes nothing — no second row and no second audit
+event — so a client that retried after a timeout cannot credit an account
+twice. An empty adjustment (both deltas zero) is refused with
+`400 ADJUSTMENT_EMPTY`.
 
 ## Outbound Chatwoot command
 

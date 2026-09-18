@@ -130,6 +130,27 @@ class TestQuota:
         assert resp.json()["usage"]["quota"] == 5
         assert resp.json()["usage"]["remaining"] == 5
 
+    def test_the_put_response_reports_real_usage_not_zero(self) -> None:
+        """The regression this handler had.
+
+        `set_config('app.tenant_id', ..., true)` is transaction-scoped, and the
+        handler commits the new quota before reading the snapshot. The read
+        after that commit was therefore unbound, and RLS returned **zero rows
+        with no error** - so the endpoint reported `runs_used: 0` for a tenant
+        that had consumed runs. `quota` and `remaining` come from the tenant
+        row and were still right, which is why asserting only those left the
+        bug invisible.
+        """
+        assert _queue_run(_client(TENANT, "support_admin")).status_code == 200
+
+        resp = _client(TENANT, "tenant_owner").put(
+            "/v1/tenant/quota", headers=_headers(str(uuid.uuid4())), json={"monthly_run_quota": 5}
+        )
+        assert resp.status_code == 200, resp.text
+        usage = resp.json()["usage"]
+        assert usage["runs_used"] == 1, "a committed run must still be visible after the commit"
+        assert usage["remaining"] == 4
+
     def test_non_admin_cannot_set_the_quota(self) -> None:
         resp = _client(TENANT, "support_agent").put(
             "/v1/tenant/quota", headers=_headers(str(uuid.uuid4())), json={"monthly_run_quota": 5}
@@ -271,3 +292,115 @@ def _period_start() -> int:
     from platform_core.identity.usage import period_bounds
 
     return period_bounds(_now())[0]
+
+
+class TestBillingAdjustment:
+    """`POST /v1/tenant/billing/adjustments` — correcting an append-only ledger.
+
+    The ledger grants the app role no UPDATE and no DELETE, so a correction is
+    a new row. That makes the endpoint the only way to fix a billing error
+    without a database console, and makes its idempotency load-bearing: a
+    retried correction that applied twice would misstate what a customer owes.
+    """
+
+    def _adjust(self, client: TestClient, *, key: str | None = None, **body: object) -> object:
+        payload = {"run_id": str(uuid.uuid4()), "prompt_tokens_delta": -50, **body}
+        headers = _headers(key if key is not None else str(uuid.uuid4()))
+        return client.post("/v1/tenant/billing/adjustments", headers=headers, json=payload)
+
+    def test_only_the_owner_may_adjust(self) -> None:
+        """BILLING_ADJUST, not TENANT_ADMIN. A support admin administers the
+        tenant; crediting an account is a financial statement about a
+        customer."""
+        resp = self._adjust(_client(TENANT, "support_admin"))
+        assert resp.status_code == 403, resp.text
+
+    def test_an_auditor_may_not_adjust_either(self) -> None:
+        """Reading the ledger and changing it are different capabilities."""
+        resp = self._adjust(_client(TENANT, "auditor"))
+        assert resp.status_code == 403, resp.text
+
+    def test_a_write_without_an_idempotency_key_is_refused(self) -> None:
+        resp = _client(TENANT, "tenant_owner").post(
+            "/v1/tenant/billing/adjustments",
+            headers=_headers(),
+            json={"run_id": str(uuid.uuid4()), "prompt_tokens_delta": -10},
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"]["code"] == "IDEMPOTENCY_KEY_REQUIRED"
+
+    def test_an_empty_adjustment_is_refused(self) -> None:
+        """A zero delta would append a row that changes no total."""
+        resp = self._adjust(_client(TENANT, "tenant_owner"), prompt_tokens_delta=0)
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"]["code"] == "ADJUSTMENT_EMPTY"
+
+    def test_a_credit_reduces_the_period_total(self) -> None:
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO billing_entries (id, tenant_id, event_id, run_id, "
+                    "entry_kind, route, run_status, prompt_tokens, completion_tokens, "
+                    "period_start, recorded_at) "
+                    "VALUES (:id, :t, :ev, :run, 'usage', '', '', 500, 0, :period, :ts)"
+                ),
+                {
+                    "id": str(uuid.uuid4()),
+                    "t": TENANT,
+                    "ev": str(uuid.uuid4()),
+                    "run": str(uuid.uuid4()),
+                    "period": _period_start(),
+                    "ts": _now(),
+                },
+            )
+        admin.dispose()
+
+        resp = self._adjust(_client(TENANT, "tenant_owner"), prompt_tokens_delta=-200)
+        assert resp.status_code == 200, resp.text
+        billing = resp.json()["billing"]
+        assert billing["usage_entries"] == 1
+        assert billing["adjustment_entries"] == 1
+        assert billing["prompt_tokens"] == 300, "500 consumed less a 200 credit"
+
+    def test_the_same_idempotency_key_does_not_credit_twice(self) -> None:
+        """The property that makes this safe to retry. Without it, a client
+        that retried after a timeout would credit the account twice."""
+        client = _client(TENANT, "tenant_owner")
+        key = str(uuid.uuid4())
+
+        first = self._adjust(client, key=key, prompt_tokens_delta=-100)
+        assert first.status_code == 200, first.text
+        assert first.json()["duplicate"] is False
+
+        second = self._adjust(client, key=key, prompt_tokens_delta=-100)
+        assert second.status_code == 200, second.text
+        assert second.json()["duplicate"] is True, "a redelivery must be a no-op"
+        assert second.json()["billing"]["adjustment_entries"] == 1
+
+    def test_a_redelivery_writes_no_second_audit_event(self) -> None:
+        """An audit trail that records a retry as an action reports activity
+        that never happened."""
+        client = _client(TENANT, "tenant_owner")
+        key = str(uuid.uuid4())
+        self._adjust(client, key=key)
+        self._adjust(client, key=key)
+
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            count = conn.execute(
+                text(
+                    "SELECT count(*) FROM audit_events WHERE tenant_id = :t "
+                    "AND action = 'billing.adjustment.recorded'"
+                ),
+                {"t": TENANT},
+            ).scalar()
+        admin.dispose()
+        assert count == 1
+
+    def test_a_different_key_is_a_second_correction(self) -> None:
+        """Two deliberate corrections are two rows; only a retry collapses."""
+        client = _client(TENANT, "tenant_owner")
+        self._adjust(client, key=str(uuid.uuid4()))
+        resp = self._adjust(client, key=str(uuid.uuid4()))
+        assert resp.json()["billing"]["adjustment_entries"] == 2

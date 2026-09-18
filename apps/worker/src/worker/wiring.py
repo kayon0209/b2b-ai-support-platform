@@ -192,12 +192,14 @@ def app_role_url() -> str:
     makes a missing `app.tenant_id` setting return zero rows instead of
     every tenant's rows.
 
-    Derived from the configured URL rather than a second setting so the two
-    can never disagree: a deployment that points `APP_DATABASE_URL` at its
-    own host does not also have to remember to update an app-role override.
+    Delegates to `db.app_role_url`, the single statement of which role a
+    session connects as. Re-derived here until now, which meant the API and the
+    workers each owned a copy of an expression whose duplication is precisely
+    how one of them ends up on the superuser.
     """
-    settings = get_settings()
-    return settings.database_url.replace("platform:platform@", "platform_app:platform_app@")
+    from platform_core.db import app_role_url as _app_role_url
+
+    return _app_role_url()
 
 
 def build_ingestion_deps(*, require_embedding: bool = True) -> IngestionDeps:
