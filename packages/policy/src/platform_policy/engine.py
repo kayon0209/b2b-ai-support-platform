@@ -61,6 +61,14 @@ class Action(StrEnum):
     # the Jira connection, and collapsing the two would grant exactly that.
     CONNECTOR_READ = "connector.read"
     CONNECTOR_ADMIN = "connector.admin"
+    # Compliance export (docs/development-plan.md Phase 5, "Retention and
+    # compliance controls"). Its own action because it is the one endpoint
+    # that returns an audit-log extract and case content together, and
+    # because an export endpoint is exactly where access quietly widens.
+    # Granted only to roles that already hold **both** AUDIT_READ and
+    # CASE_READ, so it confers no access a role did not have - asserted in
+    # the policy tests rather than left as an intention.
+    COMPLIANCE_EXPORT = "compliance.export"
 
 
 # Role -> allowed actions (docs/security.md recommended roles).
@@ -81,6 +89,9 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
             # Reads the connection inventory: a suspected credential leak is
             # investigated from here. Not CONNECTOR_ADMIN - security staff
             # audit the configuration, they do not change it.
+            # Compliance export: audit + case content, both of which this
+            # role already reads. No new reach, so no new grant.
+            Action.COMPLIANCE_EXPORT,
             Action.CONNECTOR_READ,
         }
     ),
@@ -126,7 +137,14 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
     "support_viewer": frozenset({Action.CASE_READ, Action.KNOWLEDGE_READ}),
     "integration_service": frozenset({Action.TOOL_READ, Action.TOOL_WRITE_LOW}),
     "auditor": frozenset(
-        {Action.AUDIT_READ, Action.CASE_READ, Action.PROMPT_READ, Action.FLAG_READ}
+        {
+            Action.AUDIT_READ,
+            Action.CASE_READ,
+            Action.PROMPT_READ,
+            Action.FLAG_READ,
+            # The auditor's whole purpose is to take a copy out for review.
+            Action.COMPLIANCE_EXPORT,
+        }
     ),
 }
 

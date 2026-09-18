@@ -60,6 +60,37 @@ _REDACTIONS = [
     (re.compile(r"\b\d{15,19}\b"), "***card***"),  # long digit runs
 ]
 
+REDACTED = "***"
+
+# A key whose *name* says it holds a credential.
+#
+# The patterns above redact a secret that appears **inside a string**
+# (`"api_token=xyz"`). A secret that arrives as a mapping value never does: the
+# name is the key, and the value is a bare token that matches nothing.
+#
+#     {"api_token": "lin_api_key_123"}   ->  before: unchanged, after: redacted
+#
+# So `redact_value` was a text redactor that happened to walk containers, and
+# a credential passed as a field sailed straight through. Found while wiring
+# readable metadata into the audit trail, where the caller passes exactly that
+# shape.
+#
+# `credential(?!_ref)` is deliberate: `credential_ref` is a secret-manager
+# *reference* (`vault://kv/crm/acme`), not a secret. Redacting it would hide
+# which reference was pointed somewhere, which is the question an audit of a
+# credential rotation is actually asking.
+_SENSITIVE_KEY = re.compile(
+    r"(?i)("
+    r"authorization"
+    r"|api[_-]?key|api[_-]?token"
+    r"|access[_-]?token|refresh[_-]?token"
+    r"|secret"
+    r"|password|passwd"
+    r"|credential(?!_ref)"
+    r"|private[_-]?key"
+    r")"
+)
+
 
 def redact_value(value: Any) -> Any:
     if isinstance(value, str):
@@ -67,7 +98,10 @@ def redact_value(value: Any) -> Any:
             value = pattern.sub(replacement, value)
         return value
     if isinstance(value, dict):
-        return {k: redact_value(v) for k, v in value.items()}
+        return {
+            k: REDACTED if isinstance(k, str) and _SENSITIVE_KEY.search(k) else redact_value(v)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
         return [redact_value(v) for v in value]
     return value

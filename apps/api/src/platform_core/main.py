@@ -33,6 +33,7 @@ from platform_core.agent_runtime.prompt_router import router as prompt_router
 from platform_core.agent_runtime.router import router as agent_runtime_router
 from platform_core.audit.router import router as audit_router
 from platform_core.cases.router import router as cases_router
+from platform_core.compliance.router import router as compliance_router
 from platform_core.config import Settings, get_settings
 from platform_core.evaluation.router import router as quality_router
 from platform_core.http_metrics import HttpMetricsMiddleware
@@ -85,6 +86,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="B2B AI Support Platform", version="0.1.0", lifespan=lifespan)
 app.include_router(support_bridge_router)
 app.include_router(audit_router)
+app.include_router(compliance_router)
 app.include_router(cases_router)
 app.include_router(retrieval_router)
 app.include_router(agent_runtime_router)

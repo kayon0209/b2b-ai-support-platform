@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from platform_core.cases.models import (
     DEFAULT_SLA,
     Case,
+    CaseEscalation,
     CaseStatus,
     check_transition,
     check_version,
@@ -189,3 +190,88 @@ class CaseService:
         status = CaseStatus(case.status)
         if status in DEFAULT_SLA.running_states and case.last_state_changed_at:
             case.elapsed_running_seconds += max(now - case.last_state_changed_at, 0)
+
+
+async def export_cases(
+    session: AsyncSession, *, tenant_id: uuid.UUID, since: int, until: int, limit: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """A bounded extract of this tenant's Cases and their escalation ledger.
+
+    Returns `(cases, escalations, truncated)`. Two lists rather than nested
+    objects: a compliance extract is read by a person or a spreadsheet, and a
+    flat ledger keyed by `case_id` is easier to check than a tree.
+
+    Opening the export window on `opened_at` rather than on the last update is
+    deliberate. "Show me everything from Q3" means Cases that *arose* in Q3; a
+    window on `last_state_changed_at` would hide a Case opened in Q2 and
+    resolved in Q3, which is exactly the one an auditor is looking for.
+    """
+    rows = (
+        await session.execute(
+            select(Case)
+            .where(
+                Case.tenant_id == tenant_id,
+                Case.opened_at >= since,
+                Case.opened_at <= until,
+            )
+            .order_by(Case.opened_at, Case.id)
+            .limit(limit + 1)
+        )
+    ).scalars()
+    cases = list(rows)
+    truncated = len(cases) > limit
+    cases = cases[:limit]
+
+    case_ids = [c.id for c in cases]
+    escalations: list[dict[str, Any]] = []
+    if case_ids:
+        escalation_rows = (
+            await session.execute(
+                select(CaseEscalation)
+                .where(
+                    CaseEscalation.tenant_id == tenant_id,
+                    CaseEscalation.case_id.in_(case_ids),
+                )
+                .order_by(CaseEscalation.escalated_at, CaseEscalation.id)
+            )
+        ).scalars()
+        escalations = [
+            {
+                "case_id": str(e.case_id),
+                "clock": e.clock,
+                "level": int(e.level),
+                "reason_code": e.reason_code,
+                "breach_seconds": int(e.breach_seconds),
+                "routed_to": e.team_ref,
+                "escalated_at": e.escalated_at,
+            }
+            for e in escalation_rows
+        ]
+
+    return (
+        [
+            {
+                "case_id": str(c.id),
+                "subject": c.subject,
+                "description": c.description,
+                "category": c.category,
+                "priority": c.priority,
+                "status": c.status,
+                "enterprise_account_id": (
+                    str(c.enterprise_account_id) if c.enterprise_account_id else None
+                ),
+                "sla_tier": c.sla_tier,
+                "assignee_ref": c.assignee_ref,
+                "team_ref": c.team_ref,
+                "opened_at": c.opened_at,
+                "first_response_due_at": c.first_response_due_at,
+                "resolution_due_at": c.resolution_due_at,
+                "first_responded_at": c.first_responded_at,
+                "resolved_at": c.resolved_at,
+                "closed_at": c.closed_at,
+            }
+            for c in cases
+        ],
+        escalations,
+        truncated,
+    )

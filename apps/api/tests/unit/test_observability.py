@@ -93,3 +93,54 @@ def test_allowlist_covers_core_pipeline_fields() -> None:
         "reason_code",
     ):
         assert field in ALLOWED_LOG_FIELDS
+
+
+# --- redaction is key-aware, not only text-aware ---------------------------
+#
+# The patterns above redact a secret that appears *inside a string*. A secret
+# that arrives as a mapping value never does - the name is the key, and the
+# value is a bare token - so before this, `redact_value` was a text redactor
+# that happened to walk containers and a credential passed as a field sailed
+# through. Found while wiring readable metadata into the audit trail, whose
+# caller passes exactly that shape.
+
+
+def test_a_credential_field_is_redacted_by_its_key() -> None:
+    assert redact_value({"api_token": "lin_api_key_123", "window": 60}) == {
+        "api_token": "***",
+        "window": 60,
+    }
+
+
+def test_a_credential_field_is_redacted_at_any_depth() -> None:
+    assert redact_value({"outer": {"client_secret": "xyz", "team": "eng"}}) == {
+        "outer": {"client_secret": "***", "team": "eng"}
+    }
+
+
+def test_shouty_environment_style_keys_are_redacted() -> None:
+    """Names come from both styles - JSON-ish (`api_token`) and environment-ish
+    (`APP_CHATWOOT_WEBHOOK_SECRET`)."""
+    assert redact_value({"APP_CHATWOOT_WEBHOOK_SECRET": "abc"}) == {
+        "APP_CHATWOOT_WEBHOOK_SECRET": "***"
+    }
+
+
+def test_a_credential_reference_is_not_redacted() -> None:
+    """`credential_ref` is a secret-manager *reference*, not a secret. Redacting
+    it would hide which reference was pointed somewhere, which is the question
+    an audit of a credential rotation is asking."""
+    value = {"credential_ref": "vault://kv/crm/acme", "status": "active"}
+    assert redact_value(value) == value
+
+
+def test_an_empty_credential_field_is_still_marked() -> None:
+    """Marked regardless of emptiness, so the rule is "this field is a
+    credential" rather than "this field is a credential that happened to be
+    populated" - the conditional version is one refactor away from a leak."""
+    assert redact_value({"api_key": ""}) == {"api_key": "***"}
+
+
+def test_text_patterns_still_apply_to_values() -> None:
+    redacted = redact_value({"note": "contact ada@example.com today"})
+    assert redacted["note"] == "contact ***@*** today"
