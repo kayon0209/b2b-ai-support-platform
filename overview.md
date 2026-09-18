@@ -286,6 +286,25 @@ e2e 的第一版**在什么都没跑通的情况下通过了**：它接受 `mess
 `message_type == 1`，并要求必须存在 InboxEvent——按本设计，收到没收到的东西是不可能的，
 所以它必须是失败而不是通过。
 
+### 验收标准的验证：`e2e_chatwoot_duplicate_delivery.py`
+
+Phase 1 的首要验收标准是「重复投递 webhook 绝不产生重复的客户回复」。它此前只有合成载荷的
+契约测试，**从未有人问过真实 Chatwoot 是否出现了第二条回复**。
+
+```
+first delivery  -> 202 {"status": "received", ...}
+second delivery -> 200 {"status": "duplicate", ...}
+inbox events: 1     outbound replies: 1
+E2E OK
+```
+
+三处必须做对，而每一处最初都想错了：**202 vs 200**（新投递 202 `received`、重投 200
+`duplicate`——重投必须是成功，否则 Chatwoot 会永远重试）；**消息必须真实存在于 Chatwoot**
+（`minimize_chatwoot_payload` 刻意剥掉 `content`，worker 靠 `fetch_message` 取回；合成 id
+取不到问题，于是没有回复——第一版就是这样，看起来像平台不回答）；**Chatwoot 自己不能再投递**
+（否则那是另一条投递，产生第二条回复是正确行为）。因此测试期间临时摘掉账号 webhook，
+`finally` 里恢复（事后核对：id、url、订阅均一致）。
+
 最终诚实的结果：
 
 ```
@@ -309,6 +328,7 @@ E2E OK
 | `release_check --evidence-only` | exit 0；15/4/3 条零容忍背书测试 |
 | **真实 MinIO 端到端** | 上传 → MinIO → worker → `chunks=2 with_embedding=2` → `hybrid_search hits=2` |
 | **真实 Chatwoot 双向往返** | 客户消息 → 签名 webhook → InboxEvent → 弃权通知**出现在会话中** |
+| **重复投递（Phase 1 首要验收标准）** | 同一投递两次 → `202 received` / `200 duplicate` → **1 条 InboxEvent、1 条客户回复** |
 | `ai-api` 容器 | 启动成功，`/healthz` 200 |
 | admin-web | `typecheck` + `build` 通过 |
 | **阻塞式对话框** | `src/` 内**零**（仅注释中提及） |
@@ -329,9 +349,6 @@ E2E OK
   但模型在施压下不肯给引用。属于 prompt 发布流程的工作。
 - **read-tool 成功率的门禁需要生产租户**，不是 fixture：没有真实 `tool_executions` 流量时
   它必然失败，这是设计如此。现在它至少**能**看到流量了。
-- **webhook secret 在两处不一致**：`.env` 是 `e2e-webhook-secret`，而 compose 用
-  `local-dev-webhook-secret` 覆盖以匹配 Chatwoot 的 webhook 行。在 Docker 外跑 API 会因此
-  用错 secret 并拒绝全部投递，值得统一。
 - **k8s 清单从未部署到真实集群**；替代品是 27 项结构断言，README 明说这一点。
 - **Postgres / Redis 只被引用，未被部署**（各自是带备份/故障转移的 StatefulSet 命题）。
 
@@ -345,3 +362,4 @@ E2E OK
 （文档与记忆）→ `69ff6b9`（账本更正 API/UI + RLS 会话绑定与 read-tool 门禁修复）
 → `217b9c4`（记忆整理）→ `d597288`（报告更新）→ `f0a51c4`（移除全部阻塞式对话框）
 → `b36388b`（报告收尾）→ `e207d8d`（弃权必须回复客户 + 部署缺陷修复 + Chatwoot 端到端）
+→ `f7180d5`（报告更新）→ `bc1fba3`（重复投递验收验证 + webhook secret 对齐）
