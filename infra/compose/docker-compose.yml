@@ -78,7 +78,11 @@ services:
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
       APP_REDIS_URL: redis://ai-redis:6379/0
       APP_SECRET_KEY: local-dev-secret
-      APP_CHATWOOT_WEBHOOK_SECRET: local-dev-webhook-secret
+      # Must match the secret on Chatwoot's webhook row. Read from the
+      # environment so the .env value and this one cannot disagree - they
+      # did, and an API run outside Docker would have rejected every
+      # delivery with a 401 that looks like silence, not misconfiguration.
+      APP_CHATWOOT_WEBHOOK_SECRET: ${APP_CHATWOOT_WEBHOOK_SECRET:-local-dev-webhook-secret}
       APP_CHATWOOT_BASE_URL: http://chatwoot-web:3000
       APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
       APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}

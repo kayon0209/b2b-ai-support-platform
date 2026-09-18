@@ -187,6 +187,27 @@ Known, tracked gaps are asserted to fail in `tests/evals/test_release_gates.py`
 (`KNOWN_GAPS`). A gap is recorded there rather than relaxed in the dataset, so
 it stays visible until it is actually fixed.
 
+### End-to-end scripts
+
+These are not part of `pytest`: they need the compose stack, and some need a
+live model. They exist because a suite that runs against the venv cannot tell
+you whether the deployed thing works.
+
+| Script | Proves |
+|---|---|
+| `tests/e2e/e2e_ingestion_minio.py` | upload → real MinIO → worker → chunks with embeddings → `hybrid_search` recalls them |
+| `tests/e2e/e2e_chatwoot_loop.py` | customer message in Chatwoot → signed webhook → InboxEvent → orchestrator → **reply visible in the conversation** |
+| `tests/e2e/e2e_chatwoot_duplicate_delivery.py` | the same delivery twice → one InboxEvent → **one** customer reply (Phase 1's first acceptance criterion) |
+
+They found what the suite could not: an API image that could not start, a
+compose service that could not authenticate, a Chatwoot webhook that was never
+delivered because Sidekiq was down, and an abstention path that produced
+silence instead of telling the customer anything.
+
+**Stop the `ai-*` services before running `pytest`.** `ai-worker-interactive`
+runs an outbox relay that claims rows every second and competes with the suite
+for them; the symptom is one intermittent failure that passes when run alone.
+
 ## Performance testing
 
 Scenarios:
