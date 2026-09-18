@@ -37,6 +37,12 @@ from platform_core.config import Settings, get_settings
 from platform_core.evaluation.router import router as quality_router
 from platform_core.http_metrics import HttpMetricsMiddleware
 from platform_core.identity.branding import router as tenant_branding_router
+from platform_core.identity.domain_router import (
+    public_router as public_branding_router,
+)
+from platform_core.identity.domain_router import (
+    router as tenant_domains_router,
+)
 from platform_core.identity.middleware import TenantContextMiddleware, build_resolver
 from platform_core.identity.router import router as identity_router
 from platform_core.identity.usage import router as tenant_usage_router
@@ -92,6 +98,9 @@ app.include_router(feature_flag_router)
 app.include_router(identity_router)
 app.include_router(tenant_branding_router)
 app.include_router(tenant_usage_router)
+app.include_router(tenant_domains_router)
+# Host-resolved and unauthenticated: a tenant's public branding page.
+app.include_router(public_branding_router)
 app.include_router(connectors_router)
 app.include_router(dead_letter_router)
 # Provider-signed inbound webhooks. Authenticated by HMAC, not by a bearer

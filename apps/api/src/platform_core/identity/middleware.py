@@ -48,6 +48,10 @@ EXEMPT_PATHS = {
     # Without this exemption accept is unreachable in the real app (401 before
     # the handler runs) even though the handler is correct.
     "/v1/identity/members/accept",
+    # The tenant's public branding page, resolved from the Host header. It
+    # carries no token by design and returns public branding only - no
+    # tenant id, no configuration.
+    "/v1/public/branding",
 }
 
 # Prefix exemptions, for routes with a path parameter.

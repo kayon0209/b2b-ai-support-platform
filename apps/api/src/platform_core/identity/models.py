@@ -138,3 +138,30 @@ class MembershipInvitation(Base, PkMixin, TenantMixin):
     status: Mapped[str] = mapped_column(
         String(31), nullable=False, default=InvitationStatus.PENDING.value
     )
+
+
+class TenantDomain(Base, PkMixin, TenantMixin):
+    """A host a tenant claims, and whether that claim has been proven.
+
+    The migration carries the reasoning; the two facts worth repeating here are
+    that `domain` uniqueness is global (two tenants owning one host would make
+    Host -> tenant resolution depend on row order) and that **only verified
+    rows resolve**. An unverified claim must never be served: a request's Host
+    header is caller-controlled, so serving an unverified claim would let a
+    tenant publish their branding on a domain they do not own.
+    """
+
+    __tablename__ = "tenant_domains"
+    __table_args__ = (UniqueConstraint("domain", name="uq_tenant_domain"),)
+
+    # Stored lowercase (a CHECK constraint enforces it); normalised at the API
+    # boundary so a raw insert cannot create a second row describing the same
+    # host with different casing.
+    domain: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Proves the claim was made by someone holding this value out of band.
+    # Not a secret for authentication - it identifies the claim, and is what an
+    # operator checks against the DNS record the tenant published.
+    verification_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    # NULL means unproven. Nothing serves an unproven domain.
+    verified_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
