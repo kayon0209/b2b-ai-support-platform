@@ -1,9 +1,9 @@
 # Project Memory — B2B AI Customer Support Platform
 
 Durable rules only. Daily logs (`YYYY-MM-DD.md`) hold the narrative and
-rationale. **Keep this file tight** — it is truncated on injection when it
-grows large, so a long entry silently loses its own tail. Consolidated
-2026-09-18 from ~16KB to ~11.7KB by moving rationale to the daily logs.
+rationale. **Keep this file tight** — it is truncated on injection when it grows
+large, so it is ordered most-critical-first and the tail is the part that gets
+lost. Consolidated 2026-09-18 from ~16KB; trim rationale, never a rule.
 
 ## Environment
 
@@ -75,28 +75,25 @@ like a pipeline bug. **Never leave probe rows in the database.**
 ## Async and sessions
 
 - **`set_config('app.tenant_id', ..., true)` is transaction-scoped** — it does
-  not survive `COMMIT`. Re-apply after a commit or RLS returns zero rows →
-  `NoResultFound`, indistinguishable from "never written". **`tenant_session`
-  now rebinds on `after_begin`**, so a handler that commits mid-request keeps
-  the binding; that is the fix, not a rule to remember. Every tenant-scoped
-  handler must use `tenant_session(ctx)` — 22 sites used to open
-  `session_scope_with_url(...)` + `apply_rls_tenant(...)` by hand and none of
-  them rebound.
+  not survive `COMMIT`, and an unbound read returns zero rows with no error.
+  **`tenant_session` now rebinds on `after_begin`**, so a handler that commits
+  mid-request keeps the binding. Every tenant-scoped handler must use
+  `tenant_session(ctx)`; 22 sites used to open `session_scope_with_url(...)` +
+  `apply_rls_tenant(...)` by hand and none rebound.
 - **`db.app_role_url()` is the only place the app-role URL is computed.** Five
-  modules used to derive it independently, including the auth middleware and
-  the worker wiring. Its docstring: *"a second copy is how one of them ends up
+  modules derived it independently (including the auth middleware and the
+  worker wiring). Its docstring: *"a second copy is how one of them ends up
   pointing at the owner."*
 - **A failed flush poisons the session.** `await session.rollback()` before
-  raising, or the router's `commit()` raises `PendingRollbackError` and a
-  clean 409 becomes a 500. `begin_nested()` does **not** help. Prefer
-  `ON CONFLICT DO NOTHING` to insert-then-catch: a rollback discards *the whole
+  raising, or the router's `commit()` raises `PendingRollbackError` and a clean
+  409 becomes a 500 (`begin_nested()` does **not** help). Prefer `ON CONFLICT
+  DO NOTHING` to insert-then-catch: a rollback discards *the whole
   transaction*, including earlier rows in the same sweep.
 - **The outbox relay's caller owns the transaction.** `run_once(session)` does
-  not commit; pass `commit=True` or a `session_scope()`, or it reports
-  `sent=1` while persisting nothing.
-- **A relay batch binds RLS per row** (`apply_rls_tenant`) — the claim runs
-  before any tenant is known. Without it an insert failing `WITH CHECK` is
-  rejected, but `ON CONFLICT DO NOTHING` makes that zero rows and no error.
+  not commit; pass `commit=True` or a `session_scope()`, or it reports `sent=1`
+  while persisting nothing. Each row is dispatched under its **own** tenant's
+  RLS binding — the claim runs before any tenant is known, and without the
+  binding an insert failing `WITH CHECK` becomes zero rows and no error.
 
 ## Windows: never launch the API with bare uvicorn
 
@@ -142,13 +139,12 @@ worth having for the *message* only; the constraint is the authority.
 - **A test passing against a long-lived DB is not evidence about the
   migrations** — only `downgrade base && upgrade head` is. A missing `GRANT`
   shipped twice that way (`users` 0021, `tenant_domains` 0027);
-  `test_schema_privileges.py` now covers every table.
-  `EXPECTED_MIGRATIONS` is a deliberate gate — bump it per revision.
+  `test_schema_privileges.py` now covers every table, and
+  `EXPECTED_MIGRATIONS` is a gate to bump per revision.
 - **A guard that cannot be observed failing is not evidence.** The acyclicity
   trigger was installed, enabled, and inert: `FOUND` is **false** after
-  `EXECUTE ... INTO` even when the SELECT returned a row, so
-  `IF NOT FOUND THEN cursor_id := NULL` discarded the parent just read and a
-  two-node cycle was accepted. Terminate a PL/pgSQL walk on the **value**.
+  `EXECUTE ... INTO` even when the SELECT returned a row. Terminate a PL/pgSQL
+  walk on the **value**.
 
 ## Auth, middleware, types
 
@@ -178,31 +174,24 @@ closed.
 
 ## A test double's scale leaks into production logic
 
-The same failure as the inert acyclicity trigger, and worth stating on its own:
-`_sources_compete` guarded "comparable ranking" with an **absolute** 0.05 margin.
-`hybrid_search` fuses with RRF, so a score is `sum(1/(60+rank))`: the top two are
-1/61 and 1/62, a gap of **0.000264**, and the largest possible gap is ~0.016. The
-guard could never fire, so conflict detection collapsed into "do both passages
-contain numbers?" and answerable questions were handed off.
+`_sources_compete` guarded "comparable ranking" with an **absolute** 0.05
+margin. `hybrid_search` fuses with RRF, so a score is `sum(1/(60+rank))`: the
+top two are 1/61 and 1/62, a gap of **0.000264**, and the largest possible gap
+is ~0.016. The guard could never fire, so conflict detection collapsed into "do
+both passages contain numbers?" and answerable questions were handed off. The
+constant was calibrated against `tests/evals/harness.py` (term-overlap
+fractions spanning 0..1), and **no unit test scored a chunk outside 0.2–0.9**.
 
-The constant was calibrated against `tests/evals/harness.py`, whose scores are
-term-overlap fractions spanning 0..1 - and against that scale it works. **No
-unit test scored a chunk outside 0.2–0.9**, so the rule was only ever exercised
-at the scale where it happens to be correct.
+Rules: a threshold comparing retrieval scores must be **relative**; a heuristic
+exercised only through a harness must be **tested at the production scale**.
 
-Rule: **any threshold that compares retrieval scores must be relative, and any
-threshold must be tested at the production scale.** When a heuristic is only
-exercised through a harness, check the harness's score distribution against the
-real one before trusting the constant.
+**Same shape in the read-tool gate**: its tests bound `app.tenant_id` in the
+test helper, but the only real caller never did, so it read zero rows forever.
+**Test the caller, not just the function** — "the aggregation works" and
+"anything reaches it" are different claims.
 
-`scripts/run_eval.py` is what found it - and is the only thing that can, because
-it is the only path that runs the real pipeline end to end.
-
-**The same shape, once more, in the read-tool gate**: its integration tests
-bound `app.tenant_id` in the test helper, but the only real caller never did.
-The function was tested under conditions the caller never provided, so it read
-zero rows forever. **Test the caller, not just the function** - "the
-aggregation works" and "anything reaches it" are different claims.
+`scripts/run_eval.py` found the first, and is the only path that can: it is the
+only one that runs the real pipeline end to end.
 
 ## Release gates
 
