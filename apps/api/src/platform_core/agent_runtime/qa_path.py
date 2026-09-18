@@ -86,6 +86,7 @@ ABSTAIN_NO_EVIDENCE = "NO_AUTHORIZED_EVIDENCE"
 ABSTAIN_CONFLICT = "CONFLICTING_SOURCES"
 ABSTAIN_LOW_RELEVANCE = "EVIDENCE_BELOW_THRESHOLD"
 ABSTAIN_RESTRICTED = "RESTRICTED_REQUEST"
+ABSTAIN_AMBIGUOUS_IDENTITY = "AMBIGUOUS_ACCOUNT_IDENTITY"
 
 
 @dataclass
@@ -491,3 +492,60 @@ def safe_abstention_text(reason_code: str) -> str:
 
 def excerpt_hash(excerpt: str) -> str:
     return hashlib.sha256(excerpt.encode()).hexdigest()
+
+
+# --- Account-identity dependence (in progress) ------------------------------
+#
+# Moved below `_stem` / `_query_terms`: the module-level frozenset called
+# `_stem` before it was defined, so importing this module raised NameError and
+# the whole application failed to start.
+#
+# NOTE: `_is_identity_dependent` currently has no caller, and the term set
+# needs rework before it is wired in: "are" is in it, so the general question
+# "Are monthly plans refundable?" (an eval case that must be *answered*) would
+# be flagged as identity-dependent and abstained. The intended fix for the
+# `ambiguous-refund-eligibility` gap is to resolve the account identity before
+# retrieval, not to pattern-match the question.
+
+# Patterns that signal a question depends on the caller's account identity
+# rather than a policy stated in the knowledge base. When such a question is
+# asked, the answer varies by who is asking - and the knowledge base retrieval
+# path has no account identity. Without resolution, answering from a policy
+# that contains multiple plan variants would fabricate the caller's specific
+# eligibility.
+_AMBIGUOUS_IDENTITY_TERMS = frozenset(
+    _stem(word)
+    for word in (
+        "am",
+        "are",
+        "my",
+        "mine",
+        "me",
+        "account",
+        "plan",
+        "eligible",
+        "eligibility",
+        "tier",
+        "subscription",
+        "contract",
+    )
+)
+
+
+def _is_identity_dependent(question: str) -> bool:
+    """True when a question asks about the caller's personal account state.
+
+    The knowledge base cannot answer "am I eligible" without knowing the
+    caller's plan: a policy that says "annual: 30 days, monthly: 14 days"
+    has both figures, and citing one without resolving the account would
+    state a fact that may not apply. This is not an injection guard - it
+    cannot tell a genuine question from a crafted one - it is a
+    *honesty* guard: when the answer genuinely depends on who is asking
+    and that identity is not available, abstain rather than guess.
+    """
+    q_terms = _query_terms(question)
+    identity_terms = _AMBIGUOUS_IDENTITY_TERMS
+    # Must contain at least one identity-dependence term to flag.
+    # A question about general policy ("how do refunds work") does not
+    # need account resolution; "am I eligible" does.
+    return bool(q_terms & identity_terms)
