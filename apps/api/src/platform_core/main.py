@@ -44,6 +44,7 @@ from platform_core.identity.domain_router import (
     router as tenant_domains_router,
 )
 from platform_core.identity.middleware import TenantContextMiddleware, build_resolver
+from platform_core.identity.org_router import router as org_router
 from platform_core.identity.router import router as identity_router
 from platform_core.identity.usage import router as tenant_usage_router
 from platform_core.integrations.router import (
@@ -96,6 +97,7 @@ app.include_router(feature_flag_router)
 # Observability last: /metrics is an unauthenticated infrastructure endpoint
 # and its own guard is inside the router (see observability_router).
 app.include_router(identity_router)
+app.include_router(org_router)
 app.include_router(tenant_branding_router)
 app.include_router(tenant_usage_router)
 app.include_router(tenant_domains_router)

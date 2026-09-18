@@ -45,6 +45,7 @@ from platform_core.api import (
 from platform_core.audit import service as audit_service
 from platform_core.config import get_settings
 from platform_core.db import session_scope_with_url
+from platform_core.identity import org
 from platform_core.identity.models import (
     InvitationStatus,
     Membership,
@@ -87,6 +88,10 @@ class AcceptInviteIn(BaseModel):
 
 class RoleUpdateIn(BaseModel):
     role: str
+    # Optional department assignment. Absent means "leave it alone" - this
+    # endpoint also changes the role, and a role change must not silently
+    # detach the member from their department. Explicit `null` clears it.
+    department_id: uuid.UUID | None = None
 
 
 def _role_value(role: MembershipRole | str) -> str:
@@ -449,6 +454,24 @@ async def update_member_role(request: Request, member_id: str, body: RoleUpdateI
             return error_response("MEMBERSHIP_NOT_FOUND", "membership not found", status_code=404)
         before_role = _role_value(membership.role)
         membership.role = MembershipRole(body.role)
+
+        supplied = body.model_dump(exclude_unset=True)
+        department_changed = False
+        if "department_id" in supplied:
+            if body.department_id is not None and not await org.department_exists(
+                session, tenant_id=ctx.tenant_id, department_id=body.department_id
+            ):
+                # Also the answer for another tenant's department: RLS cannot
+                # see it, and saying "that exists but is not yours" would
+                # confirm the existence of another tenant's rows.
+                return error_response(
+                    "DEPARTMENT_NOT_FOUND",
+                    "department not found in this tenant",
+                    status_code=404,
+                )
+            department_changed = membership.department_id != body.department_id
+            membership.department_id = body.department_id
+
         await audit_service.record(
             session,
             ctx=ctx,
@@ -456,11 +479,23 @@ async def update_member_role(request: Request, member_id: str, body: RoleUpdateI
             resource_type="membership",
             resource_id=membership.id,
             before={"role": before_role},
-            after={"role": body.role, "idempotency_key": idem},
+            after={
+                "role": body.role,
+                "idempotency_key": idem,
+                **(
+                    {"department_id": str(body.department_id) if body.department_id else None}
+                    if department_changed
+                    else {}
+                ),
+            },
             trace_id=trace_id,
         )
         await session.commit()
-        result = {"user_id": str(membership.user_id), "role": _role_value(membership.role)}
+        result = {
+            "user_id": str(membership.user_id),
+            "role": _role_value(membership.role),
+            "department_id": (str(membership.department_id) if membership.department_id else None),
+        }
 
     return ok_response(result, trace_id=trace_id)
 

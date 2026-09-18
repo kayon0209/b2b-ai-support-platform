@@ -2,8 +2,18 @@
 
 import enum
 import uuid
+from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, Enum, ForeignKey, String, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Enum,
+    ForeignKey,
+    ForeignKeyConstraint,
+    String,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from platform_core.orm_base import Base, PkMixin, TenantMixin
@@ -73,13 +83,30 @@ class Membership(Base, PkMixin, TenantMixin):
     single-role for MVP; policy conditions arrive in Phase 2 ABAC."""
 
     __tablename__ = "memberships"
-    __table_args__ = (UniqueConstraint("tenant_id", "user_id", name="uq_membership_tenant_user"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "user_id", name="uq_membership_tenant_user"),
+        UniqueConstraint("id", "tenant_id", name="uq_memberships_id_tenant"),
+        # Composite so a membership cannot be filed under another tenant's
+        # department. RLS hides the other tenant's row rather than rejecting
+        # the value, so a plain FK would let the write succeed and then read
+        # back as "no department" - a silent, unqueryable inconsistency.
+        ForeignKeyConstraint(
+            ["department_id", "tenant_id"],
+            ["departments.id", "departments.tenant_id"],
+            name="fk_memberships_department_same_tenant",
+        ),
+    )
 
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     role: Mapped[MembershipRole] = mapped_column(
         Enum(MembershipRole, native_enum=False, values_callable=_enum_values), nullable=False
     )
     status: Mapped[str] = mapped_column(String(31), default="active")
+    # Named in docs/domain-model.md since the beginning and absent from the
+    # schema until migration 0028. Optional: membership is not conditional on
+    # an org chart existing, and a tenant with no departments is a tenant where
+    # every member has this null.
+    department_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True, index=True)
 
 
 class ExternalIdentity(Base, PkMixin, TenantMixin):
@@ -165,3 +192,108 @@ class TenantDomain(Base, PkMixin, TenantMixin):
     # NULL means unproven. Nothing serves an unproven domain.
     verified_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class AccountTier(enum.StrEnum):
+    """Contract tier. Closed, because an SLA clock is derived from it.
+
+    A free-text tier would let a typo fall through to the default policy
+    silently, and the symptom would be a customer with a tighter contractual
+    window than they were actually given. The API validates against this set
+    and the column carries a CHECK constraint, so the value is enforced at both
+    boundaries.
+    """
+
+    STRATEGIC = "strategic"
+    ENTERPRISE = "enterprise"
+    STANDARD = "standard"
+    BASIC = "basic"
+
+
+class ContractStatus(enum.StrEnum):
+    """`churned` is a value rather than a deletion: the account's history and
+    its closed Cases must remain readable, and an audit of "what did we agree
+    to" is answered from rows that still exist."""
+
+    ACTIVE = "active"
+    PENDING = "pending"
+    SUSPENDED = "suspended"
+    CHURNED = "churned"
+
+
+class EnterpriseAccount(Base, PkMixin, TenantMixin):
+    """The tenant's own customer/account hierarchy.
+
+    `docs/domain-model.md` warns not to confuse this with a Chatwoot Account,
+    and it is right to: Chatwoot owns the conversation, this owns the contract.
+    `cases.enterprise_account_id` points here.
+
+    The composite foreign keys (`(parent_id, tenant_id)` -> `(id, tenant_id)`)
+    are the reason the parent link is trustworthy. A single-column FK would
+    accept another tenant's account as a parent, and because RLS hides that row
+    the mistake would not raise - the child would simply read as a root, which
+    is indistinguishable from a deliberate root.
+    """
+
+    __tablename__ = "enterprise_accounts"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_enterprise_accounts_id_tenant"),
+        ForeignKeyConstraint(
+            ["parent_id", "tenant_id"],
+            ["enterprise_accounts.id", "enterprise_accounts.tenant_id"],
+            name="fk_enterprise_accounts_parent_same_tenant",
+        ),
+    )
+
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True, index=True)
+    # The CRM's identifier for this account, so a sync can upsert instead of
+    # inserting a second copy. UNIQUE per tenant (partial, see migration 0028).
+    external_crm_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    tier: Mapped[AccountTier] = mapped_column(
+        Enum(AccountTier, native_enum=False, values_callable=_enum_values),
+        nullable=False,
+        default=AccountTier.STANDARD,
+        server_default=AccountTier.STANDARD.value,
+    )
+    contract_status: Mapped[ContractStatus] = mapped_column(
+        Enum(ContractStatus, native_enum=False, values_callable=_enum_values),
+        nullable=False,
+        default=ContractStatus.ACTIVE,
+        server_default=ContractStatus.ACTIVE.value,
+    )
+    attributes: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class Department(Base, PkMixin, TenantMixin):
+    """An internal org unit, used to route work and to scope ABAC conditions.
+
+    Hierarchy for the same reason as `EnterpriseAccount`, and with the same
+    composite-FK guard. `slug` is the stable handle an IdP group mapping or a
+    Jira project binding would target - names get renamed, so mapping off the
+    name would silently re-point a binding.
+    """
+
+    __tablename__ = "departments"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_departments_id_tenant"),
+        UniqueConstraint("tenant_id", "slug", name="uq_departments_tenant_slug"),
+        ForeignKeyConstraint(
+            ["parent_id", "tenant_id"],
+            ["departments.id", "departments.tenant_id"],
+            name="fk_departments_parent_same_tenant",
+        ),
+    )
+
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Stored lowercase; a CHECK constraint enforces it so a raw insert cannot
+    # create a second row that is the same department with different casing.
+    slug: Mapped[str] = mapped_column(String(63), nullable=False)
+    external_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")

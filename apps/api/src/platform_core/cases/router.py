@@ -17,6 +17,7 @@ Error mapping (stable codes per docs/api-contracts.md):
   unknown command        -> 400 VALIDATION_FAILED
 """
 
+import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Query, Request
@@ -46,7 +47,7 @@ from platform_core.cases.models import (
     TransitionNotAllowed,
     VersionConflict,
 )
-from platform_core.cases.service import CaseService
+from platform_core.cases.service import CaseError, CaseService
 from platform_core.outbox_service import enqueue
 from platform_policy import Action
 
@@ -61,6 +62,9 @@ class CaseCreateIn(BaseModel):
     description: str = Field(default="", max_length=20_000)
     priority: str = Field(default="p2")
     category: str = Field(default="general", max_length=63)
+    # The account this Case is about. Determines the SLA policy via the
+    # account's contract tier (see `cases.models.sla_policy_for_tier`).
+    enterprise_account_id: uuid.UUID | None = None
 
 
 class CaseCommandIn(BaseModel):
@@ -77,6 +81,12 @@ def _serialize(case: Case) -> dict[str, Any]:
         "status": case.status,
         "priority": case.priority,
         "category": case.category,
+        # Both were previously absent from the API surface entirely, which is
+        # how `enterprise_account_id` came to be a column nothing could write.
+        "enterprise_account_id": (
+            str(case.enterprise_account_id) if case.enterprise_account_id else None
+        ),
+        "sla_tier": case.sla_tier,
         "assignee_ref": case.assignee_ref,
         "team_ref": case.team_ref,
         "version": int(case.version),
@@ -115,13 +125,24 @@ async def create_case(request: Request, body: CaseCreateIn) -> Any:
     trace_id = new_trace_id()
     async with tenant_session(ctx) as session:
         service = CaseService(session)
-        case = await service.create_case(
-            tenant_id=ctx.tenant_id,
-            subject=body.subject,
-            description=body.description,
-            priority=body.priority,
-            category=body.category,
-        )
+        try:
+            case = await service.create_case(
+                tenant_id=ctx.tenant_id,
+                subject=body.subject,
+                description=body.description,
+                priority=body.priority,
+                category=body.category,
+                enterprise_account_id=body.enterprise_account_id,
+            )
+        except CaseError as exc:
+            # One code for "no such account" and "another tenant's account":
+            # RLS cannot see the latter, and distinguishing them would make
+            # this endpoint a way to enumerate account ids.
+            return error_response(
+                exc.code,
+                "the account does not exist in this tenant",
+                status_code=404 if exc.code == "ACCOUNT_NOT_FOUND" else 400,
+            )
         await audit_service.record(
             session,
             ctx=ctx,
@@ -130,7 +151,14 @@ async def create_case(request: Request, body: CaseCreateIn) -> Any:
             resource_id=case.id,
             decision="completed",
             reason_code="OK",
-            after={"priority": case.priority, "category": case.category},
+            after={
+                "priority": case.priority,
+                "category": case.category,
+                "enterprise_account_id": (
+                    str(case.enterprise_account_id) if case.enterprise_account_id else None
+                ),
+                "sla_tier": case.sla_tier,
+            },
             trace_id=trace_id,
         )
         await enqueue(

@@ -20,7 +20,16 @@ from platform_core.cases.models import (
     check_transition,
     check_version,
     sla_deadline,
+    sla_policy_for_tier,
 )
+
+
+class CaseError(Exception):
+    """A Case command that must be refused with a caller-readable code."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
 
 
 class CaseService:
@@ -36,8 +45,38 @@ class CaseService:
         priority: str = "p2",
         category: str = "general",
         actor_id: uuid.UUID | None = None,
+        enterprise_account_id: uuid.UUID | None = None,
     ) -> Case:
+        """Open a Case, deriving its SLA clocks from the account's contract.
+
+        `enterprise_account_id` was a column nothing could write before this:
+        the API did not accept it and this method never set it, so a Case could
+        not be attached to the account it was about. The FK added in migration
+        0028 makes a cross-tenant account unrepresentable, and because RLS
+        cannot see the other tenant's row, an unknown id and a foreign id both
+        report `ACCOUNT_NOT_FOUND` - so this cannot be used to discover which
+        accounts exist elsewhere.
+        """
         now = int(time.time())
+
+        tier: str | None = None
+        contract_status: str | None = None
+        if enterprise_account_id is not None:
+            # Imported here rather than at module import: `cases` depends on one
+            # narrow identity read, and a module-level import of the identity
+            # package would make the dependency look like a cycle to anyone
+            # reading the graph.
+            from platform_core.identity.org import account_sla_facts
+
+            facts = await account_sla_facts(
+                self._session, tenant_id=tenant_id, account_id=enterprise_account_id
+            )
+            if facts is None:
+                raise CaseError("ACCOUNT_NOT_FOUND", str(enterprise_account_id))
+            tier, contract_status = facts
+
+        policy = sla_policy_for_tier(tier, contract_status=contract_status)
+
         case = Case(
             tenant_id=tenant_id,
             subject=subject,
@@ -48,18 +87,23 @@ class CaseService:
             version=1,
             opened_at=now,
             last_state_changed_at=now,
+            enterprise_account_id=enterprise_account_id,
+            # Snapshotted, not resolved later: the deadline is recomputed on a
+            # priority change, and re-reading the account then would let a
+            # mid-Case contract change move a clock that is already running.
+            sla_tier=tier,
         )
         self._session.add(case)
         await self._session.flush()
         case.first_response_due_at = sla_deadline(
-            DEFAULT_SLA,
+            policy,
             priority=priority,
             opened_at=now,
             elapsed_running_seconds=0,
             first_response=True,
         )
         case.resolution_due_at = sla_deadline(
-            DEFAULT_SLA,
+            policy,
             priority=priority,
             opened_at=now,
             elapsed_running_seconds=0,
@@ -106,15 +150,21 @@ class CaseService:
                 row.closed_at = now
         elif command == "change_priority":
             row.priority = params["priority"]
+            # The tier recorded at open, not the account's current one. A
+            # priority change is a decision about this Case; a contract edit
+            # that happened in between is not, and letting it through here
+            # would mean the same Case had a different contractual window
+            # depending on when the deadline happened to be recomputed.
+            policy = sla_policy_for_tier(row.sla_tier)
             row.first_response_due_at = sla_deadline(
-                DEFAULT_SLA,
+                policy,
                 priority=row.priority,
                 opened_at=row.opened_at,
                 elapsed_running_seconds=row.elapsed_running_seconds,
                 first_response=True,
             )
             row.resolution_due_at = sla_deadline(
-                DEFAULT_SLA,
+                policy,
                 priority=row.priority,
                 opened_at=row.opened_at,
                 elapsed_running_seconds=row.elapsed_running_seconds,

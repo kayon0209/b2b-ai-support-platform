@@ -9,10 +9,18 @@ command carries expected_version.
 import enum
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
-from sqlalchemy import BigInteger, ForeignKey, Index, String, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -132,14 +140,86 @@ def is_breached(deadline_ts: int, now: int | None = None) -> bool:
     return (now or int(time.time())) > deadline_ts
 
 
+# --- contract tier -> SLA policy -------------------------------------------
+#
+# A customer's contract tier scales the SLA targets. It does **not** change
+# `running_states`: which statuses stop a clock is a property of the support
+# workflow, not of what the customer bought, and letting a tier change it would
+# mean two customers with the same workflow paused at different points.
+TIER_TARGET_MULTIPLIERS: dict[str, float] = {
+    "strategic": 0.25,
+    "enterprise": 0.5,
+    "standard": 1.0,
+    "basic": 2.0,
+}
+
+
+def sla_policy_for_tier(tier: str | None, *, contract_status: str | None = "active") -> SlaPolicy:
+    """The SLA policy in force for a Case on this account.
+
+    Two decisions worth stating, because both are silent if they go the other
+    way:
+
+    - **A tier only applies while the contract is active.** `pending`,
+      `suspended` and `churned` all resolve to `standard`. An account that
+      stopped paying does not keep a 15-minute first-response target: a tighter
+      clock that the customer is no longer entitled to would fire escalations
+      nobody agreed to.
+    - **An unknown or absent tier resolves to `standard`,** which is exactly
+      the policy that was in force before tiers existed. So a Case with no
+      account, or an account predating this field, gets the deadline it would
+      have got yesterday rather than a shorter one. A typo cannot reach here -
+      the column carries a CHECK constraint - but a `None` reaches here
+      constantly, and that must be the safe direction.
+
+    The multiplier is applied to the target minutes and floored at one minute:
+    a tier is not permitted to produce a zero-length window, which would make
+    every Case instantly breached.
+    """
+
+    multiplier = (
+        TIER_TARGET_MULTIPLIERS.get(tier or "", 1.0) if _is_active(contract_status) else 1.0
+    )
+    return replace(
+        DEFAULT_SLA,
+        first_response_minutes=max(int(DEFAULT_SLA.first_response_minutes * multiplier), 1),
+        resolution_minutes=max(int(DEFAULT_SLA.resolution_minutes * multiplier), 1),
+    )
+
+
+def _is_active(contract_status: str | None) -> bool:
+    """Absent means active. A Case created before accounts existed has no
+    status to consult, and treating that as *not* active would silently loosen
+    every pre-existing Case's clock."""
+    return contract_status is None or contract_status == "active"
+
+
 # --- ORM models ---
 
 
 class Case(Base, PkMixin, TenantMixin):
     __tablename__ = "cases"
-    __table_args__ = (Index("ix_cases_status", "status"),)
+    __table_args__ = (
+        Index("ix_cases_status", "status"),
+        UniqueConstraint("id", "tenant_id", name="uq_cases_id_tenant"),
+        # Composite: a Case cannot belong to another tenant's account. It also
+        # turns the column from "a uuid that might mean something" into a
+        # reference - before 0028 this had no FK and no target table, so any
+        # uuid at all could sit here and nothing would report it.
+        ForeignKeyConstraint(
+            ["enterprise_account_id", "tenant_id"],
+            ["enterprise_accounts.id", "enterprise_accounts.tenant_id"],
+            name="fk_cases_account_same_tenant",
+        ),
+    )
 
     enterprise_account_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True, index=True)
+    # The tier the clock was started under, snapshotted at open. The deadline
+    # is recomputed on a priority change, and re-resolving the tier then would
+    # mean a mid-Case contract change silently moved an already-running
+    # deadline - and "why was the first-response target 30 minutes" would
+    # depend on when the question is asked.
+    sla_tier: Mapped[str | None] = mapped_column(String(31), nullable=True)
     subject: Mapped[str] = mapped_column(String(512), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     category: Mapped[str] = mapped_column(String(63), nullable=False, default="general")
