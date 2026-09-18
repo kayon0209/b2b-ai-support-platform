@@ -239,10 +239,17 @@ def test_the_cli_fails_the_read_tool_gate_without_telemetry(
 
 
 def test_the_cli_passes_once_every_gate_has_evidence(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     """The positive path, so the suite proves the CLI *can* go green - a
-    command that can only ever fail is not a gate, it is a wall."""
+    command that can only ever fail is not a gate, it is a wall.
+
+    `--report` points at a path that does not exist on purpose. Without it the
+    run picks up whatever `tests/artifacts/eval_report.json` happens to hold,
+    and a developer who had just run `scripts/run_eval.py` against a pipeline
+    with real quality failures would see this test fail for a reason that has
+    nothing to do with the CLI.
+    """
     import platform_core.evaluation.evidence as evidence_module
 
     monkeypatch.setattr(
@@ -261,7 +268,15 @@ def test_the_cli_passes_once_every_gate_has_evidence(
         return ReadToolOutcome(succeeded=100, failed=0, third_party_failures=0)
 
     monkeypatch.setattr(release_check, "_read_tool_outcomes", _healthy)
-    code = release_check.main(["--allow-missing-eval", "--tenant-id", "t"])
+    code = release_check.main(
+        [
+            "--allow-missing-eval",
+            "--report",
+            str(tmp_path / "absent.json"),
+            "--tenant-id",
+            "t",
+        ]
+    )
     out = capsys.readouterr().out
     assert code == 0, out
     assert "release_allowed: True" in out

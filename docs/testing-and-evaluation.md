@@ -147,6 +147,46 @@ A prompt, model, retrieval or policy change may ship only if:
 - latency and cost remain within budget;
 - failures are reviewed by category, not hidden in an average score.
 
+### Running them
+
+The gates are computed from evidence, never from hand-typed numbers.
+
+```bash
+# 1. The test suite writes the zero-tolerance counts as it runs.
+pytest
+python -m platform_core.evaluation.release_check --evidence-only
+
+# 2. The quality numbers come from the dataset run against the real pipeline.
+#    Requires Postgres, MinIO and a live APP_LLM_API_KEY.
+python scripts/run_eval.py
+
+# 3. The release decision. Exit 0 ships, 1 blocks, 2 means the inputs were
+#    unusable (re-run, do not read it as a failure).
+python -m platform_core.evaluation.release_check --tenant-id <tenant-uuid>
+```
+
+Three inputs, three different sources, and the gate refuses rather than
+substituting a default when one is missing:
+
+| Gate input | Produced by | If absent |
+|---|---|---|
+| zero-tolerance counts | the `zero_tolerance`-tagged tests, via the pytest plugin | gate blocks; a partial run (<500 tests) is rejected outright |
+| evaluation report | `scripts/run_eval.py` | gate blocks (exit 2); `--allow-missing-eval` shows the picture knowing it fails |
+| read-tool success | live `tool_executions` rows over 7 days | gate blocks; `--skip-db` is for offline runs, not for passing |
+
+`scripts/run_eval.py` seeds the dataset corpus into a throwaway tenant,
+ingests it through the real worker with real embeddings, retrieves through
+`hybrid_search` (real ACL and status filters), and generates with the live
+model — so `active`, `expired` and `unauthorized` are enforced by the same
+machinery as production rather than simulated. It cleans the tenant up
+afterwards. The **deterministic harness in `tests/evals/harness.py` must not
+be used for this**: it serves a fixed corpus through a lexical ranker, so its
+numbers are the test double's, not the system's.
+
+Known, tracked gaps are asserted to fail in `tests/evals/test_release_gates.py`
+(`KNOWN_GAPS`). A gap is recorded there rather than relaxed in the dataset, so
+it stays visible until it is actually fixed.
+
 ## Performance testing
 
 Scenarios:

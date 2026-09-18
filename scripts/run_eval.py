@@ -1,0 +1,394 @@
+"""Run the evaluation dataset against the real pipeline and write its report.
+
+`release_check` reads `tests/artifacts/eval_report.json` and nothing produced
+it. That made the documented release process unexecutable: three quality gates
+(citation coverage, abstention correctness, forbidden claims) had a reader, a
+threshold, and no input.
+
+**Why this is not the test harness.** `tests/evals/harness.py` serves a fixed
+corpus through a lexical ranker so a regression reproduces deterministically.
+Feeding *that* to the gate would report an oracle's numbers as measured
+quality - the same theatre as quoting an RPO from a logical dump. This script
+therefore does the opposite of the harness: it seeds the same corpus into a
+real tenant, ingests it through the real worker with real embeddings, retrieves
+through `hybrid_search` with the real ACL and status filters, and generates
+with the live model. Every number in the report comes from the system under
+test.
+
+The dataset's `availability` field is reproduced with the machinery that
+actually enforces it, not simulated:
+
+    active        -> an open space (no ACL rows), status 'active'
+    expired       -> status 'expired', which `hybrid_search` filters out
+    unauthorized  -> a space carrying an ACL grant for a principal the cases
+                     do not act as, so the ACL filter closes it
+
+Requires the compose services (Postgres, MinIO) and a live `APP_LLM_API_KEY`.
+
+Usage:
+    python scripts/run_eval.py                 # writes tests/artifacts/eval_report.json
+    python scripts/run_eval.py --keep-tenant   # leave the tenant for inspection
+    python scripts/run_eval.py --limit 3       # smoke-run a few cases first
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import time
+import uuid
+from dataclasses import asdict
+from pathlib import Path
+
+# The e2e MinIO container, unless the environment already names a bucket.
+os.environ.setdefault("APP_OBJECT_STORAGE_ENDPOINT", "localhost:19000")
+os.environ.setdefault("APP_OBJECT_STORAGE_ACCESS_KEY", "minioadmin")
+os.environ.setdefault("APP_OBJECT_STORAGE_SECRET_KEY", "minioadmin")
+os.environ.setdefault("APP_OBJECT_STORAGE_BUCKET", "documents")
+os.environ.setdefault("APP_OBJECT_STORAGE_SECURE", "false")
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+for _p in (
+    "apps/api/src",
+    "apps/worker/src",
+    "packages/contracts/src",
+    "packages/policy/src",
+    "packages/observability/src",
+    # `tests/` rather than the repo root: there is no `tests/__init__.py`, so
+    # `tests.evals.dataset` is not importable, but `tests/evals/__init__.py`
+    # exists and makes `evals` a package. Adding `tests/` gives
+    # `evals.dataset` without introducing an `__init__.py` that would change
+    # how pytest collects the suite.
+    "tests",
+):
+    sys.path.insert(0, str(REPO_ROOT / _p))
+
+from evals.dataset import CORPUS, all_cases  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
+
+from platform_core.agent_runtime.generator import LlmAnswerGenerator  # noqa: E402
+from platform_core.config import get_settings  # noqa: E402
+from platform_core.evaluation.runner import EvalReport, EvaluationRunner  # noqa: E402
+from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant  # noqa: E402
+from platform_core.knowledge import service as knowledge  # noqa: E402
+from platform_core.llm.gitee_ai import GiteeAiClient  # noqa: E402
+from platform_core.retrieval.hybrid import (  # noqa: E402
+    PrincipalScope,
+    ProviderEmbedder,
+    hybrid_search,
+)
+
+PLATFORM_URL = os.environ.get(
+    "APP_ADMIN_DATABASE_URL",
+    "postgresql+psycopg://platform:platform@localhost:5435/platform",
+)
+APP_URL = os.environ.get(
+    "APP_TEST_DATABASE_URL",
+    "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
+)
+
+REPORT_PATH = REPO_ROOT / "tests" / "artifacts" / "eval_report.json"
+
+# The principal the "unauthorized" corpus is withheld from. Every dataset case
+# runs as `support_agent`, so a grant to this role closes the space to all of
+# them - which is the point: the entry must be unreachable, not merely unused.
+CLOSED_PRINCIPAL_ROLE = "tenant_owner"
+
+_SYSTEM = "system"
+
+
+def _ctx(tenant_id: uuid.UUID) -> TenantContext:
+    return TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind=_SYSTEM)
+
+
+async def _seed(platform, app, *, slug: str) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """Create the tenant, an open space and a closed space. Returns their ids.
+
+    The tenant is created as the superuser, then everything else as the *app*
+    role with the tenant bound: the knowledge tables are FORCE RLS, so an
+    insert from an unbound connection is refused by the policy's WITH CHECK.
+    """
+    async with platform() as s:
+        tenant_id = (
+            await s.execute(
+                text(
+                    "INSERT INTO tenants (id, slug, name, status) "
+                    "VALUES (gen_random_uuid(), :slug, :slug, 'active') RETURNING id"
+                ),
+                {"slug": slug},
+            )
+        ).scalar()
+        await s.commit()
+
+    async with app() as s:
+        await apply_rls_tenant(s, _ctx(tenant_id))
+        open_space = (
+            await s.execute(
+                text(
+                    "INSERT INTO knowledge_spaces (id, tenant_id, name) "
+                    "VALUES (gen_random_uuid(), :t, 'eval-open') RETURNING id"
+                ),
+                {"t": tenant_id},
+            )
+        ).scalar()
+        closed_space = (
+            await s.execute(
+                text(
+                    "INSERT INTO knowledge_spaces (id, tenant_id, name) "
+                    "VALUES (gen_random_uuid(), :t, 'eval-restricted') RETURNING id"
+                ),
+                {"t": tenant_id},
+            )
+        ).scalar()
+        # One ACL row is what makes a space closed. A space with no rows is
+        # readable by the whole tenant by design, so `unauthorized` cannot be
+        # expressed by "put it somewhere else" - it needs a grant that the
+        # caller does not hold.
+        await s.execute(
+            text(
+                "INSERT INTO knowledge_acls "
+                "(id, tenant_id, resource_type, resource_id, principal_type, principal_id) "
+                "VALUES (gen_random_uuid(), :t, 'space', :space, 'role', :role)"
+            ),
+            {"t": tenant_id, "space": closed_space, "role": CLOSED_PRINCIPAL_ROLE},
+        )
+        await s.commit()
+
+    return tenant_id, open_space, closed_space
+
+
+async def _ingest_corpus(
+    app, *, tenant_id: uuid.UUID, open_space: uuid.UUID, closed_space: uuid.UUID, embedder
+) -> dict[str, uuid.UUID]:
+    """Upload and ingest every corpus entry. Returns version_key -> version id."""
+    versions: dict[str, uuid.UUID] = {}
+    for entry in CORPUS:
+        space = closed_space if entry.availability == "unauthorized" else open_space
+        data = entry.text.encode("utf-8")
+        async with app() as s:
+            await apply_rls_tenant(s, _ctx(tenant_id))
+            created = await knowledge.create_document(
+                s,
+                tenant_id=tenant_id,
+                space_id=space,
+                title=entry.document_title,
+                canonical_uri=f"doc://eval-{entry.version_key}",
+                data=data,
+                content_type="text/markdown",
+                filename=f"{entry.version_key}.md",
+                classification="internal",
+                version_label="v1",
+            )
+            # Commit before uploading: the worker claims from another
+            # connection and an uncommitted row is invisible to it.
+            await s.commit()
+            knowledge.upload_object(created.object_key, data, "text/markdown")
+            versions[entry.version_key] = created.version_id
+        print(f"  uploaded {entry.version_key} ({entry.availability})", flush=True)
+
+    # One worker pass per document, so a failure names the document it came
+    # from instead of a batch statistic.
+    #
+    # The assertion is on *this* version's row, not on `stats.ready == 1`:
+    # `claim_ingestion_versions` has no tenant filter (one bulk worker serves
+    # every tenant, which is correct), so a claimable row left anywhere else in
+    # the database joins the batch and a count-based assertion measures the
+    # wrong thing.
+    from worker.ingestion_consumer import drain_ingestion_once
+
+    for key, version_id in versions.items():
+        async with app() as s:
+            stats = await drain_ingestion_once(s, embedder=embedder, batch=10)
+            await s.commit()
+        async with app() as s:
+            await apply_rls_tenant(s, _ctx(tenant_id))
+            row = (
+                (
+                    await s.execute(
+                        text(
+                            "SELECT ingestion_status, status FROM document_versions WHERE id = :v"
+                        ),
+                        {"v": version_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        if row["ingestion_status"] != "ready":
+            raise RuntimeError(
+                f"ingesting {key} left ingestion_status={row['ingestion_status']!r} "
+                f"(status={row['status']!r}, stats={stats}); every corpus entry must "
+                "be indexed or the run measures nothing"
+            )
+
+    # `expired` is applied after ingestion because the worker marks a
+    # successfully ingested version `active`. Setting it before would be
+    # overwritten - and would also have the worker skip it.
+    #
+    # The `rowcount` assertion is not decoration. `document_versions` is FORCE
+    # RLS and `set_config('app.tenant_id', ..., true)` is transaction-scoped:
+    # an UPDATE issued after a COMMIT is unbound, matches nothing, and reports
+    # **rowcount 0 with no error**. Writing this loop as "update, commit, then
+    # verify" is exactly how that bug is born - it was, once, while writing
+    # this script.
+    expired = [e.version_key for e in CORPUS if e.availability == "expired"]
+    async with app() as s:
+        await apply_rls_tenant(s, _ctx(tenant_id))
+        for key in expired:
+            rowcount = (
+                await s.execute(
+                    text("UPDATE document_versions SET status = 'expired' WHERE id = :v"),
+                    {"v": versions[key]},
+                )
+            ).rowcount
+            if rowcount != 1:
+                raise RuntimeError(f"could not mark {key} expired (rowcount={rowcount})")
+        await s.commit()
+
+    return versions
+
+
+async def _cleanup(platform, *, tenant_id: uuid.UUID, slug: str) -> None:
+    """Remove every row this run created. Order matters: chunks reference
+    versions, versions reference documents."""
+    async with platform() as s:
+        for stmt in (
+            "DELETE FROM chunks WHERE document_version_id IN "
+            "(SELECT id FROM document_versions WHERE tenant_id = :t)",
+            "DELETE FROM knowledge_acls WHERE tenant_id = :t",
+            "DELETE FROM document_versions WHERE tenant_id = :t",
+            "DELETE FROM documents WHERE tenant_id = :t",
+            "DELETE FROM knowledge_spaces WHERE tenant_id = :t",
+            "DELETE FROM tenants WHERE id = :t AND slug = :slug",
+        ):
+            params = {"t": tenant_id}
+            if ":slug" in stmt:
+                params["slug"] = slug
+            await s.execute(text(stmt), params)
+        await s.commit()
+
+
+def _write_report(report: EvalReport, *, tenant_id: uuid.UUID, elapsed: float) -> None:
+    """Serialize in the shape `release_check._report_from_artifact` reads.
+
+    The per-case results are kept as well: the aggregate is what the gate
+    decides on, but a reviewer asked to explain a failed release needs to see
+    which case moved.
+    """
+    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": report.run_id,
+        "started_at": report.started_at,
+        "finished_at": report.finished_at,
+        "total": report.total,
+        "passed": report.passed,
+        "failed": report.failed,
+        "abstention_correct": report.abstention_correct,
+        "abstention_false": report.abstention_false,
+        "citation_violations": report.citation_violations,
+        "forbidden_claim_hits": report.forbidden_claim_hits,
+        # Provenance: a quality number without its source is not evidence.
+        "provenance": {
+            "generated_by": "scripts/run_eval.py",
+            "tenant_id": str(tenant_id),
+            "elapsed_seconds": round(elapsed, 1),
+            "model": get_settings().llm_model,
+            "embedding_model": get_settings().llm_embedding_model,
+            "retrieval": "hybrid_search (real ACL + status filters)",
+            "note": "real tenant corpus, real embeddings, live model",
+        },
+        "results": [asdict(r) for r in report.results],
+    }
+    REPORT_PATH.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+async def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--keep-tenant", action="store_true", help="do not clean up")
+    parser.add_argument("--limit", type=int, default=0, help="run only the first N cases")
+    args = parser.parse_args(argv)
+
+    if not get_settings().llm_api_key:
+        print(
+            "FATAL: APP_LLM_API_KEY is not set; the model boundary fails closed.",
+            file=sys.stderr,
+        )
+        return 2
+
+    platform_engine = create_async_engine(PLATFORM_URL)
+    app_engine = create_async_engine(APP_URL)
+    platform = async_sessionmaker(platform_engine, expire_on_commit=False)
+    app = async_sessionmaker(app_engine, expire_on_commit=False)
+
+    slug = f"eval-run-{uuid.uuid4().hex[:8]}"
+    tenant_id: uuid.UUID | None = None
+    started = time.monotonic()
+    try:
+        print(f"tenant slug: {slug}")
+        tenant_id, open_space, closed_space = await _seed(platform, app, slug=slug)
+        print(f"tenant={tenant_id}")
+
+        client = GiteeAiClient()
+        print(f"ingesting {len(CORPUS)} corpus entries through the real worker…")
+        await _ingest_corpus(
+            app,
+            tenant_id=tenant_id,
+            open_space=open_space,
+            closed_space=closed_space,
+            embedder=client,
+        )
+
+        # --- the real pipeline, plugged into the runner's two seams --------
+        query_embedder = ProviderEmbedder(provider=client, _dimensions=client.dimensions)
+        generator = LlmAnswerGenerator(client)
+
+        async def retrieve(question: str, scope: PrincipalScope):
+            async with app() as s:
+                await apply_rls_tenant(s, _ctx(tenant_id))
+                return await hybrid_search(
+                    s,
+                    tenant_id=tenant_id,
+                    query=question,
+                    top_k=8,
+                    principal=scope,
+                    embedder=query_embedder,
+                )
+
+        async def answer(question: str, evidence):
+            return await generator.generate(question, evidence)
+
+        cases = all_cases()
+        if args.limit:
+            cases = cases[: args.limit]
+        print(f"running {len(cases)} cases against {get_settings().llm_model}…")
+        report = await EvaluationRunner(answer, retrieve).run(cases)
+
+        elapsed = time.monotonic() - started
+        _write_report(report, tenant_id=tenant_id, elapsed=elapsed)
+        print(
+            f"\n{report.passed}/{report.total} passed, "
+            f"citation_violations={report.citation_violations}, "
+            f"abstention_false={report.abstention_false}, "
+            f"forbidden_claim_hits={report.forbidden_claim_hits}"
+        )
+        print(f"report written to {REPORT_PATH.relative_to(REPO_ROOT)} ({elapsed:.0f}s)")
+        for result in report.results:
+            if not result.passed:
+                print(f"  FAILED {result.case_id}: {result.reason_codes}")
+        return 0
+    finally:
+        if tenant_id is not None and not args.keep_tenant:
+            await _cleanup(platform, tenant_id=tenant_id, slug=slug)
+            print(f"cleaned up tenant {slug}")
+        elif tenant_id is not None:
+            print(f"left tenant {slug} in place (--keep-tenant)")
+        await app_engine.dispose()
+        await platform_engine.dispose()
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop))
