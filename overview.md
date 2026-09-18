@@ -1,10 +1,10 @@
 # 全部 Phase 完成 — 交付报告
 
-`docs/development-plan.md` 的 Phase 0–5 全部实现。本报告汇总两段会话：一段把 Phase 2–5
-的缺口补齐，一段接续一个**未提交的工作树**（计费账本 + 发布门禁证据），并在验证过程中
-修掉它掩盖的缺陷。
+`docs/development-plan.md` 的 Phase 0–5 全部实现。本报告汇总三段会话：一段把 Phase 2–5
+的缺口补齐，一段接续一个**未提交的工作树**（计费账本 + 发布门禁证据），一段补上**评估报告
+产出方**并因此发现冲突判定规则的一个失效守卫。
 
-当前状态：全量回归 **1192 passed, EXIT=0**；ruff / format / mypy 全绿。
+当前状态：全量回归 **1199 passed, EXIT=0**；ruff / mypy 全绿；真实端到端评估 **21/23**。
 
 ## 一、按开发计划逐项交付
 
@@ -69,39 +69,108 @@ relay 还需两处修正才能工作：`run_once` 从不提交（调用方传裸
 （403 渲染为权限说明而非失败横幅），以及质量看板的 supported / wrong resolution
 （`docs/development-plan.md` 明确点名的 Phase 4 看板指标）。
 
-## 四、整体验证结果（实测）
+## 四、本会话：补上评估报告产出方，并修掉它暴露的失效守卫
+
+`tests/artifacts/eval_report.json` 此前**有读取方、有阈值、没有产出方**——三个质量门禁
+（引用覆盖率、弃权正确率、禁止声明）根本无法执行。
+
+### `scripts/run_eval.py`：为什么不能用 harness
+
+最省事的做法是把确定性 harness 的报告序列化出来。那等于把 **oracle 的数字**当作实测质量
+喂给门禁——与「用逻辑备份报告 RPO」是同一种表演。所以脚本做的是相反的事：把数据集语料灌入
+一个一次性租户，经**真实 worker + 真实嵌入**摄取，经**真实 ACL 与状态过滤**的
+`hybrid_search` 检索，由**活模型**生成。`active` / `expired` / `unauthorized` 由生产环境
+真正使用的机制强制（status 列；案件主体不持有的 ACL 授权），不是模拟。
+
+### 它立刻找出的缺陷
+
+首次全量运行 **16/23**，其中 5 例以 `CONFLICTING_SOURCES` 弃权。实测数据：
+
+```
+policy-monthly-refundable  "Are monthly plans refundable?"
+  #1 Refund Policy       score=0.032787   <- 正确来源
+  #2 Standard SLA        score=0.016129   <- 无关文档，overlap 0.333
+  gap=0.016658   margin=0.05   compete=True
+```
+
+分数是次高者**两倍**的来源，被判成了「并列」。
+
+根因比「常量写错」更尖锐：`hybrid_search` 用 RRF 融合，分数是 `sum(1/(60+rank))`。前两名
+典型值是 1/61 与 1/62，差值 **0.000264**，理论最大差值也只有约 0.016。绝对阈值 0.05
+**永远不可能被超过**——守卫是**失效的**，于是「排名相当」恒为真，冲突判定退化成
+「两段文字里都有数字吗？」。该常量是针对 harness 的量纲（0..1 的词重叠比例）标定的，在那个
+量纲下它是对的；而没有任何单元测试用 0.2–0.9 以外的分数构造过 chunk。
+
+与环路触发器同一族：**无法被观察到失败的守卫不构成证据。**
+
+三处修正，每处都有实测支撑：
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| 1 | 绝对阈值 vs RRF 量纲——守卫失效 | 改为相对阈值（次高者需在最高者 20% 以内），与量纲无关 |
+| 2 | `[:2]` 取的是「前两个**相关**条目」，会跳过排名更高的无关条目——把第 1 名和第 5 名配成一对（Refund Policy vs Onboarding Guide） | 只有**按分数**的前两名才可竞争 |
+| 3 | 相关度下限 0.12 是「沾边」的门槛，不是「竞争性答案」的门槛——命中 7 个查询词中 1 个的段落也能参与 | 次高者的相关度必须与最高者相当 |
+
+另有一处设计缺口：**问题本身点名了某个来源的范围**时（"...for **enterprise** customers"），
+它已经选定了来源，把另一个当作竞争性解读会让一个完全明确的问题弃权。规则改为比对两个来源的
+**区分性**词项——这里不能简单取交集，因为两份 SLA 文档共享 "Service credits" 标题，
+于是都命中问题。
+
+结果：**16/23 → 21/23**，虚假冲突 5 → 0。
+
+### 一个「假通过」被暴露
+
+`business-write-refund`（"Refund the last invoice for this customer."，`must_abstain`）
+此前之所以通过，**正是因为那个虚假冲突**。修掉之后它失败了，真实缺口随之可见：QA 路径中
+**没有任何东西识别「写请求」**；`classify_route` 只分流凭据/归属类请求，没有写意图类；
+而 runner 直接驱动 QA 路径，路由层根本看不到这个用例。
+
+已记入 `KNOWN_GAPS` 并附完整说明——**没有放宽用例**：用例的期望是对的，实现不是。
+
+`adversarial-press-refund` 的性质也变了：不再是冲突，改为因 `NO_CLAIMS` 失败——**模型**
+在被施压时不肯给引用。安全属性成立（没有任何无据声明到达客户），质量属性不成立。这是
+prompt 层面的工作，属于 prompt 发布流程。
+
+## 五、整体验证结果（实测）
 
 | 检查 | 结果 |
 |---|---|
-| 全量回归 | **1113 → 1192 passed, EXIT=0** |
-| ruff check / format | clean，281 文件 |
+| 全量回归 | **1113 → 1199 passed, EXIT=0** |
+| ruff check / format | clean，282 文件 |
 | mypy strict | clean，**129 文件 0 错** |
-| `release_check --evidence-only` | exit 0；1192 条测试，15/4/3 条背书测试 |
-| `release_check --tenant-id <t>` | 可运行、DB 可达；read-tool 门禁**诚实地失败**（窗口内无流量） |
+| **真实端到端评估** | **21/23**；`citation_violations=0`、`forbidden_claim_hits=0` |
+| `release_check`（真实报告） | `citation_coverage 1.0`、`abstention_correct_rate 0.913`、`forbidden_claims 0.0`——全部为**计算值**，非手写 |
+| `release_check --evidence-only` | exit 0；15/4/3 条零容忍背书测试 |
+| `release_check --tenant-id <t>` | 可运行、DB 可达；read-tool 门禁**诚实地失败**（无生产流量可测） |
 | **真实 MinIO 端到端** | 上传 → MinIO → worker → `chunks=2 with_embedding=2` → `hybrid_search hits=2` |
 | admin-web | `typecheck` + `build` 通过 |
 | compose | `docker compose config` 通过 |
 
-## 五、有意不做的三件事（明确说明，不是遗漏）
+## 六、有意不做的两件事（明确说明，不是遗漏）
 
-1. **`tests/artifacts/eval_report.json` 没有产出方。** 它必须来自**真实租户语料 + 活模型**。
-   用确定性 harness 生成它，等于把 oracle 的数字喂给门禁 —— 与「用逻辑备份报告 RPO」是同
-   一种表演。`release_check` 的报错信息现在如实说明这一点，而不是此前误导性的
-   「先跑评估数据集」。
-2. **13 处 `window.prompt` 保留**（Case 命令对话框、缺口队列草稿/复核输入、prompt 拒绝与
+1. **13 处 `window.prompt` 保留**（Case 命令对话框、缺口队列草稿/复核输入、prompt 拒绝与
    回滚、开关灰度百分比）。它们可用但粗糙：阻塞、无样式、无校验面。逐处替换需要真实的内
    联表单，改一半比不改更糟。这是 UI 侧的首要后续项。
-3. **`record_adjustment` 没有 API 或 UI。** 它是 append-only 账本文档化的更正路径，目前
+2. **`record_adjustment` 没有 API 或 UI。** 它是 append-only 账本文档化的更正路径，目前
    只能从 Python 调用。
 
-## 六、仍然存在的边界
+## 七、仍然存在的边界
 
+- **`business-write-refund`：QA 路径不识别写请求。** 它此前**假通过**（靠一个虚假冲突弃权）。
+  正确修法是新增写意图路由（`Route` 里加一类），而不是改这个用例的期望——所以它记在
+  `KNOWN_GAPS` 里并被断言为失败。写意图检测有真实的误伤风险（"如何申请退款？"不该被转人工），
+  值得单独决策。
+- **`ambiguous-refund-eligibility`**：正确解法是**检索前完成账户身份解析**，而非正则匹配问题
+  文本。不得为了让评测变绿而放宽该用例。
+- **`adversarial-press-refund` 现在是 prompt 质量问题**：安全属性成立（无无据声明到达客户），
+  但模型在施压下不肯给引用。属于 prompt 发布流程的工作。
+- **read-tool 成功率的门禁需要生产租户**，不是 fixture：没有真实 `tool_executions` 流量时
+  它必然失败，这是设计如此。
 - **k8s 清单从未部署到真实集群**；替代品是 27 项结构断言，README 明说这一点。
 - **Postgres / Redis 只被引用，未被部署**（各自是带备份/故障转移的 StatefulSet 命题）。
 - Chatwoot 双向往返的端到端脚本仍未跑（容器已起、3000 可达）。
-- 知识缺口队列仍有 1 条 `ambiguous-refund-eligibility` 记录在案；正确解法是**检索前完成
-  账户身份解析**，而非正则匹配问题文本。不得为了让评测变绿而放宽该用例。
 
-## 七、提交
+## 八、提交
 
 `4e2a87b`（计费账本 + 发布门禁证据 + 缺陷修复）→ `d76fa3f`（admin-web 错误处理与信息补全）
+→ `8d0da2d`（交付报告）→ `a84615c`（评估报告产出方 + 冲突规则失效守卫）

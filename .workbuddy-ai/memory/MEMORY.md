@@ -167,6 +167,28 @@ Gitee AI (模力方舟), OpenAI-compatible, `https://ai.gitee.com/v1`:
 Credentials in `.env` (gitignored); an unset key fails the model boundary
 closed.
 
+## A test double's scale leaks into production logic
+
+The same failure as the inert acyclicity trigger, and worth stating on its own:
+`_sources_compete` guarded "comparable ranking" with an **absolute** 0.05 margin.
+`hybrid_search` fuses with RRF, so a score is `sum(1/(60+rank))`: the top two are
+1/61 and 1/62, a gap of **0.000264**, and the largest possible gap is ~0.016. The
+guard could never fire, so conflict detection collapsed into "do both passages
+contain numbers?" and answerable questions were handed off.
+
+The constant was calibrated against `tests/evals/harness.py`, whose scores are
+term-overlap fractions spanning 0..1 - and against that scale it works. **No
+unit test scored a chunk outside 0.2–0.9**, so the rule was only ever exercised
+at the scale where it happens to be correct.
+
+Rule: **any threshold that compares retrieval scores must be relative, and any
+threshold must be tested at the production scale.** When a heuristic is only
+exercised through a harness, check the harness's score distribution against the
+real one before trusting the constant.
+
+`scripts/run_eval.py` is what found it - and is the only thing that can, because
+it is the only path that runs the real pipeline end to end.
+
 ## Release gates
 
 Zero-tolerance counts are **derived, not typed**: a test declares
@@ -179,9 +201,12 @@ writer is a plugin, not a conftest, because the suite has two test roots.
 
 `release_check` exits **0** all gates pass, **1** a gate failed, **2** inputs
 unusable. `--evidence-only` is the CI check; `--skip-db` still fails the
-read-tool gate by design. **`tests/artifacts/eval_report.json` has no
-producer** — it needs a real tenant corpus + live model; generating it from the
-deterministic harness would be theatre.
+read-tool gate by design. **`scripts/run_eval.py` produces
+`tests/artifacts/eval_report.json`** from the real pipeline (throwaway tenant,
+real worker + embeddings, real ACL/status filters, live model) and cleans up
+after itself. Never generate it from the deterministic harness: that feeds the
+gate an oracle's numbers. `docs/testing-and-evaluation.md` documents the
+sequence. Read-tool telemetry needs a live tenant, not a fixture.
 
 ## Admin UI (`apps/admin-web`)
 
