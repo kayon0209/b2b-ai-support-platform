@@ -459,10 +459,16 @@ async def execute_tool_call(request: Request, proposal_id: str, body: ToolPropos
         # tenant with no connected system yields no executor, and the
         # gateway reports TOOL_EXECUTOR_MISSING rather than the router
         # inventing a different failure.
+        #
+        # `ctx` and `trace_id` are passed so that a credential the provider
+        # rejects is attributed to this actor in the connector's audit trail
+        # and joins the same trace as the call that revealed it.
         executors = await resolve_executors(
             session,
             tenant_id=ctx.tenant_id,
             tool_names=[tool.name] if tool is not None else [],
+            ctx=ctx,
+            trace_id=trace_id,
         )
 
         gateway = ToolGateway(session, executors)

@@ -53,6 +53,14 @@ class Action(StrEnum):
     TOOL_WRITE_LOW = "tool.write.low"
     TOOL_WRITE_CONFIRMED = "tool.write.confirmed"
     TOOL_HUMAN_APPROVAL = "tool.human_approval"
+    # Connector vocabulary. Deliberately separate from the tool vocabulary:
+    # TOOL_READ lets a support agent see which tools exist, while connector
+    # administration inspects and changes a tenant's external-system
+    # configuration - including rotating a credential reference. Someone
+    # authorized to run a Jira tool is not thereby authorized to reconfigure
+    # the Jira connection, and collapsing the two would grant exactly that.
+    CONNECTOR_READ = "connector.read"
+    CONNECTOR_ADMIN = "connector.admin"
 
 
 # Role -> allowed actions (docs/security.md recommended roles).
@@ -70,6 +78,10 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
             Action.KNOWLEDGE_READ,
             Action.PROMPT_READ,
             Action.FLAG_READ,
+            # Reads the connection inventory: a suspected credential leak is
+            # investigated from here. Not CONNECTOR_ADMIN - security staff
+            # audit the configuration, they do not change it.
+            Action.CONNECTOR_READ,
         }
     ),
     "support_admin": frozenset(
@@ -88,6 +100,11 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
             # expires) but not a human_approval tool, which is reserved
             # for tenant_owner.
             Action.TOOL_WRITE_CONFIRMED,
+            # Sees connector health: when a Jira connection is parked in
+            # NEEDS_REAUTH the support admin is the one whose tools stopped
+            # working, so the state has to be visible to them. Rotating the
+            # credential stays with CONNECTOR_ADMIN.
+            Action.CONNECTOR_READ,
         }
     ),
     "knowledge_manager": frozenset(

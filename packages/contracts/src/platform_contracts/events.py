@@ -38,6 +38,13 @@ class EventType(enum.StrEnum):
     # Emitted when an agent run reaches a terminal, billable outcome. Carries
     # the metering facts (route, token counts) a billing consumer needs.
     USAGE_RECORDED = "usage.recorded"
+    # Emitted when an outbound connector call is rejected on authentication
+    # and the connector is parked in NEEDS_REAUTH. This is the alertable half
+    # of "OAuth reauthorization is visible and actionable"
+    # (docs/development-plan.md Phase 3): without an event there is no
+    # consumer to notify the tenant, and the tenant only discovers the
+    # expired credential when a support agent's tool call fails.
+    CONNECTOR_NEEDS_REAUTH = "connector.needs_reauth"
 
 
 class InboundEventType(enum.StrEnum):
@@ -57,6 +64,7 @@ class InboundEventType(enum.StrEnum):
 class AggregateType(enum.StrEnum):
     CASE = "case"
     AGENT_RUN = "agent_run"
+    CONNECTOR = "connector"
 
 
 class _Strict(BaseModel):
@@ -95,6 +103,21 @@ class UsageRecordedPayload(_Strict):
     completion_tokens: int = Field(default=0, ge=0)
 
 
+class ConnectorNeedsReauthPayload(_Strict):
+    """A connector whose credential was rejected.
+
+    Carries no secret and no credential reference: the reference names a path
+    in the secret manager, and a notification consumer has no need for it.
+    `error_code` is the classified connector error, so a consumer can tell
+    "the token expired" (reauthorize) from "the provider rejected us"
+    (investigate) without re-reading anything.
+    """
+
+    connector_id: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    error_code: str = Field(min_length=1)
+
+
 class EventEnvelope(BaseModel):
     """The row shape the outbox guarantees to any consumer.
 
@@ -126,6 +149,7 @@ PAYLOAD_SCHEMAS: dict[EventType, type[BaseModel]] = {
     EventType.CASE_CREATED: CaseCreatedPayload,
     EventType.CASE_UPDATED: CaseUpdatedPayload,
     EventType.USAGE_RECORDED: UsageRecordedPayload,
+    EventType.CONNECTOR_NEEDS_REAUTH: ConnectorNeedsReauthPayload,
 }
 
 
@@ -195,6 +219,7 @@ __all__ = [
     "AggregateType",
     "CaseCreatedPayload",
     "CaseUpdatedPayload",
+    "ConnectorNeedsReauthPayload",
     "ContractError",
     "UsageRecordedPayload",
     "EventEnvelope",
