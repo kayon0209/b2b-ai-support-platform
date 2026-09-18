@@ -842,20 +842,42 @@ def test_a_claim_with_no_negation_is_not_reported() -> None:
     assert claim_contradiction_candidates(draft, evidence) == []
 
 
-def test_the_known_false_positive_is_pinned() -> None:
-    """This one *is* reported, and it is true.
+def test_a_claim_that_adds_information_is_not_reported() -> None:
+    """This was the false positive that made ADR 0005 refuse a blocking guard.
 
-    "not issued instantly" does not contradict "issued within 5 business days",
-    so this is a false positive - measured at 1 in 6 hand-written pairs. It is
-    asserted rather than tolerated: it is the entire reason ADR 0005 refuses to
-    promote this to a guard, and a change that quietly "fixes" it should have to
-    update this test and the ADR with it.
+    "not issued instantly" does not contradict "issued within 5 business days" -
+    it adds *instantly*, which the excerpt never mentions, and it is true. The
+    first version of this metric flagged it, at a measured precision of 1 in 2.
+
+    The "introduces no content of its own" rule fixed it: a contradiction
+    inverts information rather than adding to it. Precision is now 2/2 over
+    nine hand-written pairs. Pinned so a regression has to say so.
     """
     draft, evidence = _claim(
         "Refunds are not issued instantly.",
         "Refunds are issued to the original payment method within 5 business days.",
     )
+    assert claim_contradiction_candidates(draft, evidence) == []
+
+
+def test_a_negated_predicate_matches_its_other_surface_form() -> None:
+    """`refundable` and `refunded` are one predicate. Without the fold this
+    real contradiction was missed."""
+    draft, evidence = _claim(
+        "Annual plans are not refundable.",
+        "Annual plans may be refunded within 30 days of purchase.",
+    )
     assert claim_contradiction_candidates(draft, evidence) == [0]
+
+
+def test_a_claim_going_beyond_its_evidence_is_declined() -> None:
+    """The known miss: this asserts something false, but it adds *email*, so
+    the rule declines rather than guessing. Documented, not hidden."""
+    draft, evidence = _claim(
+        "Customers cannot request a refund by email.",
+        "Customers may request a refund within 30 days.",
+    )
+    assert claim_contradiction_candidates(draft, evidence) == []
 
 
 def test_a_claim_without_its_own_text_is_skipped() -> None:

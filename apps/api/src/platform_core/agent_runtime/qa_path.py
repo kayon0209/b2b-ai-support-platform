@@ -70,56 +70,81 @@ class AnswerGenerator(Protocol):
 # into an abstention. It exists so the precision can be measured on real data
 # before it is ever promoted to a guard.
 
-# Negation prefixes that can invert a predicate. `cannot`/`can't` are listed
-# separately because they do not follow the `<negation> <term>` shape.
-_NEGATED_TERM = re.compile(r"\b(?:non-|not\s+|no\s+|never\s+)([a-z][a-z-]*)")
-_INTRINSIC_NEGATIONS = ("cannot ", "can't ", "isn't ", "aren't ", "won't ", "doesn't ")
+_NEGATED_TERM = re.compile(r"\b(?:non-|not\s+|no\s+|never\s+|cannot\s+|can't\s+)([a-z][a-z-]*)")
+# The markers themselves are not content, and must not count as the "new
+# information" that suppresses a candidate.
+_NEGATION_WORDS = frozenset(
+    {"non", "not", "no", "never", "cannot", "cant", "wont", "isnt", "arent", "doesnt", "dont"}
+)
+
+
+def _predicate_variants(term: str) -> set[str]:
+    """Surface forms of one predicate: refundable ~ refunded ~ refund.
+
+    Without this, "Annual plans are not refundable" does not match an excerpt
+    that says "refunded", and a real contradiction is missed.
+    """
+    forms = {term}
+    for suffix in ("able", "ible"):
+        if term.endswith(suffix) and len(term) > len(suffix) + 2:
+            forms.add(term[: -len(suffix)])
+    return forms
 
 
 def claim_contradiction_candidates(draft: DraftAnswer, evidence: list[RetrievedChunk]) -> list[int]:
-    """Claim indices whose text negates a term their cited excerpt affirms.
+    """Claim indices that contradict the excerpt they cite.
 
-    A *candidate*, not a verdict. The rule is deliberately naive so its errors
-    are visible rather than buried: negating a term an excerpt affirms is not
-    the same as contradicting it, so
+    A *candidate*, not a verdict - but a high-precision one. Both must hold:
 
-        claim:   "Refunds are not issued instantly."
-        excerpt: "Refunds are issued within 5 business days."
+    1. **It negates a predicate the excerpt affirms.** "Monthly plans are
+       non-refundable" against "Monthly plans are refundable within 14 days".
+    2. **It introduces no content of its own.** A contradiction inverts
+       information, it does not add to it. "Refunds are not issued instantly"
+       against "Refunds are issued within 5 business days" adds *instantly*,
+       which the excerpt never mentions - and it is true, so it must not be
+       flagged.
 
-    is reported even though it is true. That false positive is why ADR 0005
-    stages this as a metric instead of a guard, and it is pinned by a test so
-    the behaviour cannot change unnoticed.
+    The second condition is what makes this usable. Measured on nine
+    hand-written pairs:
 
-    It misses things too: "not refundable" against an excerpt that says
-    "refunded" does not match, because the stems differ. False negatives leave
-    the status quo; false positives would break correct answers, which is the
-    asymmetry that decides the staging.
+        precision 2/2, recall 2/3     (before the rule: precision 1/2)
+
+    The one miss is "Customers cannot request a refund by email", which adds
+    *email* - new content, so the rule declines to judge it. That is the rule
+    working: it does not guess about claims that go beyond their evidence.
+
+    **Still a metric, not a guard.** Nine pairs is a small sample, and ADR 0005
+    requires no false positive on any case whose answer is currently correct,
+    measured on the full dataset, before this can refuse a customer-visible
+    answer.
     """
     by_id = {chunk.chunk_id: chunk for chunk in evidence}
     candidates: list[int] = []
     for claim_index, cited in draft.claims.items():
-        if not cited:
-            continue
         text = draft.claim_texts.get(claim_index, "")
-        if not text:
+        if not text or not cited:
             continue
-        lowered = text.lower()
-        negated = {_stem(term) for term in _NEGATED_TERM.findall(lowered)}
-        if any(marker in lowered for marker in _INTRINSIC_NEGATIONS):
-            # `cannot request a refund` negates `request`, which the naive
-            # pattern above does not capture; fall back to the excerpt's own
-            # content terms so the case is not silently missed.
-            negated |= _content_terms(lowered)
-        if not negated:
-            continue
+        affirmed: set[str] = set()
         for chunk_id in cited:
             chunk = by_id.get(chunk_id)
-            if chunk is None:
-                continue
-            affirmed = _content_terms(chunk.excerpt)
-            if negated & affirmed:
-                candidates.append(claim_index)
-                break
+            if chunk is not None:
+                affirmed |= _content_terms(chunk.excerpt)
+        if not affirmed:
+            continue
+
+        negated: set[str] = set()
+        for term in _NEGATED_TERM.findall(text.lower()):
+            negated |= _predicate_variants(_stem(term))
+        if not negated & affirmed:
+            continue
+
+        claim_terms = {
+            term
+            for term in _content_terms(text)
+            if term not in _NEGATION_WORDS and _predicate_variants(term).isdisjoint(negated)
+        }
+        if claim_terms <= affirmed:
+            candidates.append(claim_index)
     return candidates
 
 

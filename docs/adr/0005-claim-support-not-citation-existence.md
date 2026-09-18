@@ -62,26 +62,36 @@ string would still be caught before it reaches a customer.
 3. Until then, `validate_citations` keeps its current behaviour, and its
    docstring states what it does not check (it does).
 
-## Why not naive negation matching
+### Why not negation matching alone
 
 The obvious implementation is "the claim negates a term the excerpt affirms".
-Measured on six hand-written pairs, it scores **1 true positive, 1 false
-positive, 2 false negatives**:
+Measured on nine hand-written pairs, on its own it scores **1 true positive and
+1 false positive**:
 
 | claim | excerpt | expected | got |
 |---|---|---|---|
-| Monthly plans are non-refundable. | Monthly plans are refundable within 14 days. | fire | **fire** |
-| Refunds are not issued instantly. | Refunds are issued within 5 business days. | no fire | **fires** (wrong) |
-| Annual plans are not refundable. | Annual plans may be refunded within 30 days. | fire | misses (`refundable` vs `refunded`) |
-| Customers cannot request a refund by email. | Customers may request a refund. | fire | misses (`cannot` is not in the pattern) |
+| Monthly plans are non-refundable. | ...are refundable within 14 days. | fire | fire |
+| Refunds are not issued instantly. | ...are issued within 5 business days. | no fire | **fires** |
 
-The false positive is the disqualifying one. Negating a term the excerpt affirms
-is not the same as contradicting it - "not issued instantly" is true of an
-excerpt that says "issued within 5 business days". A guard that fires there
-turns a correct answer into an abstention, which is a worse outcome than the
-stochastic gate it would replace.
+That false positive alone would be disqualifying. A guard that fires there turns
+a *correct* answer into an abstention, which is worse than the stochastic gate
+it would replace.
 
-The two misses are the lesser problem: a false negative leaves the status quo.
+**What fixed it**: a contradiction inverts information rather than adding to it.
+Requiring the claim to introduce **no content beyond the negation** - every other
+content term must also appear in the excerpt - makes the second case decline
+(instantly is new) while the first still fires. Two further refinements: the
+negation markers themselves are not content, and `refundable`/`refunded`/`refund`
+are one predicate, which recovers "Annual plans are not refundable" against an
+excerpt that says "refunded".
+
+Measured after: **precision 2/2, recall 2/3**. The remaining miss is
+"Customers cannot request a refund by email", which adds *email* - the rule
+declines claims that go beyond their evidence instead of guessing about them.
+
+Nine pairs is still a small sample, which is why the staging stands. The
+promotion criterion below is unchanged, and it must be measured on the full
+dataset, not on pairs chosen by hand.
 
 ## Why not a model-based entailment check now
 
