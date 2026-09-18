@@ -193,3 +193,33 @@ def test_the_unbound_app_role_cannot_read_any_tenant_owned_table() -> None:
     counts = asyncio.run(_count_unbound(), loop_factory=asyncio.SelectorEventLoop)
     visible = {table: n for table, n in counts.items() if n}
     assert not visible, f"unbound app role can read rows in: {visible}"
+
+
+def test_every_table_in_the_database_is_known_to_the_orm() -> None:
+    """`Base.metadata` must be complete wherever a session can be opened.
+
+    A mapped module that no entry point imports leaves the metadata partial,
+    and the symptom is not a missing table - it is a foreign key that cannot
+    resolve, raised only in whichever process happens to map the child table
+    first. That is exactly how `cases.enterprise_account_id` broke a worker
+    test while the API tests passed, which is why `models_registry` exists and
+    why it is checked here rather than trusted.
+
+    `alembic_version` is excluded: it is the migration tool's own bookkeeping,
+    not a platform table.
+    """
+    from platform_core.db import create_engine as _create_engine  # noqa: F401
+    from platform_core.orm_base import Base
+
+    engine = create_engine(ADMIN_URL)
+    with engine.begin() as conn:
+        db_tables = {
+            str(row[0])
+            for row in conn.execute(
+                text("SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'")
+            ).all()
+        }
+    engine.dispose()
+
+    unknown = sorted(db_tables - set(Base.metadata.tables) - {"alembic_version"})
+    assert unknown == [], f"tables exist in the database but no model maps them: {unknown}"

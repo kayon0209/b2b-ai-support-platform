@@ -5,6 +5,7 @@ Worker classes per docs/deployment-and-operations.md:
 - ingestion:   parsing/chunking/embedding (bulk, lowest priority)
 - outbox:      relays committed business events to their consumers
 - retention:   periodic per-tenant data-lifecycle sweep
+- sla:         periodic per-tenant breach scan and escalation ladder
 
 Backpressure is structural rather than an in-process queue: each class polls
 its own table and claims a batch with `FOR UPDATE SKIP LOCKED`, and bulk work
@@ -40,6 +41,7 @@ from worker.inbox_consumer import drain_once
 from worker.ingestion_consumer import drain_ingestion_once
 from worker.outbox_relay import OutboxRelay, OutboxWorker, build_default_relay
 from worker.retention_consumer import drain_retention_once
+from worker.sla_consumer import drain_sla_once
 from worker.wiring import (
     IngestionDeps,
     WorkerConfigurationError,
@@ -67,7 +69,14 @@ ROLE_OUTBOX = "outbox"
 # once and runs on a long interval. Its own role so a slow sweep never delays
 # customer replies.
 ROLE_RETENTION = "retention"
-WORKER_ROLES = (ROLE_INTERACTIVE, ROLE_INGESTION, ROLE_OUTBOX, ROLE_RETENTION)
+ROLE_SLA = "sla"
+WORKER_ROLES = (
+    ROLE_INTERACTIVE,
+    ROLE_INGESTION,
+    ROLE_OUTBOX,
+    ROLE_RETENTION,
+    ROLE_SLA,
+)
 
 
 @dataclass
@@ -283,6 +292,48 @@ class RetentionWorker:
         )
 
 
+class SlaWorker:
+    """Periodically scans for breached SLA clocks and walks the ladder.
+
+    A minute, not the hour the retention sweep uses: a breach is actionable
+    now, and the ladder's second rung is an hour past the deadline, so an
+    interval longer than that would report level 2 and level 1 in the same
+    sweep - the record would be right and the notification would be useless.
+
+    The sweep is idempotent by construction (`case_escalations`' unique key),
+    so a repeated cycle changes nothing and a missed one is caught up on the
+    next pass because the level is derived from the deadline rather than from
+    the previous level.
+    """
+
+    DEFAULT_INTERVAL_SECONDS = 60.0
+
+    def __init__(self, config: WorkerConfig | None = None) -> None:
+        self._config = config or WorkerConfig(
+            poll_interval_seconds=self.DEFAULT_INTERVAL_SECONDS, batch=1
+        )
+        self._stopping = False
+
+    def request_stop(self) -> None:
+        self._stopping = True
+
+    @property
+    def stopping(self) -> bool:
+        return self._stopping
+
+    async def run_once(self) -> int:
+        stats = await drain_sla_once()
+        return stats.escalated
+
+    async def run_forever(self) -> None:
+        await _run_poll_loop(
+            name=ROLE_SLA,
+            cycle=self.run_once,
+            config=self._config,
+            stopping=lambda: self._stopping,
+        )
+
+
 def install_signal_handlers(worker: Any, loop: asyncio.AbstractEventLoop) -> None:
     """Graceful shutdown on SIGTERM/SIGINT where supported (POSIX)."""
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -350,6 +401,13 @@ def main() -> None:
         asyncio.run(_run_retention_only())
         return
 
+    if queue == ROLE_SLA:
+        # No wiring either: the breach scan reads Cases and writes its own
+        # ledger. It notifies through the outbox, which is the relay's job.
+        logger.info("worker_wiring", queue=queue)
+        asyncio.run(_run_sla_only())
+        return
+
     # Real collaborators, assembled in one place. `build_interactive_deps`
     # raises when the chat provider is missing, so the worker fails to start
     # rather than claiming messages and silently never replying.
@@ -406,6 +464,17 @@ async def _run_retention_only() -> None:
     except KeyboardInterrupt:  # pragma: no cover - interactive stop
         worker.request_stop()
         logger.info("worker_interrupted", queue=ROLE_RETENTION)
+
+
+async def _run_sla_only() -> None:
+    worker = SlaWorker()
+    loop = asyncio.get_running_loop()
+    install_signal_handlers(worker, loop)
+    try:
+        await worker.run_forever()
+    except KeyboardInterrupt:  # pragma: no cover - interactive stop
+        worker.request_stop()
+        logger.info("worker_interrupted", queue=ROLE_SLA)
 
 
 async def _run_outbox_only() -> None:

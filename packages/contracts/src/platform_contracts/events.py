@@ -45,6 +45,13 @@ class EventType(enum.StrEnum):
     # consumer to notify the tenant, and the tenant only discovers the
     # expired credential when a support agent's tool call fails.
     CONNECTOR_NEEDS_REAUTH = "connector.needs_reauth"
+    # Emitted when an SLA clock on a Case has run out and the escalation
+    # ladder recorded a rung. Carries the clock, the level and how far past
+    # the deadline the Case was, because "which commitment did we miss, how
+    # badly, and who was told" is the whole content of an escalation and a
+    # consumer should not have to re-derive it from the Case row - which by
+    # then may have been resolved.
+    CASE_SLA_BREACHED = "case.sla_breached"
 
 
 class InboundEventType(enum.StrEnum):
@@ -87,6 +94,24 @@ class CaseUpdatedPayload(_Strict):
     command: str = Field(min_length=1)
     status: str = Field(min_length=1)
     version: int = Field(ge=1)
+
+
+class CaseSlaBreachedPayload(_Strict):
+    """One rung of the escalation ladder, recorded.
+
+    `breach_seconds` is how far past the deadline the Case was at the moment
+    of escalation. It is a fact about the response, not a live value: the
+    clock keeps running, and a consumer that recomputed it later would
+    report a different number for the same event.
+    """
+
+    case_id: str = Field(min_length=1)
+    clock: str = Field(min_length=1)
+    level: int = Field(ge=1)
+    breach_seconds: int = Field(ge=0)
+    # The queue a level-2 escalation was routed to, or None when the Case
+    # already had a team and the ladder declined to overrule it.
+    routed_to: str | None = None
 
 
 class UsageRecordedPayload(_Strict):
@@ -150,6 +175,7 @@ PAYLOAD_SCHEMAS: dict[EventType, type[BaseModel]] = {
     EventType.CASE_UPDATED: CaseUpdatedPayload,
     EventType.USAGE_RECORDED: UsageRecordedPayload,
     EventType.CONNECTOR_NEEDS_REAUTH: ConnectorNeedsReauthPayload,
+    EventType.CASE_SLA_BREACHED: CaseSlaBreachedPayload,
 }
 
 
@@ -218,6 +244,7 @@ __all__ = [
     "EVENT_VERSION",
     "AggregateType",
     "CaseCreatedPayload",
+    "CaseSlaBreachedPayload",
     "CaseUpdatedPayload",
     "ConnectorNeedsReauthPayload",
     "ContractError",

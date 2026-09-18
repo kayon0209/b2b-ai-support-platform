@@ -24,6 +24,11 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+# Imported for its side effect: every mapped table is registered, so a
+# foreign key pointing at another module's table always resolves. Without it
+# the failure is import-order dependent and reads like a broken schema - see
+# `models_registry`.
+from platform_core import models_registry  # noqa: F401  (side-effect import)
 from platform_core.config import get_settings
 
 _UNSUPPORTED_LOOP = "ProactorEventLoop"

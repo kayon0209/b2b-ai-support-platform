@@ -252,3 +252,39 @@ class CaseConversation(Base, PkMixin, TenantMixin):
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id"), nullable=False, index=True)
     conversation_ref_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     relationship: Mapped[str] = mapped_column(String(31), nullable=False, default="origin")
+
+
+class CaseEscalation(Base, PkMixin, TenantMixin):
+    """One rung of the escalation ladder, recorded once.
+
+    `UNIQUE (case_id, clock, level)` is the idempotency mechanism rather than a
+    `SELECT`-then-`INSERT` in the scanner: two workers polling concurrently
+    would both read "not yet escalated" and both escalate, which is the same
+    check-then-act race the ingestion claim had. With the constraint, the loser
+    gets an integrity error and skips, and the guarantee holds for any future
+    caller.
+
+    The migration carries the rest of the reasoning (why `breach_seconds` is a
+    snapshot, why the routing refs are not foreign keys).
+    """
+
+    __tablename__ = "case_escalations"
+    __table_args__ = (
+        UniqueConstraint("case_id", "clock", "level", name="uq_case_escalation_once"),
+        Index("ix_case_escalations_case", "case_id"),
+    )
+
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id"), nullable=False)
+    # 'first_response' | 'resolution'. A string rather than an enum type, so a
+    # third clock is a data change rather than a type migration.
+    clock: Mapped[str] = mapped_column(String(31), nullable=False)
+    level: Mapped[int] = mapped_column(nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(63), nullable=False)
+    # How far past the deadline at the moment of escalation. Recorded, not
+    # derived: recomputing it later would rewrite history as the clock runs.
+    breach_seconds: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
+    # Where the escalation was routed, snapshotted. Not foreign keys: the
+    # targets are opaque external refs that get renamed.
+    assignee_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    team_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    escalated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
