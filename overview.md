@@ -1,74 +1,78 @@
 # b2b-ai-support-plan — 本轮开发报告
 
-**提交**：`9d4a384`（连接器健康/重授权）、`2e4ee13`（排序修复）、`f03bcd5`（P1 摄取回归 + 死信）
-**验证基线**：全量 **776 passed, EXIT=0**（754 → 776）；真实 MinIO 端到端绿；`ruff check` / `ruff format --check` / `mypy`（105 文件，0 错）全绿；alembic 在 `0025`
-**环境**：Docker Desktop 已恢复；`ai-postgres:5435` / `ai-redis:6380` / `b2b-e2e-minio:19000` 可用
+**提交**：`9d4a384`（连接器健康/重授权）→ `2e4ee13` → `f03bcd5`（P1 摄取回归 + 死信）→ `96a2963`（可续传同步）→ `b3b88b1`（连接器 webhook）→ `554142f`（限流 + 恢复演练 + 特性开关）→ `8c2a4d1`（自定义域名）
+
+**验证基线**：全量 **885 passed, EXIT=0**（基线 754）；真实 MinIO 端到端绿；恢复演练 **55 项检查全过**；`ruff check` / `ruff format --check` / `mypy`（110 文件，0 错）全绿；alembic 在 `0027`
+
+**Phase 状态**：**Phase 0–4 完成；Phase 5 完成自定义域名，SAML/SCIM 与 k8s 模板未开始（见第五节）**
 
 ---
 
-## 一、本轮最重要的一件事：一个 P1 摄取回归，是端到端跑出来的
+## 一、本轮的元规律：三个 P1/P2 级缺陷都是「跑出来」的，不是读出来的
 
-Docker 恢复后**第一件事就是跑真实 MinIO 端到端**，它立刻失败了：
+| 缺陷 | 怎么发现的 | 为什么测试没抓到 |
+|---|---|---|
+| **每个 API 上传的文档都入库失败** | 真实 MinIO 端到端 | fixture 播种的版本**没有** `content_type`，走了兜底分支 |
+| **迁移建表却忘了授权** | 域名接口第一个请求 `permission denied` | 迁移全绿、单测全绿，且只在**全新库**上失败 |
+| **恢复演练把并发变更误报成数据丢失** | 演练第一次运行报 7 个 FAIL | 演练只看了「恢复后 vs 源」，没检查源是否静止 |
+
+三者的共同点：**一个只在真实运行路径上才成立的假设**。
+
+### 1. 摄取 P1（`0025`）
 
 ```
 IngestionError: unsupported content type for parsing: "text/markdown"
 ```
 
-注意值**外面的引号**。`parse_document` 是精确匹配内容类型的，`"text/markdown"` 带引号就什么都匹配不上。
+注意值外面的引号。`->` 返回 JSON 标量，转 `text` 会保留双引号；`0024` 用了 `->`，于是只有 API 路径（唯一会在 metadata 里写 `content_type` 的路径）失败。已在活库上取证 `->` 与 `->>` 的差异后才改。
 
-根因（改任何东西之前先在活库上取证）：
+### 2. 迁移漏授权（`0027`）
 
-```sql
-'{"content_type": "text/markdown"}'::jsonb ->  'content_type' ::text  => "text/markdown"   -- 带引号
-'{"content_type": "text/markdown"}'::jsonb ->> 'content_type'         => text/markdown     -- 干净
-```
+`tenant_domains` 建了表、配了 RLS、迁移干净，但没有 `GRANT ... TO platform_app`。**这是同一个形状的第二次**（`users` 在 `0021` 才补上）。因此新增 `test_schema_privileges.py` 覆盖全部 34 张表——并且同时钉住镜像结论：`audit_events` **只有** SELECT+INSERT，因为审计可改就不再是审计。
 
-`->` 返回 **JSON** 值，把 JSON 字符串转 `text` 会保留两侧双引号。迁移 `0024` 用了 `->`。
+### 3. 恢复演练的假警报
 
-**后果**：**每一个经 API 上传的文档都必然入库失败**——因为只有 API 路径会在 `metadata` 里写 `content_type`。
+回归测试正在跑时执行演练，`test_dead_letters` 的清理在 dump 期间删掉了自己的租户，演练把「源在动」报成「恢复丢了数据」。一个会这样误报的演练只会教会人忽略它。现在 dump 前后各取一次源快照，不一致就退出码 2 并明说「源非静止」。
 
-**为什么测试全绿还是漏了**：`test_ingestion_worker.py` 的 `_make_version` 播种的版本**根本没有** `content_type`。`->` 取不存在的键，两个算子都返回 SQL NULL，worker 走 markdown 兜底，于是全过。**fixture 没有复现生产那一行**——这就是这类覆盖盲区的形状。
+## 二、Phase 3：三个「存在但从不被消费」的缺口全部闭合
 
-修复：迁移 `0025` 改 `->>`（签名不变，故 `CREATE OR REPLACE`），`EXPECTED_MIGRATIONS` 24 → 25；`_make_version` 支持按 API 的写法播种；新增三个测试，其中一个**断言精确字符串**（`in` 会放过带引号的值），另一个把 e2e 路径钉进套件，使它不可能再退回「只有 e2e 能发现」。
+- **健康与重授权**：`health_check()` 零调用方、`NEEDS_REAUTH` 从不被写、无轮换路径。
+  关键决策：`health_check()` 走的是**无鉴权**的 `/health`，所以**探测成功不能证明凭证有效**——因此探测**永远不能**清除 `NEEDS_REAUTH`，清除还必须证明凭证**可解析**。
+- **死信**：`DeadLetterItem` 有模型、有清扫、**没有生产者**。载荷永不落库（存 `tool:sha256(params)`，仍能回答「是不是同一个操作失败了 40 次」）；鉴权拒绝排除在外；歧义优先于错误码。**刻意不做重放**——载荷不在行里，歧义行在有人确认第一次是否落库前不能重试。
+- **可续传同步**：`SyncCursor` 零引用、`fetch` 零调用方。写调用方时暴露出 `fetch` 把 cursor 当 JQL 用——分页**永远不可能工作**，但会以 200 + 空结果集的形式**静默**表现为「没有更多记录」。游标只做存储、从不解析；**失败不移动游标**。
+- **连接器 webhook**：`EXEMPT_PATHS` 原本只做精确匹配，而 webhook 路径以连接器 id 结尾——补了显式的前缀豁免，并写明「该前缀下的一切都必须验签」。
 
-## 二、Phase 3：连接器健康、重授权、凭证轮换
+## 三、Phase 4：限流、恢复演练、第一个开关消费方
 
-Phase 3 验收标准「OAuth 重新授权可见且可操作」此前**不可能成立**——三个缺陷同属「存在但从不被消费」：
+- **限流**：令牌桶（固定窗口会在边界放行两倍，且算不出有意义的 `Retry-After`）。Redis 存计数——这正是 ADR 0002 说的「Redis 不存会改变请求结果的持久状态」的**反例**，ADR 已据此更新。Redis 不可用时**降级为进程内桶，而不是 fail-open**；`/healthz` 与 `/metrics` **永不限流**（限了指标等于在事故中蒙住监控）。
+- **恢复演练**：文档承诺了季度演练却无脚本。现在断言 33 张表行数、14 张表的**按租户分布**（总数相等而租户间搬移是总数看不出的）、审计**计数与时间跨度**、outbox 状态分布、续跑护栏约束、以及悬挂引用。**RPO 刻意不测**——逻辑 dump 的 RPO 按定义是 0，报它等于演戏。
+- **特性开关的第一个消费方**：`flag_service.evaluate` 在自身模块外**零调用**，所以开关能定义、能审计、能预览，却**不改变任何行为**。接入的正是重排序器——它已实现、已测试，但**生产回答路径从不重排**（`wiring.py` 甚至留着「Reranking is likewise optional」的注释而代码里没建）。默认 False，未定义的开关绝不是静默开启。
+  **灰度范围比看上去窄，这是真发现**：开关属于租户且有 RLS，门控在运行租户自己的 session 里求值，加上 `target_tenant` 拒绝自定向，因此**跨租户的集中灰度当前不可表达**。
 
-| 缺陷 | 证据 |
+## 四、Phase 5：自定义域名
+
+Host 是调用方可控的，所以两条边界必须写死：
+
+- **Host 永不为已鉴权请求选择租户**（那就是「从请求里取 tenant）」；它只能决定渲染**哪个租户的公开品牌页**。
+- **未验证的域名绝不解析**。否则任何租户都能声称别人的域名并在其上挂自己的品牌页。
+- 域名全局唯一（两租户同一主机 → 解析结果取决于行顺序）；`CHECK (domain = lower(domain))` 让归一化成为结构约束。
+- 验证目前是**运维书面确认**，不是 DNS 检查——读 TXT 记录需要一个解析器依赖与其失败模式决策，文档直说，不让 `verified_at` 看起来像自动检查。
+
+## 五、剩余（诚实说明，不含糊）
+
+- **SAML / SCIM**：未开始。各自都是真实协议实现（SAML 需 XML 签名校验与 metadata 交换；SCIM 需资源 schema、过滤与分页）。做得半成品比没有更糟，无法诚实地塞进一个切片。
+- **`infra/kubernetes/`**：未开始，`infra/` 目前只有 `compose/`。
+- **额外 IM 渠道**：适配器存在，但没有生产发送路径。
+- **已知且有意保留**：`ambiguous-refund-eligibility`（`must_abstain=True`）。正确解法是检索前完成账户身份解析；不得为让评测变绿而放宽该用例。
+- **可整理项（非缺陷）**：`flag_service` / `flag_router` 位于 `knowledge/` 模块，但特性开关是平台级概念，放在那里名不副实；迁移的话是一次纯粹的 import 重构。
+
+## 六、最终端到端验证
+
+| 检查 | 结果 |
 |---|---|
-| `health_check()` 零调用方 | 定义于 4 处，grep 调用方 = 0 |
-| `NEEDS_REAUTH` / `DEGRADED` / `last_health_at` 从不被写 | 枚举与列已定义，无生产赋值 |
-| 无轮换路径 | `credentials.py` 只解析 `env://` |
-
-**最值得留存的设计决策**：`health_check()` 走的是**无鉴权**的 `GET /health`，所以探测成功**不能**证明凭证有效。由此推出两条规则：
-
-1. 探测**永远不能**清除 `NEEDS_REAUTH`——否则一个已知被拒的凭证会被静默重新武装，而平台对 `active` 连接器接下来的动作是**执行写操作**。
-2. 清除 `NEEDS_REAUTH` 只能靠显式运维动作，且该动作还必须证明凭证**可解析**——这条拦住的是「运维把引用指向了忘记设置的变量」，否则 API 会对一个仍无法鉴权的连接器报告 `active`。
-
-另：`{"api_token": ""}` 视为**缺失**，因为 `Authorization: Bearer ` 不是凭证；无 scheme 的引用被拒，因为那通常是粘贴进来的密钥，而该列被每个请求读取并进备份。
-
-一个由**集成测试**（不是评审）暴露的排序缺陷：两个条件同时失败时我先报「不可达」。运维真正能修的是自己那个缺失的密钥，先报网络会让他们白跑一轮——已交换顺序并加测试钉住。
-
-## 三、Phase 3：死信从「只有模型没有生产者」变成可见工作
-
-`DeadLetterItem` 有模型、有保留期清扫，**没有生产者**：重试耗尽的连接器操作除了一个没人列出的失败 `ToolExecution` 行之外什么也不留。
-
-- **载荷永不落库**。行里存 `"{tool}:{sha256(params)[:32]}"`，仍能回答「同一个操作是不是失败了 40 次」，同时让客户派生的值不进入一个被运维端点读取、被备份复制的表。`sort_keys=True` 是承重的：少了它，插入顺序不同就得到不同摘要，这个归组会**静默失效**。
-- 鉴权拒绝**排除在外**（它有 NEEDS_REAUTH）；其余全部记录，且**歧义优先于错误码**，行上写 `AMBIGUOUS_OUTCOME`，因为运维的第一个问题是「到底有没有写进去」——这是错误码回答不了的。
-- **刻意不做重放端点**：载荷不在行里（设计如此），而歧义行在有人确认第一次是否落库之前不能重试——那是运维判断，不是循环。
-
-## 四、顺带修的与记录的
-
-- `AuthReportingExecutor` 改名 **`ConnectorOutcomeExecutor`**：它现在还产出死信，旧名字会主动误导——正是本仓库专门审计的那类缺陷。
-- 写 fixture 时踩到已知坑：`document_versions.metadata` 是 NOT NULL 且有 `'{}'` 默认值，**显式传 NULL 会覆盖默认值** → `NotNullViolation`。
-- 库里 2026-09-17 那条 `'list' object has no attribute 'vectors'` 失败记录是**历史残留**（当时脚本已改），当前 e2e 走同一路径且通过，非活动缺陷。
-
-## 五、剩余待办（按既定顺序）
-
-1. **Phase 3 收尾**：`SyncCursor` 写入/读取（增量同步位置）、连接器 webhook 摄取端点
-2. **Phase 4**：入站限流中间件、备份/恢复演练脚本、**特性开关运行时消费**（开关可定义、可审计、可预览，但**不改变任何行为**，故灰度当前不可执行）
-3. **Phase 5**：自定义域名 Host→tenant 路由、SAML/SCIM、`infra/kubernetes/` HA 模板
-4. **最终**：整体验证与端到端（Postgres + Redis + MinIO 已通；Chatwoot + Keycloak 待起）
-
-已知且**有意保留**的缺口：`ambiguous-refund-eligibility`（`must_abstain=True`）。正确解法是检索前做完账户身份解析，而非正则匹配问题文本；不得为让评测变绿而放宽该用例。
+| 全量回归 | **885 passed, EXIT=0** |
+| 真实 MinIO 端到端 | 绿（`ready=1`、`chunks=2 with_embedding=2`、`hybrid_search hits=2`） |
+| 备份/恢复演练 | **55 项检查，0 失败**，RTO 0.9s |
+| 迁移链（降到 base 再升回 head） | 通过（内含 `test_migration_and_performance`） |
+| 静态门禁 | ruff clean、format clean、mypy 110 文件 0 错 |
+| 未覆盖 | Chatwoot(3000) 与 Keycloak(8081) 未启动，因此 Chatwoot 双向往返与 OIDC 真令牌流程未复跑 |
