@@ -1,103 +1,74 @@
 # b2b-ai-support-plan — 本轮开发报告
 
-**提交**：`9d4a384` — `feat(integrations): make connector health and reauthorization real`
-**验证基线**：新增 19 个单元测试通过；无 DB 子集 **243 passed, rc=0**；`ruff check` / `ruff format --check` / `mypy`（104 文件，0 错）全绿
-**端到端验证**：**未能执行** —— Docker Desktop 全程未启动（见第四节）
+**提交**：`9d4a384`（连接器健康/重授权）、`2e4ee13`（排序修复）、`f03bcd5`（P1 摄取回归 + 死信）
+**验证基线**：全量 **776 passed, EXIT=0**（754 → 776）；真实 MinIO 端到端绿；`ruff check` / `ruff format --check` / `mypy`（105 文件，0 错）全绿；alembic 在 `0025`
+**环境**：Docker Desktop 已恢复；`ai-postgres:5435` / `ai-redis:6380` / `b2b-e2e-minio:19000` 可用
 
 ---
 
-## 一、先行核查：项目实际进度比预期靠前得多
+## 一、本轮最重要的一件事：一个 P1 摄取回归，是端到端跑出来的
 
-上一轮的记忆摘要停在 Phase 0/1，但仓库 HEAD 已在 Phase 5。以 `docs/development-plan.md` 为准绳逐条回代码核对后（证据见
-`.workbuddy-ai/artifacts/phase-progress-and-remaining-work.md`）：
+Docker 恢复后**第一件事就是跑真实 MinIO 端到端**，它立刻失败了：
 
-| Phase | 结论 |
-|---|---|
-| 0 基础与尽职调查 | **DONE** — ADR 4/4、依赖扫描 CI、dependabot |
-| 1 AI 回答与交接循环 | **DONE** — 签名 webhook+去重、摄取流水线、预过滤检索+引用、弃权/交接、发送前租约复检、观测性 |
-| 2 企业身份/授权/Case/SLA | **DONE** — OIDC+JWKS、RBAC/ABAC、全表 FORCE RLS、知识 ACL、Case+SLA、审计 |
-| 3 集成与工具 | **PARTIAL** — 尾部未闭合（本轮补上一块） |
-| 4 质量与生产加固 | **PARTIAL** — 限流、备份演练、开关运行时消费缺失 |
-| 5 产品化 | **PARTIAL** — SAML/SCIM、自定义域名路由、HA 模板缺失 |
+```
+IngestionError: unsupported content type for parsing: "text/markdown"
+```
 
-核查方法沿用本仓库的既有审计手法：**对任何被依赖的能力，grep 它的写入方/调用方**——文档与
-「直接调用该函数的测试」都不会暴露缺失的生产调用方。
+注意值**外面的引号**。`parse_document` 是精确匹配内容类型的，`"text/markdown"` 带引号就什么都匹配不上。
 
-## 二、本轮交付：Phase 3 连接器健康与重授权
+根因（改任何东西之前先在活库上取证）：
 
-Phase 3 的验收标准之一「OAuth 重新授权可见且可操作」此前**无法成立**，因为三个东西都「存在但从不被消费」：
+```sql
+'{"content_type": "text/markdown"}'::jsonb ->  'content_type' ::text  => "text/markdown"   -- 带引号
+'{"content_type": "text/markdown"}'::jsonb ->> 'content_type'         => text/markdown     -- 干净
+```
+
+`->` 返回 **JSON** 值，把 JSON 字符串转 `text` 会保留两侧双引号。迁移 `0024` 用了 `->`。
+
+**后果**：**每一个经 API 上传的文档都必然入库失败**——因为只有 API 路径会在 `metadata` 里写 `content_type`。
+
+**为什么测试全绿还是漏了**：`test_ingestion_worker.py` 的 `_make_version` 播种的版本**根本没有** `content_type`。`->` 取不存在的键，两个算子都返回 SQL NULL，worker 走 markdown 兜底，于是全过。**fixture 没有复现生产那一行**——这就是这类覆盖盲区的形状。
+
+修复：迁移 `0025` 改 `->>`（签名不变，故 `CREATE OR REPLACE`），`EXPECTED_MIGRATIONS` 24 → 25；`_make_version` 支持按 API 的写法播种；新增三个测试，其中一个**断言精确字符串**（`in` 会放过带引号的值），另一个把 e2e 路径钉进套件，使它不可能再退回「只有 e2e 能发现」。
+
+## 二、Phase 3：连接器健康、重授权、凭证轮换
+
+Phase 3 验收标准「OAuth 重新授权可见且可操作」此前**不可能成立**——三个缺陷同属「存在但从不被消费」：
 
 | 缺陷 | 证据 |
 |---|---|
-| `health_check()` 零调用方 | 定义于 `sdk.py` / `crm.py` / `jira.py` / `im.py`，全仓 grep 调用方 = 0 |
-| `NEEDS_REAUTH` / `DEGRADED` / `last_health_at` 从不被写 | 枚举与列已定义，无任何生产赋值 |
-| 无轮换路径 | `credentials.py` 只解析 `env://`，没有任何代码重指引用 |
+| `health_check()` 零调用方 | 定义于 4 处，grep 调用方 = 0 |
+| `NEEDS_REAUTH` / `DEGRADED` / `last_health_at` 从不被写 | 枚举与列已定义，无生产赋值 |
+| 无轮换路径 | `credentials.py` 只解析 `env://` |
 
-**后果**：租户的 Jira token 过期后，连接器仍是 `active`，每次工具调用以
-`CONNECTOR_AUTH_EXPIRED` 失败，而平台里没有任何地方说明这件事。
+**最值得留存的设计决策**：`health_check()` 走的是**无鉴权**的 `GET /health`，所以探测成功**不能**证明凭证有效。由此推出两条规则：
 
-### 关键设计决策（值得留存）
+1. 探测**永远不能**清除 `NEEDS_REAUTH`——否则一个已知被拒的凭证会被静默重新武装，而平台对 `active` 连接器接下来的动作是**执行写操作**。
+2. 清除 `NEEDS_REAUTH` 只能靠显式运维动作，且该动作还必须证明凭证**可解析**——这条拦住的是「运维把引用指向了忘记设置的变量」，否则 API 会对一个仍无法鉴权的连接器报告 `active`。
 
-`health_check()` 走的是**无鉴权**的 `GET {base}/health`（`crm.py:98`，不带 Authorization 头），所以：
+另：`{"api_token": ""}` 视为**缺失**，因为 `Authorization: Bearer ` 不是凭证；无 scheme 的引用被拒，因为那通常是粘贴进来的密钥，而该列被每个请求读取并进备份。
 
-> **探测成功不能证明凭证有效。**
+一个由**集成测试**（不是评审）暴露的排序缺陷：两个条件同时失败时我先报「不可达」。运维真正能修的是自己那个缺失的密钥，先报网络会让他们白跑一轮——已交换顺序并加测试钉住。
 
-由此推出两条规则，已固化进 `integrations/health.py`：
+## 三、Phase 3：死信从「只有模型没有生产者」变成可见工作
 
-1. **探测永远不会清除 `NEEDS_REAUTH`。** 若「可达」能解除它，一个已知被拒的凭证会被静默重新武装，
-   而平台接下来对一个 `active` 连接器要做的事是**执行写操作**。
-2. `NEEDS_REAUTH` 只能由**显式运维动作**清除，且该动作还必须证明凭证现在**可解析**
-   （`can_clear_reauth` 同时要求可达 **且** `credential_is_present`）。第二个条件正是为了拦住
-   「运维把引用指向了一个忘记设置的变量」——否则 API 会对一个仍无法鉴权的连接器报告 `active`。
+`DeadLetterItem` 有模型、有保留期清扫，**没有生产者**：重试耗尽的连接器操作除了一个没人列出的失败 `ToolExecution` 行之外什么也不留。
 
-另：`{"api_token": ""}` 视为**缺失**。它产生 `Authorization: Bearer `（空），这不是凭证，
-却会让连接器看起来已配置而每次调用都 401。
+- **载荷永不落库**。行里存 `"{tool}:{sha256(params)[:32]}"`，仍能回答「同一个操作是不是失败了 40 次」，同时让客户派生的值不进入一个被运维端点读取、被备份复制的表。`sort_keys=True` 是承重的：少了它，插入顺序不同就得到不同摘要，这个归组会**静默失效**。
+- 鉴权拒绝**排除在外**（它有 NEEDS_REAUTH）；其余全部记录，且**歧义优先于错误码**，行上写 `AMBIGUOUS_OUTCOME`，因为运维的第一个问题是「到底有没有写进去」——这是错误码回答不了的。
+- **刻意不做重放端点**：载荷不在行里（设计如此），而歧义行在有人确认第一次是否落库之前不能重试——那是运维判断，不是循环。
 
-### 落地内容
+## 四、顺带修的与记录的
 
-- `integrations/health.py` — 状态转移做成**纯函数**（`status_after_probe` /
-  `status_after_auth_failure` / `can_clear_reauth`）+ 异步落库器。纯函数是刻意的：
-  决定「连接器能否执行写操作」的规则因此**无需 Postgres 即可验证**。
-- `tool_gateway/registry.AuthReportingExecutor` — 适配器是以**返回值**（dict）而非异常报告
-  `CONNECTOR_AUTH_EXPIRED` 的，所以工具路径上没有任何环节能观察到它。包装器在 build 时套上
-  （只有那里同时握有 `Connector` 行与 session），并原样委托 `verify_postcondition`。
-- `integrations/router.py` — `GET /v1/connectors`、`POST .../health-check`、
-  `POST .../reactivate`、`PUT .../credential-ref`。
-- `EventType.CONNECTOR_NEEDS_REAUTH`（**仅在转入** NEEDS_REAUTH 时发出，持续失败的连接器只通知一次）。
-- `Action.CONNECTOR_READ` / `CONNECTOR_ADMIN` —— 与工具词汇表**刻意分离**：
-  「被允许调用 Jira 工具」不等于「被允许重新配置 Jira 连接」。`support_admin` 可读健康
-  （工具坏掉的就是他们），轮换凭证仅 `tenant_owner`。
+- `AuthReportingExecutor` 改名 **`ConnectorOutcomeExecutor`**：它现在还产出死信，旧名字会主动误导——正是本仓库专门审计的那类缺陷。
+- 写 fixture 时踩到已知坑：`document_versions.metadata` 是 NOT NULL 且有 `'{}'` 默认值，**显式传 NULL 会覆盖默认值** → `NotNullViolation`。
+- 库里 2026-09-17 那条 `'list' object has no attribute 'vectors'` 失败记录是**历史残留**（当时脚本已改），当前 e2e 走同一路径且通过，非活动缺陷。
 
-### 测试接缝的选择
+## 五、剩余待办（按既定顺序）
 
-仅在重授权**成功**路径上 monkeypatch `probe_connector`：为了回答 `/health` 而搭一个 HTTP 服务
-是在测 `httpx`，不是测这条规则。不可达路径统一用 `http://127.0.0.1:9`（discard 端口），
-连接立即被拒，避免每次运行都吃一次 DNS + connect 超时。
+1. **Phase 3 收尾**：`SyncCursor` 写入/读取（增量同步位置）、连接器 webhook 摄取端点
+2. **Phase 4**：入站限流中间件、备份/恢复演练脚本、**特性开关运行时消费**（开关可定义、可审计、可预览，但**不改变任何行为**，故灰度当前不可执行）
+3. **Phase 5**：自定义域名 Host→tenant 路由、SAML/SCIM、`infra/kubernetes/` HA 模板
+4. **最终**：整体验证与端到端（Postgres + Redis + MinIO 已通；Chatwoot + Keycloak 待起）
 
-## 三、连带定位的一个环境缺陷（非本轮引入）
-
-`apps/api/tests/unit/identity/test_tenant_context.py::test_unresolvable_token_is_401_not_a_synthetic_context`
-被归在 `unit/` 下，却走真实的 `bootstrap_token_resolver` → 连 Postgres。
-Docker 不在时它**挂在连接上**（不是失败，是挂住），把整个 `pytest apps/api/tests/unit` 拖死。
-结果是「全量测试超时」看起来像代码回归，实际是环境缺失。
-
-无 DB 时可通过的是 **243 个测试**（排除该用例后 `rc=0`）。该用例归类问题已记录，待 Docker 可用后
-再决定是移到 `integration/` 还是改为可注入的解析器。
-
-## 四、未完成的验证（显式声明）
-
-Docker Desktop 全程未启动：`ai-postgres:5435`、`ai-redis:6380`、`minio:19000`、
-`chatwoot:3000`、`keycloak:8081` 全部不可达，`docker ps` 无法连上 daemon。
-本机 `5432` 上另有一个原生 PostgreSQL，但 `postgres` 与 `platform` 两个用户名都被拒，
-凭证未知；把项目指向它会脱离文档化的 compose 环境，故未采用。
-
-因此 **`apps/api/tests/integration/test_connector_health.py`（18 个测试）已写完但未运行**。
-在这一文件通过之前，本轮切片**不得视为已验证**。
-
-## 五、下一步（按既定顺序）
-
-1. Docker 恢复后：跑本轮 18 个集成测试 → 全量回归 → 迁移链 → 真实 MinIO 端到端
-2. Phase 3 收尾：死信生产者 + 管理端查询/重放、`SyncCursor` 写入与读取、连接器 webhook 摄取
-3. Phase 4：入站限流中间件、备份/恢复演练脚本、特性开关运行时消费
-4. Phase 5：自定义域名 Host→tenant 路由、SAML/SCIM、`infra/kubernetes/` HA 模板
-5. 最终：整体验证与端到端（MinIO + Postgres + Redis + Chatwoot + Keycloak）
+已知且**有意保留**的缺口：`ambiguous-refund-eligibility`（`must_abstain=True`）。正确解法是检索前做完账户身份解析，而非正则匹配问题文本；不得为让评测变绿而放宽该用例。
