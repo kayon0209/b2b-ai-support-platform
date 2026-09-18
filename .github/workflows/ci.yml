@@ -118,7 +118,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install fastapi "sqlalchemy[asyncio]" "psycopg[binary]" pydantic pydantic-settings uuid6 alembic pytest pytest-asyncio httpx
+        run: pip install -r requirements-dev.txt
       - name: Run unit tests
         run: pytest apps/api/tests/unit packages/contracts/tests -m "not integration"
         env:
@@ -146,7 +146,7 @@ jobs:
              GRANT platform_app TO platform;
              GRANT ALL ON SCHEMA public TO platform_app;"
       - name: Install dependencies
-        run: pip install fastapi "sqlalchemy[asyncio]" "psycopg[binary]" pydantic pydantic-settings uuid6 alembic pytest pytest-asyncio httpx
+        run: pip install -r requirements-dev.txt
       - name: Run migrations
         run: alembic -c apps/api/migrations/alembic.ini upgrade head
         env:

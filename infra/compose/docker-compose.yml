@@ -63,6 +63,16 @@ services:
     build:
       context: ../..
       dockerfile: infra/compose/api.Dockerfile
+    # The full environment, not a hand-listed subset. The API container
+    # previously enumerated its own variables and omitted the auth config,
+    # so it exited at startup with 'no authentication configured' even
+    # against a correctly filled .env. `required: false` keeps a fresh
+    # checkout working before .env exists.
+    env_file:
+      - path: ../../.env
+        required: false
+    # Explicit values below win over env_file, and exist to repoint the
+    # services at their in-network addresses.
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
@@ -94,6 +104,16 @@ services:
       context: ../..
       dockerfile: infra/compose/api.Dockerfile
     command: ["python", "-m", "worker.runner"]
+    # The full environment, not a hand-listed subset. The API container
+    # previously enumerated its own variables and omitted the auth config,
+    # so it exited at startup with 'no authentication configured' even
+    # against a correctly filled .env. `required: false` keeps a fresh
+    # checkout working before .env exists.
+    env_file:
+      - path: ../../.env
+        required: false
+    # Explicit values below win over env_file, and exist to repoint the
+    # services at their in-network addresses.
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
@@ -117,6 +137,16 @@ services:
       context: ../..
       dockerfile: infra/compose/api.Dockerfile
     command: ["python", "-m", "worker.runner"]
+    # The full environment, not a hand-listed subset. The API container
+    # previously enumerated its own variables and omitted the auth config,
+    # so it exited at startup with 'no authentication configured' even
+    # against a correctly filled .env. `required: false` keeps a fresh
+    # checkout working before .env exists.
+    env_file:
+      - path: ../../.env
+        required: false
+    # Explicit values below win over env_file, and exist to repoint the
+    # services at their in-network addresses.
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
@@ -140,6 +170,16 @@ services:
       context: ../..
       dockerfile: infra/compose/api.Dockerfile
     command: ["python", "-m", "worker.runner"]
+    # The full environment, not a hand-listed subset. The API container
+    # previously enumerated its own variables and omitted the auth config,
+    # so it exited at startup with 'no authentication configured' even
+    # against a correctly filled .env. `required: false` keeps a fresh
+    # checkout working before .env exists.
+    env_file:
+      - path: ../../.env
+        required: false
+    # Explicit values below win over env_file, and exist to repoint the
+    # services at their in-network addresses.
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
@@ -158,6 +198,16 @@ services:
       context: ../..
       dockerfile: infra/compose/api.Dockerfile
     command: ["python", "-m", "worker.runner"]
+    # The full environment, not a hand-listed subset. The API container
+    # previously enumerated its own variables and omitted the auth config,
+    # so it exited at startup with 'no authentication configured' even
+    # against a correctly filled .env. `required: false` keeps a fresh
+    # checkout working before .env exists.
+    env_file:
+      - path: ../../.env
+        required: false
+    # Explicit values below win over env_file, and exist to repoint the
+    # services at their in-network addresses.
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
@@ -175,6 +225,16 @@ services:
       context: ../..
       dockerfile: infra/compose/api.Dockerfile
     command: ["python", "-m", "worker.runner", "--outbox-only"]
+    # The full environment, not a hand-listed subset. The API container
+    # previously enumerated its own variables and omitted the auth config,
+    # so it exited at startup with 'no authentication configured' even
+    # against a correctly filled .env. `required: false` keeps a fresh
+    # checkout working before .env exists.
+    env_file:
+      - path: ../../.env
+        required: false
+    # Explicit values below win over env_file, and exist to repoint the
+    # services at their in-network addresses.
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform

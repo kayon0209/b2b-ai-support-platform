@@ -38,6 +38,13 @@ last command — use `${PIPESTATUS[0]}` or no pipe. CI's `release-evidence` job
 runs the **full** suite (not `-m integration`: `unauthorized_writes` is backed
 by unit tests) then `release_check --evidence-only`.
 
+**Stop the `ai-*` services before running the suite.** `ai-worker-interactive`
+runs an outbox relay that claims rows every second, so a test that commits an
+outbox event and then asserts on its own relay's batch sees `claimed=0`. The
+symptom is a single intermittent failure in `test_billing_ledger` /
+`test_outbox_relay` that passes when run alone. Same root cause as the
+"outbox is global" rule below: one shared queue, two consumers.
+
 ## The recurring defect family: a capability with no consumer
 
 Every audit round finds the same shape — a value, column, or function that

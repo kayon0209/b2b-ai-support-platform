@@ -431,11 +431,19 @@ def test_restricted_request_never_reaches_model_and_hands_off() -> None:
     assert outcome.status.value == "abstained"
     assert outcome.abstain_reason == "RESTRICTED_REQUEST"
     assert outcome.handoff is True
-    # The model was never consulted and nothing was sent to the customer
-    # through the outbound transport.
+    # The model was never consulted, and the lease moved to the human queue.
     assert generator.calls == 0
-    assert sender.calls == []
     assert owner == "queue"
+    # The customer *is* told. This assertion used to read `sender.calls == []`,
+    # which encoded the bug: `_finish_abstain` built the customer-safe notice
+    # and never dispatched it, so a refused request produced silence. A
+    # refusal the customer never hears is indistinguishable from an outage.
+    assert len(sender.calls) == 1, "the refusal notice must reach the customer"
+    notice = sender.calls[0]["content"]
+    assert notice == outcome.answer_text
+    # ...and it must not leak what was refused.
+    for secret in ("password", "api key", "admin"):
+        assert secret not in notice.lower(), f"the notice leaked {secret!r}"
 
 
 def test_no_evidence_abstains_without_model_call() -> None:
@@ -474,7 +482,14 @@ def test_no_evidence_abstains_without_model_call() -> None:
     assert outcome.status.value == "abstained"
     assert outcome.abstain_reason
     assert generator.calls == 0
-    assert sender.calls == []
+    # Abstaining is a decision not to answer, not a decision to go quiet: the
+    # customer is told the answer could not be verified and that a human is
+    # coming. `sender.calls == []` here used to assert the opposite, and a
+    # live Chatwoot run showed what that meant in practice - the customer
+    # waited on a reply that was never sent.
+    assert len(sender.calls) == 1, "the abstention notice must reach the customer"
+    assert sender.calls[0]["content"] == outcome.answer_text
+    assert sender.calls[0]["command_id"] == f"run:{outcome.run_id}"
 
 
 def test_outbound_failure_marks_run_failed_not_completed() -> None:

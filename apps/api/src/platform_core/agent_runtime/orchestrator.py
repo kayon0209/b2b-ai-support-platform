@@ -455,6 +455,8 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
             )
 
         # --- 3. Retrieve authorized evidence. ---
@@ -489,6 +491,8 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
             )
 
         # --- 4. Abstention gate before spending a model call. ---
@@ -503,6 +507,8 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
             )
 
         # --- 5. Generate a draft. ---
@@ -518,6 +524,8 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
             )
         try:
             draft = await self._generate_with_telemetry(ctx, question, evidence)
@@ -541,6 +549,8 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
             )
 
         # --- 6. Validate citations. Unsupported output is not publishable. ---
@@ -560,6 +570,8 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
             )
 
         # --- 7. Persist citations with the run still RUNNING. ---
@@ -754,13 +766,62 @@ class AgentOrchestrator:
         ctx: TraceContext,
         started: float,
         question: str,
+        chatwoot_account_id: str | None,
+        chatwoot_conversation_id: str | None,
     ) -> RunOutcome:
-        """Record abstention, release the lease to the human queue, and
-        send the customer-safe notice (still behind the lease gate)."""
+        """Record abstention, release the lease to the human queue, and send
+        the customer-safe notice (still behind the lease gate).
+
+        The notice is the point. This method used to compute
+        `safe_abstention_text` and return it in the outcome without ever
+        dispatching it, so an unanswerable question produced **silence**: the
+        handoff happened internally and the customer was told nothing - not
+        that the platform could not verify the answer, and not that a human was
+        coming. Abstention is the most common failure mode, so that was the
+        most common outcome a customer could experience.
+
+        Found by `tests/e2e/e2e_chatwoot_loop.py`, which is the only thing that
+        asks a live Chatwoot whether a reply appeared.
+        """
         run.status = RunStatus.ABSTAINED.value
         run.abstain_reason = decision.reason_code[:127]
         run.latency_ms = int((time.monotonic() - started) * 1000)
         await self._session.flush()
+
+        notice = safe_abstention_text(decision.reason_code)
+
+        # Send the notice **before** releasing the lease, because the lease
+        # gate below refuses once the owner is the queue. Releasing first was
+        # the first version of this fix and it blocked every notice with
+        # "owner is queue" - the customer would still have heard nothing, just
+        # with a different reason in the log.
+        #
+        # The re-check is the same one the answer path performs: a human may
+        # have taken over between retrieval and here, and a notice saying "let
+        # me connect you with a colleague" sent *after* a colleague already
+        # replied is exactly the duplicate the lease exists to stop.
+        send_error = ""
+        try:
+            await lease_service.assert_can_send(
+                self._session,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_version=expected_lease_version,
+            )
+        except LeaseConflict as exc:
+            send_error = f"LEASE_CONFLICT: {exc}"
+            logger.warning("abstain_notice_blocked", ctx, reason_code=str(exc))
+            get_metrics().lease_conflicts_total.inc()
+        else:
+            send_error = await self._dispatch(
+                run=run,
+                tenant_id=tenant_id,
+                draft_text=notice,
+                ctx=ctx,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+                conversation_ref_id=conversation_ref_id,
+            )
 
         if decision.handoff:
             await lease_service.release_to_queue(
@@ -769,6 +830,7 @@ class AgentOrchestrator:
                 conversation_ref_id=conversation_ref_id,
                 reason=f"abstain:{decision.reason_code}",
             )
+
         await audit_service.record(
             self._session,
             ctx=TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="service"),
@@ -777,7 +839,7 @@ class AgentOrchestrator:
             resource_id=run.id,
             decision="abstained",
             reason_code=decision.reason_code[:63],
-            after={"handoff": decision.handoff},
+            after={"handoff": decision.handoff, "notice_sent": not send_error},
             trace_id=ctx.trace_id,
         )
         logger.info(
@@ -786,6 +848,7 @@ class AgentOrchestrator:
             route=run.route,
             status=run.status,
             reason_code=decision.reason_code,
+            notice_sent=not send_error,
         )
         get_metrics().observe_run(
             outcome="handed_off" if decision.handoff else "abstained",
@@ -797,9 +860,10 @@ class AgentOrchestrator:
             run_id=run.id,
             status=RunStatus.ABSTAINED,
             route=run.route,
-            answer_text=safe_abstention_text(decision.reason_code),
+            answer_text=notice,
             abstain_reason=decision.reason_code,
             handoff=decision.handoff,
+            send_blocked_reason=send_error,
             latency_ms=run.latency_ms,
             trace_id=ctx.trace_id,
         )

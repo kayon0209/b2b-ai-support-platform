@@ -21,6 +21,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.agent_runtime.prompts import KNOWLEDGE_QA_PROMPT
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -340,3 +342,109 @@ def test_scenario_full_knowledge_qa_with_citations(e2e_env: dict) -> None:
     # A phantom citation is rejected (never cite out-of-context versions)
     phantom_draft = DraftAnswer(text="x", claims={0: [uuid.uuid4()]})
     assert validate_citations(phantom_draft, evidence).ok is False
+
+
+class _RecordingSender:
+    """ChatwootClient-compatible transport double that records every send."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def send_message(self, *, account_id, conversation_id, content, command_id):
+        self.calls.append(
+            {
+                "account_id": account_id,
+                "conversation_id": conversation_id,
+                "content": content,
+                "command_id": command_id,
+            }
+        )
+
+        class _Result:
+            ambiguous = False
+
+        return _Result()
+
+
+class _UnusedGenerator:
+    """Abstention happens before generation, so reaching this is a failure.
+
+    Carries `template` because the orchestrator records prompt lineage on
+    every run, including one that abstains before generating.
+    """
+
+    template = KNOWLEDGE_QA_PROMPT
+
+    async def generate(self, question, evidence):  # pragma: no cover
+        raise AssertionError("an abstaining run must never reach the model")
+
+
+def test_scenario_insufficient_evidence_answers_the_customer(e2e_env: dict) -> None:
+    """Scenario 4 from this module's docstring: "Insufficient evidence ->
+    abstention with handoff reason".
+
+    It was listed and never written, which is how the defect below survived:
+    `_finish_abstain` computed `safe_abstention_text` and returned it in the
+    RunOutcome **without dispatching it**, so an unanswerable question produced
+    silence. The handoff happened internally; the customer was told nothing -
+    not that the platform could not verify an answer, and not that a human was
+    coming. Abstention is the most common failure mode, so that was the most
+    common thing a customer could experience.
+
+    The assertion is on the *transport*, not on the outcome object: the outcome
+    carried the right text the whole time. Only a live Chatwoot - or this
+    recording double - can tell you whether it was ever sent.
+    """
+    from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
+    from platform_core.db import create_engine
+    from platform_core.retrieval.hybrid import PrincipalScope
+
+    tid = uuid.UUID(e2e_env["tenant_id"])
+    conv = uuid.uuid4()
+    # Nothing in the seeded corpus is about this, so retrieval finds no
+    # evidence and the gate must abstain.
+    question = "What is the airspeed velocity of an unladen swallow?"
+
+    async def scenario() -> tuple[object, _RecordingSender]:
+        engine = create_engine(APP_URL)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        sender = _RecordingSender()
+        async with factory() as session:
+            await session.execute(
+                text("SELECT set_config('app.tenant_id', :t, true)"),
+                {"t": str(tid)},
+            )
+            orchestrator = AgentOrchestrator(
+                session,
+                OrchestratorDeps(generator=_UnusedGenerator(), sender=sender),
+            )
+            outcome = await orchestrator.run(
+                tenant_id=tid,
+                conversation_ref_id=conv,
+                question=question,
+                principal=PrincipalScope(
+                    principal_types=("role",), principal_ids=("support_agent",)
+                ),
+                chatwoot_account_id=CHATWOOT_ACCOUNT,
+                chatwoot_conversation_id=str(conv),
+            )
+            await session.commit()
+        await engine.dispose()
+        return outcome, sender
+
+    outcome, sender = _run(scenario())
+
+    assert outcome.abstain_reason, "the run must record why it abstained"
+    assert outcome.handoff is True, "no evidence means a human, not a retry"
+    assert len(sender.calls) == 1, (
+        "the customer-safe notice must actually be sent; an abstention that "
+        "reaches nobody leaves the customer waiting on a reply that never comes"
+    )
+    sent = sender.calls[0]
+    assert sent["conversation_id"] == str(conv)
+    assert sent["account_id"] == CHATWOOT_ACCOUNT
+    assert sent["content"] == outcome.answer_text
+    assert "connect you with a human" in sent["content"].lower()
+    assert sent["command_id"] == f"run:{outcome.run_id}", (
+        "the outbound key is derived from the run id, so a retry cannot double-send"
+    )

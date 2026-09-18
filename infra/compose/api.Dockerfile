@@ -3,12 +3,19 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY pyproject.toml ./
+COPY requirements.txt ./
 COPY apps/api/src ./apps/api/src
 COPY apps/worker/src ./apps/worker/src
 COPY packages ./packages
 COPY apps/api/migrations ./apps/api/migrations
 
-RUN pip install --no-cache-dir fastapi 'uvicorn[standard]' sqlalchemy[asyncio] 'psycopg[binary]' pydantic pydantic-settings uuid6 alembic httpx jsonschema && \
+# The manifest, not a hand-written list. This step used to name eleven packages
+# inline and had drifted: it omitted `prometheus-client`, which
+# `platform_core.main` imports, so the container raised ModuleNotFoundError on
+# startup and could never serve a request - while the test suite, which runs
+# against the venv, stayed green. A list maintained in two places is a list
+# that disagrees with itself.
+RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir -e . --no-deps 2>/dev/null || true
 
 ENV PYTHONPATH=/app/apps/api/src:/app/apps/worker/src:/app/packages/contracts/src:/app/packages/policy/src:/app/packages/observability/src

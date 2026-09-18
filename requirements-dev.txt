@@ -1,70 +1,18 @@
-# Pinned dependency manifest for the B2B AI support platform.
+# Development and verification dependencies.
 #
-# This file exists because the project previously declared its runtime
-# dependencies nowhere: they were installed ad hoc into .venv, and when that
-# environment was damaged there was no way to reconstruct it. Everything the
-# API, worker and test suite import is listed here so a fresh checkout is
-# reproducible with two commands:
+# Runtime dependencies live in `requirements.txt` and are included here, so a
+# fresh checkout is reproducible with two commands:
 #
 #   python -m venv .venv
 #   .venv/Scripts/python -m pip install -r requirements-dev.txt   # Windows
 #   .venv/bin/python   -m pip install -r requirements-dev.txt     # POSIX
 #
-# Ranges rather than exact pins: this is a pre-1.0 platform and the locks are
-# maintained by the CI image, not here. Lower bounds are the versions the
-# suite was actually verified against (see .workbuddy-ai/memory/).
+# Splitting the two matters: the API image installs `requirements.txt` only, so
+# no test framework is in the runtime image, and a package added for the
+# application lands in both places rather than in whichever list the author
+# happened to remember.
 
-# --- Web framework and configuration ---------------------------------------
-fastapi>=0.115
-uvicorn[standard]>=0.32
-pydantic>=2.9
-pydantic-settings>=2.6
-# Required by FastAPI to parse multipart/form-data, which the knowledge
-# document upload uses. Without it every Form/File route raises at import
-# time, so it is a runtime dependency, not an optional extra.
-python-multipart>=0.0.9
-
-# --- Persistence -----------------------------------------------------------
-sqlalchemy>=2.0.36
-psycopg[binary,pool]>=3.2
-alembic>=1.14
-greenlet>=3.1          # SQLAlchemy's async bridge; required explicitly on 3.12
-pgvector>=0.3.6
-
-# --- Async work and caching ------------------------------------------------
-# The custom platform owns its own Redis. It is never shared with Chatwoot
-# (see AGENTS.md, "Prohibited shortcuts").
-redis>=5.2
-celery>=5.4
-
-# --- Object storage --------------------------------------------------------
-minio>=7.2
-
-# --- Security --------------------------------------------------------------
-pyjwt[crypto]>=2.10
-cryptography>=43
-# SAML response signature verification. A vetted XML-DSig implementation
-# rather than a hand-rolled one: getting canonicalisation or the
-# signature-wrapping defence subtly wrong is how a SAML SP accepts a
-# forged assertion, and that is not a bug a test suite reliably finds.
-signxml>=4
-lxml>=5
-
-# --- Observability ---------------------------------------------------------
-structlog>=24.4
-prometheus-client>=0.21
-
-# --- Contracts and utilities -----------------------------------------------
-jsonschema>=4.23
-pyyaml>=6.0
-httpx>=0.27
-tenacity>=9.0
-uuid6>=2024.7.10
-
-# --- Document parsing -------------------------------------------------------
-# Used by the ingestion pipeline to extract text from PDF and DOCX uploads.
-pypdf>=5.0
-python-docx>=1.2
+-r requirements.txt
 
 # --- Development and verification ------------------------------------------
 pytest>=8.3

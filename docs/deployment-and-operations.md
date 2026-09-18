@@ -31,7 +31,35 @@ loki
 
 Chatwoot and the custom platform use separate PostgreSQL databases and Redis instances.
 
-## Configuration
+### Starting the stack
+
+```bash
+cp .env.example .env      # then fill in APP_LLM_API_KEY
+docker compose --env-file .env -f infra/compose/docker-compose.yml up -d
+```
+
+Two things about this are load-bearing, and both were broken until a live
+end-to-end run exposed them:
+
+- **`--env-file .env` is required.** Every `ai-*` service declares
+  `env_file: ../../.env` (with `required: false`, so a fresh checkout still
+  parses), and the values it supplies — `APP_ALLOW_BOOTSTRAP_TOKENS`,
+  `APP_LLM_API_KEY`, the Chatwoot token — are not optional. The services used
+  to enumerate their own variables and omitted the auth configuration, so
+  `ai-api` exited at startup with "no authentication configured" even against
+  a correctly filled `.env`.
+- **`chatwoot-sidekiq` must be running for the AI loop to work at all.**
+  Chatwoot delivers webhooks through a Sidekiq job; with Sidekiq down nothing
+  is ever POSTed to `/v1/webhooks/chatwoot`, so the platform receives no
+  messages and answers none. The symptom is silence, not an error.
+
+Runtime dependencies live in `requirements.txt` and are installed by
+`infra/compose/api.Dockerfile` from that manifest. It used to hand-list a
+subset, which drifted and omitted `prometheus-client`; the API image then
+raised `ModuleNotFoundError` on import and could not start, while the test
+suite — which runs against the venv — stayed green.
+
+### Configuration
 
 - Environment variables contain non-secret configuration.
 - Secrets are loaded from a secret manager or orchestrator secret store.
