@@ -16,6 +16,7 @@ from platform_core.agent_runtime.qa_path import (
     _chunk_overlap,
     _query_terms,
     _term_overlap,
+    claim_contradiction_candidates,
     decide_abstention,
     excerpt_hash,
     safe_abstention_text,
@@ -792,3 +793,74 @@ def test_the_identity_refusal_explains_itself() -> None:
     text = safe_abstention_text(ABSTAIN_AMBIGUOUS_IDENTITY)
     assert "contract" in text
     assert "human colleague" in text
+
+
+# --- Claim support: a metric, not a guard (ADR 0005) ----------------------
+#
+# `validate_citations` checks that a citation *resolves*. It cannot see a claim
+# that contradicts the excerpt it cites, which is how an answer asserting
+# "monthly plans are non-refundable" can cite the policy that says they are
+# refundable and pass.
+#
+# `claim_contradiction_candidates` is the metric that sees it. It is
+# deliberately naive, so its errors are pinned here rather than discovered in
+# production: the false positive below is the reason ADR 0005 stages it as a
+# metric instead of a guard.
+
+
+def _claim(text: str, excerpt: str) -> DraftAnswer:
+    chunk = _located(excerpt, title="Refund Policy", section=["Eligibility"])
+    return DraftAnswer(
+        text=text,
+        claims={0: [chunk.chunk_id]},
+        claim_texts={0: text},
+    ), [chunk]  # type: ignore[return-value]
+
+
+def test_a_contradicting_claim_is_reported() -> None:
+    """The real case: the model restates what the evidence denies."""
+    draft, evidence = _claim(
+        "Monthly plans are non-refundable.",
+        "Monthly plans are refundable within 14 days.",
+    )
+    assert claim_contradiction_candidates(draft, evidence) == [0]
+
+
+def test_a_supported_claim_is_not_reported() -> None:
+    draft, evidence = _claim(
+        "Monthly plans are refundable within 14 days.",
+        "Monthly plans are refundable within 14 days.",
+    )
+    assert claim_contradiction_candidates(draft, evidence) == []
+
+
+def test_a_claim_with_no_negation_is_not_reported() -> None:
+    draft, evidence = _claim(
+        "The refund window is 14 days for monthly plans.",
+        "Monthly plans are refundable within 14 days.",
+    )
+    assert claim_contradiction_candidates(draft, evidence) == []
+
+
+def test_the_known_false_positive_is_pinned() -> None:
+    """This one *is* reported, and it is true.
+
+    "not issued instantly" does not contradict "issued within 5 business days",
+    so this is a false positive - measured at 1 in 6 hand-written pairs. It is
+    asserted rather than tolerated: it is the entire reason ADR 0005 refuses to
+    promote this to a guard, and a change that quietly "fixes" it should have to
+    update this test and the ADR with it.
+    """
+    draft, evidence = _claim(
+        "Refunds are not issued instantly.",
+        "Refunds are issued to the original payment method within 5 business days.",
+    )
+    assert claim_contradiction_candidates(draft, evidence) == [0]
+
+
+def test_a_claim_without_its_own_text_is_skipped() -> None:
+    """`DraftAnswer` may carry claims without per-claim text (a hand-built
+    draft); the metric must not invent one from the joined answer."""
+    chunk = _located("Monthly plans are refundable.", title="P", section=[])
+    draft = DraftAnswer(text="Monthly plans are non-refundable.", claims={0: [chunk.chunk_id]})
+    assert claim_contradiction_candidates(draft, [chunk]) == []

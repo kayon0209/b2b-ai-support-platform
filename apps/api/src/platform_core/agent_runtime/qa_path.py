@@ -30,6 +30,14 @@ class DraftAnswer:
     # claim_index -> referenced chunk ids
     claims: dict[int, list[uuid.UUID]] = field(default_factory=dict)
     route: str = "knowledge_qa"
+    # claim_index -> that claim's own sentence.
+    #
+    # `text` is the claims joined for the customer; this keeps them separate.
+    # The generator parsed them individually and used to throw that away, which
+    # meant a claim could not be checked against the excerpt it cites - only the
+    # whole answer could, which is too coarse to say anything. ADR 0005's
+    # claim-support metric needs the granularity, so it is carried here.
+    claim_texts: dict[int, str] = field(default_factory=dict)
     # Token accounting from the provider, carried through this boundary so the
     # caller can persist it on the AgentRun. Empty when no model call happened
     # (e.g. no evidence at all).
@@ -49,6 +57,70 @@ class AnswerGenerator(Protocol):
     webhook path."""
 
     async def generate(self, question: str, evidence: list[RetrievedChunk]) -> DraftAnswer: ...
+
+
+# --- Claim support (metric, not a guard) -----------------------------------
+#
+# `validate_citations` checks that a citation resolves. This checks something
+# else: whether the claim's text is contradicted by the excerpt it cites.
+#
+# **This is a metric. It must not refuse a customer-visible answer.** Its
+# precision is not good enough yet - see ADR 0005, which measures 1 false
+# positive in 6 hand-written pairs, and a false positive turns a correct answer
+# into an abstention. It exists so the precision can be measured on real data
+# before it is ever promoted to a guard.
+
+# Negation prefixes that can invert a predicate. `cannot`/`can't` are listed
+# separately because they do not follow the `<negation> <term>` shape.
+_NEGATED_TERM = re.compile(r"\b(?:non-|not\s+|no\s+|never\s+)([a-z][a-z-]*)")
+_INTRINSIC_NEGATIONS = ("cannot ", "can't ", "isn't ", "aren't ", "won't ", "doesn't ")
+
+
+def claim_contradiction_candidates(draft: DraftAnswer, evidence: list[RetrievedChunk]) -> list[int]:
+    """Claim indices whose text negates a term their cited excerpt affirms.
+
+    A *candidate*, not a verdict. The rule is deliberately naive so its errors
+    are visible rather than buried: negating a term an excerpt affirms is not
+    the same as contradicting it, so
+
+        claim:   "Refunds are not issued instantly."
+        excerpt: "Refunds are issued within 5 business days."
+
+    is reported even though it is true. That false positive is why ADR 0005
+    stages this as a metric instead of a guard, and it is pinned by a test so
+    the behaviour cannot change unnoticed.
+
+    It misses things too: "not refundable" against an excerpt that says
+    "refunded" does not match, because the stems differ. False negatives leave
+    the status quo; false positives would break correct answers, which is the
+    asymmetry that decides the staging.
+    """
+    by_id = {chunk.chunk_id: chunk for chunk in evidence}
+    candidates: list[int] = []
+    for claim_index, cited in draft.claims.items():
+        if not cited:
+            continue
+        text = draft.claim_texts.get(claim_index, "")
+        if not text:
+            continue
+        lowered = text.lower()
+        negated = {_stem(term) for term in _NEGATED_TERM.findall(lowered)}
+        if any(marker in lowered for marker in _INTRINSIC_NEGATIONS):
+            # `cannot request a refund` negates `request`, which the naive
+            # pattern above does not capture; fall back to the excerpt's own
+            # content terms so the case is not silently missed.
+            negated |= _content_terms(lowered)
+        if not negated:
+            continue
+        for chunk_id in cited:
+            chunk = by_id.get(chunk_id)
+            if chunk is None:
+                continue
+            affirmed = _content_terms(chunk.excerpt)
+            if negated & affirmed:
+                candidates.append(claim_index)
+                break
+    return candidates
 
 
 def validate_citations(draft: DraftAnswer, evidence: list[RetrievedChunk]) -> ValidationResult:

@@ -291,6 +291,10 @@ def _write_report(report: EvalReport, *, tenant_id: uuid.UUID, elapsed: float) -
         "abstention_false": report.abstention_false,
         "citation_violations": report.citation_violations,
         "forbidden_claim_hits": report.forbidden_claim_hits,
+        # ADR 0005: reported, never gated. A claim that negates a term its
+        # cited excerpt affirms is worth seeing even when the citation
+        # resolves, which is all `citation_violations` can tell you.
+        "contradiction_candidates": report.contradiction_candidates,
         # Provenance: a quality number without its source is not evidence.
         "provenance": {
             "generated_by": "scripts/run_eval.py",
@@ -373,7 +377,8 @@ async def main(argv: list[str] | None = None) -> int:
             f"\n{report.passed}/{report.total} passed, "
             f"citation_violations={report.citation_violations}, "
             f"abstention_false={report.abstention_false}, "
-            f"forbidden_claim_hits={report.forbidden_claim_hits}"
+            f"forbidden_claim_hits={report.forbidden_claim_hits}, "
+            f"contradiction_candidates={report.contradiction_candidates}"
         )
         print(f"report written to {REPORT_PATH.relative_to(REPO_ROOT)} ({elapsed:.0f}s)")
         for result in report.results:

@@ -162,6 +162,10 @@ class LlmAnswerGenerator:
             text="\n".join(claim_texts),
             claims=claims,
             route="knowledge_qa",
+            # Kept, not discarded: ADR 0005's claim-support metric checks each
+            # claim against the excerpt it cites, and the joined answer is too
+            # coarse to attribute a contradiction to a claim.
+            claim_texts=dict(enumerate(claim_texts)),
             usage=usage,
         )
 

@@ -19,6 +19,7 @@ from typing import Protocol
 
 from platform_core.agent_runtime.qa_path import (
     DraftAnswer,
+    claim_contradiction_candidates,
     decide_abstention,
     validate_citations,
 )
@@ -70,6 +71,11 @@ class CaseResult:
     reason_codes: list[str] = field(default_factory=list)
     unsupported_claims: list[int] = field(default_factory=list)
     citation_ok: bool = True
+    # ADR 0005: claims whose text negates a term their cited excerpt affirms.
+    # A *metric*, not a verdict - it has known false positives, so it is
+    # reported and never enforced. It exists so its precision can be measured
+    # on the dataset before it is ever promoted to a guard.
+    contradicted_claims: list[int] = field(default_factory=list)
     forbidden_hit: bool = False
     required_missing: bool = False
     latency_ms: int = 0
@@ -87,6 +93,8 @@ class EvalReport:
     abstention_false: int
     citation_violations: int
     forbidden_claim_hits: int
+    # Sum over cases of `contradicted_claims`. Reported, never gated.
+    contradiction_candidates: int = 0
     unsafe_action_attempts: int = 0
     results: list[CaseResult] = field(default_factory=list)
 
@@ -143,6 +151,10 @@ class EvaluationRunner:
             validation = validate_citations(draft, evidence)
             result.citation_ok = validation.ok
             result.unsupported_claims = validation.unsupported_claims
+            # Measured regardless of whether the citations resolved: a claim
+            # that contradicts its excerpt is worth seeing even when it cites
+            # something real, which is the case validation cannot see.
+            result.contradicted_claims = claim_contradiction_candidates(draft, evidence)
             if not validation.ok:
                 result.passed = False
                 result.reason_codes.append(validation.reason_code)
@@ -188,6 +200,7 @@ class EvaluationRunner:
             ),
             citation_violations=sum(1 for r in results if not r.citation_ok),
             forbidden_claim_hits=sum(1 for r in results if r.forbidden_hit),
+            contradiction_candidates=sum(len(r.contradicted_claims) for r in results),
             results=results,
         )
         return report
