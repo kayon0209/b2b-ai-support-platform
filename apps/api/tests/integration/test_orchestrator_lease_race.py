@@ -277,6 +277,7 @@ def test_human_takeover_mid_generation_blocks_outbound_send() -> None:
     assert outcome.answer_text, "the draft is retained for the human agent"
 
 
+@pytest.mark.zero_tolerance("duplicate_replies")
 def test_happy_path_sends_once_with_run_derived_idempotency_key() -> None:
     """Unchanged lease => exactly one send, keyed by the run id so a retry
     of the same run can never double-send."""
@@ -529,6 +530,7 @@ def test_outbound_failure_marks_run_failed_not_completed() -> None:
     assert output_hash is None
 
 
+@pytest.mark.zero_tolerance("duplicate_replies")
 def test_duplicate_run_of_same_event_does_not_double_send() -> None:
     """Idempotency at the outbound boundary: the webhook layer already
     dedups by delivery id (test_e2e_acceptance). Here we pin the second

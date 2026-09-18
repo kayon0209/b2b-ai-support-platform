@@ -82,6 +82,9 @@ def reset_usage():
         conn.execute(text("DELETE FROM agent_runs WHERE tenant_id = :t"), {"t": TENANT})
         # Cleared too, so the audit assertion counts only its own write.
         conn.execute(text("DELETE FROM audit_events WHERE tenant_id = :t"), {"t": TENANT})
+        # The ledger is append-only for the app role; the admin role is what
+        # clears it between tests so a rollup assertion measures one test.
+        conn.execute(text("DELETE FROM billing_entries WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(
             text("UPDATE tenants SET monthly_run_quota = NULL WHERE id = :t"), {"t": TENANT}
         )
@@ -185,3 +188,86 @@ class TestQuota:
             ).scalar()
         admin.dispose()
         assert count == 1
+
+
+class TestBillingRollup:
+    """`GET /v1/tenant/billing` — the ledger the invoice is computed from.
+
+    The rollup function itself is covered by `test_billing_ledger.py`. What is
+    pinned here is the HTTP contract the admin UI reads: the envelope key, and
+    the permission boundary. Both would fail silently in the UI - a wrong key
+    renders an empty card, and a missing check renders commercial data to a
+    support agent.
+    """
+
+    def test_the_envelope_is_billing_not_data(self) -> None:
+        """The UI reads `body.billing`. `ok_response` spreads the payload
+        rather than nesting it under `data`, so this asserts the exact key
+        instead of trusting that convention to hold."""
+        resp = _client(TENANT, "auditor").get("/v1/tenant/billing", headers=_headers())
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "billing" in body, body
+        assert "trace_id" in body
+        billing = body["billing"]
+        assert billing["entries"] == 0
+        assert billing["usage_entries"] == 0
+        assert billing["adjustment_entries"] == 0
+        assert billing["total_tokens"] == 0
+        assert billing["period_end"] > billing["period_start"]
+
+    def test_a_support_admin_cannot_read_commercial_totals(self) -> None:
+        """AUDIT_READ, not CASE_READ. Billing totals are commercial data; the
+        support role can see the live run count but not the ledger."""
+        resp = _client(TENANT, "support_admin").get("/v1/tenant/billing", headers=_headers())
+        assert resp.status_code == 403, resp.text
+
+    def test_an_auditor_can_read_them(self) -> None:
+        resp = _client(TENANT, "auditor").get("/v1/tenant/billing", headers=_headers())
+        assert resp.status_code == 200, resp.text
+
+    def test_a_recorded_usage_entry_appears_in_the_rollup(self) -> None:
+        """End-to-end through the API: a ledger row written for this tenant
+        is visible in the response, so the endpoint is not reading an
+        unrelated table."""
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO billing_entries (id, tenant_id, event_id, run_id, "
+                    "entry_kind, route, run_status, prompt_tokens, completion_tokens, "
+                    "period_start, recorded_at) "
+                    "VALUES (:id, :t, :ev, :run, 'usage', 'knowledge_qa', 'completed', "
+                    "120, 40, :period, :ts)"
+                ),
+                {
+                    "id": str(uuid.uuid4()),
+                    "t": TENANT,
+                    "ev": str(uuid.uuid4()),
+                    "run": str(uuid.uuid4()),
+                    "period": _period_start(),
+                    "ts": _now(),
+                },
+            )
+        admin.dispose()
+
+        resp = _client(TENANT, "auditor").get("/v1/tenant/billing", headers=_headers())
+        assert resp.status_code == 200, resp.text
+        billing = resp.json()["billing"]
+        assert billing["usage_entries"] == 1
+        assert billing["prompt_tokens"] == 120
+        assert billing["completion_tokens"] == 40
+        assert billing["total_tokens"] == 160
+
+
+def _now() -> int:
+    import time
+
+    return int(time.time())
+
+
+def _period_start() -> int:
+    """First instant of the current calendar month, matching the API."""
+    from platform_core.identity.usage import period_bounds
+
+    return period_bounds(_now())[0]

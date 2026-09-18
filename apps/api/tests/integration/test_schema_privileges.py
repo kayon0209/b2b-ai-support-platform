@@ -18,6 +18,12 @@ must have **no** UPDATE or DELETE. An audit trail that can be edited is not an
 audit trail, and the way that invariant would break is a migration copying the
 usual four-privilege grant. Asserting the exception keeps it an intentional
 property rather than an accident of who wrote which migration.
+
+`billing_entries` is withheld the same two privileges for the same reason.
+This file caught it as an apparent regression the moment the ledger landed,
+which is the allowlist doing its job: the blanket rule could not tell
+"append-only by design" from "grant forgotten", so the decision is written
+down here instead of the test being loosened.
 """
 
 import asyncio
@@ -58,6 +64,12 @@ RESTRICTED_BY_DESIGN: dict[str, tuple[frozenset[str], str]] = {
     "tenants": (
         frozenset({"DELETE"}),
         "tenant deletion is not an application operation; the lifecycle answer is suspend",
+    ),
+    "billing_entries": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only ledger: a row that can be rewritten is not a record of what "
+        "was consumed. Corrections are new rows (`record_adjustment`), and the "
+        "rollup applies the sign, so no UPDATE is ever needed",
     ),
 }
 

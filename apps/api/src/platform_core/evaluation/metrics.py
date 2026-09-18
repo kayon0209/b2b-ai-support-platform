@@ -1,9 +1,15 @@
 """Quality metrics aggregation (ticket 35, docs/testing-and-evaluation.md).
 
-Deterministic aggregation over AgentRun + Citation rows (no LLM judging
-here — rubric scoring plugs into the evaluation runner instead). Produces
-the dashboard numbers: citation coverage, abstention rate, handoff rate,
-route distribution, latency percentiles.
+Deterministic aggregation over AgentRun + Citation + Case rows (no LLM
+judging here — rubric scoring plugs into the evaluation runner instead).
+Produces the five dashboard numbers docs/development-plan.md Phase 4 names:
+supported resolution, wrong resolution, abstention, handoff, citation
+coverage — plus route distribution and latency percentiles.
+
+Supported vs wrong resolution is derived from the Case, not from the run:
+a Case that was resolved and never reopened is a resolution that held; one
+that was reopened is a resolution that did not. Deriving it from
+`CaseStatus.RESOLVED` alone would count both as wins.
 """
 
 import uuid
@@ -13,6 +19,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime.models import AgentRun, RunStatus
+from platform_core.cases.models import Case, CaseStatus
+from platform_core.evaluation.gates import ReadToolOutcome
 
 
 @dataclass
@@ -30,10 +38,17 @@ class QualityMetrics:
     untimed_runs: int = 0
     latency_p50_ms: int | None = None
     latency_p95_ms: int | None = None
+    # Resolution outcomes over Cases touched in the window.
+    cases_measured: int = 0
+    supported_resolution: int = 0
+    wrong_resolution: int = 0
+    open_cases: int = 0
     # Ratios derived after aggregation
     abstention_rate: float = 0.0
     handoff_rate: float = 0.0
     citation_coverage: float = 1.0
+    supported_resolution_rate: float = 0.0
+    wrong_resolution_rate: float = 0.0
 
     def finalize(self) -> "QualityMetrics":
         if self.total_runs:
@@ -41,6 +56,14 @@ class QualityMetrics:
             self.handoff_rate = round(self.handed_off / self.total_runs, 4)
             completed = max(self.completed, 1)
             self.citation_coverage = round(self.runs_with_citations / completed, 4)
+        # Denominator is resolved-or-reopened Cases only: an open Case has
+        # not yet had the chance to be a wrong resolution, and counting it
+        # as either would make the rate move with backlog rather than quality.
+        if self.cases_measured:
+            self.supported_resolution_rate = round(
+                self.supported_resolution / self.cases_measured, 4
+            )
+            self.wrong_resolution_rate = round(self.wrong_resolution / self.cases_measured, 4)
         return self
 
 
@@ -125,7 +148,116 @@ async def aggregate_quality_metrics(
     latencies.sort()
     metrics.latency_p50_ms = _percentile(latencies, 0.50)
     metrics.latency_p95_ms = _percentile(latencies, 0.95)
+    await _aggregate_resolution(session, tenant_id=tenant_id, cutoff=cutoff, metrics=metrics)
     return metrics.finalize()
+
+
+async def _aggregate_resolution(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    cutoff: int,
+    metrics: QualityMetrics,
+) -> None:
+    """Roll Case outcomes into the report.
+
+    "Touched in the window" means the Case was opened, resolved or reopened
+    inside it, so a Case resolved this week shows up in this week's numbers
+    even if it was opened last month. The two counters are disjoint:
+
+    - `supported_resolution`  resolved or closed, and never reopened;
+    - `wrong_resolution`      ever reached RESOLVED and later reopened.
+
+    A Case that is currently REOPENED counts as a wrong resolution: it did
+    resolve once, and that resolution did not hold. A Case closed without
+    ever being resolved (e.g. spam, duplicate) is deliberately excluded from
+    both rather than scored as a win.
+    """
+    rows = (
+        await session.execute(
+            select(Case.status, Case.resolved_at, Case.closed_at).where(
+                Case.tenant_id == tenant_id,
+                (Case.opened_at >= cutoff)
+                | (Case.resolved_at >= cutoff)
+                | (Case.closed_at >= cutoff)
+                | (Case.status == CaseStatus.REOPENED.value),
+            )
+        )
+    ).all()
+
+    for status, resolved_at, closed_at in rows:
+        if status == CaseStatus.REOPENED.value:
+            # Resolved at least once (the transition is one-way into it) and
+            # since reopened: the resolution did not hold.
+            metrics.cases_measured += 1
+            metrics.wrong_resolution += 1
+        elif status == CaseStatus.RESOLVED.value and resolved_at is not None:
+            # Resolved and still resolved. `resolved_at >= cutoff` is not
+            # re-checked because the query above already windowed on it.
+            metrics.cases_measured += 1
+            metrics.supported_resolution += 1
+        elif status == CaseStatus.CLOSED.value and resolved_at is not None:
+            # Closed *after* being resolved, and never reopened (a reopen is
+            # excluded above because the status would be REOPENED or have
+            # come back through RESOLVED again).
+            metrics.cases_measured += 1
+            metrics.supported_resolution += 1
+        elif status == CaseStatus.CLOSED.value and closed_at is not None and closed_at >= cutoff:
+            # Closed without resolution: neither a win nor a failure.
+            continue
+        else:
+            metrics.open_cases += 1
+
+
+async def aggregate_read_tool_outcomes(
+    session: AsyncSession, *, tenant_id: uuid.UUID, window_seconds: int = 3600
+) -> ReadToolOutcome:
+    """Read-tool success over the trailing window, from real executions.
+
+    Feeds the documented release gate ("read-tool success excluding
+    third-party outage: >= 99%"). Reads `tool_executions` joined to
+    `tool_definitions` so only `risk = 'read'` tools are counted - a write
+    that failed authorization is a policy outcome, not a read availability
+    signal, and folding it in would let a tightening of policy look like a
+    broken tool.
+
+    Status mapping:
+      verified/executed  -> succeeded
+      failed             -> failed, unless error_code marks a provider fault
+      unknown/executing  -> not counted (ambiguous is not evidence either way)
+    """
+    from platform_core.tool_gateway.gateway import THIRD_PARTY_ERROR_CODES
+    from platform_core.tool_gateway.models import ToolDefinition, ToolExecution
+
+    cutoff = _now() - window_seconds
+    rows = (
+        await session.execute(
+            select(ToolExecution.status, ToolExecution.error_code)
+            .join(ToolDefinition, ToolDefinition.id == ToolExecution.tool_definition_id)
+            .where(
+                ToolExecution.tenant_id == tenant_id,
+                ToolDefinition.risk == "read",
+                ToolExecution.started_at >= cutoff,
+            )
+        )
+    ).all()
+
+    outcome = ReadToolOutcome()
+    succeeded = outcome.succeeded
+    failed = outcome.failed
+    third_party = outcome.third_party_failures
+    for status, error_code in rows:
+        if status in ("executed", "verified"):
+            succeeded += 1
+        elif status == "failed":
+            if error_code in THIRD_PARTY_ERROR_CODES:
+                third_party += 1
+            else:
+                failed += 1
+    # `ReadToolOutcome` is frozen on purpose (it is a value object handed to
+    # the gate, not a mutable accumulator), so the totals are built here and
+    # frozen once at the end.
+    return ReadToolOutcome(succeeded=succeeded, failed=failed, third_party_failures=third_party)
 
 
 def _now() -> int:

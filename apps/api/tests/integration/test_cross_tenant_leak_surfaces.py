@@ -236,6 +236,7 @@ def _body_leaks(resp: Any) -> bool:
 # --- 1. Guessed resource ids -------------------------------------------------
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_guessed_case_id_is_not_found_not_forbidden() -> None:
     """404, not 403: a 403 would confirm the case exists elsewhere."""
     resp = _client(TENANT_B, "support_agent").get(f"/v1/cases/{A['case']}", headers=_auth())
@@ -243,6 +244,7 @@ def test_guessed_case_id_is_not_found_not_forbidden() -> None:
     assert not _body_leaks(resp)
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_guessed_case_id_with_a_privileged_role_is_still_not_found() -> None:
     """A stronger role must not turn 'invisible' into 'visible'.
 
@@ -255,6 +257,7 @@ def test_guessed_case_id_with_a_privileged_role_is_still_not_found() -> None:
         assert not _body_leaks(resp)
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_case_list_is_empty_for_a_tenant_with_no_cases() -> None:
     resp = _client(TENANT_B, "support_agent").get("/v1/cases", headers=_auth())
     assert resp.status_code == 200
@@ -267,6 +270,7 @@ def test_case_list_is_empty_for_a_tenant_with_no_cases() -> None:
 # --- 2. Retrieval evidence and source_uri ------------------------------------
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_retrieval_never_returns_another_tenants_evidence() -> None:
     """The highest-value leak: a question about A's confidential topic asked
     by B must retrieve nothing, and must never reveal A's document URI."""
@@ -284,6 +288,7 @@ def test_retrieval_never_returns_another_tenants_evidence() -> None:
         assert len(items) == 0, "retrieval returned another tenant's evidence"
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_retrieval_of_a_named_document_does_not_cross_tenants() -> None:
     resp = _client(TENANT_B, "support_agent").post(
         "/v1/retrieval/query",
@@ -297,6 +302,7 @@ def test_retrieval_of_a_named_document_does_not_cross_tenants() -> None:
 # --- 3. Audit trail ----------------------------------------------------------
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_audit_events_do_not_expose_another_tenants_records() -> None:
     resp = _client(TENANT_B, "auditor").get("/v1/audit-events", headers=_auth())
     assert resp.status_code == 200, f"unexpected {resp.status_code}: {resp.text[:200]}"
@@ -321,12 +327,14 @@ def test_audit_access_requires_the_audit_role() -> None:
 # --- 4. Quality metrics and dashboards --------------------------------------
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_quality_metrics_are_scoped_to_the_calling_tenant() -> None:
     resp = _client(TENANT_B, "security_admin").get("/v1/quality/metrics", headers=_auth())
     assert resp.status_code in (200, 403), f"unexpected {resp.status_code}: {resp.text[:200]}"
     assert not _body_leaks(resp)
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_quality_routes_are_scoped_to_the_calling_tenant() -> None:
     resp = _client(TENANT_B, "security_admin").get("/v1/quality/routes", headers=_auth())
     assert resp.status_code in (200, 403), f"unexpected {resp.status_code}: {resp.text[:200]}"
@@ -336,6 +344,7 @@ def test_quality_routes_are_scoped_to_the_calling_tenant() -> None:
 # --- 5. External resource mappings ------------------------------------------
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_another_tenants_external_id_cannot_be_resolved() -> None:
     """External ids are attacker-guessable (sequential Chatwoot ids), so the
     mapping lookup must be tenant-filtered, not merely authenticated.

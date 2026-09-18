@@ -79,13 +79,19 @@ pythonpath = [
     "packages/policy/src",
     "packages/contracts/src",
     "packages/observability/src",
+    ".",
 ]
 testpaths = ["apps/api/tests", "packages/contracts/tests", "tests/evals"]
-addopts = "-q --strict-markers"
+# Loaded explicitly rather than as a conftest: the suite has two test roots
+# (`apps/api/tests` and `tests/`), so a conftest at either one is not an
+# ancestor of the other, and the release-gate evidence collector must see
+# every zero-tolerance test in the session.
+addopts = "-q --strict-markers -p pytest_plugins_release.gate_evidence"
 markers = [
     "integration: requires docker-compose services",
     "contract: schema contract tests",
     "eval: LLM evaluation dataset and release gates",
+    "zero_tolerance(name): a test whose pass is the evidence for a release gate's zero-tolerance count",
 ]
 
 [build-system]

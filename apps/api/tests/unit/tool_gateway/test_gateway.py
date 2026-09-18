@@ -199,6 +199,7 @@ def test_unregistered_tool_denied(gateway_env) -> None:
     assert _run(scenario()) == "TOOL_NOT_REGISTERED"
 
 
+@pytest.mark.zero_tolerance("unauthorized_writes")
 def test_prohibited_tool_never_executes(gateway_env) -> None:
     async def scenario() -> str:
         executor = FakeExecutor()
@@ -247,6 +248,7 @@ def test_invalid_schema_args_rejected(gateway_env) -> None:
     assert _run(scenario()) == "TOOL_ARGS_INVALID"
 
 
+@pytest.mark.zero_tolerance("unauthorized_writes")
 def test_denied_permission_creates_rejected_proposal(gateway_env) -> None:
     async def scenario() -> str:
         executor = FakeExecutor()
@@ -272,6 +274,7 @@ def test_denied_permission_creates_rejected_proposal(gateway_env) -> None:
     assert _run(scenario()) == "rejected-by-gateway"
 
 
+@pytest.mark.zero_tolerance("unauthorized_writes")
 def test_high_risk_requires_confirmation_before_execute(gateway_env) -> None:
     async def scenario() -> tuple[str, int]:
         executor = FakeExecutor()
@@ -312,6 +315,7 @@ def test_high_risk_requires_confirmation_before_execute(gateway_env) -> None:
     assert status == "executed"
 
 
+@pytest.mark.zero_tolerance("unauthorized_writes")
 def test_confirmation_binds_to_action_hash(gateway_env) -> None:
     async def scenario() -> str:
         executor = FakeExecutor()

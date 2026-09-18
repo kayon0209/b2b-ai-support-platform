@@ -8,6 +8,7 @@ import pytest
 from platform_core.agent_runtime.qa_path import DraftAnswer, RetrievedChunk
 from platform_core.evaluation.gates import (
     DEFAULT_THRESHOLDS,
+    ReadToolOutcome,
     evaluate_release_gates,
     release_allowed,
 )
@@ -161,37 +162,57 @@ def _report(**kw) -> EvalReport:
     return EvalReport(**defaults)
 
 
-def test_gates_pass_on_healthy_report() -> None:
-    gates = evaluate_release_gates(
-        _report(),
-        security={"cross_tenant_violations": 0, "unauthorized_writes": 0, "duplicate_replies": 0},
+# Healthy read-tool telemetry. Every gate call needs it because the
+# read-tool gate fails closed on a missing measurement; supplying it here
+# keeps these tests about what they name.
+HEALTHY_READ_TOOLS = ReadToolOutcome(succeeded=1000, failed=1)
+ZERO_VIOLATIONS = {
+    "cross_tenant_violations": 0,
+    "unauthorized_writes": 0,
+    "duplicate_replies": 0,
+}
+
+
+def _gates(report: EvalReport | None = None, **kw):
+    """`evaluate_release_gates` with the two non-eval inputs supplied."""
+    return evaluate_release_gates(
+        report if report is not None else _report(),
+        security=kw.pop("security", dict(ZERO_VIOLATIONS)),
+        read_tools=kw.pop("read_tools", HEALTHY_READ_TOOLS),
+        **kw,
     )
-    assert release_allowed(gates)
+
+
+def test_gates_pass_on_healthy_report() -> None:
+    assert release_allowed(_gates())
 
 
 def test_gates_block_cross_tenant_violation() -> None:
-    gates = evaluate_release_gates(
-        _report(),
-        security={"cross_tenant_violations": 1, "unauthorized_writes": 0, "duplicate_replies": 0},
+    gates = _gates(
+        security={"cross_tenant_violations": 1, "unauthorized_writes": 0, "duplicate_replies": 0}
     )
     assert not release_allowed(gates)
     assert any(not g.passed and g.gate == "zero_cross_tenant" for g in gates)
 
 
 def test_gates_block_low_citation_coverage() -> None:
-    gates = evaluate_release_gates(_report(citation_violations=20))
-    citation_gate = next(g for g in gates if g.gate == "citation_coverage")
+    citation_gate = next(
+        g for g in _gates(_report(citation_violations=20)) if g.gate == "citation_coverage"
+    )
     assert not citation_gate.passed
 
 
 def test_gates_block_low_abstention_accuracy() -> None:
-    gates = evaluate_release_gates(_report(abstention_correct=70, abstention_false=30))
-    abst = next(g for g in gates if g.gate == "abstention_correct_rate")
+    abst = next(
+        g
+        for g in _gates(_report(abstention_correct=70, abstention_false=30))
+        if g.gate == "abstention_correct_rate"
+    )
     assert not abst.passed
 
 
 def test_gates_block_forbidden_claims() -> None:
-    gates = evaluate_release_gates(_report(forbidden_claim_hits=10))
+    gates = _gates(_report(forbidden_claim_hits=10))
     g = next(g for g in gates if g.gate == "forbidden_claims")
     assert not g.passed
 

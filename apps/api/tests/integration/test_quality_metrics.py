@@ -304,3 +304,286 @@ def test_aggregation_never_counts_another_tenant(clean_runs: None) -> None:
 
     assert metrics_a.total_runs == 1
     assert metrics_b.total_runs == 3
+
+
+# --- Resolution outcomes (docs/development-plan.md Phase 4) ---
+#
+# "supported resolution" and "wrong resolution" are named in the plan and
+# were never computed. They are derived from Case, not from AgentRun: a
+# resolution that was later reopened did not hold, and scoring it as a win
+# (which `status == resolved` alone would do) is the whole reason the two
+# numbers are separate.
+
+_CASE_INSERT = (
+    "INSERT INTO cases "
+    "(id, tenant_id, subject, priority, status, opened_at, resolved_at, closed_at) "
+    "VALUES (:id, :t, 'subject', 'p2', :status, :opened, :resolved, :closed)"
+)
+
+
+def _new_case(
+    *,
+    tenant: str = TENANT_A,
+    status: str = "resolved",
+    opened_at: int | None = None,
+    resolved_at: int | None = None,
+    closed_at: int | None = None,
+) -> dict:
+    now = int(time.time())
+    return {
+        "id": str(uuid.uuid4()),
+        "t": tenant,
+        "status": status,
+        "opened": now - 600 if opened_at is None else opened_at,
+        "resolved": resolved_at,
+        "closed": closed_at,
+    }
+
+
+def _clear_cases(conn) -> None:
+    conn.execute(
+        text("DELETE FROM cases WHERE tenant_id IN (:a, :b)"),
+        {"a": TENANT_A, "b": TENANT_B},
+    )
+
+
+def _insert_cases(*rows: dict) -> None:
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        _clear_cases(conn)
+        for row in rows:
+            conn.execute(text(_CASE_INSERT), row)
+    admin.dispose()
+
+
+@pytest.fixture
+def clean_cases() -> None:
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        _clear_cases(conn)
+    yield
+    with admin.begin() as conn:
+        _clear_cases(conn)
+    admin.dispose()
+
+
+def test_a_resolved_case_that_was_never_reopened_counts_as_supported(
+    clean_cases: None,
+) -> None:
+    now = int(time.time())
+    _insert_cases(_new_case(status="resolved", resolved_at=now - 60))
+
+    metrics = _run(_aggregate())
+    assert metrics.cases_measured == 1
+    assert metrics.supported_resolution == 1
+    assert metrics.wrong_resolution == 0
+    assert metrics.supported_resolution_rate == 1.0
+
+
+def test_a_reopened_case_counts_as_a_wrong_resolution(clean_cases: None) -> None:
+    """The case did resolve once; that resolution did not hold.
+
+    This is the assertion that makes the metric worth having - a report that
+    counted REOPENED as neutral would never show a quality problem.
+    """
+    now = int(time.time())
+    _insert_cases(
+        _new_case(status="reopened", resolved_at=now - 600, closed_at=None),
+        _new_case(status="resolved", resolved_at=now - 60),
+    )
+
+    metrics = _run(_aggregate())
+    assert metrics.cases_measured == 2
+    assert metrics.wrong_resolution == 1
+    assert metrics.supported_resolution == 1
+    assert metrics.wrong_resolution_rate == 0.5
+
+
+def test_an_open_case_is_not_counted_as_either_outcome(clean_cases: None) -> None:
+    """Otherwise the rate moves with backlog rather than with quality."""
+    _insert_cases(
+        _new_case(status="in_progress"),
+        _new_case(status="waiting_customer"),
+        _new_case(status="resolved", resolved_at=int(time.time()) - 60),
+    )
+
+    metrics = _run(_aggregate())
+    assert metrics.cases_measured == 1
+    assert metrics.open_cases == 2
+
+
+def test_a_case_closed_without_resolution_is_neither_win_nor_loss(
+    clean_cases: None,
+) -> None:
+    now = int(time.time())
+    _insert_cases(_new_case(status="closed", resolved_at=None, closed_at=now - 30))
+
+    metrics = _run(_aggregate())
+    assert metrics.cases_measured == 0
+    assert metrics.supported_resolution == 0
+    assert metrics.wrong_resolution == 0
+
+
+def test_resolution_counts_never_cross_tenants(clean_cases: None) -> None:
+    now = int(time.time())
+    _insert_cases(
+        _new_case(tenant=TENANT_A, status="resolved", resolved_at=now - 60),
+        _new_case(tenant=TENANT_B, status="reopened", resolved_at=now - 600),
+        _new_case(tenant=TENANT_B, status="reopened", resolved_at=now - 500),
+    )
+
+    metrics_a = _run(_aggregate(TENANT_A))
+    metrics_b = _run(_aggregate(TENANT_B))
+    assert (metrics_a.supported_resolution, metrics_a.wrong_resolution) == (1, 0)
+    assert (metrics_b.supported_resolution, metrics_b.wrong_resolution) == (0, 2)
+
+
+# --- Read-tool success (the Phase 4 gate's data source) ---
+
+
+def _seed_read_tool() -> str:
+    """One read-risk tool definition, plus a write one to prove the filter."""
+    admin = create_engine(ADMIN_URL)
+    read_id = str(uuid.uuid4())
+    write_id = str(uuid.uuid4())
+    with admin.begin() as conn:
+        conn.execute(
+            text("DELETE FROM tool_executions WHERE tenant_id IN (:a, :b)"),
+            {"a": TENANT_A, "b": TENANT_B},
+        )
+        conn.execute(
+            text("DELETE FROM tool_definitions WHERE name IN ('probe_read', 'probe_write')")
+        )
+        for tid, name, risk in (
+            (read_id, "probe_read", "read"),
+            (write_id, "probe_write", "low_write"),
+        ):
+            conn.execute(
+                text(
+                    "INSERT INTO tool_definitions "
+                    "(id, tenant_id, name, version, risk, input_schema, output_schema, "
+                    " required_permissions, timeout_ms, idempotent, requires_confirmation) "
+                    "VALUES (:id, NULL, :name, 1, :risk, '{}', '{}', '[]', 10000, true, false)"
+                ),
+                {"id": tid, "name": name, "risk": risk},
+            )
+    admin.dispose()
+    return read_id
+
+
+def _insert_execution(
+    *, tenant: str, tool_id: str, status: str, error_code: str | None = None
+) -> None:
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO tool_executions "
+                "(id, tenant_id, actor_id, tool_definition_id, idempotency_key, status, "
+                " sanitized_input, started_at, completed_at, error_code) "
+                "VALUES (:id, :t, :actor, :tool, :key, :status, '{}', :started, :started, :err)"
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "t": tenant,
+                "actor": str(uuid.uuid4()),
+                "tool": tool_id,
+                "key": str(uuid.uuid4()),
+                "status": status,
+                "started": int(time.time()) - 10,
+                "err": error_code,
+            },
+        )
+    admin.dispose()
+
+
+async def _read_tools(tenant: str = TENANT_A):
+    from platform_core.db import create_engine as app_engine
+    from platform_core.evaluation.metrics import aggregate_read_tool_outcomes
+
+    engine = app_engine(APP_URL)
+    try:
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            await session.execute(
+                text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant}
+            )
+            return await aggregate_read_tool_outcomes(session, tenant_id=uuid.UUID(tenant))
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+def read_tool() -> str:
+    tool_id = _seed_read_tool()
+    yield tool_id
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text("DELETE FROM tool_executions WHERE tenant_id IN (:a, :b)"),
+            {"a": TENANT_A, "b": TENANT_B},
+        )
+        conn.execute(
+            text("DELETE FROM tool_definitions WHERE name IN ('probe_read', 'probe_write')")
+        )
+    admin.dispose()
+
+
+def test_read_tool_success_counts_only_read_risk_tools(read_tool: str) -> None:
+    """A failed write must not move the read-availability number."""
+    _insert_execution(tenant=TENANT_A, tool_id=read_tool, status="verified")
+    _insert_execution(
+        tenant=TENANT_A, tool_id=read_tool, status="failed", error_code="TOOL_EXECUTION_ERROR"
+    )
+
+    outcome = _run(_read_tools())
+    assert outcome.succeeded == 1
+    assert outcome.failed == 1
+    assert outcome.success_rate == 0.5
+
+
+def test_third_party_failures_are_separated_from_our_failures(read_tool: str) -> None:
+    """`docs/development-plan.md` excludes provider outages from the gate.
+
+    Before `classify_execution_error` existed every executor exception was
+    recorded as TOOL_EXECUTION_ERROR, so a vendor outage was indistinguishable
+    from a bug and the gate could not be computed at all.
+    """
+    _insert_execution(tenant=TENANT_A, tool_id=read_tool, status="verified")
+    for _ in range(3):
+        _insert_execution(
+            tenant=TENANT_A, tool_id=read_tool, status="failed", error_code="CONNECTOR_TIMEOUT"
+        )
+    _insert_execution(
+        tenant=TENANT_A, tool_id=read_tool, status="failed", error_code="TOOL_EXECUTION_ERROR"
+    )
+
+    outcome = _run(_read_tools())
+    assert outcome.succeeded == 1
+    assert outcome.failed == 1, "our failure"
+    assert outcome.third_party_failures == 3
+    assert outcome.success_rate == 0.5, "rate counts only our failures"
+    assert outcome.excluded_fraction == 0.6
+
+
+def test_ambiguous_and_in_flight_executions_are_not_counted(read_tool: str) -> None:
+    """`unknown` is not evidence in either direction."""
+    _insert_execution(tenant=TENANT_A, tool_id=read_tool, status="verified")
+    _insert_execution(tenant=TENANT_A, tool_id=read_tool, status="unknown")
+    _insert_execution(tenant=TENANT_A, tool_id=read_tool, status="executing")
+
+    outcome = _run(_read_tools())
+    assert outcome.counted == 1
+    assert outcome.total_observed == 1
+
+
+def test_read_tool_outcomes_are_tenant_scoped(read_tool: str) -> None:
+    _insert_execution(tenant=TENANT_A, tool_id=read_tool, status="verified")
+    _insert_execution(
+        tenant=TENANT_B, tool_id=read_tool, status="failed", error_code="TOOL_EXECUTION_ERROR"
+    )
+
+    a = _run(_read_tools(TENANT_A))
+    b = _run(_read_tools(TENANT_B))
+    assert (a.succeeded, a.failed) == (1, 0)
+    assert (b.succeeded, b.failed) == (0, 1)

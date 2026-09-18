@@ -52,6 +52,13 @@ class QualityMetricsOut(BaseModel):
     route_counts: dict[str, int]
     latency_p50_ms: int | None
     latency_p95_ms: int | None
+    # Resolution outcomes (docs/development-plan.md Phase 4 names both).
+    cases_measured: int
+    supported_resolution: int
+    wrong_resolution: int
+    open_cases: int
+    supported_resolution_rate: float
+    wrong_resolution_rate: float
 
 
 def _principal_from_ctx(ctx: TenantContext) -> Principal:
@@ -82,6 +89,12 @@ async def _aggregate(
         route_counts=metrics.route_counts,
         latency_p50_ms=metrics.latency_p50_ms,
         latency_p95_ms=metrics.latency_p95_ms,
+        cases_measured=metrics.cases_measured,
+        supported_resolution=metrics.supported_resolution,
+        wrong_resolution=metrics.wrong_resolution,
+        open_cases=metrics.open_cases,
+        supported_resolution_rate=metrics.supported_resolution_rate,
+        wrong_resolution_rate=metrics.wrong_resolution_rate,
     )
 
 

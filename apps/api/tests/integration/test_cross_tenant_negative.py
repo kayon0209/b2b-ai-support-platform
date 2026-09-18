@@ -195,6 +195,7 @@ def seed_all_tables() -> None:
     admin.dispose()
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
     """One sweep across all tenant-owned tables: A sees its row, B sees
     none, no-context sees none, B cannot write into A's scope."""
@@ -247,6 +248,7 @@ def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
         assert fails_closed, f"{table}: missing context must yield zero rows"
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_guessing_other_tenant_resource_ids_yields_nothing() -> None:
     """Direct-ID access with B's context against A's known row IDs."""
     from sqlalchemy.ext.asyncio import async_sessionmaker

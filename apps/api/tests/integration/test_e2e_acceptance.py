@@ -162,6 +162,7 @@ def _post_webhook(client: TestClient, body: bytes, delivery_id: str) -> object:
     )
 
 
+@pytest.mark.zero_tolerance("duplicate_replies")
 def test_scenario_duplicate_webhook_single_ingest(e2e_env: dict) -> None:
     client = TestClient(e2e_env["app"], raise_server_exceptions=False)
     body = json.dumps(

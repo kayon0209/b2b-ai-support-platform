@@ -1,290 +1,212 @@
 # Project Memory — B2B AI Customer Support Platform
 
-Long-term conventions and environment facts. Daily logs live in `YYYY-MM-DD.md`.
+Durable rules only. Daily logs (`YYYY-MM-DD.md`) hold the narrative and
+rationale. **Keep this file tight** — it is truncated on injection when it
+grows large, so a long entry silently loses its own tail. Consolidated
+2026-09-18 from ~16KB to ~11.7KB by moving rationale to the daily logs.
 
 ## Environment
 
-- **Working dir**: `D:/360Downloads/360驱动大师目录/b2b-ai-support-plan/b2b-ai-support-plan`
-- **Python**: `.venv/Scripts/python.exe` (3.12.0, system-based). Managed runtime
-  `C:/Users/Rose/.workbuddy-ai/binaries/python/versions/3.13.12/python.exe` has
-  **no pytest** — always use the venv.
-- **PYTHONPATH must use absolute paths joined by `;` on Windows**:
-  ```bash
-  R="D:/360Downloads/360驱动大师目录/b2b-ai-support-plan/b2b-ai-support-plan"
-  export PYTHONPATH="$R/apps/api/src;$R/packages/contracts/src;$R/packages/policy/src;$R/packages/observability/src;$R/apps/worker/src"
-  ./.venv/Scripts/python.exe -m pytest apps packages -q
-  ```
-  Using `:` or relative paths yields "No module named 'platform_core'" and makes
-  it look like every test file failed to collect.
-- **Docker ports**: ai-postgres `5435`, chatwoot-postgres `5434`, ai-redis `6380`,
-  chatwoot-redis `6381`, Chatwoot `3000`, API `8000`, Keycloak `8081`, MinIO `9000/9001`.
-- **Two DB roles**: `platform` (superuser, bypasses RLS — use for seeding/cleanup)
-  and `platform_app` (NOBYPASSRLS — use for anything asserting isolation).
-- `packages/observability/src/observability.py` is a top-level `observability`
-  module, **not** `platform_core.observability`. Import as
-  `from observability import JsonLogger, TraceContext, new_trace_context`.
+- **Dir**: `D:/360Downloads/360驱动大师目录/b2b-ai-support-plan/b2b-ai-support-plan`
+- **Python**: `.venv/Scripts/python.exe` (3.12). The managed 3.13 runtime has
+  **no pytest**.
+- **PYTHONPATH: absolute, `;`-joined** — relative or `:`-joined gives
+  `No module named 'platform_core'` and looks like every test failed to
+  collect: `$R/apps/api/src;$R/packages/contracts/src;$R/packages/policy/src;$R/packages/observability/src;$R/apps/worker/src`
+  where `R` is the dir above.
+- **Ports**: ai-postgres `5435`, chatwoot-postgres `5434`, ai-redis `6380`,
+  chatwoot-redis `6381`, Chatwoot `3000`, API `8000`, Keycloak `8081`, MinIO
+  `9000/9001`; the e2e uses a pre-existing `b2b-e2e-minio` on `19000`.
+- **DB roles**: `platform` (superuser, bypasses RLS — seeding/cleanup),
+  `platform_app` (NOBYPASSRLS — anything asserting isolation).
+- `packages/observability/src/observability.py` is top-level `observability`,
+  **not** `platform_core.observability`.
 
-## Non-obvious correctness rules
+## Verification
 
-- **`set_config('app.tenant_id', ..., true)` is transaction-scoped.** It does not
-  survive `COMMIT`. Any read after a commit must re-apply it, or RLS silently
-  returns zero rows and you get `NoResultFound` — which looks exactly like
-  "the data was never written". This has cost real debugging time.
-- **ProviderRole is a StrEnum.** Serialize chat roles with `str(m.role)`, not
-  `m.role.value`; the latter breaks when a plain equivalent string is passed.
-- **pytest's summary line goes to stderr.** `| grep passed` in a pipeline can
-  come back empty even on a fully green run. Trust the **exit code** (0 = all pass).
-- **mypy "Duplicate module named `__main__`"** means there are empty
-  `src/__init__.py` files making each `src/` look like a package root. The fix is
-  `explicit_package_bases = true` plus removing the empty inits — not changing code.
-- Celery/Redis for the custom platform must stay **separate** from Chatwoot's Redis.
+```bash
+./.venv/Scripts/python.exe -m pytest    # pyproject supplies pythonpath
+./.venv/Scripts/python.exe -m ruff check apps packages scripts tests pytest_plugins_release
+./.venv/Scripts/python.exe -m ruff format --check apps packages scripts tests pytest_plugins_release
+./.venv/Scripts/python.exe -m mypy      # strict, 129 files, 0 errors
+./.venv/Scripts/python.exe -m platform_core.evaluation.release_check --evidence-only
+./.venv/Scripts/python.exe tests/e2e/e2e_ingestion_minio.py
+```
+
+pytest's summary goes to **stderr**, and `EXIT=$?` after a pipe reports the
+last command — use `${PIPESTATUS[0]}` or no pipe. CI's `release-evidence` job
+runs the **full** suite (not `-m integration`: `unauthorized_writes` is backed
+by unit tests) then `release_check --evidence-only`.
+
+## The recurring defect family: a capability with no consumer
+
+Every audit round finds the same shape — a value, column, or function that
+exists and is tested but that no production path reads or writes. Found:
+`AgentRun.started_at`, `AgentRun.token_usage`, `sweep_expired_data`,
+`credential_ref`, priority-queue admission, `_is_identity_dependent`,
+`health_check`, `NEEDS_REAUTH`, `SyncCursor`, `DeadLetterItem`,
+`flag_service.evaluate`, the reranker, `cases.enterprise_account_id`,
+`release_check`'s CI caller, `eval_report.json`'s producer,
+`drain_outbox_once` + `_now`.
+
+**For any field a reader depends on, grep its writers/callers.** A test or doc
+calling a function directly will not reveal a missing production caller.
+
+## RLS
+
+**Bootstrap pattern (8 instances).** A tenant-owned table read *before* a
+binding exists needs a narrow `SECURITY DEFINER` function: pinned
+`SET search_path = pg_catalog, public`, `REVOKE ALL FROM PUBLIC` and from
+`platform`, `GRANT EXECUTE` to `platform_app` only, `RETURNS TABLE (...)`
+(0015, 0016, 0018, 0019, 0026, 0027, 0030 ×2).
+
+Never loosen a policy to `USING (app.tenant_id IS NULL OR ...)` — that grants
+table-wide read across tenants and `test_cross_tenant_leak_surfaces.py` fails.
+
+**RLS fails silently on writes.** Unbound `SELECT` → zero rows; unbound
+`UPDATE`/`DELETE` → `rowcount 0` with **no error**. Assert `rowcount` on any
+app-role write. `FOR UPDATE` requires the function be `VOLATILE`.
+
+**Cross-tenant queue scans are global by design** (`claim_pending`,
+`claim_ingestion_versions`, `reclaim_stale_ingestions` have no tenant filter),
+so a leftover claimable row anywhere enters the next suite's batch and looks
+like a pipeline bug. **Never leave probe rows in the database.**
+
+## Async and sessions
+
+- **`set_config('app.tenant_id', ..., true)` is transaction-scoped** — it does
+  not survive `COMMIT`. Re-apply after a commit or RLS returns zero rows →
+  `NoResultFound`, indistinguishable from "never written".
+- **A failed flush poisons the session.** `await session.rollback()` before
+  raising, or the router's `commit()` raises `PendingRollbackError` and a
+  clean 409 becomes a 500. `begin_nested()` does **not** help. Prefer
+  `ON CONFLICT DO NOTHING` to insert-then-catch: a rollback discards *the whole
+  transaction*, including earlier rows in the same sweep.
+- **The outbox relay's caller owns the transaction.** `run_once(session)` does
+  not commit; pass `commit=True` or a `session_scope()`, or it reports
+  `sent=1` while persisting nothing.
+- **A relay batch binds RLS per row** (`apply_rls_tenant`) — the claim runs
+  before any tenant is known. Without it an insert failing `WITH CHECK` is
+  rejected, but `ON CONFLICT DO NOTHING` makes that zero rows and no error.
+
+## Windows: never launch the API with bare uvicorn
+
+**Always `python -m platform_core.main`.** uvicorn hardcodes
+`ProactorEventLoop` on Windows and builds its loop **before** importing the
+app, so an import-time `set_event_loop_policy` cannot help. psycopg async
+refuses a Proactor loop → every DB request dies at connect, and
+`TenantContextMiddleware` rendered that as a bare `401 AUTH_UNRESOLVED`.
+
+**Any DB-touching script needs**
+`asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)` (the integration
+test convention). It silently disabled `release_check`'s read-tool gate.
+`uvicorn.run(loop=...)` takes a **string**, not a class.
+
+## Idempotency belongs in a constraint
+
+`UNIQUE` + `ON CONFLICT DO NOTHING` beats read-then-write wherever replicas
+race (ingestion claims, `uq_inbox_delivery`, `uq_case_escalation_once`,
+`uq_saml_assertion_once`, `uq_billing_entry_event`). An RLS-scoped pre-check is
+worth having for the *message* only; the constraint is the authority.
+
+## Schema and migrations
+
+- **`alembic_version` is a single-row head table** — `count(*)` is 1, not the
+  migration count; use `walk_revisions()`.
+- **Non-ASCII repo path**: `script_location = %(here)s` silently fails under
+  `ConfigParser`; call `cfg.set_main_option("script_location", ...)`.
+- **`DROP`/`CREATE DATABASE` cannot run in a transaction** — set
+  `isolation_level="AUTOCOMMIT"` on the *engine*.
+- **`(metadata -> 'k')::text` keeps JSON quotes**; `->>` does not. A content
+  type read with `->` reached the parser as `"text/markdown"` and matched
+  nothing, while the fixture (seeding no `content_type`) stayed green — **a
+  fixture that does not reproduce the production row is a coverage gap.**
+- **A NOT NULL column filled by a trigger still needs an ORM
+  `server_default`** (SQLAlchemy emits an explicit NULL, which overrides the
+  DEFAULT), and it must be dialect-neutral — unit tests build on SQLite.
+- **Enum columns are `String` holding lowercase *values*.** ORM `Enum(...)`
+  needs `values_callable=_enum_values` or reads raise `LookupError`.
+- **Tenant tables have no FK on `tenant_id`** (RLS enforces isolation, not
+  constraints), so orphans are possible. Compose parent FKs as
+  `(parent_id, tenant_id) -> (id, tenant_id)`; a single-column FK would accept
+  another tenant's row and RLS would hide it.
+- **A test passing against a long-lived DB is not evidence about the
+  migrations** — only `downgrade base && upgrade head` is. A missing `GRANT`
+  shipped twice that way (`users` 0021, `tenant_domains` 0027);
+  `test_schema_privileges.py` now covers every table.
+  `EXPECTED_MIGRATIONS` is a deliberate gate — bump it per revision.
+- **A guard that cannot be observed failing is not evidence.** The acyclicity
+  trigger was installed, enabled, and inert: `FOUND` is **false** after
+  `EXECUTE ... INTO` even when the SELECT returned a row, so
+  `IF NOT FOUND THEN cursor_id := NULL` discarded the parent just read and a
+  two-node cycle was accepted. Terminate a PL/pgSQL walk on the **value**.
+
+## Auth, middleware, types
+
+- **Token-only endpoints must be in `middleware.py::EXEMPT_PATHS`** (or
+  `EXEMPT_PREFIXES`, e.g. `/v1/webhooks/`). The middleware 401s non-exempt
+  paths *before* the handler, so the endpoint is unreachable in the real app
+  while a middleware-less `TestClient(fresh_app)` test still passes.
+  `TestClient(platform_core.main.app)` is the only proof of reachability.
+- **Auth failures are deliberately indistinguishable** — unknown slug,
+  suspended tenant, missing/inactive membership all raise `identity not found
+  or inactive`; splitting them makes login an enumeration oracle.
+  `resolve_identity` and `resolve_by_slug` must agree.
+- **mypy "Duplicate module named `__main__`"** = empty `src/__init__.py`
+  files; fix with `explicit_package_bases = true` and remove them.
+- New domain code must be mypy-strict clean. `opentelemetry.*`,
+  `lxml.*`/`signxml.*`, `alembic.*`, `jsonschema.*`/`uuid6.*` are in
+  `ignore_missing_imports`.
 
 ## LLM provider
 
-- Gitee AI (模力方舟), OpenAI-compatible, `https://ai.gitee.com/v1`.
-- Models: `qwen3.8-flash` (chat, reasoning — thinking channel is separated from
-  the answer), `Qwen3-Embedding-8B`, `bge-reranker-v2-m3`.
-- **`Qwen3-Embedding-8B` is natively 1024-dim but honors `dimensions: 1536`**, so
-  the existing `chunks.embedding vector(1536)` column needs no migration.
-- Credentials live in `.env` (gitignored). `.env.example` is the tracked template.
-  Never commit the real key; unset key means the model boundary fails closed.
+Gitee AI (模力方舟), OpenAI-compatible, `https://ai.gitee.com/v1`:
+`qwen3.8-flash` (chat; thinking channel separated from the answer),
+`Qwen3-Embedding-8B` (natively 1024-dim but honors `dimensions: 1536`, so
+`chunks.embedding vector(1536)` needs no migration), `bge-reranker-v2-m3`.
+Credentials in `.env` (gitignored); an unset key fails the model boundary
+closed.
 
-## Verification commands
+## Release gates
 
-```bash
-./.venv/Scripts/python.exe -m pytest apps packages -q -W ignore   # expect exit 0
-./.venv/Scripts/python.exe -m ruff check apps packages scripts
-./.venv/Scripts/python.exe -m ruff format --check apps packages scripts
-./.venv/Scripts/python.exe scripts/smoke_gitee_ai.py             # live provider check
-docker compose -f infra/compose/docker-compose.yml config --quiet
-```
+Zero-tolerance counts are **derived, not typed**: a test declares
+`@pytest.mark.zero_tolerance("<invariant>")`, the
+`pytest_plugins_release.gate_evidence` plugin writes
+`tests/artifacts/release_gate_evidence.json`, and `evaluation/evidence.py` is
+the only reader. A skipped, deselected or dropped backing test makes the count
+non-zero or the evidence unusable; a partial run (<500 tests) is refused. The
+writer is a plugin, not a conftest, because the suite has two test roots.
 
-## Delivery conventions
+`release_check` exits **0** all gates pass, **1** a gate failed, **2** inputs
+unusable. `--evidence-only` is the CI check; `--skip-db` still fails the
+read-tool gate by design. **`tests/artifacts/eval_report.json` has no
+producer** — it needs a real tenant corpus + live model; generating it from the
+deterministic harness would be theatre.
 
-- Commits: conventional-commit subject, then a body explaining **why**. State the
-  test count delta and the ruff/mypy status.
-- New domain code must be mypy-strict clean. There are ~49 pre-existing errors in
-  older modules; do not add to them and do not fix them incidentally.
-- Architecture rules and prohibited shortcuts are in `AGENTS.md` — read it before
-  changing module boundaries.
+## Admin UI (`apps/admin-web`)
 
-## Integration test gotchas
+- **`ApiError` must extend `Error`.** Every call site reads
+  `err instanceof Error ? err.message : String(err)`; as a plain object it fell
+  through to `String(err)`, so every error banner and `alert()` rendered
+  `[object Object]`.
+- `ok_response` **spreads** its payload (adding `trace_id`), so responses are
+  `{usage: ...}` / `{billing: ...}`, not nested under `data`.
+- Use `useAction()` + `<ActionFeedback>` for writes — no `alert()` (blocks the
+  tab, unstylable, not a live region). `useAsync` exposes `errorStatus`, so a
+  page can tell a 403 (permission boundary → a note) from a 500 (→ a banner).
+- Vite proxies `/api` → `localhost:8000`; `.env` needs `VITE_API_TOKEN`. Gates
+  are only `tsc` + `vite build` — front-end defects are invisible to pytest.
 
-- **alembic `Config` + non-ASCII repo path**: `script_location = %(here)s` in
-  `alembic.ini` is read by `ConfigParser`, which **silently fails** when the
-  path contains Chinese chars (e.g. `360驱动大师目录`); `command.upgrade` then
-  dies with "No 'script_location' key found". Fix: call
-  `cfg.set_main_option("script_location", str(ALEMBIC_INI.parent))` after
-  `Config(...)`. Also, for a test under `apps/api/tests/integration/`,
-  `ALEMBIC_INI` is `Path(__file__).resolve().parents[4]` (the workspace is
-  `.../b2b-ai-support-plan/b2b-ai-support-plan/apps/...`, so `parents[3]` is the
-  inner `apps/` dir, not the repo root).
-- **psycopg async needs `SelectorEventLoop` on Windows**: a plain `asyncio.run`
-  uses `ProactorEventLoop`, which psycopg rejects. Run async DB benchmarks with
-  `asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)`.
-- **`alembic_version` is a single-row "current head" table** — `SELECT count(*)`
-  returns 1, NOT the migration count. Count migrations with
-  `len(list(ScriptDirectory.from_config(cfg).walk_revisions()))`; verify at-head
-  via `version_num IN ScriptDirectory(...).get_heads()`.
-- **`DROP`/`CREATE DATABASE` cannot run inside a transaction**: set
-  `create_engine(url).execution_options(isolation_level="AUTOCOMMIT")` on the
-  *engine* before connecting (not on a connection already inside `begin()`).
-- **local Postgres `max_connections=100` is tight**: size async pools well below
-  it (pool_size=30) for concurrency benchmarks, or connections get refused and
-  latency explodes.
+## Tooling and conventions
 
-## Windows startup — the API must not be launched with bare uvicorn
-
-**Always start the API with `python -m platform_core.main`.** Never
-`uvicorn platform_core.main:app` on Windows.
-
-Reason: uvicorn's `uvicorn/loops/asyncio.py::asyncio_loop_factory` hardcodes
-`ProactorEventLoop` when `sys.platform == "win32" and not use_subprocess`, and
-uvicorn builds its loop **before** importing the app — so an import-time
-`set_event_loop_policy` in `main.py` cannot influence it. psycopg async refuses
-to run on a Proactor loop, so every DB-backed request dies at connect time.
-
-The failure mode was nasty: `TenantContextMiddleware.dispatch` caught the
-exception and returned a bare `401 AUTH_UNRESOLVED`, which is indistinguishable
-from a bad token. It looked like an auth bug for a long time.
-
-`platform_core.db.ensure_async_db_loop()` now raises a loud, actionable
-`RuntimeError` instead, so the diagnosis is immediate. `main.py::run()` passes
-`loop=asyncio.SelectorEventLoop` explicitly.
-
-## Migrations that read FORCE-RLS tables
-
-`memberships` is FORCE RLS, so its rows are invisible unless `app.tenant_id` is
-bound — but auth resolution is what *discovers* the tenant, so it logically runs
-before any binding exists. Migration `0015_membership_bootstrap` solves this with
-`resolve_active_membership(slug, user_id)`: a read-only `SECURITY DEFINER`
-function granting EXECUTE (never SELECT) back to `platform_app`.
-
-Do **not** "fix" a future variant of this by loosening the policy to
-`USING (app.tenant_id IS NULL OR ...)`. That grants table-wide read across every
-tenant and `test_cross_tenant_leak_surfaces.py` will (correctly) fail.
-
-`resolve_identity` (single probe, function-based) and `resolve_by_slug`
-(two-step: tenants → bind → memberships) are both live and must agree. Which to
-use: single probe when you only need identity, two-step when you also need tenant
-settings.
-
-**Enum columns are `String` in the migrations and hold lowercase enum *values*.**
-Any ORM `Enum(...)` must pass `values_callable=_enum_values`, or SQLAlchemy looks
-for member *names* (`ACTIVE`) and every read raises `LookupError`.
-
-**Auth failures are deliberately indistinguishable.** Unknown slug, suspended
-tenant, missing membership and inactive membership all raise the same
-`identity not found or inactive`. Splitting them would make login a tenant/user
-enumeration oracle. If a test wants to tell them apart, it must use the two-step
-path, not the single probe.
-
-## Changing the migration count
-
-`test_migration_and_performance.py::EXPECTED_MIGRATIONS` is a deliberate gate —
-it exercises the whole chain down to base and back up on a fresh database. Bump
-it when adding a revision; a non-reversible migration then fails in CI rather
-than during a production rollback.
-
-## The outbox is global — test suites that touch it must drain it
-
-`claim_pending` scans `outbox_events` with **no tenant filter**, which is correct
-in production (one relay drains everything). The consequence for tests: any
-queued row left by another suite is claimed by the relay suite's batch, and
-`stats.claimed == 1` style assertions then measure the wrong thing.
-
-This produces an **intermittent, ordering-dependent** failure that looks exactly
-like a bug in the relay. `test_outbox_relay.py::_cleanup` therefore also deletes
-rows with `status = 'queued'`. Rows in `sent` are inert.
-
-If you add a test that commits an outbox event, either clean up after yourself or
-accept that the relay suite depends on you doing so.
-
-## RLS fails silently on writes, not just reads
-
-The read path is the well-known one: an unbound `SELECT` on a FORCE-RLS table
-returns **zero rows**, which is indistinguishable from "no data". Measured on
-`document_versions`:
-
-```
-SELECT count(*) FROM document_versions   -- platform → N rows, platform_app → 0
-```
-
-The write path is worse and easy to miss — **the same is true of `UPDATE`**:
-
-```
-unbound UPDATE document_versions ... WHERE id = <known id>   -- rowcount 0, NO error
-bound   UPDATE document_versions ... WHERE id = <known id>   -- rowcount 1
-```
-
-No exception is raised. A claim that reported success (`claimed=1`) persisted
-nothing, and the only reason it was caught is that a later assertion read the
-row back. **Any `UPDATE`/`DELETE` issued from an unbound app-role session must
-assert its `rowcount`**, or the failure surfaces far from its cause — or not at
-all. When the tenant is only discoverable from the row itself, bind per row
-(the tenant comes from the row, so this is not an escalation).
-
-Same root cause, same remedy as the auth bootstrap: a narrow `SECURITY DEFINER`
-function with a pinned `search_path`, `REVOKE ALL FROM PUBLIC`, and EXECUTE
-granted only to `platform_app`. Now used by `0015`, `0016`, `0018` and `0019` —
-four instances, so treat this as the standing pattern, not a one-off.
-
-Corollary: `FOR UPDATE` requires the function to be declared **`VOLATILE`**.
-PostgreSQL refuses it in a non-volatile function at creation time.
-
-## Cross-tenant queue scans are global — by design, and tests must account for it
-
-`claim_ingestion_versions` (like the outbox relay) has **no tenant filter**: one
-bulk worker serves every tenant, which is correct. The test consequence is that
-**any** leftover claimable row anywhere enters the next suite's batch.
-
-A manual probe that left one `uploaded` row in a *seeded* tenant made
-`test_ingestion_produces_chunks_and_marks_ready` fail with
-`IngestStats(claimed=2, ready=2)` — a message that reads exactly like a pipeline
-bug. `test_ingestion_worker.py`'s autouse fixture therefore moves claimable rows
-belonging to *other* tenants to `expired` (terminal, not claimable). It does not
-delete them: that is someone else's data, and altering data to make a test pass
-is the wrong fix.
-
-**Consequence for working in this repo: never leave probe rows in the database.**
-Ad-hoc `scripts/_probe_*.py` that write to the real DB are the leak source. Use
-a throwaway tenant and clean it up, or do not write at all.
-
-## Timestamps the database owns need `server_default` in the ORM too
-
-Adding a NOT NULL column whose value comes from a trigger is not enough on its
-own. SQLAlchemy emits the column in the `INSERT` with an **explicit NULL** when
-the ORM metadata declares no default, and **an explicit NULL overrides the
-column's `DEFAULT`** — so the constraint fires before the trigger can help.
-Measured: every upload returned HTTP 503
-`IntegrityError: null value in column "updated_at"`.
-
-The `server_default` must be a **dialect-neutral literal** (e.g. `0`), not a
-Postgres expression like `EXTRACT(EPOCH FROM now())`. Unit tests build the
-schema via `Base.metadata.create_all` on SQLite, which cannot parse it — that
-single mistake broke all 13 `tool_gateway` tests with a DDL error. On Postgres
-the trigger overwrites the placeholder, so the true value still wins.
-
-## Two embedder interfaces, deliberately
-
-- Worker / ingestion needs the **batch** shape:
-  `embed(texts) -> EmbeddingResult`.
-- `hybrid_search` needs the **query** shape: `Embedder.embed_query(query)`.
-
-A stub that implements only one will let a test pass while the other path is
-never exercised. When faking embeddings, implement both, and note which caller
-uses which.
-
-## Local tooling
-
-- `scripts/seed_admin_demo.py` creates the `admin-demo` tenant + `tenant_owner`
-  user and prints a bootstrap token (`pt_admin-demo_<uuid>`). Use it to exercise
-  the API and admin-web by hand; it is throwaway local tooling, not product code.
-- Start the API with `python -m platform_core.main` (see Windows startup above),
-  Vite with `npx vite`. The Vite dev server proxies `/api` → `localhost:8000`.
-- `admin-web` `.env` needs `VITE_API_TOKEN`; `.env.example` is the template.
-- Real end-to-end ingestion check (needs the `b2b-e2e-minio` container on
-  `19000`, and MinIO credentials in `APP_OBJECT_STORAGE_*`):
-  `./.venv/Scripts/python.exe tests/e2e/e2e_ingestion_minio.py`
-  — uploads, runs the real worker, and asserts `hybrid_search` recall.
-
-## Auth middleware & the type gate
-
-- **Token-only endpoints must be in `identity/middleware.py::EXEMPT_PATHS`.**
-  The middleware 401s any path not exempt *before* the handler runs. An
-  endpoint whose caller cannot have a token yet (invite acceptance, webhooks)
-  is otherwise unreachable in the real app while a middleware-less
-  `TestClient(fresh_app)` test still passes. `TestClient(platform_core.main.app)`
-  is the only thing that proves reachability.
-- **`uvicorn.run(loop=...)` takes a string, not a class.** Use the dotted path
-  (`"asyncio:SelectorEventLoop"` on Windows, `"asyncio:new_event_loop"`
-  elsewhere). Passing the class only "works" because uvicorn's importer
-  passes non-strings through — an accident, and a mypy error.
-- **mypy strict is clean (0 errors / 98 files)** as of `18ce565`. Keep it that
-  way; `opentelemetry.*` is in `ignore_missing_imports` because the SDK is an
-  optional, lazily-imported extra.
-- **`users` is granted to `platform_app` by migration `0021`.** Before that no
-  migration granted it (only the live DB had it out-of-band), so a fresh
-  migration-built DB could not list members or create a user.
-- **Any test fixture that writes to the shared DB must clean up.** The perf
-  benchmark had leaked 78 `perf-*` tenants before its fixture grew a teardown.
-
-## RLS bootstrap: the standing pattern (8 instances)
-
-A tenant-owned table that must be read **before** a tenant binding exists needs a
-narrow `SECURITY DEFINER` function: pinned `SET search_path = pg_catalog, public`,
-`REVOKE ALL FROM PUBLIC` (and from `platform`), `GRANT EXECUTE` to `platform_app`
-only, returning a narrow projection (`RETURNS TABLE (...)`). Instances:
-0015 `resolve_active_membership`, 0016 `resolve_oidc_identity`, 0018
-`claim_ingestion_versions`, 0019 `reclaim_stale_ingestions`, 0026
-`resolve_connector_for_webhook`, 0027 `resolve_domain_tenant`, 0030
-`resolve_saml_connection`, 0030 `resolve_scim_token`.
-
-## Idempotency belongs in a constraint, not a check-then-insert
-
-`UNIQUE` + `ON CONFLICT DO NOTHING` beats read-then-write wherever two replicas
-can race: ingestion claims, webhook delivery dedupe (`uq_inbox_delivery`),
-escalation rungs (`uq_case_escalation_once`), SAML assertion replay
-(`uq_saml_assertion_once`). Prefer `ON CONFLICT` to catching `IntegrityError`,
-because catching means rolling back the whole transaction.
-
+- `scripts/seed_admin_demo.py` seeds the `admin-demo` tenant and prints
+  `pt_admin-demo_<uuid>`; `scripts/backup_restore_drill.py` restores into a
+  scratch DB and asserts counts, per-tenant distribution, audit min/max, outbox
+  status and resume guards. Its exit **2** means "source was not quiescent",
+  not data loss.
+- Conventional-commit subject + a body explaining **why**; state the test count
+  delta and ruff/mypy status. Read `AGENTS.md` before changing module
+  boundaries. SAML login issues **no session**; a first SAML login **never
+  provisions a role**; a SCIM **Group maps to a Department, never to a
+  `MembershipRole`**; `infra/kubernetes/` has **never been applied to a
+  cluster**.

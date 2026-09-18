@@ -55,6 +55,7 @@ def _app_engine() -> object:
     return create_engine(DB_URL)
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_tenant_sees_only_own_rows() -> None:
     uid = uuid.uuid4()
     admin = create_engine(ADMIN_URL)
@@ -90,6 +91,7 @@ def test_tenant_sees_only_own_rows() -> None:
         conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": uid})
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_no_context_fails_closed() -> None:
     engine = _app_engine()
     with engine.connect() as conn:
@@ -98,6 +100,7 @@ def test_no_context_fails_closed() -> None:
     assert rows == 0
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_cross_tenant_insert_blocked() -> None:
     engine = _app_engine()
     with engine.connect() as conn:
@@ -113,6 +116,7 @@ def test_cross_tenant_insert_blocked() -> None:
     engine.dispose()
 
 
+@pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_audit_events_append_only() -> None:
     engine = _app_engine()
     with engine.connect() as conn:

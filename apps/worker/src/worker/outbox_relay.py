@@ -34,14 +34,15 @@ production can back them with Celery or an HTTP sink.
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
+from platform_core.billing.service import handle_usage_recorded
 from platform_core.db import session_scope
+from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
 from platform_core.outbox import OutboxEvent
 from platform_core.outbox_service import claim_pending, mark_failed, mark_sent
 
@@ -97,11 +98,41 @@ class OutboxRelay:
     def register(self, event_type: str, handler: OutboxHandler) -> None:
         self.handlers[event_type] = handler
 
-    async def run_once(self, session: AsyncSession) -> RelayStats:
+    async def run_once(self, session: AsyncSession, *, commit: bool = False) -> RelayStats:
         """Claim and dispatch one batch. Returns what happened.
 
         The session is supplied by the caller so a cycle shares one unit of
         work, matching `inbox_consumer.drain_once`.
+
+        **The caller owns the transaction.** Everything this method writes -
+        the handler's rows and the `mark_sent` / `mark_failed` update - lands
+        in the session's transaction, which is only durable once somebody
+        commits. `OutboxWorker.run_once` supplies a `session_scope()`, which
+        commits; a caller that passes a raw session must either commit
+        itself or pass `commit=True`, which commits once at the end of the
+        batch.
+
+        Getting this wrong is silent and expensive. A caller that forgets
+        sees `RelayStats.sent == 1` - the handler ran, no exception was
+        raised - while the transaction is rolled back on close and nothing
+        was actually recorded. This is exactly how the billing ledger was
+        found reporting `sent=1` with an empty rollup.
+
+        `commit=True` is deliberately the *end* of the batch, not per row:
+        the batch shares one unit of work, so a crash mid-batch leaves the
+        whole batch to be retried rather than half-delivered.
+
+        **Each row is dispatched under its own tenant's RLS binding.** The
+        claim query runs before any tenant is known (the worker discovers
+        tenants from the rows it claims), but everything after it - the
+        handler's reads and writes, and the `mark_sent` / `mark_failed`
+        update - must run with `app.tenant_id` set to that row's tenant.
+        Without it the app role's RLS policy filters the work away, and the
+        failure is invisible: an insert whose `WITH CHECK` does not match is
+        rejected, but `ON CONFLICT DO NOTHING` turns that rejection into
+        zero rows inserted and no error, so the relay reports `sent` while
+        the ledger stays empty. This was found exactly that way - a billing
+        test saw `sent=1` and an empty rollup.
         """
         stats = RelayStats()
         rows = await claim_pending(session, batch=self.batch)
@@ -109,12 +140,26 @@ class OutboxRelay:
         if not rows:
             return stats
 
+        await self._dispatch(session, rows, stats)
+        if commit:
+            await session.commit()
+        return stats
+
+    async def _dispatch(
+        self, session: AsyncSession, rows: list[OutboxEvent], stats: RelayStats
+    ) -> None:
+        """Dispatch claimed rows in place. Commit stays with the caller."""
+
         for row in rows:
             if row.attempts > self.max_attempts:
                 # Already over budget from earlier cycles: leave it queued
                 # and do not count it as work this cycle.
                 stats.parked += 1
                 continue
+
+            # Scope to the event's tenant before the handler touches anything.
+            # Set per row, so one batch can span tenants without mixing them.
+            await apply_rls_tenant(session, _ctx_for(row))
 
             handler = self.handlers.get(row.event_type)
             if handler is None:
@@ -132,7 +177,15 @@ class OutboxRelay:
             except Exception as exc:  # noqa: BLE001 - classified below
                 # Record, do not re-raise: one bad event must not stop the
                 # rest of the batch or roll back the publishes already done.
-                await mark_failed(session, row.id, f"{type(exc).__name__}: {exc}")
+                #
+                # The savepoint is required. A handler that failed *inside*
+                # the database (an integrity error, a policy violation) has
+                # aborted the enclosing transaction, so the `mark_failed`
+                # UPDATE below would itself raise - and the reason the event
+                # failed would be lost, which is the one thing an operator
+                # needs from a parked row.
+                async with session.begin_nested():
+                    await mark_failed(session, row.id, f"{type(exc).__name__}: {exc}")
                 logger.warning(
                     "outbox_delivery_failed",
                     event_type=row.event_type,
@@ -145,8 +198,6 @@ class OutboxRelay:
 
             await mark_sent(session, row.id)
             stats.sent += 1
-
-        return stats
 
 
 async def log_only_handler(session: AsyncSession, event: OutboxEvent) -> None:
@@ -170,19 +221,21 @@ async def log_only_handler(session: AsyncSession, event: OutboxEvent) -> None:
 def build_default_relay(batch: int = DEFAULT_BATCH) -> OutboxRelay:
     """Relay with the event types the platform currently emits.
 
-    The two case events are the only ones `cases/router.py` produces today;
-    listing them explicitly means a new event type is a deliberate addition
-    rather than something that silently falls through.
+    Every emitted type is listed explicitly. That is the point of this
+    function: a new event type is a deliberate addition here rather than
+    something that silently falls through to the log-only default.
+
+    `usage.recorded` was the case that motivated the rule. The orchestrator
+    had been enqueuing it since the usage API landed, and because this list
+    named only the two case events, every billing event hit the log-only
+    handler - so "usage quotas and billing events" (docs/development-plan.md
+    Phase 5) had an emitter and no aggregator.
     """
     relay = OutboxRelay(batch=batch)
     relay.register("case.created", log_only_handler)
     relay.register("case.updated", log_only_handler)
+    relay.register("usage.recorded", handle_usage_recorded)
     return relay
-
-
-async def drain_outbox_once(session: AsyncSession, *, relay: OutboxRelay) -> RelayStats:
-    """Single-cycle helper mirroring `inbox_consumer.drain_once`."""
-    return await relay.run_once(session)
 
 
 class OutboxWorker:
@@ -232,8 +285,18 @@ class OutboxWorker:
         logger.info("outbox_relay_stopped")
 
 
-def _now() -> int:  # pragma: no cover - trivial
-    return int(time.time())
+def _ctx_for(row: OutboxEvent) -> TenantContext:
+    """The RLS context for an outbox row.
+
+    `actor_kind="system"`: the relay acts on behalf of no user. The actor is
+    what audit trails attribute an action to, and claiming a user here would
+    attribute a delivery to someone who did not make it.
+    """
+    return TenantContext(
+        tenant_id=row.tenant_id,
+        actor_id=None,
+        actor_kind="system",
+    )
 
 
 async def pending_count(session: AsyncSession) -> int:
@@ -257,7 +320,6 @@ __all__ = [
     "OutboxWorker",
     "RelayStats",
     "build_default_relay",
-    "drain_outbox_once",
     "log_only_handler",
     "pending_count",
 ]

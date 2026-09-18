@@ -25,7 +25,11 @@ from collections.abc import Awaitable
 import pytest
 
 from platform_core.agent_runtime.qa_path import DraftAnswer
-from platform_core.evaluation.gates import evaluate_release_gates, release_allowed
+from platform_core.evaluation.gates import (
+    ReadToolOutcome,
+    evaluate_release_gates,
+    release_allowed,
+)
 from platform_core.evaluation.runner import EvalCase, EvalReport, EvaluationRunner
 from platform_core.retrieval.hybrid import PrincipalScope, RetrievedChunk
 
@@ -163,7 +167,8 @@ def test_release_gates_block_a_simulated_cross_tenant_violation() -> None:
     The doc's first gate is zero cross-tenant violations. The dataset
     cannot produce one (it never touches the database), so the count is
     injected from the negative suite - which is exactly how the gate is
-    meant to be used in CI.
+    meant to be used in CI. Read-tool telemetry is injected the same way,
+    from live `tool_executions` rows.
     """
     report = _run_dataset()
     clean = evaluate_release_gates(
@@ -173,6 +178,7 @@ def test_release_gates_block_a_simulated_cross_tenant_violation() -> None:
             "unauthorized_writes": 0,
             "duplicate_replies": 0,
         },
+        read_tools=ReadToolOutcome(succeeded=1000, failed=1),
     )
     assert release_allowed(clean), "\n".join(
         f"{g.gate}: {g.observed} vs {g.threshold}" for g in clean if not g.passed
@@ -185,9 +191,84 @@ def test_release_gates_block_a_simulated_cross_tenant_violation() -> None:
             "unauthorized_writes": 0,
             "duplicate_replies": 0,
         },
+        read_tools=ReadToolOutcome(succeeded=1000, failed=1),
     )
     assert not release_allowed(dirty)
     assert any(not g.passed and g.gate == "zero_cross_tenant" for g in dirty)
+
+
+def test_a_missing_read_tool_measurement_fails_the_gate() -> None:
+    """No evidence must not read as no failures.
+
+    Before this gate existed the release decision silently ignored read-tool
+    health; the failure mode to avoid is a caller that simply forgets to
+    pass it and gets green.
+    """
+    report = _run_dataset()
+    gates = evaluate_release_gates(
+        report,
+        security={"cross_tenant_violations": 0, "unauthorized_writes": 0, "duplicate_replies": 0},
+    )
+    gate = next(g for g in gates if g.gate == "read_tool_success_rate")
+    assert not gate.passed
+    assert gate.observed is None
+    assert not release_allowed(gates)
+
+
+def test_read_tool_gate_enforces_the_documented_99_percent() -> None:
+    """`docs/development-plan.md` Phase 4: >= 99%, excluding third-party outage."""
+    report = _run_dataset()
+    security = {"cross_tenant_violations": 0, "unauthorized_writes": 0, "duplicate_replies": 0}
+
+    # 99% exactly passes (the doc says ">= 99%").
+    at_floor = evaluate_release_gates(
+        report, security=security, read_tools=ReadToolOutcome(succeeded=990, failed=10)
+    )
+    assert next(g for g in at_floor if g.gate == "read_tool_success_rate").passed
+
+    below = evaluate_release_gates(
+        report, security=security, read_tools=ReadToolOutcome(succeeded=989, failed=11)
+    )
+    assert not next(g for g in below if g.gate == "read_tool_success_rate").passed
+    assert not release_allowed(below)
+
+
+def test_third_party_failures_are_excluded_but_not_unbounded() -> None:
+    """The documented exclusion must not become a way to hide a broken tool."""
+    report = _run_dataset()
+    security = {"cross_tenant_violations": 0, "unauthorized_writes": 0, "duplicate_replies": 0}
+
+    # A vendor outage raises the rate rather than lowering it.
+    outage = evaluate_release_gates(
+        report,
+        security=security,
+        read_tools=ReadToolOutcome(succeeded=995, failed=1, third_party_failures=400),
+    )
+    assert next(g for g in outage if g.gate == "read_tool_success_rate").passed
+
+    # ...but excusing most of the traffic is refused even though the
+    # remaining calls look perfect.
+    laundered = evaluate_release_gates(
+        report,
+        security=security,
+        read_tools=ReadToolOutcome(succeeded=100, failed=0, third_party_failures=900),
+    )
+    gate = next(g for g in laundered if g.gate == "read_tool_success_rate")
+    assert not gate.passed
+    assert "not credible" in gate.detail
+
+
+def test_read_tool_gate_refuses_an_empty_window() -> None:
+    """Zero executions is not perfection; it is an unmeasured system."""
+    report = _run_dataset()
+    gates = evaluate_release_gates(
+        report,
+        security={"cross_tenant_violations": 0, "unauthorized_writes": 0, "duplicate_replies": 0},
+        read_tools=ReadToolOutcome(),
+    )
+    gate = next(g for g in gates if g.gate == "read_tool_success_rate")
+    assert not gate.passed
+    assert "no read-tool executions" in gate.detail
 
 
 def test_dataset_covers_each_documented_category_at_least_once() -> None:

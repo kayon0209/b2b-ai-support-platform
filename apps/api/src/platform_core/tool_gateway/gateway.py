@@ -50,6 +50,57 @@ class ToolDenied(ToolGatewayError):
     pass
 
 
+# Errors that are the upstream provider's fault, not ours. The read-tool
+# success gate is documented as "excluding third-party outage", so the
+# distinction has to exist at the point the failure is recorded - collapsing
+# every exception into one code (which this did) makes that gate
+# uncomputable and, worse, makes a vendor outage look like our regression.
+_THIRD_PARTY_ERROR_CODES = frozenset(
+    {
+        "CONNECTOR_AUTH_EXPIRED",
+        "CONNECTOR_TIMEOUT",
+        "CONNECTOR_UNAVAILABLE",
+        "CIRCUIT_OPEN",
+        "UPSTREAM_TIMEOUT",
+        "UPSTREAM_UNAVAILABLE",
+    }
+)
+
+# Exception types that mean the same thing regardless of which adapter
+# raised them.
+_THIRD_PARTY_EXCEPTIONS = (
+    TimeoutError,
+    ConnectionError,
+    OSError,
+)
+
+# Public alias: the evaluation layer needs the same definition of "the
+# provider's fault" that the gateway writes, so the two cannot drift.
+THIRD_PARTY_ERROR_CODES = _THIRD_PARTY_ERROR_CODES
+
+
+def classify_execution_error(exc: BaseException) -> str:
+    """Map an executor exception to a stable error code.
+
+    Returns one of the `_THIRD_PARTY_ERROR_CODES` when the fault is the
+    provider's, otherwise `TOOL_EXECUTION_ERROR`. The classifier is
+    deliberately conservative: an unrecognised failure is *ours*, because
+    wrongly blaming a vendor hides a bug, while wrongly claiming a bug
+    merely costs an investigation.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code in _THIRD_PARTY_ERROR_CODES:
+        return code
+    if isinstance(exc, _THIRD_PARTY_EXCEPTIONS):
+        return "CONNECTOR_UNAVAILABLE"
+    # A CircuitOpen raised by the resilience layer, matched by name so this
+    # module does not import the integrations package (which would be a
+    # cycle: integrations already depends on the gateway's contracts).
+    if type(exc).__name__ == "CircuitOpen":
+        return "CIRCUIT_OPEN"
+    return "TOOL_EXECUTION_ERROR"
+
+
 @runtime_checkable
 class ToolExecutor(Protocol):
     """Adapter-backed executor registered per tool name.
@@ -295,11 +346,12 @@ class ToolGateway:
                 tool.name, proposal.sanitized_input, proposal.idempotency_key
             )
         except Exception as exc:  # noqa: BLE001 - classified below
+            code = classify_execution_error(exc)
             execution.status = ProposalStatus.FAILED.value
-            execution.error_code = "TOOL_EXECUTION_ERROR"
+            execution.error_code = code
             execution.completed_at = int(time.time())
             await self._mark(proposal, ProposalStatus.FAILED.value)
-            raise ToolGatewayError("TOOL_EXECUTION_ERROR", str(exc)[:200]) from exc
+            raise ToolGatewayError(code, str(exc)[:200]) from exc
 
         execution.sanitized_output = sanitize_arguments(output or {})
         execution.completed_at = int(time.time())

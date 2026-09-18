@@ -151,6 +151,35 @@ async def get_usage(request: Request) -> Any:
     return ok_response({"usage": snapshot.as_dict()})
 
 
+@router.get("/billing")
+async def get_billing_rollup(request: Request) -> Any:
+    """This tenant's billing ledger total for the current calendar month.
+
+    Reads the append-only ledger (migration 0031) rather than re-counting
+    `agent_runs`: the ledger is the record an invoice is computed from, and
+    it is fed by the same `usage.recorded` event the run emits, so the two
+    agree by construction while the ledger additionally survives a run row
+    being rewritten.
+
+    Requires AUDIT_READ - the same audience as the audit trail. Billing
+    totals are commercial data, not operational telemetry a support agent
+    needs to answer a customer.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return _unresolved()
+
+    denied = require_policy(ctx, Action.AUDIT_READ)
+    if denied is not None:
+        return denied
+
+    from platform_core.billing import monthly_rollup
+
+    async with tenant_session(ctx) as session:
+        rollup = await monthly_rollup(session, tenant_id=ctx.tenant_id)
+    return ok_response({"billing": rollup.as_dict()})
+
+
 @router.put("/quota")
 async def set_quota(request: Request, body: QuotaIn) -> Any:
     ctx = get_context(request)

@@ -39,7 +39,7 @@ version is already causing harm.
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,6 +47,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from platform_core.agent_runtime.models import PromptTemplate
 from platform_core.audit import service as audit_service
 from platform_core.identity.tenant_context import TenantContext
+
+if TYPE_CHECKING:
+    # Import for typing only. `evaluation.gates` imports the evaluation
+    # runner, and the runner is reachable from the runtime; importing it at
+    # module scope would make the release path depend on the eval stack at
+    # import time, which is the wrong direction.
+    from platform_core.evaluation.gates import GateResult
 
 # P0 categories: a regression in any of these blocks release outright
 # (docs/testing-and-evaluation.md "no P0 safety regression"). Mirrors the
@@ -250,7 +257,11 @@ async def submit_candidate(
     return row
 
 
-def check_release_gate(evidence: EvaluationEvidence | None) -> None:
+def check_release_gate(
+    evidence: EvaluationEvidence | None,
+    *,
+    platform_gates: "list[GateResult] | None" = None,
+) -> None:
     """Refuse promotion without clean evidence.
 
     Two distinct refusals, because the remedies differ:
@@ -261,6 +272,18 @@ def check_release_gate(evidence: EvaluationEvidence | None) -> None:
     Non-P0 regressions are recorded but allowed: docs/development-plan.md
     gates on P0 specifically, and blocking every metric movement would make
     the gate unusable and tempt operators to disable it.
+
+    `platform_gates` is the *other* half of the same decision. The
+    candidate's own category scores answer "did this prompt get worse"; the
+    platform gates answer "is the platform releasable at all" (cross-tenant
+    leakage, unauthorized writes, duplicate replies, read-tool health). Both
+    have always had to pass, but they were evaluated in two places, so a
+    caller could run one and forget the other - and the one most likely to be
+    forgotten was the one whose evidence is harder to gather. Passing them
+    here makes a single call the only way to promote, so neither half can be
+    skipped by omission. Passing `None` is allowed only for callers that
+    genuinely have no platform-gate context (unit tests of prompt logic);
+    the release path supplies it.
     """
     if evidence is None:
         raise ReleaseError(
@@ -278,6 +301,12 @@ def check_release_gate(evidence: EvaluationEvidence | None) -> None:
         names = ", ".join(sorted(r.category for r in blocking))
         raise ReleaseError("P0_REGRESSION", f"P0 categories regressed: {names}")
 
+    if platform_gates is not None:
+        failed = [g for g in platform_gates if not g.passed]
+        if failed:
+            summary = "; ".join(f"{g.gate}={g.observed} (needs {g.threshold})" for g in failed)
+            raise ReleaseError("PLATFORM_GATE_FAILED", summary)
+
 
 async def promote(
     session: AsyncSession,
@@ -285,14 +314,18 @@ async def promote(
     ctx: TenantContext,
     version_id: uuid.UUID,
     evidence: EvaluationEvidence | None,
+    platform_gates: "list[GateResult] | None" = None,
 ) -> PromptTemplate:
     """Make a version active, gated on evaluation evidence.
 
     Exactly one version per (tenant, template_name) is active afterwards:
     the previously active version is archived in the same transaction, so a
     reader can never observe two actives.
+
+    `platform_gates` is forwarded to `check_release_gate`; see there for why
+    the two halves of the decision belong in one call.
     """
-    check_release_gate(evidence)
+    check_release_gate(evidence, platform_gates=platform_gates)
     assert evidence is not None  # narrowed by check_release_gate
 
     row = await _load(session, ctx=ctx, version_id=version_id)
