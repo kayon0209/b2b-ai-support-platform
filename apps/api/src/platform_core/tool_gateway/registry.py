@@ -55,12 +55,25 @@ CredentialResolver = Callable[[str | None], dict[str, str]]
 TOOL_CAPABILITY: dict[str, str] = {
     "jira.create_issue": "create_issue",
     "crm.update_account": "update_account",
+    # Linear is the other half of Phase 3's "Jira or Linear" priority. A tenant
+    # on Linear had no ticket path at all before this entry existed.
+    "linear.create_issue": "create_issue",
+    "im.send_notification": "send_notification",
 }
 
-# tool name -> the connector provider that can serve it.
-TOOL_PROVIDER: dict[str, str] = {
-    "jira.create_issue": "jira",
-    "crm.update_account": "crm",
+# tool name -> the connectors that can serve it, in preference order.
+#
+# A tuple rather than one provider because a tool's *meaning* is independent of
+# which vendor implements it: `im.send_notification` is "notify the on-call
+# channel", and a tenant on Feishu must be able to call it. Mapping it to
+# `im_webhook` alone would leave the Feishu and Teams adapters registered but
+# unreachable - dead code, which is the defect this repository keeps finding.
+# The first provider with an active connector that claims the capability wins.
+TOOL_PROVIDERS: dict[str, tuple[str, ...]] = {
+    "jira.create_issue": ("jira",),
+    "crm.update_account": ("crm",),
+    "linear.create_issue": ("linear",),
+    "im.send_notification": ("im_webhook", "feishu", "teams"),
 }
 
 
@@ -236,19 +249,27 @@ class ConnectorExecutorResolver:
         return by_provider
 
     def _build(self, tool_name: str, available: dict[str, Connector]) -> ToolExecutor | None:
-        provider = TOOL_PROVIDER.get(tool_name)
+        providers = TOOL_PROVIDERS.get(tool_name)
         capability = TOOL_CAPABILITY.get(tool_name)
-        if provider is None or capability is None:
+        if not providers or capability is None:
             return None
 
-        connector = available.get(provider)
-        if connector is None:
-            return None
+        provider: str | None = None
+        connector: Connector | None = None
+        for candidate in providers:
+            found = available.get(candidate)
+            if found is None:
+                continue
+            # The connector must claim the capability the tool needs. A
+            # connector that only reads must not become a write path, and a
+            # candidate that cannot serve the tool must not shadow a later one
+            # that can.
+            if capability not in (found.capabilities or []):
+                continue
+            provider, connector = candidate, found
+            break
 
-        # The connector must claim the capability the tool needs. A
-        # connector that only reads must not become a write path.
-        caps = connector.capabilities or []
-        if capability not in caps:
+        if provider is None or connector is None:
             return None
 
         factory = self._factories.get(provider)
@@ -317,9 +338,36 @@ def default_factories() -> dict[str, AdapterFactory]:
         # claims `update_account`, so a lookup-only CRM stays read-only.
         return CrmWriteAdapter(context)
 
+    def _build_linear(context: ConnectorContext) -> ToolExecutor:
+        from platform_core.integrations.linear import LinearAdapter
+
+        return LinearAdapter(context)
+
+    # Three IM providers, not one: Feishu and Teams reject the Slack body, so
+    # folding them into `im_webhook` would produce notifications the provider
+    # discards while the platform reports success. See `integrations/im.py`.
+    def _build_im(context: ConnectorContext) -> ToolExecutor:
+        from platform_core.integrations.im import ImNotificationAdapter
+
+        return ImNotificationAdapter(context)
+
+    def _build_feishu(context: ConnectorContext) -> ToolExecutor:
+        from platform_core.integrations.im import FeishuNotificationAdapter
+
+        return FeishuNotificationAdapter(context)
+
+    def _build_teams(context: ConnectorContext) -> ToolExecutor:
+        from platform_core.integrations.im import TeamsNotificationAdapter
+
+        return TeamsNotificationAdapter(context)
+
     return {
         "jira": AdapterFactory(provider="jira", build=_build_jira),
         "crm": AdapterFactory(provider="crm", build=_build_crm),
+        "linear": AdapterFactory(provider="linear", build=_build_linear),
+        "im_webhook": AdapterFactory(provider="im_webhook", build=_build_im),
+        "feishu": AdapterFactory(provider="feishu", build=_build_feishu),
+        "teams": AdapterFactory(provider="teams", build=_build_teams),
     }
 
 
@@ -416,7 +464,7 @@ __all__ = [
     "ConnectorExecutorResolver",
     "ConnectorOutcomeExecutor",
     "TOOL_CAPABILITY",
-    "TOOL_PROVIDER",
+    "TOOL_PROVIDERS",
     "default_factories",
     "build_adapter",
     "probe_connector",

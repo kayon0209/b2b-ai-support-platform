@@ -267,9 +267,15 @@ def test_unreachable_probe_records_time_and_degrades() -> None:
 
 
 def test_probe_reports_unsupported_provider_distinctly() -> None:
-    """`linear` has no adapter in this deployment. Reporting that as an outage
-    would send the operator to the network to fix a capability gap."""
-    cid = _insert_connector(provider="linear", capabilities='["read_issue"]')
+    """`servicenow` ships no adapter in this deployment. Reporting that as an
+    outage would send the operator to the network to fix a capability gap.
+
+    This test used `linear` as the example until Linear was actually shipped -
+    at which point it stopped testing an unsupported provider and started
+    asserting that a supported one is not. The provider has to be one the
+    registry genuinely has no factory for.
+    """
+    cid = _insert_connector(provider="servicenow", capabilities='["read_issue"]')
     resp = _client(TENANT, "tenant_owner").post(
         f"/v1/connectors/{cid}/health-check", headers=_headers()
     )

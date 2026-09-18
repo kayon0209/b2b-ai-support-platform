@@ -20,7 +20,7 @@ from platform_core.integrations.sdk import ConnectorContext
 from platform_core.tool_gateway.gateway import ToolExecutor
 from platform_core.tool_gateway.registry import (
     TOOL_CAPABILITY,
-    TOOL_PROVIDER,
+    TOOL_PROVIDERS,
     AdapterFactory,
     ConnectorExecutorResolver,
 )
@@ -93,10 +93,10 @@ def _factories(built: list[ConnectorContext]) -> dict[str, AdapterFactory]:
 
         return AdapterFactory(provider=provider, build=build)
 
-    # Only providers that appear in TOOL_PROVIDER need a factory; adding a
+    # Only providers that appear in TOOL_PROVIDERS need a factory; adding a
     # factory for a provider with no tools is what the wiring test guards
     # against in the other direction.
-    return {p: make(p) for p in sorted(set(TOOL_PROVIDER.values()))}
+    return {p: make(p) for p in sorted({p for ps in TOOL_PROVIDERS.values() for p in ps})}
 
 
 @pytest.mark.asyncio
@@ -246,7 +246,7 @@ def test_tool_vocabulary_is_fully_declared() -> None:
     A tool that appears in one map but not the other would silently resolve
     to nothing, which is hard to diagnose from a request log.
     """
-    assert set(TOOL_PROVIDER) == set(TOOL_CAPABILITY)
+    assert set(TOOL_PROVIDERS) == set(TOOL_CAPABILITY)
 
 
 def test_every_declared_tool_has_a_registered_adapter() -> None:
@@ -261,8 +261,12 @@ def test_every_declared_tool_has_a_registered_adapter() -> None:
     from platform_core.tool_gateway.registry import default_factories
 
     factories = default_factories()
-    for tool_name, provider in TOOL_PROVIDER.items():
-        assert provider in factories, f"{tool_name} maps to unregistered provider {provider}"
+    # Every provider in the tuple, not just the preferred one: a tool that can
+    # only be served by the first entry leaves the alternatives registered but
+    # unreachable, which is indistinguishable from not shipping them.
+    for tool_name, providers in TOOL_PROVIDERS.items():
+        for provider in providers:
+            assert provider in factories, f"{tool_name} maps to unregistered provider {provider}"
 
 
 @pytest.mark.asyncio
@@ -326,3 +330,41 @@ async def test_unsupported_credential_reference_yields_no_credentials() -> None:
 
     # `_connector` uses vault://, which the default resolver does not support.
     assert built[0].credentials == {}
+
+
+@pytest.mark.asyncio
+async def test_the_im_tool_resolves_for_a_feishu_connector() -> None:
+    """`im.send_notification` is "notify the on-call channel", not "post to a
+    Slack-shaped webhook". Mapping the tool to `im_webhook` alone left the
+    Feishu and Teams adapters registered but unreachable - dead code, and a
+    tenant on Lark could not be paged at all.
+    """
+    built: list[ConnectorContext] = []
+    session = _FakeSession(
+        [_connector("feishu", ["send_notification"], ConnectorStatus.ACTIVE.value)]
+    )
+    resolver = ConnectorExecutorResolver(session, tenant_id=TENANT, factories=_factories(built))
+
+    executors = await resolver.executors_for(["im.send_notification"])
+
+    assert set(executors) == {"im.send_notification"}
+    assert built[0].configuration["base_url"] == "https://feishu.example"
+
+
+@pytest.mark.asyncio
+async def test_a_preferred_provider_without_the_capability_does_not_shadow_another() -> None:
+    """A Slack connector that only reads must not block a Feishu connector
+    that can send: the first candidate is a preference, not a veto."""
+    built: list[ConnectorContext] = []
+    session = _FakeSession(
+        [
+            _connector("im_webhook", ["read_notification"], ConnectorStatus.ACTIVE.value),
+            _connector("feishu", ["send_notification"], ConnectorStatus.ACTIVE.value),
+        ]
+    )
+    resolver = ConnectorExecutorResolver(session, tenant_id=TENANT, factories=_factories(built))
+
+    executors = await resolver.executors_for(["im.send_notification"])
+
+    assert set(executors) == {"im.send_notification"}
+    assert built[0].configuration["base_url"] == "https://feishu.example"
