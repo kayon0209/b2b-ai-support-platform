@@ -1,26 +1,32 @@
 import { useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
+import { useAction } from "../lib/useAction";
 import { useAsync } from "../lib/useAsync";
 import type { FeatureFlag } from "../lib/types";
-import { Badge, Card, ErrorBanner, PageHeader, Spinner } from "../components/ui";
+import {
+  ActionFeedback,
+  Badge,
+  Card,
+  ErrorBanner,
+  PageHeader,
+  Spinner,
+} from "../components/ui";
 import { dateFromEpochSeconds } from "../lib/format";
 
 export function FeatureFlags() {
   const [newKey, setNewKey] = useState("");
   const [newDesc, setNewDesc] = useState("");
+  const action = useAction();
 
   const flags = useAsync<{ items: FeatureFlag[]; total: number }>(
     () => apiGet<{ items: FeatureFlag[]; total: number }>(`/v1/flags?limit=100`),
     [],
   );
 
-  async function act(path: string, body?: unknown) {
-    try {
-      await apiPost(path, body);
-    } catch (err) {
-      alert(`Action failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    flags.reload();
+  async function act(path: string, body?: unknown): Promise<boolean> {
+    const ok = await action.run(() => apiPost(path, body).then(() => undefined));
+    if (ok) flags.reload();
+    return ok;
   }
 
   return (
@@ -46,12 +52,19 @@ export function FeatureFlags() {
           />
           <button
             className="btn btn-primary"
-            disabled={!newKey.trim()}
+            disabled={!newKey.trim() || action.busy}
             onClick={() => {
               if (!newKey.trim()) return;
-              act("/v1/flags", { key: newKey.trim(), description: newDesc.trim() }).then(() => {
-                setNewKey("");
-                setNewDesc("");
+              // Clear the form only on success: wiping what someone typed
+              // because the request failed makes them retype it blind.
+              void act("/v1/flags", {
+                key: newKey.trim(),
+                description: newDesc.trim(),
+              }).then((ok) => {
+                if (ok) {
+                  setNewKey("");
+                  setNewDesc("");
+                }
               });
             }}
           >
@@ -60,6 +73,7 @@ export function FeatureFlags() {
         </div>
       </Card>
 
+      <ActionFeedback error={action.error} notice={action.notice} />
       {flags.error ? <ErrorBanner message={flags.error} onRetry={flags.reload} /> : null}
       {flags.loading ? <Spinner label="Loading flags…" /> : null}
       {flags.data && flags.data.items.length === 0 ? (
@@ -108,10 +122,10 @@ export function FeatureFlags() {
                       if (pctRaw === null) return;
                       const pctNum = Number(pctRaw);
                       if (Number.isNaN(pctNum) || pctNum < 0 || pctNum > 100) {
-                        alert("Enter a number between 0 and 100.");
+                        action.fail("Enter a number between 0 and 100.");
                         return;
                       }
-                      act(`/v1/flags/${f.key}/rollout`, { rollout_percent: pctNum });
+                      void act(`/v1/flags/${f.key}/rollout`, { rollout_percent: pctNum });
                     }}
                   >
                     Set rollout

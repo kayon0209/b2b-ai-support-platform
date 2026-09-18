@@ -1,12 +1,22 @@
 import { useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
+import { useAction } from "../lib/useAction";
 import { useAsync } from "../lib/useAsync";
 import type { ActivePrompt, PromptVersion } from "../lib/types";
-import { Badge, Card, EmptyState, ErrorBanner, PageHeader, Spinner } from "../components/ui";
+import {
+  ActionFeedback,
+  Badge,
+  Card,
+  EmptyState,
+  ErrorBanner,
+  PageHeader,
+  Spinner,
+} from "../components/ui";
 
 export function PromptRelease() {
   const [template, setTemplate] = useState("agent_qa");
   const [draft, setDraft] = useState("");
+  const action = useAction();
 
   const list = useAsync<{ items: PromptVersion[]; total: number }>(
     () =>
@@ -22,14 +32,14 @@ export function PromptRelease() {
   );
 
   async function act(path: string, body?: unknown, okMsg?: string) {
-    try {
-      await apiPost(path, body);
-      if (okMsg) alert(okMsg);
-    } catch (err) {
-      alert(`Action failed: ${err instanceof Error ? err.message : String(err)}`);
+    const ok = await action.run(
+      () => apiPost(path, body).then(() => undefined),
+      okMsg,
+    );
+    if (ok) {
+      list.reload();
+      active.reload();
     }
-    list.reload();
-    active.reload();
   }
 
   const sorted = list.data
@@ -95,6 +105,7 @@ export function PromptRelease() {
         </div>
       </Card>
 
+      <ActionFeedback error={action.error} notice={action.notice} />
       {list.error ? <ErrorBanner message={list.error} onRetry={list.reload} /> : null}
       {list.loading ? <Spinner label="Loading versions…" /> : null}
       {list.data && sorted.length === 0 ? (

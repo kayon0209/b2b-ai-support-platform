@@ -102,9 +102,53 @@ export function QualityDashboard() {
             <Card>
               <Stat label="Latency P95" value={ms(metrics.data.latency_p95_ms)} />
             </Card>
+            <Card>
+              <Stat
+                label="Supported resolution"
+                value={pct(metrics.data.supported_resolution_rate)}
+                tone={toneFor(1 - metrics.data.supported_resolution_rate, 0.1, 0.25)}
+              />
+            </Card>
+            <Card>
+              <Stat
+                label="Wrong resolution"
+                value={pct(metrics.data.wrong_resolution_rate)}
+                tone={toneFor(metrics.data.wrong_resolution_rate, 0.05, 0.15)}
+              />
+            </Card>
           </div>
 
           <div className="grid-2">
+            <Card title="Resolution outcomes">
+              {metrics.data.cases_measured > 0 ? (
+                <ul className="kv">
+                  <li>
+                    <span>Cases measured</span>
+                    <span>{int(metrics.data.cases_measured)}</span>
+                  </li>
+                  <li>
+                    <span>Resolution held</span>
+                    <span className="text-good">{int(metrics.data.supported_resolution)}</span>
+                  </li>
+                  <li>
+                    <span>Reopened after resolving</span>
+                    <span className="text-bad">{int(metrics.data.wrong_resolution)}</span>
+                  </li>
+                </ul>
+              ) : (
+                <p className="muted">
+                  No Case was resolved or reopened in this window, so there is no resolution
+                  outcome to report yet.
+                </p>
+              )}
+              <p className="muted">
+                Derived from Cases, not runs: a Case that was resolved and never reopened is a
+                resolution that held; one that was reopened is a resolution that did not. Open
+                cases ({int(metrics.data.open_cases)}) are excluded so the rate does not move
+                with backlog.
+              </p>
+            </Card>
+
             <Card title="Outcome mix">
               <ul className="kv">
                 <li>

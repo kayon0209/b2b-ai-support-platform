@@ -677,6 +677,15 @@ h3 {
   color: var(--bad);
 }
 
+/* A write that succeeded. Distinct from `.banner-error` so a confirmation
+   cannot be mistaken for a failure at a glance, which is the one thing an
+   operator scanning the page must not do. */
+.banner-ok {
+  border-color: #b7e0c9;
+  background: var(--good-soft);
+  color: var(--good);
+}
+
 .empty-state {
   padding: 22px;
   border: 1px dashed var(--border-strong);

@@ -1,9 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
+import { ApiError } from "./types";
 
 export interface AsyncState<T> {
   data: T | null;
   loading: boolean;
   error: string | null;
+  /**
+   * HTTP status of the failure, when it was an API error.
+   *
+   * `error` alone is not enough to react to a failure: a page that wants to
+   * say "you do not have permission to see this section" has to distinguish
+   * a 403 from a 500, and the message text is the server's to choose.
+   */
+  errorStatus: number | null;
   reload: () => void;
 }
 
@@ -18,6 +27,7 @@ export function useAsync<T>(
   const [data, setData] = useState<T | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [errorStatus, setErrorStatus] = useState<number | null>(null);
   const [nonce, setNonce] = useState(0);
 
   const reload = useCallback(() => setNonce((n) => n + 1), []);
@@ -26,12 +36,15 @@ export function useAsync<T>(
     let active = true;
     setLoading(true);
     setError(null);
+    setErrorStatus(null);
     loader()
       .then((result) => {
         if (active) setData(result);
       })
       .catch((err: unknown) => {
-        if (active) setError(err instanceof Error ? err.message : String(err));
+        if (!active) return;
+        setError(err instanceof Error ? err.message : String(err));
+        setErrorStatus(err instanceof ApiError ? err.status : null);
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -42,5 +55,5 @@ export function useAsync<T>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [...deps, nonce]);
 
-  return { data, loading, error, reload };
+  return { data, loading, error, errorStatus, reload };
 }

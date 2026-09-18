@@ -32,6 +32,45 @@ export function EmptyState({ message }: { message: string }) {
   return <div className="empty-state">{message}</div>;
 }
 
+/**
+ * The result of a write action: a failure banner or a success banner, never
+ * both. Kept in one component so every page reports an action the same way -
+ * the alternative was four pages each growing their own variant.
+ *
+ * Both branches are `role="alert"`/`role="status"` so a screen reader
+ * announces the outcome of a button press that produced no visible change.
+ */
+export function ActionFeedback({
+  error,
+  notice,
+  onRetry,
+}: {
+  error: string | null;
+  notice?: string | null;
+  onRetry?: () => void;
+}) {
+  if (error) {
+    return (
+      <div className="banner banner-error" role="alert">
+        <span>{error}</span>
+        {onRetry ? (
+          <button className="btn btn-ghost" onClick={onRetry}>
+            Retry
+          </button>
+        ) : null}
+      </div>
+    );
+  }
+  if (notice) {
+    return (
+      <div className="banner banner-ok" role="status">
+        <span>{notice}</span>
+      </div>
+    );
+  }
+  return null;
+}
+
 export function PageHeader({
   title,
   subtitle,

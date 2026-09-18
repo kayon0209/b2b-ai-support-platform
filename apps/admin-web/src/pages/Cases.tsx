@@ -1,8 +1,17 @@
 import { useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
+import { useAction } from "../lib/useAction";
 import { useAsync } from "../lib/useAsync";
 import type { Case } from "../lib/types";
-import { Badge, Card, EmptyState, ErrorBanner, PageHeader, Spinner } from "../components/ui";
+import {
+  ActionFeedback,
+  Badge,
+  Card,
+  EmptyState,
+  ErrorBanner,
+  PageHeader,
+  Spinner,
+} from "../components/ui";
 import { dateFromEpochSeconds } from "../lib/format";
 
 const PRIORITIES = ["p0", "p1", "p2", "p3"];
@@ -38,19 +47,23 @@ export function Cases() {
     () => apiGet<{ case: Case }>(`/v1/cases/${selected}`),
     [selected],
   );
+  const action = useAction();
 
   async function command(command: string, parameters: Record<string, unknown> = {}) {
     if (!selected) return;
-    try {
-      await apiPost(
-        `/v1/cases/${selected}/commands`,
-        { command, parameters, reason: "" },
-        idem(),
-      );
+    const ok = await action.run(
+      async () => {
+        await apiPost(
+          `/v1/cases/${selected}/commands`,
+          { command, parameters, reason: "" },
+          idem(),
+        );
+      },
+      `Command "${command}" applied.`,
+    );
+    if (ok) {
       detail.reload();
       list.reload();
-    } catch (err) {
-      alert(`Command failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -61,6 +74,7 @@ export function Cases() {
         subtitle="Tenant-scoped support cases with SLA clocks."
       />
 
+      <ActionFeedback error={action.error} notice={action.notice} />
       {list.error ? <ErrorBanner message={list.error} onRetry={list.reload} /> : null}
       {list.loading ? <Spinner label="Loading cases…" /> : null}
       {list.data && list.data.items.length === 0 ? (

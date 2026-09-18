@@ -15,6 +15,17 @@ export interface QualityMetrics {
   route_counts: Record<string, number>;
   latency_p50_ms: number | null;
   latency_p95_ms: number | null;
+  /**
+   * Resolution outcomes, derived from Cases rather than runs. The denominator
+   * is resolved-or-reopened Cases only, so an open Case does not drag the
+   * rate around with backlog.
+   */
+  cases_measured: number;
+  supported_resolution: number;
+  wrong_resolution: number;
+  open_cases: number;
+  supported_resolution_rate: number;
+  wrong_resolution_rate: number;
 }
 
 export interface RouteDistribution {
@@ -136,9 +147,56 @@ export interface ListEnvelope<T> {
   total: number;
 }
 
-export interface ApiError {
-  status: number;
-  code: string;
-  message: string;
-  retryable: boolean;
+/** Response of GET /v1/tenant/usage and PUT /v1/tenant/quota. */
+export interface UsageSnapshot {
+  period_start: number;
+  period_end: number;
+  runs_used: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  /** null means unlimited. */
+  quota: number | null;
+  remaining: number | null;
+  over_quota: boolean;
+}
+
+/**
+ * Response of GET /v1/tenant/billing — the append-only ledger rollup an
+ * invoice is computed from. Distinct from `UsageSnapshot`, which is a
+ * live count of runs: the ledger additionally survives a run row being
+ * rewritten, and adjustments appear here as their own entries.
+ */
+export interface BillingRollup {
+  period_start: number;
+  period_end: number;
+  entries: number;
+  usage_entries: number;
+  adjustment_entries: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+/**
+ * A failed API call, as a real `Error`.
+ *
+ * It must extend `Error`, not merely be shaped like one. Every call site
+ * reads the failure with `err instanceof Error ? err.message : String(err)`,
+ * and for a plain object that falls through to `String(err)` — which renders
+ * the literal text `[object Object]`. That is what every error banner and
+ * every `alert()` in this app used to show, so the server's message (the one
+ * thing the operator needs) was thrown away at the last step.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly retryable: boolean;
+
+  constructor(status: number, code: string, message: string, retryable: boolean) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.retryable = retryable;
+  }
 }

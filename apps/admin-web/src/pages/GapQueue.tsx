@@ -1,8 +1,17 @@
 import { useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
+import { useAction } from "../lib/useAction";
 import { useAsync } from "../lib/useAsync";
 import type { Draft, Gap, GapStats } from "../lib/types";
-import { Badge, Card, EmptyState, ErrorBanner, PageHeader, Spinner } from "../components/ui";
+import {
+  ActionFeedback,
+  Badge,
+  Card,
+  EmptyState,
+  ErrorBanner,
+  PageHeader,
+  Spinner,
+} from "../components/ui";
 import { dateFromEpochSeconds, int, titleCase } from "../lib/format";
 
 const STATUSES = ["open", "acknowledged", "drafted", "resolved", "dismissed"];
@@ -41,16 +50,15 @@ export function GapQueue() {
     [],
   );
   const stats = useAsync<GapStats>(() => apiGet<GapStats>(`/v1/knowledge/gaps/stats`), []);
+  const action = useAction();
 
   async function act(path: string, body?: unknown) {
-    try {
-      await apiPost(path, body);
-    } catch (err) {
-      alert(`Action failed: ${err instanceof Error ? err.message : String(err)}`);
+    const ok = await action.run(() => apiPost(path, body).then(() => undefined));
+    if (ok) {
+      gaps.reload();
+      drafts.reload();
+      stats.reload();
     }
-    gaps.reload();
-    drafts.reload();
-    stats.reload();
   }
 
   return (
@@ -75,6 +83,8 @@ export function GapQueue() {
           </div>
         }
       />
+
+      <ActionFeedback error={action.error} notice={action.notice} />
 
       {stats.data ? (
         <div className="stat-grid stat-grid-sm">

@@ -1,4 +1,4 @@
-import type { ApiError } from "./types";
+import { ApiError } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 
@@ -66,10 +66,19 @@ export async function apiDelete<T>(path: string, idempotencyKey?: string): Promi
 
 async function unwrap<T>(res: Response): Promise<T> {
   const text = await res.text();
-  const data = text ? (JSON.parse(text) as unknown) : null;
+  let data: unknown = null;
+  if (text) {
+    try {
+      data = JSON.parse(text) as unknown;
+    } catch {
+      // A proxy or an ingress can answer with HTML (a 502 page, an auth
+      // redirect). Letting JSON.parse throw would surface as a syntax error
+      // and hide the status, which is the actionable part.
+      throw new ApiError(res.status, "NON_JSON_RESPONSE", `HTTP ${res.status}`, res.status >= 500);
+    }
+  }
   if (!res.ok) {
-    const err = toApiError(res.status, data);
-    throw err;
+    throw toApiError(res.status, data);
   }
   return data as T;
 }
@@ -79,20 +88,14 @@ function toApiError(status: number, data: unknown): ApiError {
   // on failure; cases endpoints additionally wrap success in ok_response.
   const envelope = (data ?? {}) as Record<string, any>;
   const errorBlock = envelope.error ?? {};
-  return {
+  return new ApiError(
     status,
-    code: typeof errorBlock.code === "string" ? errorBlock.code : "HTTP_ERROR",
-    message:
-      typeof errorBlock.message === "string" ? errorBlock.message : `HTTP ${status}`,
-    retryable: Boolean(errorBlock.retryable),
-  };
+    typeof errorBlock.code === "string" ? errorBlock.code : "HTTP_ERROR",
+    typeof errorBlock.message === "string" ? errorBlock.message : `HTTP ${status}`,
+    Boolean(errorBlock.retryable),
+  );
 }
 
 export function isUnauthorized(err: unknown): boolean {
-  return (
-    typeof err === "object" &&
-    err !== null &&
-    "status" in err &&
-    (err as ApiError).status === 401
-  );
+  return err instanceof ApiError && err.status === 401;
 }
