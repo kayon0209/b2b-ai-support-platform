@@ -1,10 +1,11 @@
 # 全部 Phase 完成 — 交付报告
 
-`docs/development-plan.md` 的 Phase 0–5 全部实现。本报告汇总四段会话：把 Phase 2–5 的缺口
+`docs/development-plan.md` 的 Phase 0–5 全部实现。本报告汇总五段会话：把 Phase 2–5 的缺口
 补齐、接续一个**未提交的工作树**、补上**评估报告产出方**并因此发现冲突规则的失效守卫、
-再补上**账本更正**并因此发现 RLS 会话绑定的一类系统性缺陷。
+补上**账本更正**并因此发现 RLS 会话绑定的一类系统性缺陷、最后清掉全部**阻塞式对话框**。
 
-当前状态：全量回归 **1209 passed, EXIT=0**；ruff / mypy 全绿；真实端到端评估 **21/23**。
+当前状态：全量回归 **1209 passed, EXIT=0**；ruff / mypy 全绿；真实端到端评估 **21/23**；
+admin-web `typecheck` + `build` 通过。
 
 ## 一、按开发计划逐项交付
 
@@ -198,7 +199,41 @@ SET ROLE platform_app;
 `[FAIL] read_tool_success_rate: 0.97 vs 0.99 (3 of 100 read-tool calls failed)`——
 一个真实计算出的数字，而在此之前这在结构上不可能。
 
-## 六、整体验证结果（实测）
+## 六、本会话：清掉全部阻塞式对话框
+
+13 处 `window.prompt` + 2 处 `window.confirm`，全部移除。
+
+`window.prompt` 阻塞整个标签页、无法样式化、也不作为 live region 被朗读——运维在缺口队列里
+逐条处理时，每一步都要关一个浏览器弹窗；填错一个值，还要再关一个弹窗来读报错。
+
+新增 `components/Prompt.tsx`，**保持调用点形状**，所以 diff 小且可审：
+
+```tsx
+const values = await prompt.ask({
+  title: "Transition to which status?",
+  fields: [{ name: "target", label: "Target status", options: STATUSES, required: true }],
+});
+if (!values) return;                 // 取消
+onCommand("transition", { target: values.target });
+```
+
+`ask` 返回 Promise，`confirm` 是它的 yes/no 形式，页面渲染一次 `prompt.element`。字段支持
+文本、下拉、整数（含 min/max）与必填；校验**就地**显示，而不是再弹一个窗。它刻意做成**内联
+而非模态**：出现在页面当前位置，运维不会丢失正在阅读的上下文。
+
+两处行为变化，都是改进：
+
+- **取消不再执行操作。** 旧代码对草稿复核备注写的是 `window.prompt(...) ?? ""`，所以关掉
+  弹窗**仍然会批准草稿**（备注为空）。现在取消就是取消。
+- **灰度百分比就地校验。** 旧代码在事后用一个 `alert` 报 `Number.isNaN` 与范围错误；现在
+  字段在提交前拒绝，且边界写在字段声明里而不是处理函数里。
+
+`Members` 还藏着一个更安静的同类缺陷：它自带 `run` + `setNotice`，渲染成
+`<p className="muted">{notice}</p>`——**移除成员失败**与**复制令牌成功**看起来完全一样，
+都是灰色小字。现已改用 `useAction()` + `<ActionFeedback>`：失败是红色 `role="alert"` 横幅，
+成功是绿色 `role="status"` 横幅。
+
+## 七、整体验证结果（实测）
 
 | 检查 | 结果 |
 |---|---|
@@ -211,13 +246,8 @@ SET ROLE platform_app;
 | `release_check --evidence-only` | exit 0；15/4/3 条零容忍背书测试 |
 | **真实 MinIO 端到端** | 上传 → MinIO → worker → `chunks=2 with_embedding=2` → `hybrid_search hits=2` |
 | admin-web | `typecheck` + `build` 通过 |
+| **阻塞式对话框** | `src/` 内**零**（仅注释中提及） |
 | compose | `docker compose config` 通过 |
-
-## 七、有意不做的一件事（明确说明，不是遗漏）
-
-**13 处 `window.prompt` 保留**（Case 命令对话框、缺口队列草稿/复核输入、prompt 拒绝与回滚、
-开关灰度百分比）。它们可用但粗糙：阻塞、无样式、无校验面。逐处替换需要真实的内联表单，
-改一半比不改更糟。这是 UI 侧的首要后续项。
 
 ## 八、仍然存在的边界
 
@@ -235,9 +265,11 @@ SET ROLE platform_app;
 - **Postgres / Redis 只被引用，未被部署**（各自是带备份/故障转移的 StatefulSet 命题）。
 - Chatwoot 双向往返的端到端脚本仍未跑（容器已起、3000 可达）。
 
+> 已无「有意不做」的遗留项。上一版报告里保留的 13 处 `window.prompt` 已在本轮全部替换。
+
 ## 九、提交
 
 `4e2a87b`（计费账本 + 发布门禁证据 + 缺陷修复）→ `d76fa3f`（admin-web 错误处理与信息补全）
 → `8d0da2d`（交付报告）→ `a84615c`（评估报告产出方 + 冲突规则失效守卫）→ `737361a`
 （文档与记忆）→ `69ff6b9`（账本更正 API/UI + RLS 会话绑定与 read-tool 门禁修复）
-→ `217b9c4`（记忆整理）
+→ `217b9c4`（记忆整理）→ `d597288`（报告更新）→ `f0a51c4`（移除全部阻塞式对话框）
