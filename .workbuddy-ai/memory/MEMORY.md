@@ -268,3 +268,23 @@ uses which.
   migration-built DB could not list members or create a user.
 - **Any test fixture that writes to the shared DB must clean up.** The perf
   benchmark had leaked 78 `perf-*` tenants before its fixture grew a teardown.
+
+## RLS bootstrap: the standing pattern (8 instances)
+
+A tenant-owned table that must be read **before** a tenant binding exists needs a
+narrow `SECURITY DEFINER` function: pinned `SET search_path = pg_catalog, public`,
+`REVOKE ALL FROM PUBLIC` (and from `platform`), `GRANT EXECUTE` to `platform_app`
+only, returning a narrow projection (`RETURNS TABLE (...)`). Instances:
+0015 `resolve_active_membership`, 0016 `resolve_oidc_identity`, 0018
+`claim_ingestion_versions`, 0019 `reclaim_stale_ingestions`, 0026
+`resolve_connector_for_webhook`, 0027 `resolve_domain_tenant`, 0030
+`resolve_saml_connection`, 0030 `resolve_scim_token`.
+
+## Idempotency belongs in a constraint, not a check-then-insert
+
+`UNIQUE` + `ON CONFLICT DO NOTHING` beats read-then-write wherever two replicas
+can race: ingestion claims, webhook delivery dedupe (`uq_inbox_delivery`),
+escalation rungs (`uq_case_escalation_once`), SAML assertion replay
+(`uq_saml_assertion_once`). Prefer `ON CONFLICT` to catching `IntegrityError`,
+because catching means rolling back the whole transaction.
+

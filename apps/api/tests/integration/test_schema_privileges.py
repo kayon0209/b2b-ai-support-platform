@@ -37,8 +37,28 @@ APP_ROLE = "platform_app"
 
 # Tables the application role must not be able to modify, with the reason.
 # A new entry here is a deliberate decision, not a way to silence the test.
-READ_ONLY_BY_DESIGN = {
-    "audit_events": "append-only: an editable audit trail is not an audit trail",
+# Table -> the privileges the application role is *supposed* to lack, with the
+# reason. A map rather than a set of tables to skip: "this table is special" is
+# not a specification, and the first version of this file skipped a table
+# entirely rather than saying which privilege was withheld and why.
+#
+# Found by running `alembic downgrade base && alembic upgrade head`: the test had
+# been passing against a development database where `DELETE ON tenants` had been
+# granted out of band, and a database built from the migrations alone does not
+# have it. The grant in migration 0001 withholds it, and `grep` for
+# `delete(Tenant)` / `DELETE FROM tenants` across `apps/` finds nothing - tenant
+# deletion is not an application operation at all. The lifecycle answer is
+# suspend, and a cascade across every table is not something a request handler
+# should be able to trigger.
+RESTRICTED_BY_DESIGN: dict[str, tuple[frozenset[str], str]] = {
+    "audit_events": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only: an editable audit trail is not an audit trail",
+    ),
+    "tenants": (
+        frozenset({"DELETE"}),
+        "tenant deletion is not an application operation; the lifecycle answer is suspend",
+    ),
 }
 
 PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
@@ -81,6 +101,20 @@ def _grants() -> dict[str, dict[str, bool]]:
     }
 
 
+def test_the_withheld_privileges_are_the_documented_ones() -> None:
+    """The listed exceptions must match the database exactly.
+
+    A table that quietly gains a privilege the platform decided to withhold is
+    as much a defect as one that loses a privilege it needs, and only this
+    direction catches a `GRANT ALL` pasted into a migration.
+    """
+    grants = _grants()
+    for table, (withheld, reason) in RESTRICTED_BY_DESIGN.items():
+        assert table in grants, table
+        for privilege in withheld:
+            assert grants[table][privilege.lower()] is False, f"{table} has {privilege}: {reason}"
+
+
 def test_the_application_role_can_use_every_table() -> None:
     """A missing grant is invisible until a request hits the table."""
     grants = _grants()
@@ -88,12 +122,13 @@ def test_the_application_role_can_use_every_table() -> None:
 
     missing: list[str] = []
     for table, privileges in grants.items():
-        if table in READ_ONLY_BY_DESIGN:
-            continue
+        withheld, _reason = RESTRICTED_BY_DESIGN.get(table, (frozenset(), ""))
         # SELECT and INSERT are required everywhere: a table the app cannot
         # read is dead weight, and one it cannot write is a write path that
         # fails at the first real request.
         for privilege in ("select", "insert", "update", "delete"):
+            if privilege.upper() in withheld:
+                continue
             if not privileges[privilege]:
                 missing.append(f"{table}.{privilege.upper()}")
 
@@ -113,8 +148,8 @@ def test_the_audit_trail_cannot_be_edited_or_deleted() -> None:
     privileges = grants["audit_events"]
     assert privileges["select"] is True
     assert privileges["insert"] is True
-    assert privileges["update"] is False, READ_ONLY_BY_DESIGN["audit_events"]
-    assert privileges["delete"] is False, READ_ONLY_BY_DESIGN["audit_events"]
+    assert privileges["update"] is False, RESTRICTED_BY_DESIGN["audit_events"][1]
+    assert privileges["delete"] is False, RESTRICTED_BY_DESIGN["audit_events"][1]
 
 
 def test_tenant_owned_tables_force_row_level_security() -> None:

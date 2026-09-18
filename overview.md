@@ -1,78 +1,59 @@
-# b2b-ai-support-plan — 本轮开发报告
+# 全部 Phase 完成 — 交付报告
 
-**提交**：`9d4a384`（连接器健康/重授权）→ `2e4ee13` → `f03bcd5`（P1 摄取回归 + 死信）→ `96a2963`（可续传同步）→ `b3b88b1`（连接器 webhook）→ `554142f`（限流 + 恢复演练 + 特性开关）→ `8c2a4d1`（自定义域名）
+本会话从「Phase 2 尚有两项未落地」推进到 **Phase 0–5 全部完成**，并执行了整体验证与端到端测试。全量回归 **1032 → 1118 passed, EXIT=0**。
 
-**验证基线**：全量 **885 passed, EXIT=0**（基线 754）；真实 MinIO 端到端绿；恢复演练 **55 项检查全过**；`ruff check` / `ruff format --check` / `mypy`（110 文件，0 错）全绿；alembic 在 `0027`
+## 一、按开发计划逐项交付
 
-**Phase 状态**：**Phase 0–4 完成；Phase 5 完成自定义域名，SAML/SCIM 与 k8s 模板未开始（见第五节）**
-
----
-
-## 一、本轮的元规律：三个 P1/P2 级缺陷都是「跑出来」的，不是读出来的
-
-| 缺陷 | 怎么发现的 | 为什么测试没抓到 |
+| Phase | 本轮补上的内容 | 依据 |
 |---|---|---|
-| **每个 API 上传的文档都入库失败** | 真实 MinIO 端到端 | fixture 播种的版本**没有** `content_type`，走了兜底分支 |
-| **迁移建表却忘了授权** | 域名接口第一个请求 `permission denied` | 迁移全绿、单测全绿，且只在**全新库**上失败 |
-| **恢复演练把并发变更误报成数据丢失** | 演练第一次运行报 7 个 FAIL | 演练只看了「恢复后 vs 源」，没检查源是否静止 |
+| **2** | `EnterpriseAccount` + `Department`（此前**完全不存在**）；`memberships.department_id`、`cases.enterprise_account_id` 的悬空列接上**组合外键**；契约层级驱动 SLA 时钟 | 迁移 0028 |
+| **2** | **SLA 升级执行器**——`is_breached` 此前**零调用方**，违约的 Case 只会一直违约 | 迁移 0029 + worker `sla` 角色 |
+| **3** | **Linear 适配器**（计划中「Jira **或** Linear」，此前只有 Jira）；IM 渠道拆分为 Slack/Teams/Feishu 三种真实载荷 | 提供方注册表 |
+| **5** | **自定义域名**已在上轮完成；本轮补 **SAML 2.0 SP**、**SCIM 2.0 供应**、**合规导出**、**k8s 高可用模板** | 迁移 0030 + `infra/kubernetes/` |
 
-三者的共同点：**一个只在真实运行路径上才成立的假设**。
+## 二、本轮的元规律：缺陷都是「跑出来」的
 
-### 1. 摄取 P1（`0025`）
+| 缺陷 | 怎么发现的 |
+|---|---|
+| **两节点环路被放行** | 活库探测：`EXECUTE ... INTO` 之后 `FOUND` 是 **false**，我那句 `IF NOT FOUND` 把刚读到的父节点丢掉了，遍历在第一跳就终止。单节点自环仍被拦——但那是 CHECK 约束拦的，**触发器其实一直没起作用** |
+| **SAML 状态码检查从未生效** | 单元测试断言「IdP 拒绝必须被拒」：状态码在 `Value` **属性**里，我按文本读，`"" and ...` 短路，**IdP 的显式拒绝被当成成功** |
+| **`redact_value` 只脱敏文本，不认键名** | 写审计元数据时发现 `{"api_token": "..."}` 原样穿过去了——它是「恰好会遍历容器的文本脱敏器」 |
+| **迁移建表却忘授权（第二次）** | 域名接口首个请求 `permission denied`；且**只在全新库**上失败 |
+| **`tenants` 缺 DELETE** | `downgrade base && upgrade head` 之后才暴露：这条断言此前是**在漂移过的库上通过的**，迁移本身从未授予该权限 |
+| **消费方读 `ambiguous` 会 KeyError** | 适配器早返回路径的字典形状与其它路径不一致 |
+| **`PATCH` 被当成完整资源校验** | SCIM 集成测试：只带 `active: false` 的下线请求因缺 `userName` 被拒 |
+| **元数据依导入顺序不完整** | worker 侧测试 `NoReferencedTableError`，而 API 侧测试通过——因为 API 导入全部路由 |
 
-```
-IngestionError: unsupported content type for parsing: "text/markdown"
-```
+**结论**：绿测试是不够的。真实端到端、迁移降级/升级往返、以及「这条断言到底在断言什么」的复核，各自都抓到了单元测试看不见的东西。
 
-注意值外面的引号。`->` 返回 JSON 标量，转 `text` 会保留双引号；`0024` 用了 `->`，于是只有 API 路径（唯一会在 metadata 里写 `content_type` 的路径）失败。已在活库上取证 `->` 与 `->>` 的差异后才改。
-
-### 2. 迁移漏授权（`0027`）
-
-`tenant_domains` 建了表、配了 RLS、迁移干净，但没有 `GRANT ... TO platform_app`。**这是同一个形状的第二次**（`users` 在 `0021` 才补上）。因此新增 `test_schema_privileges.py` 覆盖全部 34 张表——并且同时钉住镜像结论：`audit_events` **只有** SELECT+INSERT，因为审计可改就不再是审计。
-
-### 3. 恢复演练的假警报
-
-回归测试正在跑时执行演练，`test_dead_letters` 的清理在 dump 期间删掉了自己的租户，演练把「源在动」报成「恢复丢了数据」。一个会这样误报的演练只会教会人忽略它。现在 dump 前后各取一次源快照，不一致就退出码 2 并明说「源非静止」。
-
-## 二、Phase 3：三个「存在但从不被消费」的缺口全部闭合
-
-- **健康与重授权**：`health_check()` 零调用方、`NEEDS_REAUTH` 从不被写、无轮换路径。
-  关键决策：`health_check()` 走的是**无鉴权**的 `/health`，所以**探测成功不能证明凭证有效**——因此探测**永远不能**清除 `NEEDS_REAUTH`，清除还必须证明凭证**可解析**。
-- **死信**：`DeadLetterItem` 有模型、有清扫、**没有生产者**。载荷永不落库（存 `tool:sha256(params)`，仍能回答「是不是同一个操作失败了 40 次」）；鉴权拒绝排除在外；歧义优先于错误码。**刻意不做重放**——载荷不在行里，歧义行在有人确认第一次是否落库前不能重试。
-- **可续传同步**：`SyncCursor` 零引用、`fetch` 零调用方。写调用方时暴露出 `fetch` 把 cursor 当 JQL 用——分页**永远不可能工作**，但会以 200 + 空结果集的形式**静默**表现为「没有更多记录」。游标只做存储、从不解析；**失败不移动游标**。
-- **连接器 webhook**：`EXEMPT_PATHS` 原本只做精确匹配，而 webhook 路径以连接器 id 结尾——补了显式的前缀豁免，并写明「该前缀下的一切都必须验签」。
-
-## 三、Phase 4：限流、恢复演练、第一个开关消费方
-
-- **限流**：令牌桶（固定窗口会在边界放行两倍，且算不出有意义的 `Retry-After`）。Redis 存计数——这正是 ADR 0002 说的「Redis 不存会改变请求结果的持久状态」的**反例**，ADR 已据此更新。Redis 不可用时**降级为进程内桶，而不是 fail-open**；`/healthz` 与 `/metrics` **永不限流**（限了指标等于在事故中蒙住监控）。
-- **恢复演练**：文档承诺了季度演练却无脚本。现在断言 33 张表行数、14 张表的**按租户分布**（总数相等而租户间搬移是总数看不出的）、审计**计数与时间跨度**、outbox 状态分布、续跑护栏约束、以及悬挂引用。**RPO 刻意不测**——逻辑 dump 的 RPO 按定义是 0，报它等于演戏。
-- **特性开关的第一个消费方**：`flag_service.evaluate` 在自身模块外**零调用**，所以开关能定义、能审计、能预览，却**不改变任何行为**。接入的正是重排序器——它已实现、已测试，但**生产回答路径从不重排**（`wiring.py` 甚至留着「Reranking is likewise optional」的注释而代码里没建）。默认 False，未定义的开关绝不是静默开启。
-  **灰度范围比看上去窄，这是真发现**：开关属于租户且有 RLS，门控在运行租户自己的 session 里求值，加上 `target_tenant` 拒绝自定向，因此**跨租户的集中灰度当前不可表达**。
-
-## 四、Phase 5：自定义域名
-
-Host 是调用方可控的，所以两条边界必须写死：
-
-- **Host 永不为已鉴权请求选择租户**（那就是「从请求里取 tenant）」；它只能决定渲染**哪个租户的公开品牌页**。
-- **未验证的域名绝不解析**。否则任何租户都能声称别人的域名并在其上挂自己的品牌页。
-- 域名全局唯一（两租户同一主机 → 解析结果取决于行顺序）；`CHECK (domain = lower(domain))` 让归一化成为结构约束。
-- 验证目前是**运维书面确认**，不是 DNS 检查——读 TXT 记录需要一个解析器依赖与其失败模式决策，文档直说，不让 `verified_at` 看起来像自动检查。
-
-## 五、剩余（诚实说明，不含糊）
-
-- **SAML / SCIM**：未开始。各自都是真实协议实现（SAML 需 XML 签名校验与 metadata 交换；SCIM 需资源 schema、过滤与分页）。做得半成品比没有更糟，无法诚实地塞进一个切片。
-- **`infra/kubernetes/`**：未开始，`infra/` 目前只有 `compose/`。
-- **额外 IM 渠道**：适配器存在，但没有生产发送路径。
-- **已知且有意保留**：`ambiguous-refund-eligibility`（`must_abstain=True`）。正确解法是检索前完成账户身份解析；不得为让评测变绿而放宽该用例。
-- **可整理项（非缺陷）**：`flag_service` / `flag_router` 位于 `knowledge/` 模块，但特性开关是平台级概念，放在那里名不副实；迁移的话是一次纯粹的 import 重构。
-
-## 六、最终端到端验证
+## 三、整体验证结果（实测）
 
 | 检查 | 结果 |
 |---|---|
-| 全量回归 | **885 passed, EXIT=0** |
-| 真实 MinIO 端到端 | 绿（`ready=1`、`chunks=2 with_embedding=2`、`hybrid_search hits=2`） |
-| 备份/恢复演练 | **55 项检查，0 失败**，RTO 0.9s |
-| 迁移链（降到 base 再升回 head） | 通过（内含 `test_migration_and_performance`） |
-| 静态门禁 | ruff clean、format clean、mypy 110 文件 0 错 |
-| 未覆盖 | Chatwoot(3000) 与 Keycloak(8081) 未启动，因此 Chatwoot 双向往返与 OIDC 真令牌流程未复跑 |
+| 全量回归 | **1118 passed, EXIT=0** |
+| ruff / format / mypy | clean（263 文件 / 124 文件 0 错） |
+| `pip-audit --strict` | No known vulnerabilities found |
+| 迁移链 | `downgrade base` → 1 表 → `upgrade head` → **40 表 @ 0030** |
+| **真实 MinIO 端到端** | 上传 → MinIO → worker → 2 chunks（含嵌入）→ `hybrid_search hits=2` |
+| **备份/恢复演练** | **62 项检查、0 失败**，40 表比对，RTO 1.5s |
+| **真实 Keycloak OIDC** | 真实口令换取的令牌**通过校验**；错误签发者 / 错误受众 / 篡改令牌**全部被拒** |
+| k8s 清单 | `kubectl kustomize` 构建 20 个对象；27 项结构断言 |
+| compose | `docker compose config` 通过；新增 `ai-worker-sla` |
+| Chatwoot | 容器已起，3000 端口可达（未跑双向往返的端到端脚本） |
+
+## 四、有意不做的三件事（明确说明，不是遗漏）
+
+1. **SAML 登录不签发会话。** API 鉴权是 Keycloak 的 OIDC bearer token；在这里另造一种凭据会多出一条更少被审视的取数路径。ACS 只做它该做的：证明身份、拒绝未获角色者、写审计。
+2. **首次登录不授予角色。** IdP 属性由 IdP 管理员控制，据此发角色等于把租户权限交给对方。返回 `SAML_NO_MEMBERSHIP`（403），角色仍由租户自己授予。
+3. **SCIM 的 Group 映射到 Department，绝不映射到 Role**；`filter` 只支持 `attribute eq "value"`，并在错误里写明支持范围。
+
+## 五、仍然存在的边界
+
+- **k8s 清单从未部署到真实集群**：`kubectl apply --dry-run=client` 需要 API discovery，无法离线做闸门；替代品是那 27 项结构断言。README 明说这一点。
+- **Postgres/Redis 只被引用，未被部署**：各自是带备份/故障转移/升级问题的 StatefulSet 命题。
+- Chatwoot 双向往返的端到端脚本本轮未跑。
+- 知识缺口队列仍有 1 条 `ambiguous-refund-eligibility` 记录在案。
+
+## 六、提交
+
+`e4c0936`（Phase 2 组织架构）→ `3c293ed`（SLA 升级）→ `f38b14c`（Linear + IM）→ `3879d5c`（k8s）→ `2e1d606`（合规导出）→ `6774e38`（SAML + SCIM）→ 最终验证提交。
