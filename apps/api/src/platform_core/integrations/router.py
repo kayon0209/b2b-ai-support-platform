@@ -47,13 +47,18 @@ from platform_core.api import (
     tenant_session,
 )
 from platform_core.audit import service as audit_service
-from platform_core.integrations import health
+from platform_core.integrations import dead_letter, health
 from platform_core.integrations.credentials import resolve_credentials
-from platform_core.integrations.models import Connector
+from platform_core.integrations.models import Connector, DeadLetterItem
 from platform_core.tool_gateway.registry import probe_connector
 from platform_policy import Action
 
 router = APIRouter(prefix="/v1/connectors", tags=["integrations"])
+# The dead-letter queue is an operational surface for connector/tool work, so
+# it lives under its own prefix but shares this module's authorization story.
+# If a non-connector producer is ever added, the action pair below should be
+# revisited rather than quietly widening what CONNECTOR_READ exposes.
+dead_letter_router = APIRouter(prefix="/v1/dead-letters", tags=["integrations"])
 
 CONNECTOR_NOT_FOUND = "CONNECTOR_NOT_FOUND"
 # No adapter ships for this provider in this deployment, so reachability is
@@ -61,6 +66,7 @@ CONNECTOR_NOT_FOUND = "CONNECTOR_NOT_FOUND"
 CONNECTOR_PROBE_UNSUPPORTED = "CONNECTOR_PROBE_UNSUPPORTED"
 CONNECTOR_UNREACHABLE = "CONNECTOR_UNREACHABLE"
 CREDENTIAL_UNRESOLVED = "CREDENTIAL_UNRESOLVED"
+DEAD_LETTER_NOT_FOUND = "DEAD_LETTER_NOT_FOUND"
 
 # Longest reference we accept. A reference is a path, not a secret, so it
 # should be short; a bound stops the column from being used as storage.
@@ -336,4 +342,102 @@ async def rotate_credential_ref(
         )
 
 
-__all__ = ["router"]
+__all__ = ["dead_letter_router", "router"]
+
+
+def _dead_letter_out(item: Any) -> dict[str, Any]:
+    """Public projection of a dead-letter row.
+
+    `operation_digest` is exposed because it is what lets an operator see
+    "the same operation failed 40 times" instead of scrolling 40 rows; it
+    carries no payload (see `dead_letter.operation_digest`).
+    """
+    return {
+        "id": str(item.id),
+        "connector_id": str(item.connector_id) if item.connector_id else None,
+        "resource_type": item.resource_type,
+        "operation": item.operation,
+        "operation_digest": item.operation_digest,
+        "error_code": item.error_code,
+        "error_detail": item.error_detail,
+        "attempts": item.attempts,
+        "status": item.status,
+        "created_at": item.created_at,
+        "resolved_at": item.resolved_at,
+    }
+
+
+@dead_letter_router.get("")
+async def list_dead_letters(request: Request, status: str | None = None) -> Any:
+    """Retry-exhausted and ambiguous connector outcomes awaiting a human.
+
+    Deliberately a read-only listing plus an explicit resolve. There is no
+    replay endpoint: the payload is not stored here by design, and an
+    `ambiguous` row cannot be safely retried until someone establishes
+    whether the first attempt landed.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return _unresolved()
+    denied = require_policy(ctx, Action.CONNECTOR_READ)
+    if denied is not None:
+        return denied
+
+    if status is not None and status not in (dead_letter.PENDING, dead_letter.RESOLVED):
+        return error_response(
+            VALIDATION_FAILED,
+            f"status must be {dead_letter.PENDING!r} or {dead_letter.RESOLVED!r}",
+            status_code=400,
+        )
+
+    async with tenant_session(ctx) as session:
+        rows = await dead_letter.list_pending(session, tenant_id=ctx.tenant_id, status=status)
+        return ok_response(
+            {
+                "dead_letters": [_dead_letter_out(r) for r in rows],
+                "counts": {
+                    "pending": sum(1 for r in rows if r.status == dead_letter.PENDING),
+                    "resolved": sum(1 for r in rows if r.status == dead_letter.RESOLVED),
+                },
+            }
+        )
+
+
+@dead_letter_router.post("/{item_id}/resolve")
+async def resolve_dead_letter(request: Request, item_id: uuid.UUID) -> Any:
+    """Mark a dead letter handled. An operator attestation, recorded in audit.
+
+    Idempotent: resolving an already-resolved row returns 200 with
+    `changed: false` rather than an error, because two operators clicking the
+    same button is not an incident - and it must not write a second audit
+    event for a transition that did not happen.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return _unresolved()
+    denied = require_policy(ctx, Action.CONNECTOR_ADMIN)
+    if denied is not None:
+        return denied
+    missing_idem = require_write_idempotency(request, Action.CONNECTOR_ADMIN)
+    if missing_idem is not None:
+        return missing_idem
+
+    trace_id = new_trace_id()
+    async with tenant_session(ctx) as session:
+        item = (
+            await session.execute(
+                select(DeadLetterItem).where(
+                    DeadLetterItem.id == item_id, DeadLetterItem.tenant_id == ctx.tenant_id
+                )
+            )
+        ).scalar_one_or_none()
+        if item is None:
+            return error_response(DEAD_LETTER_NOT_FOUND, "dead letter not found", status_code=404)
+
+        changed = await dead_letter.resolve(
+            session, item, reason_code="OPERATOR_RESOLVED", ctx=ctx, trace_id=trace_id
+        )
+        await session.commit()
+        return ok_response(
+            {"dead_letter": _dead_letter_out(item), "changed": changed}, trace_id=trace_id
+        )

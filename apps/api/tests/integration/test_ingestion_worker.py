@@ -27,6 +27,7 @@ document. Everything above it is a component check.
 """
 
 import asyncio
+import json
 import os
 import sys
 import uuid
@@ -177,14 +178,32 @@ def _cleanup(admin: object) -> None:
         conn.execute(text("DELETE FROM tenants WHERE slug = ANY(:s)"), {"s": [SLUG, OTHER_SLUG]})
 
 
-def _make_version(*, tenant: str = TENANT, uri: str | None = None, body: str = DOC) -> str:
+def _make_version(
+    *,
+    tenant: str = TENANT,
+    uri: str | None = None,
+    body: str = DOC,
+    content_type: str | None = None,
+) -> str:
     """Insert a document + version at `uploaded`, exactly as the API would.
 
     Written with raw SQL rather than the service so the fixture does not
     depend on the code under test: if `create_document` regressed, a
     fixture that called it would fail for the wrong reason.
+
+    `content_type` is opt-in rather than defaulted, because the two cases are
+    genuinely different code paths and only one of them was covered before:
+    a version row with no `content_type` in metadata yields SQL NULL from the
+    claim function and the worker falls back to markdown, while a version
+    uploaded through the **API** always carries one. Migration 0024 got the
+    JSON extraction wrong and only the second path failed - see
+    `test_the_claim_returns_an_unquoted_content_type`.
     """
     uri = uri or f"doc://{uuid.uuid4()}"
+    # `metadata` is NOT NULL with a `'{}'` default, and an explicit NULL in
+    # the INSERT overrides that default - so the empty case passes `"{}"`, not
+    # None. (Same trap as the ORM `server_default` note in the project memory.)
+    metadata = json.dumps({"content_type": content_type}) if content_type else "{}"
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
         doc_id = conn.execute(
@@ -198,15 +217,16 @@ def _make_version(*, tenant: str = TENANT, uri: str | None = None, body: str = D
         version_id = conn.execute(
             text(
                 "INSERT INTO document_versions (id, tenant_id, document_id, version_label, "
-                "content_hash, status, object_uri, ingestion_status) VALUES "
+                "content_hash, status, object_uri, ingestion_status, metadata) VALUES "
                 "(gen_random_uuid(), :t, :d, :label, 'sha256:stub', 'processing', :key, "
-                "'uploaded') RETURNING id"
+                "'uploaded', CAST(:meta AS jsonb)) RETURNING id"
             ),
             {
                 "t": tenant,
                 "d": doc_id,
                 "label": f"v-{uuid.uuid4().hex[:8]}",
                 "key": f"{tenant}/stub/file.md",
+                "meta": metadata,
             },
         ).scalar_one()
     admin.dispose()
@@ -430,6 +450,106 @@ def test_search_vector_is_generated_by_the_database(monkeypatch: pytest.MonkeyPa
 
 
 # --- 2. Claim discipline --------------------------------------------------
+
+
+def test_the_claim_returns_an_unquoted_content_type() -> None:
+    """Pins the JSON extraction in `claim_ingestion_versions`.
+
+    Migration 0024 returned `(metadata -> 'content_type')::text`. `->` yields
+    a JSON value, and casting a JSON *string* to text keeps its double quotes,
+    so the worker received `"text/markdown"` (quotes included) and
+    `parse_document` rejected it as an unsupported content type:
+
+        IngestionError: unsupported content type for parsing: "text/markdown"
+
+    Asserting the exact string rather than a substring is the point: the
+    failure was two extra characters, and `in` would have accepted the buggy
+    value.
+    """
+    from worker.ingestion_consumer import claim_versions
+
+    version_id = _make_version(content_type="text/markdown")
+
+    async def _claim() -> str:
+        engine, factory = _session_factory(APP_URL)
+        try:
+            async with factory() as session:  # type: ignore[operator]
+                claimed = await claim_versions(session, batch=50)
+                await session.commit()
+                match = [c for c in claimed if str(c.version_id) == version_id]
+                assert match, "the seeded version was not claimed"
+                return str(match[0].content_type)
+        finally:
+            await engine.dispose()  # type: ignore[attr-defined]
+
+    assert _run(_claim()) == "text/markdown"
+
+
+def test_a_missing_content_type_yields_an_empty_string_not_a_literal() -> None:
+    """The other half of the same rule.
+
+    A version row predating the field yields SQL NULL, which `ClaimedVersion`
+    normalises to `""` (the field is typed `str`). That is the contract
+    `parse_document` relies on: an empty or whitespace-only content type
+    defaults to markdown, so old rows keep ingesting.
+
+    What this must never be is the *string* `"null"` or `"None"`, which would
+    fail the content-type match and turn every legacy row into a terminal
+    ingestion error.
+    """
+    from worker.ingestion_consumer import claim_versions
+
+    version_id = _make_version()
+
+    async def _claim() -> object:
+        engine, factory = _session_factory(APP_URL)
+        try:
+            async with factory() as session:  # type: ignore[operator]
+                claimed = await claim_versions(session, batch=50)
+                await session.commit()
+                match = [c for c in claimed if str(c.version_id) == version_id]
+                assert match, "the seeded version was not claimed"
+                return match[0].content_type
+        finally:
+            await engine.dispose()  # type: ignore[attr-defined]
+
+    assert _run(_claim()) == ""
+
+
+def test_an_api_style_upload_with_a_content_type_ingests_to_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The end-to-end path the e2e script exercises, pinned in the suite.
+
+    Every other ingestion test seeds a version with no `content_type`, which
+    takes the worker's markdown fallback and never touches the value the
+    claim function returns. This one seeds it the way the API does, so a
+    regression in the claim function fails here instead of only in
+    `tests/e2e/e2e_ingestion_minio.py`.
+    """
+    from worker.ingestion_consumer import drain_ingestion_once
+
+    version_id = _make_version(content_type="text/markdown")
+    monkeypatch.setattr(
+        "platform_core.knowledge.service.get_object", lambda key: DOC.encode("utf-8")
+    )
+
+    async def _drive() -> object:
+        engine, factory = _session_factory(APP_URL)
+        try:
+            async with factory() as session:  # type: ignore[operator]
+                stats = await drain_ingestion_once(session, embedder=StubEmbedder(), batch=5)
+                await session.commit()
+                return stats
+        finally:
+            await engine.dispose()  # type: ignore[attr-defined]
+
+    stats = _run(_drive())
+    assert stats.ready == 1, stats
+
+    state = _read_version(version_id)
+    assert state["status"] == "ready"
+    assert state["chunks"] > 0
 
 
 def test_a_claimed_version_is_not_claimed_twice(monkeypatch: pytest.MonkeyPatch) -> None:

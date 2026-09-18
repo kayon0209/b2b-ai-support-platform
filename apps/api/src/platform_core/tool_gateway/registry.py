@@ -32,17 +32,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.identity.tenant_context import TenantContext
+from platform_core.integrations import dead_letter
 from platform_core.integrations import health as connector_health
 from platform_core.integrations.credentials import resolve_credentials
 from platform_core.integrations.models import Connector, ConnectorStatus
-from platform_core.integrations.sdk import ConnectorContext
+from platform_core.integrations.sdk import AUTH_FAILURE_CODES, ConnectorContext
 from platform_core.tool_gateway.gateway import ToolExecutor
-
-# Every adapter reports a rejected credential as this code, in the returned
-# dict rather than as an exception (see `sdk.http_request`). Matching on it
-# here is what turns "one tool call failed" into "the connector is parked in
-# NEEDS_REAUTH and the tenant is told".
-AUTH_EXPIRED_CODE = "CONNECTOR_AUTH_EXPIRED"
 
 # A credential reference -> credentials mapping. Injected rather than read
 # here, so this module never touches a secret itself.
@@ -77,19 +72,28 @@ class AdapterFactory:
     build: Callable[[ConnectorContext], ToolExecutor]
 
 
-class AuthReportingExecutor:
-    """Wraps a `ToolExecutor` so a rejected credential is recorded.
+class ConnectorOutcomeExecutor:
+    """Wraps a `ToolExecutor` so a failed connector outcome is recorded.
 
-    Adapters signal an expired or revoked credential by *returning*
-    `{"ok": False, "error_code": "CONNECTOR_AUTH_EXPIRED"}` rather than
-    raising, so nothing in the tool path could observe it: the gateway posted
-    it through postcondition verification, marked the execution failed, and
-    the connector stayed `active`. Every subsequent call by every agent then
-    failed the same way, with no state anywhere saying why.
+    Adapters report failure by *returning* it in a dict rather than raising,
+    so nothing downstream distinguishes "the adapter declined" from "the
+    adapter did the work". Two consequences needed handling, and both are
+    invisible at the call site:
 
-    The wrapper is applied at build time (it needs the `Connector` row, which
-    only the resolver has), and it delegates `verify_postcondition` unchanged
-    - the gateway still decides the execution's final status.
+    1. A rejected credential (`CONNECTOR_AUTH_EXPIRED`) parks the connector in
+       `NEEDS_REAUTH`. Previously the connector stayed `active` and every
+       subsequent call failed the same way with no state anywhere saying why.
+    2. Any other failure becomes a dead-letter record. Retry-exhausted and
+       transport-ambiguous outcomes are exactly the ones a human must look at,
+       and they previously left nothing behind but a failed `ToolExecution`
+       row that nothing listed.
+
+    The wrapper is applied at build time - it needs the `Connector` row, which
+    only the resolver has - and it delegates `verify_postcondition` unchanged,
+    so the gateway still decides the execution's final status.
+
+    It does not swallow or rewrite the adapter's output: the caller sees byte
+    for byte what the adapter returned.
     """
 
     def __init__(
@@ -107,20 +111,44 @@ class AuthReportingExecutor:
         self._ctx = ctx
         self._trace_id = trace_id
 
+    def _context(self) -> TenantContext:
+        return self._ctx or TenantContext(
+            tenant_id=self._connector.tenant_id, actor_id=None, actor_kind="service"
+        )
+
     async def execute(
         self, tool_name: str, parameters: dict[str, Any], idempotency_key: str
     ) -> dict[str, Any] | None:
         output = await self._inner.execute(tool_name, parameters, idempotency_key)
-        if isinstance(output, dict) and output.get("error_code") == AUTH_EXPIRED_CODE:
-            ctx = self._ctx or TenantContext(
-                tenant_id=self._connector.tenant_id, actor_id=None, actor_kind="service"
-            )
+        if not isinstance(output, dict) or output.get("ok") is not False:
+            return output
+
+        error_code = str(output.get("error_code") or "")
+        ambiguous = bool(output.get("ambiguous"))
+        ctx = self._context()
+
+        if error_code in AUTH_FAILURE_CODES:
             await connector_health.record_auth_failure(
                 self._session,
                 self._connector,
-                error_code=AUTH_EXPIRED_CODE,
+                error_code=error_code,
                 ctx=ctx,
                 trace_id=self._trace_id,
+            )
+            return output
+
+        if dead_letter.should_record(error_code=error_code, ambiguous=ambiguous):
+            await dead_letter.record(
+                self._session,
+                tenant_id=self._connector.tenant_id,
+                connector_id=self._connector.id,
+                resource_type="tool_execution",
+                tool_name=tool_name,
+                parameters=parameters,
+                error_code=error_code or "CONNECTOR_UNKNOWN",
+                error_detail=str(output.get("detail") or ""),
+                attempts=int(output.get("attempts") or 0),
+                ambiguous=ambiguous,
             )
         return output
 
@@ -251,7 +279,7 @@ class ConnectorExecutorResolver:
         # Wrapped here rather than inside each adapter: the connector row and
         # the session are only available at this seam, and a per-adapter
         # implementation would be one more thing a new adapter can forget.
-        executor = AuthReportingExecutor(
+        executor = ConnectorOutcomeExecutor(
             executor,
             session=self._session,
             connector=connector,
@@ -370,10 +398,9 @@ async def resolve_executors(
 
 
 __all__ = [
-    "AUTH_EXPIRED_CODE",
     "AdapterFactory",
-    "AuthReportingExecutor",
     "ConnectorExecutorResolver",
+    "ConnectorOutcomeExecutor",
     "TOOL_CAPABILITY",
     "TOOL_PROVIDER",
     "default_factories",

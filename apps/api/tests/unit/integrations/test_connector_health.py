@@ -13,12 +13,9 @@ from typing import Any
 
 import pytest
 
-from platform_core.integrations import health
+from platform_core.integrations import dead_letter, health
 from platform_core.integrations.models import Connector
-from platform_core.tool_gateway.registry import (
-    AUTH_EXPIRED_CODE,
-    AuthReportingExecutor,
-)
+from platform_core.tool_gateway.registry import ConnectorOutcomeExecutor
 
 
 def _run(coro: Any) -> Any:
@@ -145,7 +142,10 @@ def test_only_active_connectors_are_executable() -> None:
         assert health.status_is_executable(status) is False
 
 
-# --- AuthReportingExecutor -------------------------------------------------
+# --- ConnectorOutcomeExecutor ----------------------------------------------
+
+
+AUTH_EXPIRED_CODE = "CONNECTOR_AUTH_EXPIRED"
 
 
 class _RecordingExecutor:
@@ -167,19 +167,19 @@ class _RecordingExecutor:
         return True
 
 
-def _wrapper(inner: _RecordingExecutor, captured: list[dict[str, Any]]) -> AuthReportingExecutor:
-    """Build the wrapper with the health write stubbed.
+def _wrapper(inner: _RecordingExecutor) -> ConnectorOutcomeExecutor:
+    """Build the wrapper with a session stand-in.
 
-    The wrapper's job is detection and dispatch; the write itself is covered
-    by the integration suite. Stubbing lets this test answer "is an auth
-    rejection observed at all", which is exactly the question `health_check`
-    having zero callers got wrong.
+    The wrapper's job is detection and dispatch; the writes themselves are
+    covered by the integration suite. Stubbing the session lets these tests
+    answer "is this outcome observed at all", which is exactly the question
+    `health_check` having zero callers got wrong.
     """
 
     class _Session:
         pass
 
-    return AuthReportingExecutor(
+    return ConnectorOutcomeExecutor(
         inner,
         session=_Session(),  # type: ignore[arg-type]
         connector=_connector(),
@@ -187,62 +187,138 @@ def _wrapper(inner: _RecordingExecutor, captured: list[dict[str, Any]]) -> AuthR
     )
 
 
-def test_auth_expired_result_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: list[dict[str, Any]] = []
+@pytest.fixture
+def reported(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[dict[str, Any]]]:
+    """Capture both side-effect paths instead of writing to a database."""
+    captured: dict[str, list[dict[str, Any]]] = {"auth": [], "dead_letter": []}
 
-    async def _fake_record(session: Any, connector: Any, **kwargs: Any) -> Any:
-        captured.append({"connector": connector, "kwargs": kwargs})
+    async def _fake_auth(session: Any, connector: Any, **kwargs: Any) -> Any:
+        captured["auth"].append(kwargs)
         return None
 
-    monkeypatch.setattr(health, "record_auth_failure", _fake_record)
-    inner = _RecordingExecutor({"ok": False, "error_code": AUTH_EXPIRED_CODE})
-    executor = _wrapper(inner, captured)
+    async def _fake_dead_letter(session: Any, **kwargs: Any) -> Any:
+        captured["dead_letter"].append(kwargs)
+        return None
 
-    output = _run(executor.execute("crm.update_account", {}, "k1"))
+    monkeypatch.setattr(health, "record_auth_failure", _fake_auth)
+    monkeypatch.setattr(dead_letter, "record", _fake_dead_letter)
+    return captured
+
+
+def test_auth_expired_result_parks_the_connector(reported: dict[str, list[Any]]) -> None:
+    inner = _RecordingExecutor({"ok": False, "error_code": AUTH_EXPIRED_CODE})
+
+    output = _run(_wrapper(inner).execute("crm.update_account", {}, "k1"))
 
     assert output == {"ok": False, "error_code": AUTH_EXPIRED_CODE}
-    assert len(captured) == 1
-    assert captured[0]["kwargs"]["error_code"] == AUTH_EXPIRED_CODE
+    assert len(reported["auth"]) == 1
+    assert reported["auth"][0]["error_code"] == AUTH_EXPIRED_CODE
+    # An auth rejection has its own queue; duplicating it here would fill the
+    # dead-letter list with rows whose fix is "rotate the credential".
+    assert reported["dead_letter"] == []
 
 
-def test_successful_result_is_not_reported(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: list[dict[str, Any]] = []
-
-    async def _fake_record(session: Any, connector: Any, **kwargs: Any) -> Any:
-        captured.append({"kwargs": kwargs})
-        return None
-
-    monkeypatch.setattr(health, "record_auth_failure", _fake_record)
+def test_successful_result_is_not_reported(reported: dict[str, list[Any]]) -> None:
     inner = _RecordingExecutor({"ok": True, "account_ref": "a1"})
-    executor = _wrapper(inner, captured)
 
-    _run(executor.execute("crm.update_account", {}, "k1"))
+    _run(_wrapper(inner).execute("crm.update_account", {}, "k1"))
 
-    assert captured == []
+    assert reported["auth"] == []
+    assert reported["dead_letter"] == []
 
 
-def test_non_auth_failure_is_not_reported(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A 500 from the provider is not a credential problem. Parking the
-    connector in NEEDS_REAUTH would send the operator to the wrong fix."""
-    captured: list[dict[str, Any]] = []
+def test_retry_exhausted_failure_becomes_a_dead_letter(
+    reported: dict[str, list[Any]],
+) -> None:
+    """A transport failure that exhausted its retries previously left nothing
+    behind but a failed ToolExecution row that nothing listed."""
+    inner = _RecordingExecutor({"ok": False, "error_code": "CONNECTOR_UNAVAILABLE", "attempts": 3})
 
-    async def _fake_record(session: Any, connector: Any, **kwargs: Any) -> Any:
-        captured.append({"kwargs": kwargs})
-        return None
+    _run(_wrapper(inner).execute("crm.update_account", {"account_ref": "a1"}, "k1"))
 
-    monkeypatch.setattr(health, "record_auth_failure", _fake_record)
-    inner = _RecordingExecutor({"ok": False, "error_code": "CONNECTOR_UNAVAILABLE"})
-    executor = _wrapper(inner, captured)
+    assert reported["auth"] == []
+    assert len(reported["dead_letter"]) == 1
+    assert reported["dead_letter"][0]["error_code"] == "CONNECTOR_UNAVAILABLE"
+    assert reported["dead_letter"][0]["attempts"] == 3
 
-    _run(executor.execute("crm.update_account", {}, "k1"))
 
-    assert captured == []
+def test_ambiguous_failure_becomes_a_dead_letter(reported: dict[str, list[Any]]) -> None:
+    """Ambiguity is the case a human must judge: the write may have landed and
+    the platform cannot decide on its own whether retrying is safe."""
+    inner = _RecordingExecutor(
+        {"ok": False, "error_code": "CONNECTOR_UNAVAILABLE", "ambiguous": True}
+    )
+
+    _run(_wrapper(inner).execute("crm.update_account", {}, "k1"))
+
+    assert len(reported["dead_letter"]) == 1
+    assert reported["dead_letter"][0]["ambiguous"] is True
+
+
+def test_adapter_output_is_returned_unchanged(reported: dict[str, list[Any]]) -> None:
+    """The wrapper observes; it must not rewrite what the adapter reported, or
+    the gateway's postcondition verification would judge a different result."""
+    payload = {"ok": False, "error_code": "CONNECTOR_REJECTED_400", "detail": "bad tier"}
+    inner = _RecordingExecutor(payload)
+
+    assert _run(_wrapper(inner).execute("crm.update_account", {}, "k1")) == payload
 
 
 def test_verify_postcondition_delegates_unchanged() -> None:
     """The wrapper must not change the write path's own verdict: the gateway
     still owns the final execution status."""
     inner = _RecordingExecutor({"ok": True})
-    executor = _wrapper(inner, [])
+    wrapped = _wrapper(inner)
 
-    assert _run(executor.verify_postcondition("crm.update_account", {}, {"ok": True})) is True
+    assert _run(wrapped.verify_postcondition("crm.update_account", {}, {"ok": True})) is True
+
+
+# --- dead letter classification and digest ---------------------------------
+
+
+def test_auth_rejection_is_not_a_dead_letter() -> None:
+    assert dead_letter.should_record(error_code=AUTH_EXPIRED_CODE, ambiguous=False) is False
+
+
+def test_ambiguous_outcome_is_a_dead_letter_regardless_of_code() -> None:
+    """`CONNECTOR_UNKNOWN` with ambiguous=True still means "we do not know what
+    happened", which is precisely the row a human must look at."""
+    assert dead_letter.should_record(error_code="CONNECTOR_UNKNOWN", ambiguous=True) is True
+
+
+def test_plain_failure_is_a_dead_letter() -> None:
+    assert dead_letter.should_record(error_code="CONNECTOR_UNAVAILABLE", ambiguous=False) is True
+
+
+def test_success_is_not_a_dead_letter() -> None:
+    assert dead_letter.should_record(error_code=None, ambiguous=False) is False
+
+
+def test_operation_digest_is_stable_across_key_order() -> None:
+    """Without `sort_keys` a dict that serialises in a different insertion
+    order yields a different digest, and the grouping this exists for
+    silently stops working."""
+    first = dead_letter.operation_digest(
+        tool_name="crm.update_account", parameters={"a": 1, "b": 2}
+    )
+    second = dead_letter.operation_digest(
+        tool_name="crm.update_account", parameters={"b": 2, "a": 1}
+    )
+    assert first == second
+
+
+def test_operation_digest_does_not_contain_the_payload() -> None:
+    """The digest is what makes a dead letter safe to store: the arguments can
+    be customer-derived, and this row is read by an operational endpoint and
+    copied into backups."""
+    digest = dead_letter.operation_digest(
+        tool_name="crm.update_account", parameters={"account_ref": "acme-corp-42"}
+    )
+    assert "acme-corp-42" not in digest
+    assert digest.startswith("crm.update_account:")
+
+
+def test_operation_digest_differs_between_operations() -> None:
+    first = dead_letter.operation_digest(tool_name="crm.update_account", parameters={"a": 1})
+    second = dead_letter.operation_digest(tool_name="crm.update_account", parameters={"a": 2})
+    assert first != second

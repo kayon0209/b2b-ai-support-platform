@@ -48,6 +48,12 @@ class ConnectorAuthExpired(ConnectorError):
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 AUTH_FAILURE_STATUS = {401, 403}
 
+# The error *codes* an adapter reports for a rejected credential. Declared
+# next to the status set they are derived from so a reader changing one sees
+# the other, and consumed by `dead_letter.should_record` to keep auth
+# failures out of the dead-letter queue (they have NEEDS_REAUTH instead).
+AUTH_FAILURE_CODES = frozenset({"CONNECTOR_AUTH_EXPIRED"})
+
 
 @dataclass(frozen=True)
 class ConnectorContext:
