@@ -40,6 +40,16 @@ class JiraAdapter(ConnectorAdapter):
         self._base = cfg.get("base_url", "").rstrip("/")
         self._project = cfg.get("project_key", "SUP")
 
+    @property
+    def _default_jql(self) -> str:
+        """The query a sync runs when the connector does not override it.
+
+        `ORDER BY updated ASC` is not cosmetic: a resumable sync advances a
+        position, and a stable ascending order is what stops a page boundary
+        from skipping or repeating rows between two runs.
+        """
+        return f"project = {self._project} ORDER BY updated ASC"
+
     def _headers(self) -> dict[str, str]:
         token = self.context.credentials.get("api_token", "")
         email = self.context.credentials.get("user_email", "")
@@ -64,15 +74,34 @@ class JiraAdapter(ConnectorAdapter):
         is explicit that "domain modules consume canonical models" - so the
         adapter projects provider payloads into `JiraIssueSummary` at this
         boundary rather than leaking a dict whose shape only the adapter knows.
+
+        `cursor` is an **opaque pagination token**, and nothing else. It used
+        to be overloaded: a supplied cursor replaced the JQL entirely, so the
+        first page ran the default query and every later page sent the
+        previous page's token as a *query language expression*. Pagination
+        therefore could not work - the second call would ask Jira to interpret
+        an opaque token as JQL.
+
+        The query now comes from configuration (`jql`, defaulting to the
+        project-ordered one) and the token travels as `nextPageToken`, so a
+        stored cursor means the same thing on every call. That is what makes
+        the position resumable, which is the entire point of `SyncCursor`.
         """
         if resource != "issues":
             return [], None
-        jql = cursor or f"project = {self._project} ORDER BY updated ASC"
+
+        query: dict[str, Any] = {
+            "jql": str(self.context.configuration.get("jql") or self._default_jql),
+            "maxResults": int(self.context.configuration.get("page_size") or 50),
+        }
+        if cursor:
+            query["nextPageToken"] = cursor
+
         result = await self.http_request(
             "GET",
             f"{self._base}/rest/api/3/search",
             headers=self._headers(),
-            json_body={"jql": jql, "maxResults": 50},
+            params=query,
         )
         if not result.ok or not result.data:
             return [], None

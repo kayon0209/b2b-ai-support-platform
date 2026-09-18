@@ -202,6 +202,125 @@ def test_jira_search_before_create(monkeypatch) -> None:
     assert issues[0].status == "Open"
 
 
+# --- Jira sync cursor semantics ---
+#
+# `fetch` is what makes a sync resumable, and its cursor handling was broken
+# in a way no test could see because `fetch` had no callers: a supplied cursor
+# replaced the JQL, so page 2 sent page 1's opaque token as a query-language
+# expression. These tests assert the wire, because the defect was in the wire.
+
+
+def test_jira_fetch_without_a_cursor_sends_the_default_jql(monkeypatch) -> None:
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(req.url.params)
+        return httpx.Response(200, json={"issues": [], "nextPageToken": "page-2"})
+
+    _patch_transport(monkeypatch, handler)
+    adapter = JiraAdapter(_ctx({"base_url": "http://jira.test", "project_key": "SUP"}))
+
+    records, next_cursor = _run(adapter.fetch("issues"))
+
+    assert records == []
+    assert next_cursor == "page-2"
+    assert seen["params"]["jql"] == "project = SUP ORDER BY updated ASC"
+    assert "nextPageToken" not in seen["params"]
+
+
+def test_jira_fetch_sends_a_cursor_as_a_page_token_not_as_jql(monkeypatch) -> None:
+    """The regression guard.
+
+    A stored cursor is opaque. If it reached `jql`, Jira would be asked to
+    interpret `page-2` as a query and the next page would never arrive - and
+    because the call still returns 200 with an empty result set, it would
+    look like "no more records" rather than an error.
+    """
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(req.url.params)
+        return httpx.Response(200, json={"issues": []})
+
+    _patch_transport(monkeypatch, handler)
+    adapter = JiraAdapter(_ctx({"base_url": "http://jira.test", "project_key": "SUP"}))
+
+    _run(adapter.fetch("issues", "page-2"))
+
+    assert seen["params"]["nextPageToken"] == "page-2"
+    # The query stays the configured one on every page.
+    assert seen["params"]["jql"] == "project = SUP ORDER BY updated ASC"
+
+
+def test_jira_fetch_honours_a_configured_jql(monkeypatch) -> None:
+    """A connector may scope its sync; `ORDER BY updated ASC` must remain the
+    default because a resumable position needs a stable ordering."""
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(req.url.params)
+        return httpx.Response(200, json={"issues": []})
+
+    _patch_transport(monkeypatch, handler)
+    adapter = JiraAdapter(
+        _ctx(
+            {
+                "base_url": "http://jira.test",
+                "project_key": "SUP",
+                "jql": "project = OPS ORDER BY updated ASC",
+                "page_size": 10,
+            }
+        )
+    )
+
+    _run(adapter.fetch("issues"))
+
+    assert seen["params"]["jql"] == "project = OPS ORDER BY updated ASC"
+    assert seen["params"]["maxResults"] == "10"
+
+
+def test_jira_fetch_projects_issues_to_canonical_models(monkeypatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "issues": [
+                    {
+                        "id": "42",
+                        "key": "SUP-42",
+                        "fields": {
+                            "summary": "Refund stuck",
+                            "status": {"name": "In Progress"},
+                            "assignee": {"displayName": "Dana"},
+                        },
+                    }
+                ]
+            },
+        )
+
+    _patch_transport(monkeypatch, handler)
+    adapter = JiraAdapter(_ctx({"base_url": "http://jira.test", "project_key": "SUP"}))
+
+    records, next_cursor = _run(adapter.fetch("issues"))
+
+    assert next_cursor is None  # no token means the walk is complete
+    assert len(records) == 1
+    assert records[0].key == "SUP-42"
+    assert records[0].status == "In Progress"
+    assert records[0].assignee == "Dana"
+    assert records[0].url == "http://jira.test/browse/SUP-42"
+
+
+def test_jira_fetch_ignores_an_unknown_resource(monkeypatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("an unknown resource must not reach the network")
+
+    _patch_transport(monkeypatch, handler)
+    adapter = JiraAdapter(_ctx({"base_url": "http://jira.test", "project_key": "SUP"}))
+
+    assert _run(adapter.fetch("epics")) == ([], None)
+
+
 # --- IM notification adapter (ticket 32) ---
 
 

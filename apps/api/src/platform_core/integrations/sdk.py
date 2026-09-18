@@ -130,11 +130,17 @@ class ConnectorAdapter(ABC):
         *,
         headers: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
         max_retries: int = 2,
         connect_timeout: float = 3.0,
         total_timeout: float = 10.0,
     ) -> ExecutionResult:
         """Bounded HTTP with timeout, classified errors, exponential backoff.
+
+        `params` exists because a GET with a JSON body is not portable: many
+        gateways and proxies drop it, and RFC 9110 gives a body on GET no
+        defined semantics. Any read call that carries arguments (Jira's
+        search, for instance) must pass them as query parameters.
 
         Rate limits (429) honor Retry-After. Auth failures map to
         NEEDS_REAUTH semantics via ConnectorAuthExpired. Network errors
@@ -156,7 +162,9 @@ class ConnectorAdapter(ABC):
                         pool=total_timeout,
                     )
                 ) as client:
-                    resp = await client.request(method, url, headers=headers, json=json_body)
+                    resp = await client.request(
+                        method, url, headers=headers, json=json_body, params=params
+                    )
                 if resp.status_code < 300:
                     self.breaker.on_success()
                     return ExecutionResult(

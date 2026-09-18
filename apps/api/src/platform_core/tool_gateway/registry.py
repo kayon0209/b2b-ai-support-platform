@@ -323,23 +323,21 @@ def default_factories() -> dict[str, AdapterFactory]:
     }
 
 
-async def probe_connector(
+def build_adapter(
     connector: Connector,
     *,
     credential_resolver: CredentialResolver | None = None,
     factories: dict[str, AdapterFactory] | None = None,
-) -> bool | None:
-    """Call the adapter's `health_check` for a connector.
+) -> Any | None:
+    """Build the adapter for a connector's provider, or None if none ships.
 
-    Returns the reachability result, or `None` when this deployment ships no
-    adapter for the connector's provider. `None` is not `False`: "we have no
-    way to probe this provider" and "the provider did not answer" call for
-    different operator responses, and collapsing them would report a
-    capability gap as an outage.
+    Returns None rather than raising for both "this deployment has no adapter
+    for the provider" and "the factory refused this configuration": neither is
+    an outage, and callers need to tell that apart from one.
 
-    Unlike `_build`, this deliberately does **not** require the connector to
-    claim a write capability: health is a read-side question, and a
-    read-only connector still needs to be diagnosable.
+    Unlike `_build`, no write capability is required - health and sync are
+    read-side questions, and a read-only connector still has to be
+    diagnosable and syncable.
     """
     resolver = credential_resolver or resolve_credentials
     registry = factories if factories is not None else default_factories()
@@ -354,11 +352,27 @@ async def probe_connector(
         configuration=dict(connector.configuration or {}),
     )
     try:
-        adapter = factory.build(context)
+        return factory.build(context)
     except Exception:
-        # The factory refused this configuration, which is a misconfiguration
-        # rather than an outage. Reporting "unreachable" would send the
-        # operator to the network; there is no adapter to ask.
+        return None
+
+
+async def probe_connector(
+    connector: Connector,
+    *,
+    credential_resolver: CredentialResolver | None = None,
+    factories: dict[str, AdapterFactory] | None = None,
+) -> bool | None:
+    """Call the adapter's `health_check` for a connector.
+
+    Returns the reachability result, or `None` when this deployment ships no
+    adapter for the connector's provider. `None` is not `False`: "we have no
+    way to probe this provider" and "the provider did not answer" call for
+    different operator responses, and collapsing them would report a
+    capability gap as an outage.
+    """
+    adapter = build_adapter(connector, credential_resolver=credential_resolver, factories=factories)
+    if adapter is None:
         return None
 
     probe = getattr(adapter, "health_check", None)
@@ -404,6 +418,7 @@ __all__ = [
     "TOOL_CAPABILITY",
     "TOOL_PROVIDER",
     "default_factories",
+    "build_adapter",
     "probe_connector",
     "resolve_executors",
 ]
