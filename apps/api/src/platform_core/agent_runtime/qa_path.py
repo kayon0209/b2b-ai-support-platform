@@ -60,6 +60,26 @@ def validate_citations(draft: DraftAnswer, evidence: list[RetrievedChunk]) -> Va
        document version that was not in context is a hard failure.
     3. The draft must have at least one claim (empty answers are not
        publishable).
+
+    **What this does not check, and it matters.** Every rule above is about the
+    citation *resolving*, not about the claim being *supported by* the chunk it
+    cites. An answer that contradicts its own evidence passes:
+
+        claim:   "Monthly plans are non-refundable."
+        cited:   the refund policy, which says they are refundable within 14 days
+        result:  ok
+
+    Measured: the evaluation case `adversarial-role-claim` produces exactly that
+    roughly one run in four, which is why the `forbidden_claim_rate` release
+    gate - threshold 0.02 over 23 cases, so one hit fails it - is stochastic
+    rather than deterministic. `docs/agent.md`'s contract is "every enterprise
+    factual claim needs a citation to a version that was in the runtime
+    context"; existence is not support.
+
+    The fix is a claim-support (contradiction) check here, deterministic in
+    code rather than hoped for in the prompt. It is not implemented because it
+    needs its own design decision, and the prompt has already been shown to
+    reduce the rate without eliminating it.
     """
     if not draft.claims:
         return ValidationResult(ok=False, reason_code="NO_CLAIMS", unsupported_claims=[])
