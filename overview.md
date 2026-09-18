@@ -1,11 +1,12 @@
 # 全部 Phase 完成 — 交付报告
 
-`docs/development-plan.md` 的 Phase 0–5 全部实现。本报告汇总五段会话：把 Phase 2–5 的缺口
-补齐、接续一个**未提交的工作树**、补上**评估报告产出方**并因此发现冲突规则的失效守卫、
-补上**账本更正**并因此发现 RLS 会话绑定的一类系统性缺陷、最后清掉全部**阻塞式对话框**。
+`docs/development-plan.md` 的 Phase 0–5 全部实现。本报告汇总六段会话：补齐 Phase 2–5 的
+缺口、接续一个**未提交的工作树**、补上**评估报告产出方**（并发现冲突规则的失效守卫）、
+补上**账本更正**（并发现 RLS 会话绑定的一类系统性缺陷）、清掉全部**阻塞式对话框**、
+最后跑通**真实 Chatwoot 双向往返**（并发现「弃权等于沉默」）。
 
-当前状态：全量回归 **1209 passed, EXIT=0**；ruff / mypy 全绿；真实端到端评估 **21/23**；
-admin-web `typecheck` + `build` 通过。
+当前状态：全量回归 **1210 passed, EXIT=0**；ruff / mypy 全绿；真实端到端评估 **21/23**；
+真实 Chatwoot 回路可投递；admin-web `typecheck` + `build` 通过。
 
 ## 一、按开发计划逐项交付
 
@@ -233,23 +234,90 @@ onCommand("transition", { target: values.target });
 都是灰色小字。现已改用 `useAction()` + `<ActionFeedback>`：失败是红色 `role="alert"` 横幅，
 成功是绿色 `role="status"` 横幅。
 
-## 七、整体验证结果（实测）
+## 七、本会话：跑通 Chatwoot 双向往返，以及它掩盖的沉默
+
+`tests/e2e/e2e_chatwoot_loop.py` 首次对真实 Chatwoot 内核跑通完整回路，随即找出**一个严重
+产品缺陷**和**两个部署缺陷**。
+
+### 三个前置故障
+
+| 故障 | 后果 |
+|---|---|
+| `api.Dockerfile` 手写了 11 个包，漏掉 `prometheus-client`（`platform_core.main` 在模块级导入它） | 镜像启动即 `ModuleNotFoundError`。镜像一直躺在那里是退出的；测试套件跑在 venv 上，所以从未发现 |
+| compose 的 `ai-api` 自己枚举环境变量，漏掉认证配置 | 即使 `.env` 填得完全正确，也以「no authentication configured」退出 |
+| `chatwoot-sidekiq` 处于停止状态 | Chatwoot 通过 Sidekiq 投递 webhook，因此**从未有任何请求到达** `/v1/webhooks/chatwoot`。症状是沉默，不是报错 |
+
+修法：新增运行时清单 `requirements.txt`，`requirements-dev.txt` 用 `-r` 包含它，Dockerfile
+只装清单；CI 的两个测试 job 有同样的手写清单和同样的潜在故障，现已全部改用清单。每个
+`ai-*` 服务声明 `env_file: ../../.env`（`required: false`，保证新检出也能解析），保留
+`environment:` 用于指向容器内地址。
+
+### 产品缺陷：弃权等于沉默
+
+回路跑通后，运行弃权了，**而没有任何回复发出**。
+
+`_finish_abstain` 的 docstring 写着：「记录弃权、把租约释放到人工队列、**并发送面向客户的
+安全通知**（同样在租约门禁之后）」。函数体构造了 `safe_abstention_text(...)`，放进返回的
+`RunOutcome.answer_text`，**从未接触传输层**——只有回答路径会调用 `_dispatch`。
+
+后果：**最常见的失败模式，恰恰是唯一没有任何回应的那种。** 客户问了一个知识库无法支撑的
+问题，什么也听不到——既不是「我无法核实」，也不是「正在转接人工」。交接在内部完成了，客户
+永远在等。
+
+修法：租约复检 → 发送通知 → 再释放队列。**顺序是关键**，而我的第一版写反了（先
+`release_to_queue`，于是租约门禁以 "owner is queue" 拒绝——仍然是沉默，只是日志不同）。
+新测试立刻抓到了这一点，这正是「断言传输层而不是断言 outcome 对象」的价值：outcome 里一直
+装着正确的文本。
+
+**两个既有测试断言了这个 bug。** `sender.calls == []` 出现在
+`test_restricted_request_never_reaches_model_and_hands_off` 与
+`test_no_evidence_abstains_without_model_call` 中，还带着「不应发送任何内容」的注释。它们
+真正的意图（不消耗模型、释放交接）保留；传输断言改为：恰好一条通知、内容等于
+`outcome.answer_text`、幂等键为 `run:<id>`，且受限场景下不得泄露被拒绝的词项。
+
+另外，`test_e2e_acceptance.py` 的 docstring 列了 5 个场景，**第 4 个「证据不足 → 弃权并给出
+交接原因」只列未写**——这正是这个缺陷能在一个「文档化了它所破坏的行为」的套件里存活下来的
+原因。
+
+### 我自己的一个假通过
+
+e2e 的第一版**在什么都没跑通的情况下通过了**：它接受 `message_type in (0, 1)`，于是匹配到
+客户自己那条消息；输出里 `inbox events: []` 明明就摆在那里。现已改为只接受
+`message_type == 1`，并要求必须存在 InboxEvent——按本设计，收到没收到的东西是不可能的，
+所以它必须是失败而不是通过。
+
+最终诚实的结果：
+
+```
+inbox events: [('message_created', 'received', '9fbf1093-...')]
+outbound message: "I couldn't verify an answer from our authorized knowledge
+                   base. I can connect you with a human colleague, or you can
+                   rephrase the question."
+E2E OK
+```
+
+## 八、整体验证结果（实测）
 
 | 检查 | 结果 |
 |---|---|
-| 全量回归 | **1113 → 1209 passed, EXIT=0** |
-| ruff check / format | clean，282 文件 |
+| 全量回归 | **1113 → 1210 passed, EXIT=0** |
+| ruff check / format | clean，283 文件 |
 | mypy strict | clean，**129 文件 0 错** |
 | **真实端到端评估** | **21/23**；`citation_violations=0`、`forbidden_claim_hits=0` |
 | `release_check`（真实报告） | `citation_coverage 1.0`、`abstention_correct_rate 0.913`、`forbidden_claims 0.0`——全部为**计算值**，非手写 |
 | **read-tool 门禁可达** | 种入 100 条真实执行后得出 `0.97 vs 0.99`（修复前结构上不可能） |
 | `release_check --evidence-only` | exit 0；15/4/3 条零容忍背书测试 |
 | **真实 MinIO 端到端** | 上传 → MinIO → worker → `chunks=2 with_embedding=2` → `hybrid_search hits=2` |
+| **真实 Chatwoot 双向往返** | 客户消息 → 签名 webhook → InboxEvent → 弃权通知**出现在会话中** |
+| `ai-api` 容器 | 启动成功，`/healthz` 200 |
 | admin-web | `typecheck` + `build` 通过 |
 | **阻塞式对话框** | `src/` 内**零**（仅注释中提及） |
 | compose | `docker compose config` 通过 |
 
-## 八、仍然存在的边界
+> 跑测试套件前请先停掉 `ai-*` 服务：`ai-worker-interactive` 的 outbox relay 每秒抢单，
+> 会与套件争抢同一批行，产生「单独跑就通过」的间歇性失败。
+
+## 九、仍然存在的边界
 
 - **`business-write-refund`：QA 路径不识别写请求。** 它此前**假通过**（靠一个虚假冲突弃权）。
   正确修法是新增写意图路由（`Route` 里加一类），而不是改这个用例的期望——所以它记在
@@ -261,15 +329,19 @@ onCommand("transition", { target: values.target });
   但模型在施压下不肯给引用。属于 prompt 发布流程的工作。
 - **read-tool 成功率的门禁需要生产租户**，不是 fixture：没有真实 `tool_executions` 流量时
   它必然失败，这是设计如此。现在它至少**能**看到流量了。
+- **webhook secret 在两处不一致**：`.env` 是 `e2e-webhook-secret`，而 compose 用
+  `local-dev-webhook-secret` 覆盖以匹配 Chatwoot 的 webhook 行。在 Docker 外跑 API 会因此
+  用错 secret 并拒绝全部投递，值得统一。
 - **k8s 清单从未部署到真实集群**；替代品是 27 项结构断言，README 明说这一点。
 - **Postgres / Redis 只被引用，未被部署**（各自是带备份/故障转移的 StatefulSet 命题）。
-- Chatwoot 双向往返的端到端脚本仍未跑（容器已起、3000 可达）。
 
-> 已无「有意不做」的遗留项。上一版报告里保留的 13 处 `window.prompt` 已在本轮全部替换。
+> 已无「有意不做」的遗留项。上一版报告里保留的 13 处 `window.prompt`、以及「Chatwoot
+> 双向往返脚本未跑」，都已在本轮完成。
 
-## 九、提交
+## 十、提交
 
 `4e2a87b`（计费账本 + 发布门禁证据 + 缺陷修复）→ `d76fa3f`（admin-web 错误处理与信息补全）
 → `8d0da2d`（交付报告）→ `a84615c`（评估报告产出方 + 冲突规则失效守卫）→ `737361a`
 （文档与记忆）→ `69ff6b9`（账本更正 API/UI + RLS 会话绑定与 read-tool 门禁修复）
 → `217b9c4`（记忆整理）→ `d597288`（报告更新）→ `f0a51c4`（移除全部阻塞式对话框）
+→ `b36388b`（报告收尾）→ `e207d8d`（弃权必须回复客户 + 部署缺陷修复 + Chatwoot 端到端）
