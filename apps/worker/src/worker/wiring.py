@@ -33,6 +33,7 @@ from platform_core.agent_runtime.orchestrator import OrchestratorDeps
 from platform_core.config import get_settings
 from platform_core.llm.factory import get_model_bundle
 from platform_core.retrieval.hybrid import ProviderEmbedder
+from platform_core.retrieval.reranker import Reranker
 
 
 class WorkerConfigurationError(SystemExit):
@@ -149,8 +150,18 @@ def build_interactive_deps(
         )
 
     # Embeddings are optional: retrieval degrades to lexical-only, which is
-    # still grounded evidence. Reranking is likewise optional.
+    # still grounded evidence.
     embedder = ProviderEmbedder(bundle.embedding) if bundle.embedding is not None else None
+
+    # Reranking is built here but deliberately NOT switched on. The flag
+    # `agent.rerank_enabled` decides per tenant, and an undefined flag means
+    # the fused order is kept. Wiring it unconditionally would make a
+    # quality-affecting change to every tenant's answers in one deploy, with
+    # no way to observe it on one tenant first - which is what the flag exists
+    # to prevent. Until this was added, `Reranker` was reachable only from the
+    # retrieval diagnostics endpoint, so the production answer path never
+    # reranked at all.
+    reranker = Reranker(bundle.rerank, deadline_seconds=settings.rerank_timeout_seconds)
 
     # The orchestrator does not build a generator on its own; a run with no
     # generator abstains (orchestrator step: `if self._deps.generator is
@@ -163,6 +174,7 @@ def build_interactive_deps(
     return OrchestratorDeps(
         embedder=embedder,
         generator=generator,
+        reranker=reranker,
         sender=sender,
         reader=reader,
         extra={"chat": bundle.chat, "bundle": bundle},

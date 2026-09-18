@@ -51,6 +51,11 @@ from platform_core.knowledge.flag_router import router as feature_flag_router
 from platform_core.knowledge.gap_router import router as knowledge_gap_router
 from platform_core.knowledge.router import router as knowledge_router
 from platform_core.observability_router import router as observability_router
+from platform_core.rate_limit import (
+    RateLimitMiddleware,
+    build_limiter,
+    policies_from_settings,
+)
 from platform_core.retrieval.router import router as retrieval_router
 from platform_core.support_bridge.router import router as support_bridge_router
 from platform_core.tool_gateway.router import router as tool_gateway_router
@@ -93,11 +98,26 @@ app.include_router(dead_letter_router)
 # token, so the path is in the auth middleware's exempt list.
 app.include_router(connector_webhook_router)
 app.include_router(observability_router)
-# Middleware runs in reverse registration order, so HttpMetricsMiddleware
-# (registered last) wraps the auth middleware and therefore observes every
-# request including ones auth rejects with 401. Registering them the other
-# way round would hide authentication failures from the request rate, which
-# is precisely the signal worth alerting on.
+# Middleware runs in reverse registration order, so the outermost is the one
+# added last. The intended request order is:
+#
+#   HttpMetrics -> TenantContext -> RateLimit -> routing
+#
+# RateLimit is inside TenantContext because a tenant-keyed bucket is what
+# stops one noisy tenant from consuming another's budget; it cannot key on a
+# tenant that has not been resolved yet. HttpMetrics stays outermost so that a
+# 429 still appears in the request rate, and so does a 401 - registering them
+# the other way round would hide authentication failures from the metric that
+# is supposed to surface them.
+if get_settings().rate_limit_enabled:
+    _policies = policies_from_settings(get_settings())
+    app.add_middleware(
+        RateLimitMiddleware,
+        limiter=build_limiter(redis_url=get_settings().redis_url),
+        api_policy=_policies["api"],
+        anonymous_policy=_policies["anonymous"],
+        webhook_policy=_policies["webhook"],
+    )
 app.add_middleware(TenantContextMiddleware, resolver=build_resolver())
 app.add_middleware(HttpMetricsMiddleware)
 

@@ -93,6 +93,21 @@ class Settings(BaseSettings):
     # None means "decide from the environment"; see observability_router.
     metrics_enabled: bool | None = None
 
+    # --- Inbound rate limiting (Phase 4) -------------------------------------
+    # A token bucket per tenant (or per client address for traffic that
+    # arrives without a tenant, i.e. webhooks). Counters live in Redis:
+    # ephemeral, loss-tolerant state, which is exactly what ADR 0002 says
+    # Redis is for - durable work stays in Postgres tables.
+    rate_limit_enabled: bool = True
+    # Interactive API traffic, per tenant.
+    rate_limit_requests: int = 600
+    rate_limit_window_seconds: int = 60
+    # Traffic with no tenant yet, keyed by client address.
+    rate_limit_anonymous_requests: int = 300
+    # Provider deliveries are burstier and must not be throttled into data
+    # loss, so they get their own, more generous budget.
+    rate_limit_webhook_requests: int = 1200
+
 
 @lru_cache
 def get_settings() -> Settings:

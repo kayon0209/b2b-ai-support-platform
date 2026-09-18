@@ -99,11 +99,25 @@ pilot scale and both are measured rather than assumed — the claim query is
 covered by a partial index restricted to claimable states
 (`ix_docversion_claimable`), so the scan is O(claimable), not O(rows).
 
-`APP_REDIS_URL` exists in configuration but **no application code reads it**.
-That is intentional and worth stating: Redis is present for Chatwoot and for
-cache-shaped work, not as the durable queue. If a future feature reads it, that
-is a decision requiring its own ADR, because a Redis queue would reintroduce the
-atomicity problem above.
+`APP_REDIS_URL` is used by exactly one thing: **rate-limit counters**
+(`rate_limit.py`). That distinction is the whole point and worth stating.
+
+Redis is present for cache-shaped and ephemeral state, never as the durable
+queue. A rate-limit bucket is the archetypal example of what it is for: a token
+count that is worthless after a restart, tolerates loss, and must be shared
+across replicas so the limit is a property of the tenant's entitlement rather
+than of how many pods happen to be running. Losing those counters costs one
+window of protection and nothing else.
+
+That is the opposite of the queue case above. Putting *work* in Redis would
+reintroduce exactly the atomicity problem this ADR rejects: a message could be
+delivered without the database change that was supposed to accompany it. So the
+rule is not "Redis is banned" but "Redis never holds state whose loss changes
+the outcome of a request" — and a durable queue would require its own ADR.
+
+When Redis is unreachable, the limiter falls back to per-process buckets rather
+than failing open (see `rate_limit.py` for why failing open is the wrong
+direction).
 
 ## Consequences
 

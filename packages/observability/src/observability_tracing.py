@@ -57,6 +57,8 @@ ALLOWED_SPAN_ATTRIBUTES = ALLOWED_LOG_FIELDS | {
     "span.kind",
     "queue.age_ms",
     "retrieval.candidates",
+    "retrieval.rerank_degraded",
+    "flag.rerank",
     "citation.count",
     "lease.version",
     "worker.queue",

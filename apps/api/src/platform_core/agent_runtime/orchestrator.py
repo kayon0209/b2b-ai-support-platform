@@ -48,14 +48,33 @@ from platform_core.audit import service as audit_service
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
 from platform_core.identity.tenant_context import TenantContext
+
+# Flags are read through the service, never by touching its tables: the
+# rollout maths, the tenant-target override and the kill switch all live there,
+# and a second reading of the same rows would drift from it.
+from platform_core.knowledge import flag_service
 from platform_core.llm.provider import ModelError
 from platform_core.outbox_service import enqueue
 from platform_core.retrieval.hybrid import Embedder, PrincipalScope, RetrievedChunk
+from platform_core.retrieval.reranker import Reranker
 
 logger = JsonLogger("platform.agent_runtime")
 
 CODE_VERSION = "0.1.0"
 POLICY_VERSION = "v1"
+
+# The feature flag that decides whether the answer path reranks.
+#
+# `Reranker` existed, was tested, and was used in exactly one place: the
+# retrieval diagnostics endpoint. The production answer path never reranked -
+# the same "built but never wired" shape this repository keeps finding. Wiring
+# it behind a flag rather than unconditionally is the point of a canary: the
+# reranker changes which evidence a customer-facing answer is built from, so
+# its blast radius is every answer, and rolling it out per tenant is how you
+# find that out before it is every tenant's answers.
+#
+# Default False, so an undefined flag means "keep the fused order".
+RERANK_FLAG_KEY = "agent.rerank_enabled"
 
 
 class Route(StrEnum):
@@ -103,6 +122,9 @@ class OrchestratorDeps:
     generator: LlmAnswerGenerator | None = None
     sender: object | None = None  # ChatwootClient-compatible send_message
     reader: object | None = None  # ChatwootClient-compatible fetch_message
+    # Applied only when `RERANK_FLAG_KEY` resolves true for the tenant, so the
+    # rollout is a per-tenant decision rather than a deployment-wide switch.
+    reranker: Reranker | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -129,10 +151,23 @@ async def retrieve_evidence(
     embedder: Embedder | None,
     top_k: int = 8,
     trace: TraceContext | None = None,
+    reranker: Reranker | None = None,
 ) -> list[RetrievedChunk]:
     """Authorized retrieval. Evidence never crosses tenants: the tenant
     filter and ACL narrowing are applied inside hybrid_search before any
-    candidate is scored."""
+    candidate is scored.
+
+    `reranker` is applied **after** fusion and **after** the ACL pre-filter,
+    which is the only safe order: reranking reorders what survived
+    authorization, it never decides what is visible. The reranker is passed in
+    rather than built here so a caller can canary it per tenant, and so tests
+    can supply one without a provider.
+
+    Degradation is the reranker's own contract (`RerankOutcome.degraded`), and
+    it is surfaced rather than swallowed: docs/architecture.md permits falling
+    back to the fused order only when evaluation allows it, so the fact that
+    the primary path did not run has to be observable.
+    """
     from platform_core.retrieval.hybrid import hybrid_search
 
     started = time.monotonic()
@@ -146,6 +181,16 @@ async def retrieve_evidence(
             principal=principal,
             embedder=embedder,
         )
+        if reranker is not None and len(chunks) > 1:
+            outcome = await reranker.rerank(query, chunks, top_k=top_k)
+            if outcome.degraded:
+                get_metrics().retrieval_degraded_total.labels(
+                    reason_code=outcome.reason_code or "RERANK_DEGRADED"
+                ).inc()
+            else:
+                chunks = outcome.chunks
+            if span is not None:
+                span.set_attributes(**{"retrieval.rerank_degraded": outcome.degraded})
     except Exception as exc:
         # Retrieval failure is measured as well as logged: "how often is
         # retrieval unavailable" is an operational fact that must not have
@@ -164,6 +209,47 @@ async def retrieve_evidence(
     finally:
         if span is not None:
             span.end()
+
+
+async def reranker_for_tenant(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    reranker: Reranker | None,
+) -> tuple[Reranker | None, str]:
+    """Decide whether this tenant's runs should rerank.
+
+    Returns `(reranker_or_None, reason)` - the reason is the flag decision's
+    own reason code (`UNKNOWN_FLAG`, `DISABLED`, `TENANT_TARGET`, `ROLLOUT`,
+    `NOT_IN_ROLLOUT`), which is what makes a rollout auditable after the fact:
+    "why did tenant X rerank yesterday" has an answer that is not a guess.
+
+    Extracted from the pipeline so the gate is testable without standing up a
+    run: the interesting behaviour is the decision, not the pipeline.
+
+    **Rollout scope, stated because it is not obvious.** Flags are tenant-owned
+    and RLS-scoped, and this evaluates inside the running tenant's own session,
+    so the flag a run sees is *that tenant's own*. Combined with
+    `flag_service.target_tenant` refusing self-targeting, the levers available
+    are the kill switch and the rollout percentage - a tenant can roll the
+    reranker out to itself, but the platform cannot canary it across tenants on
+    their behalf, because under RLS the platform's flag is invisible here.
+    Making that expressible needs a platform-owned flag read through a narrow
+    SECURITY DEFINER resolver (the same pattern the tenant bootstrap uses),
+    which is a decision worth making deliberately rather than inferring from
+    this function.
+    """
+    if reranker is None:
+        # No provider configured. Not a flag outcome - the capability is
+        # absent, and calling the flag would imply it was a rollout decision.
+        return None, "NO_RERANKER"
+    decision = await flag_service.evaluate(
+        session,
+        flag_key=RERANK_FLAG_KEY,
+        tenant_id=tenant_id,
+        default=False,
+    )
+    return (reranker if decision.enabled else None), decision.reason
 
 
 async def _get_or_create_prompt(
@@ -372,6 +458,13 @@ class AgentOrchestrator:
             )
 
         # --- 3. Retrieve authorized evidence. ---
+        # The reranker is gated per tenant. Evaluating the flag inside the
+        # same transaction as everything else means a rollout change takes
+        # effect on the next run rather than on the next deploy.
+        reranker, rerank_reason = await reranker_for_tenant(
+            self._session, tenant_id=tenant_id, reranker=self._deps.reranker
+        )
+        run_span.set_attributes(**{"flag.rerank": rerank_reason})
         try:
             evidence = await retrieve_evidence(
                 self._session,
@@ -380,6 +473,7 @@ class AgentOrchestrator:
                 principal=principal,
                 embedder=self._deps.embedder,
                 trace=ctx,
+                reranker=reranker,
             )
         except Exception as exc:  # noqa: BLE001 - degradation is a policy choice
             # Retrieval unavailable: never answer enterprise facts; hand off.

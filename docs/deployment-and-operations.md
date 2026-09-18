@@ -125,6 +125,42 @@ Quarterly restore drills must demonstrate:
 - audit continuity;
 - ability to resume jobs without duplicate actions.
 
+### Running the drill
+
+```bash
+./.venv/Scripts/python.exe scripts/backup_restore_drill.py
+```
+
+The script dumps the platform database with `pg_dump`, restores it into a
+scratch database it creates and drops, and then asserts each of the five
+properties above rather than printing a summary someone has to interpret. It
+never writes to the source: the source is read with `pg_dump` only.
+
+What it checks, and why those checks:
+
+| Check | Why it is the right assertion |
+|---|---|
+| exact row count, every table | a restore that silently drops a table is invisible in a "did it finish" check |
+| per-tenant distribution, 14 tenant-owned tables | totals can match while rows moved *between* tenants, which no total would reveal |
+| audit continuity: count **and** min/max timestamp | a restore that lost only the newest events still has a plausible minimum |
+| outbox status distribution | `sent` vs `queued` decides whether the relay re-sends, so resume safety depends on it |
+| resume guard constraints present | `uq_inbox_delivery` etc. are what stop a resumed job duplicating a side effect; a restore without them would look fine and duplicate work |
+| no dangling `external_resource_refs` | tenant data integrity; reported separately from the restore so it is clear whether to fix the backup or the database |
+
+Exit codes: `0` passed, `1` a check did not reproduce, `2` the source was
+**not quiescent** during the dump. The third case exists because the drill
+first reported seven confident failures while the test suite was mid-flight -
+a concurrent fixture deleting its own rows, read as data loss. A drill that
+reports that as data loss teaches people to ignore it, so the source is
+snapshotted both before and after the dump and the comparison is abandoned if
+it moved.
+
+**RPO is not measured here, deliberately.** A logical dump contains everything
+committed before it started, so its RPO is 0 by construction and reporting
+that as a measurement would be theatre. The real RPO is the interval between
+dumps plus the WAL/PITR window, which is an operational setting. The drill
+reports RTO (measured) and says this about RPO.
+
 ## Queue design
 
 Separate queues:
