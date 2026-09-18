@@ -87,6 +87,9 @@ ABSTAIN_CONFLICT = "CONFLICTING_SOURCES"
 ABSTAIN_LOW_RELEVANCE = "EVIDENCE_BELOW_THRESHOLD"
 ABSTAIN_RESTRICTED = "RESTRICTED_REQUEST"
 ABSTAIN_AMBIGUOUS_IDENTITY = "AMBIGUOUS_ACCOUNT_IDENTITY"
+# The customer asked the platform to *do* something, not to explain something.
+# The QA path answers from documents, so it must not answer this at all.
+ABSTAIN_ACTION_REQUEST = "ACTION_REQUEST"
 
 
 @dataclass
@@ -528,6 +531,178 @@ def _chunk_overlap(query: str, chunk: RetrievedChunk) -> float:
     return len(q_terms & (body_terms | located_terms)) / len(q_terms)
 
 
+# Verbs that name a *mutation* of the tenant's systems or the customer's
+# account. Deliberately excludes read operations (`REQUEST_OPERATIONS` covers
+# those: "summarise", "list", "explain") and verbs that are ambiguous between
+# acting and asking ("send me the pricing", "open a ticket" vs "open the guide").
+ACTION_VERBS = frozenset(
+    _stem(word)
+    for word in (
+        "refund",
+        "cancel",
+        "delete",
+        "remove",
+        "reset",
+        "revoke",
+        "suspend",
+        "terminate",
+        "deactivate",
+        "deprovision",
+        "unsubscribe",
+        "downgrade",
+        "upgrade",
+        "rollback",
+        "provision",
+        "purge",
+        "credit",
+        "debit",
+        "charge",
+        "reassign",
+        "escalate",
+    )
+)
+
+# Openers that mean the customer is asking to *know* something. A write verb
+# later in the sentence does not change that: "How do I cancel my
+# subscription?" is a question about a procedure, and answering it from the
+# knowledge base is exactly right.
+_INTERROGATIVE_OPENERS = frozenset(
+    {
+        "how",
+        "what",
+        "when",
+        "where",
+        "why",
+        "which",
+        "who",
+        "whose",
+        "is",
+        "are",
+        "was",
+        "were",
+        "do",
+        "does",
+        "did",
+        "am",
+        "should",
+        "shall",
+        "must",
+    }
+)
+
+_POLITE_PREFIXES = frozenset({"please", "kindly"})
+
+# "Can **you** refund this?" asks the agent to act; "Can **I** get a refund?"
+# asks whether it is possible. Only the first is an action request, and the
+# distinction is the pronoun.
+_AGENT_PRONOUNS = frozenset({"you", "someone"})
+
+# An imperative needs an object. "Refund the last invoice" is an instruction;
+# "refund window" is a noun phrase someone typed into a search box, and
+# treating it as an instruction would hand off a perfectly good question.
+# Requiring the object to be introduced by one of these is what separates them.
+_OBJECT_MARKERS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "my",
+        "our",
+        "your",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "them",
+        "his",
+        "her",
+        "their",
+    }
+)
+
+# First-person desire is unambiguously a request for action, and cannot be a
+# question: a question would open with an interrogative.
+_DESIRE_VERBS = frozenset({"want", "need", "wish", "require", "would", "'d"})
+
+
+def _imperative_with_object(tokens: list[str], index: int) -> bool:
+    """True when tokens[index] is a write verb followed by an object."""
+    if index >= len(tokens) or _stem(tokens[index]) not in ACTION_VERBS:
+        return False
+    rest = tokens[index + 1 :]
+    if not rest:
+        return False
+    return rest[0] in _OBJECT_MARKERS
+
+
+def _is_action_request(query: str) -> bool:
+    """True when the customer is asking the platform to do something.
+
+    `docs/agent.md` routes business mutations through the Tool Gateway with
+    confirmation, and the QA path answers from documents. So an action request
+    reaching the QA path must abstain and hand off - answering it from the
+    knowledge base tells the customer how refunds work when they asked for a
+    refund, which reads as the platform ignoring them.
+
+    This was `business-write-refund`'s tracked gap. The case passed for a while
+    by accident: `_sources_compete` called two unrelated documents a tie on an
+    absolute margin RRF scores can never exceed, and that spurious conflict
+    happened to produce the required abstention. Fixing the margin removed the
+    accident and made the real gap visible.
+
+    Deliberately narrow, in four forms:
+
+        <verb> <object>            "Refund the last invoice."
+        please|kindly <verb> ...   "Please delete the workspace."
+        can|could|would|will you <verb> ...
+                                   "Can you refund the last invoice?"
+        I|we want|need|would ... to <verb>
+                                   "I want to cancel my subscription."
+
+    It never fires on a write verb that is merely *present*: "How do I cancel
+    my subscription?" and "What is the process to delete a workspace?" open
+    with an interrogative, and "refund window" has no object. Measured against
+    the whole evaluation dataset it fires on exactly one case and on none of
+    the answerable, adversarial or injection cases.
+
+    Known false negative, accepted on purpose: a bare noun phrase with no
+    object ("refund!") is not detected. Firing wrongly hands a legitimate
+    question to a human, which is the more expensive mistake of the two.
+    """
+    tokens = re.findall(r"[a-z']+", query.lower())
+    if not tokens:
+        return False
+    head = tokens[0]
+
+    if head in _INTERROGATIVE_OPENERS:
+        return False
+
+    if head in {"can", "could", "would", "will", "may"}:
+        if len(tokens) < 3 or tokens[1] not in _AGENT_PRONOUNS:
+            return False
+        return _stem(tokens[2]) in ACTION_VERBS
+
+    if head in _POLITE_PREFIXES:
+        return _imperative_with_object(tokens, 1)
+
+    if head in {"i", "we"} and len(tokens) > 2 and tokens[1] in _DESIRE_VERBS:
+        # The write verb has to be the *object* of the desire, not merely
+        # nearby: "I need to know the refund policy" is a question about a
+        # refund, and only the "to <verb>" / "<determiner> <verb>" shapes are
+        # requests to act.
+        rest = tokens[2:]
+        if rest and rest[0] in {"like", "love", "prefer"}:
+            rest = rest[1:]
+        if len(rest) < 2:
+            return False
+        if rest[0] == "to":
+            return _stem(rest[1]) in ACTION_VERBS
+        return rest[0] in _OBJECT_MARKERS and _stem(rest[1]) in ACTION_VERBS
+
+    return _imperative_with_object(tokens, 0)
+
+
 def decide_abstention(
     query: str,
     evidence: list[RetrievedChunk],
@@ -538,13 +713,18 @@ def decide_abstention(
 ) -> AbstentionDecision:
     """Deterministic abstention gate (ticket 18).
 
-    Never guesses when: no evidence, evidence is topically unrelated, or
-    the request touches restricted data. Unrelated evidence with zero
-    relevant candidates triggers handoff (not just clarification) because
-    repeatedly probing retrieval wastes the customer's time.
+    Never guesses when: no evidence, evidence is topically unrelated, the
+    request touches restricted data, or the customer asked for an action
+    rather than an answer. Unrelated evidence with zero relevant candidates
+    triggers handoff (not just clarification) because repeatedly probing
+    retrieval wastes the customer's time.
     """
     if restricted_query:
         return AbstentionDecision(abstain=True, reason_code=ABSTAIN_RESTRICTED, handoff=True)
+    if _is_action_request(query):
+        # Checked before the evidence gates: whether the customer asked for an
+        # action does not depend on what retrieval happened to find.
+        return AbstentionDecision(abstain=True, reason_code=ABSTAIN_ACTION_REQUEST, handoff=True)
     if not evidence:
         return AbstentionDecision(abstain=True, reason_code=ABSTAIN_NO_EVIDENCE, handoff=True)
     if len(evidence) < min_results:
@@ -567,6 +747,14 @@ def safe_abstention_text(reason_code: str) -> str:
         return (
             "I can't provide that information. Let me connect you with a "
             "human colleague who can help."
+        )
+    if reason_code == ABSTAIN_ACTION_REQUEST:
+        # Names the actual problem - the platform does not act on its own -
+        # rather than implying the answer was merely hard to find. A customer
+        # who asked for a refund is not helped by "I couldn't verify that".
+        return (
+            "I can't make changes to your account myself. Let me connect you "
+            "with a human colleague who can action this for you."
         )
     return (
         "I couldn't verify an answer from our authorized knowledge base. "

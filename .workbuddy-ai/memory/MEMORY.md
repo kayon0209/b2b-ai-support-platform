@@ -197,6 +197,15 @@ test helper, but the only real caller never did, so it read zero rows forever.
 **Test the caller, not just the function** — "the aggregation works" and
 "anything reaches it" are different claims.
 
+**Validate a new heuristic against the whole eval dataset before wiring it in.**
+`qa_path._is_action_request` (the QA path refusing action requests instead of
+answering them from the corpus) was deferred three times on "false-positive
+risk". Running it over all 23 dataset questions *first* showed it firing on
+exactly the one case it should, and caught three wrong versions: a bare write
+verb matched the search phrase "refund window"; the window for a first-person
+desire matched "I need to know the refund policy"; and "can I" had to be
+separated from "can you". Cheap to measure, expensive to guess.
+
 `scripts/run_eval.py` found the first, and is the only path that can: it is the
 only one that runs the real pipeline end to end.
 

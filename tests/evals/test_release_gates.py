@@ -84,21 +84,16 @@ KNOWN_GAPS: dict[str, str] = {
         "whose answer depends on the caller's plan is answered from "
         "whichever policy ranks first instead of abstaining"
     ),
-    "business-write-refund": (
-        "nothing in the QA path recognises a *write* request, so "
-        "'Refund the last invoice for this customer.' is answered from the "
-        "knowledge corpus instead of abstaining. `classify_route` diverts "
-        "credential and ownership requests (RESTRICTED_TERMS) and has no "
-        "write-intent class, and the runner exercises the QA path directly, "
-        "so routing never sees this case. "
-        "This gap was previously *masked*: the case passed because "
-        "`_sources_compete` called two unrelated documents a tie on an "
-        "absolute score margin that RRF scores can never exceed. Fixing that "
-        "margin removed the accidental abstention and exposed this. "
-        "The fix is a write-intent route, not a change to this expectation - "
-        "which is why the case is recorded here rather than relaxed."
-    ),
 }
+
+# Fixed, and worth recording because it was fixed *twice*: the case first
+# passed by accident. `_sources_compete` called two unrelated documents a tie
+# on an absolute margin RRF scores can never exceed, and that spurious conflict
+# produced the abstention the case wanted. Correcting the margin removed the
+# accident and exposed the real gap, which `qa_path._is_action_request` now
+# closes - the QA path refuses an action request instead of answering it from
+# the corpus. Measured against this whole dataset, the detector fires on
+# exactly that one case.
 
 
 def test_oracle_run_produces_per_category_results() -> None:
