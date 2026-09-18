@@ -432,6 +432,7 @@ which one applies to you.」——说「我无法核实」是**假话**，政策
 | ruff check / format | clean，284 文件 |
 | mypy strict | clean，**129 文件 0 错** |
 | **真实端到端评估** | **23/23 全通过**；`citation_violations=0`、`abstention_false=0`、`forbidden_claim_hits=0`、`contradiction_candidates=0`；`KNOWN_GAPS` 已清空 |
+| **重复采样（`--samples 3`）** | **21/23 用例完全确定**；波动仅限两条对抗用例（`adversarial-press-refund`、`adversarial-role-claim`，各 1/3 失败） |
 | `release_check`（真实报告） | `citation_coverage 1.0`、`abstention_correct_rate 0.9565`、`forbidden_claims 0.0`——全部为**计算值**，非手写 |
 | **read-tool 门禁可达** | 种入 100 条真实执行后得出 `0.97 vs 0.99`（修复前结构上不可能） |
 | `release_check --evidence-only` | exit 0；15/4/3 条零容忍背书测试 |
@@ -454,7 +455,9 @@ which one applies to you.」——说「我无法核实」是**假话**，政策
 
 - **read-tool 成功率的门禁需要生产租户**，不是 fixture：没有真实 `tool_executions` 流量时
   它必然失败，这是设计如此。现在它至少**能**看到流量了。
-- **k8s 清单从未部署到真实集群**；替代品是 27 项结构断言，README 明说这一点。
+- **k8s 清单从未部署到真实集群**；替代品是 27 项结构断言。已核实**离线无法**用 kubectl
+  做 schema 校验：`--validate=strict` 要从 API server 取 OpenAPI schema，连
+  `--dry-run=client --validate=false` 也会先取 API group list。这是环境限制，不是代码问题。
 - **Postgres / Redis 只被引用，未被部署**（各自是带备份/故障转移的 StatefulSet 命题）。
 
 > 已无「有意不做」的遗留项。上一版报告里保留的 13 处 `window.prompt`、以及「Chatwoot
@@ -471,3 +474,4 @@ which one applies to you.」——说「我无法核实」是**假话**，政策
 → `ce02d68`（报告更新）→ `50c0982`（拒绝动作请求 + prompt v2）
 → `82ce28b`（拒绝变体条件化答案，`KNOWN_GAPS` 清空）
 → `b624ecf`（ADR 0005 + claim-support 指标，分阶段而非直接拦截）
+→ `f668a9f`（`--samples N` 测量逐用例波动）
