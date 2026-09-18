@@ -1,10 +1,10 @@
 # 全部 Phase 完成 — 交付报告
 
-`docs/development-plan.md` 的 Phase 0–5 全部实现。本报告汇总三段会话：一段把 Phase 2–5
-的缺口补齐，一段接续一个**未提交的工作树**（计费账本 + 发布门禁证据），一段补上**评估报告
-产出方**并因此发现冲突判定规则的一个失效守卫。
+`docs/development-plan.md` 的 Phase 0–5 全部实现。本报告汇总四段会话：把 Phase 2–5 的缺口
+补齐、接续一个**未提交的工作树**、补上**评估报告产出方**并因此发现冲突规则的失效守卫、
+再补上**账本更正**并因此发现 RLS 会话绑定的一类系统性缺陷。
 
-当前状态：全量回归 **1199 passed, EXIT=0**；ruff / mypy 全绿；真实端到端评估 **21/23**。
+当前状态：全量回归 **1209 passed, EXIT=0**；ruff / mypy 全绿；真实端到端评估 **21/23**。
 
 ## 一、按开发计划逐项交付
 
@@ -131,30 +131,95 @@ policy-monthly-refundable  "Are monthly plans refundable?"
 在被施压时不肯给引用。安全属性成立（没有任何无据声明到达客户），质量属性不成立。这是
 prompt 层面的工作，属于 prompt 发布流程。
 
-## 五、整体验证结果（实测）
+## 五、本会话：账本更正，以及它暴露的 RLS 会话缺陷
+
+### `POST /v1/tenant/billing/adjustments`
+
+账本是 append-only（应用角色只有 SELECT/INSERT），所以更正必须是一行新记录——在此之前，
+修一笔计费错误只能进数据库控制台。
+
+`record_adjustment` 此前**刻意不去重**（按 `(run_id, 时间戳)` 取键，理由是「更正是一次
+审慎操作，重复调用就是第二次更正」）。这对 Python 调用方成立，对 HTTP 调用方不成立：
+仓库要求每个写命令都带 `Idempotency-Key`，而一个不去重的重试会把账户**重复冲抵**。现在
+它接受可选 key、按 `(tenant, key)` 取键、用 `ON CONFLICT DO NOTHING`；端点始终传入 key。
+重放返回 `{"duplicate": true}` 且**不写第二条审计事件**——把重试记成一次操作的审计轨迹，
+是在报告从未发生过的活动。
+
+新增 `Action.BILLING_ADJUST`，仅 `tenant_owner` 持有。**读账本和改账本是两种能力**：
+`auditor` 能读，不能改。
+
+### 它暴露的缺陷：`set_config` 活不过 `COMMIT`
+
+端点第一次跑测试时返回 `adjustment_entries: 0`——旁边那条直接插入的 usage 行也一样。
+`tenant_session` 只在 yield 之前**设置一次** `set_config('app.tenant_id', ..., true)`。
+处理器会提交（这样行在被报告之前就已落盘），而事务作用域的绑定随事务一起消失，之后的读
+就是**未绑定**的。RLS 返回零行，**不报错**。
+
+`PUT /v1/tenant/quota` 一直是同一个形状、一直是错的：它提交新配额之后再读用量快照，于是
+对任何租户都报 `runs_used: 0`。它的测试只断言了 `quota` 和 `remaining`——这两个来自
+tenants 行，仍然正确，所以没人发现。
+
+**结构性修复，而不是逐个调用点修补**：`tenant_session` 现在在 `after_begin` 重新绑定，
+对处理器开启的每个事务都成立。「需要被记住的规则」在这个仓库里已经被忘记过两次。
+
+证明守卫是真的：关掉监听器会让四个测试失败，包括新增的
+`test_the_put_response_reports_real_usage_not_zero`。
+
+### 22 处重复的会话装配，5 份重复的角色 URL
+
+`prompt_router`、`flag_router`、`gap_router`、`audit/router`、`evaluation/router`、
+`knowledge/router` 各自重写了 `session_scope_with_url(app_url) + apply_rls_tenant(...)`
+——共 22 处，且**没有一处**得到逐事务重绑定。现已全部改用 `tenant_session(ctx)`。
+
+另有五个模块各自计算应用角色 URL，包括**认证中间件**与 worker 装配。现全部委托给
+`db.app_role_url()`，而它自己的 docstring 写着：*「放在这里而不是每个调用方各自一份，
+是因为第二份正是其中一个最终指向 superuser 的方式。」* 现在 `db.py` 之外零副本。
+
+### read-tool 门禁此前**永远不可能通过**
+
+`release_check._read_tool_outcomes` 读的是 `tool_executions`（FORCE RLS），**没有绑定
+租户**。在活库上实测（同一事务内已提交一行）：
+
+```
+SET ROLE platform_app;
+  unbound_rows=0
+  set_config('app.tenant_id', '<tenant>', true);
+  bound_rows=1
+```
+
+它对任何租户都看到零行，于是门禁永远报「窗口内无 read-tool 执行」——一个与 read tool 毫无
+关系的理由。现已绑定后再查。
+
+**测试为何没抓到**：`aggregate_read_tool_outcomes` 的集成测试由测试助手自己绑定租户。
+函数是在「唯一的真实调用方从不提供的条件」下被测的。新增测试**走调用方**而不是走函数，
+因为「聚合能用」和「有东西能到达它」是两个不同的命题。
+
+端到端证明：为一个一次性租户种入 100 条 read-tool 执行后跑 CLI，得到
+`[FAIL] read_tool_success_rate: 0.97 vs 0.99 (3 of 100 read-tool calls failed)`——
+一个真实计算出的数字，而在此之前这在结构上不可能。
+
+## 六、整体验证结果（实测）
 
 | 检查 | 结果 |
 |---|---|
-| 全量回归 | **1113 → 1199 passed, EXIT=0** |
+| 全量回归 | **1113 → 1209 passed, EXIT=0** |
 | ruff check / format | clean，282 文件 |
 | mypy strict | clean，**129 文件 0 错** |
 | **真实端到端评估** | **21/23**；`citation_violations=0`、`forbidden_claim_hits=0` |
 | `release_check`（真实报告） | `citation_coverage 1.0`、`abstention_correct_rate 0.913`、`forbidden_claims 0.0`——全部为**计算值**，非手写 |
+| **read-tool 门禁可达** | 种入 100 条真实执行后得出 `0.97 vs 0.99`（修复前结构上不可能） |
 | `release_check --evidence-only` | exit 0；15/4/3 条零容忍背书测试 |
-| `release_check --tenant-id <t>` | 可运行、DB 可达；read-tool 门禁**诚实地失败**（无生产流量可测） |
 | **真实 MinIO 端到端** | 上传 → MinIO → worker → `chunks=2 with_embedding=2` → `hybrid_search hits=2` |
 | admin-web | `typecheck` + `build` 通过 |
 | compose | `docker compose config` 通过 |
 
-## 六、有意不做的两件事（明确说明，不是遗漏）
+## 七、有意不做的一件事（明确说明，不是遗漏）
 
-1. **13 处 `window.prompt` 保留**（Case 命令对话框、缺口队列草稿/复核输入、prompt 拒绝与
-   回滚、开关灰度百分比）。它们可用但粗糙：阻塞、无样式、无校验面。逐处替换需要真实的内
-   联表单，改一半比不改更糟。这是 UI 侧的首要后续项。
-2. **`record_adjustment` 没有 API 或 UI。** 它是 append-only 账本文档化的更正路径，目前
-   只能从 Python 调用。
+**13 处 `window.prompt` 保留**（Case 命令对话框、缺口队列草稿/复核输入、prompt 拒绝与回滚、
+开关灰度百分比）。它们可用但粗糙：阻塞、无样式、无校验面。逐处替换需要真实的内联表单，
+改一半比不改更糟。这是 UI 侧的首要后续项。
 
-## 七、仍然存在的边界
+## 八、仍然存在的边界
 
 - **`business-write-refund`：QA 路径不识别写请求。** 它此前**假通过**（靠一个虚假冲突弃权）。
   正确修法是新增写意图路由（`Route` 里加一类），而不是改这个用例的期望——所以它记在
@@ -165,12 +230,14 @@ prompt 层面的工作，属于 prompt 发布流程。
 - **`adversarial-press-refund` 现在是 prompt 质量问题**：安全属性成立（无无据声明到达客户），
   但模型在施压下不肯给引用。属于 prompt 发布流程的工作。
 - **read-tool 成功率的门禁需要生产租户**，不是 fixture：没有真实 `tool_executions` 流量时
-  它必然失败，这是设计如此。
+  它必然失败，这是设计如此。现在它至少**能**看到流量了。
 - **k8s 清单从未部署到真实集群**；替代品是 27 项结构断言，README 明说这一点。
 - **Postgres / Redis 只被引用，未被部署**（各自是带备份/故障转移的 StatefulSet 命题）。
 - Chatwoot 双向往返的端到端脚本仍未跑（容器已起、3000 可达）。
 
-## 八、提交
+## 九、提交
 
 `4e2a87b`（计费账本 + 发布门禁证据 + 缺陷修复）→ `d76fa3f`（admin-web 错误处理与信息补全）
-→ `8d0da2d`（交付报告）→ `a84615c`（评估报告产出方 + 冲突规则失效守卫）
+→ `8d0da2d`（交付报告）→ `a84615c`（评估报告产出方 + 冲突规则失效守卫）→ `737361a`
+（文档与记忆）→ `69ff6b9`（账本更正 API/UI + RLS 会话绑定与 read-tool 门禁修复）
+→ `217b9c4`（记忆整理）
