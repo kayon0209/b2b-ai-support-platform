@@ -61,7 +61,7 @@ jsonschema>=4.23
 pyyaml>=6.0
 httpx>=0.27
 tenacity>=9.0
-uuid6>=2024.7.10
+uuid6>=2025.0.1
 
 # --- Document parsing -------------------------------------------------------
 # Used by the ingestion pipeline to extract text from PDF and DOCX uploads.
