@@ -206,9 +206,20 @@ export function CustomerChat() {
       const res = await apiGet<{ items: { role: string; text: string; at: number }[] }>(
         `/v1/customer/conversations/${conversationRef}/timeline`,
       );
+      // The same question can be written twice: once when the customer's
+      // message is persisted, and once by the worker's own memory pass.
+      // Showing it twice reads like a duplicate send, so collapse on
+      // identical role + text.
+      const seen = new Set<string>();
+      const rows = res.items.filter((t) => {
+        const key = `${t.role}:${t.text}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
       setMessages(
-        res.items.map((t) => ({
-          id: `s-${t.at}-${t.role}`,
+        rows.map((t) => ({
+          id: `s-${t.at}-${t.role}-${t.text.length}`,
           role: t.role === "customer" ? "customer" : "agent",
           text: t.text,
           at: t.at * 1000,
