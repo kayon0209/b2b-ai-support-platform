@@ -51,7 +51,7 @@ signxml>=4
 lxml>=5
 
 # --- Observability ---------------------------------------------------------
-structlog>=24.4
+structlog>=26.1.0
 # Imported by platform_core.http_metrics at module import, so the API cannot
 # start without it. This is the package the Dockerfile was missing.
 prometheus-client>=0.21
