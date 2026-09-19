@@ -255,7 +255,17 @@ async def _local_turn_text(message_id: object) -> str | None:
             row = (
                 await session.execute(text("SELECT resolve_turn_text(:m)"), {"m": turn_id})
             ).scalar_one_or_none()
-    except Exception:  # noqa: BLE001 - fall through to the Chatwoot read
+    except Exception as exc:  # noqa: BLE001 - fall through to the Chatwoot read
+        # Logged, not swallowed. A bare `return None` here made every
+        # platform-originated question indistinguishable from "no body
+        # found": the event was acked, the run sat queued, and nothing in
+        # the log said why.
+        logger.warning(
+            "local_turn_read_failed",
+            new_trace_context(service_name="worker"),
+            turn_id=str(turn_id),
+            error=f"{type(exc).__name__}: {exc}",
+        )
         return None
     return row if isinstance(row, str) and row.strip() else None
 
