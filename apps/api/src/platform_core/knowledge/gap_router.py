@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from platform_core.api import (
+    domain_error_response,
     error_response,
     require_write_idempotency,
     tenant_session,
@@ -88,15 +89,14 @@ def _denied(action: str, reason: str) -> JSONResponse:
     )
 
 
-def _gap_error(exc: gap_service.GapError) -> dict[str, Any]:
-    return {
-        "error": {
-            "code": exc.code,
-            "reason": exc.detail or exc.code,
-            "retryable": False,
-        },
-        "trace_id": "",
-    }
+def _gap_error(exc: gap_service.GapError) -> JSONResponse:
+    """A refused gap/draft action, as a real 4xx.
+
+    Returned as a JSONResponse rather than a dict: a plain dict is rendered
+    with status 200, which the admin UI reads as success (see
+    platform_core.api.domain_error_response).
+    """
+    return domain_error_response(exc.code, exc.detail)
 
 
 def _ctx_of(request: Request) -> TenantContext:

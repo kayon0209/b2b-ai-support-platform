@@ -697,7 +697,9 @@ class TestHttpSurface:
     def test_malformed_gap_id_is_not_found_not_500(self) -> None:
         mgr = _client(TENANT, "knowledge_manager")
         resp = mgr.post("/v1/knowledge/gaps/not-a-uuid/acknowledge", headers=_headers())
-        assert resp.status_code == 200
+        # NOT_FOUND is a 404. It used to come back as a 200 carrying the
+        # error, which made a refusal indistinguishable from a success.
+        assert resp.status_code == 404
         assert resp.json()["error"]["code"] == "NOT_FOUND"
 
     def test_http_publish_creates_a_document(self) -> None:

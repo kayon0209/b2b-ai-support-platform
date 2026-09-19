@@ -30,6 +30,7 @@ fallback to the default.
 import asyncio
 import os
 import signal
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -368,6 +369,21 @@ def resolve_queue(argv: list[str] | None = None) -> str:
     return raw
 
 
+def run(coro: "Awaitable[None]") -> None:
+    """`asyncio.run` with a loop psycopg can actually use.
+
+    On Windows `asyncio.run` builds a ProactorEventLoop, which psycopg's
+    async driver refuses — every DB call dies at connect. The API entrypoint
+    already selects a selector loop; the worker did not, so it could not
+    start at all on Windows and failed its first poll cycle with
+    `RuntimeError: psycopg async cannot run on a ProactorEventLoop`.
+    """
+    if sys.platform == "win32":
+        asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)  # type: ignore[arg-type]
+    else:
+        asyncio.run(coro)
+
+
 def main() -> None:
     """Local entrypoint, dispatched by `APP_WORKER_QUEUE`.
 
@@ -377,8 +393,6 @@ def main() -> None:
     its own process: it is bulk work whose batches would otherwise compete
     with customer-facing runs for the same event loop.
     """
-    import sys
-
     try:
         queue = resolve_queue(sys.argv[1:])
     except WorkerConfigurationError as exc:
@@ -386,26 +400,26 @@ def main() -> None:
         raise
 
     if queue == ROLE_OUTBOX:
-        asyncio.run(_run_outbox_only())
+        run(_run_outbox_only())
         return
 
     if queue == ROLE_INGESTION:
         ingestion_deps = build_ingestion_deps()
         logger.info("worker_wiring", queue=queue, has_embedding=ingestion_deps.can_embed)
-        asyncio.run(_run_ingestion_only(ingestion_deps))
+        run(_run_ingestion_only(ingestion_deps))
         return
 
     if queue == ROLE_RETENTION:
         # No wiring: the sweep needs no external collaborator.
         logger.info("worker_wiring", queue=queue)
-        asyncio.run(_run_retention_only())
+        run(_run_retention_only())
         return
 
     if queue == ROLE_SLA:
         # No wiring either: the breach scan reads Cases and writes its own
         # ledger. It notifies through the outbox, which is the relay's job.
         logger.info("worker_wiring", queue=queue)
-        asyncio.run(_run_sla_only())
+        run(_run_sla_only())
         return
 
     # Real collaborators, assembled in one place. `build_interactive_deps`
@@ -420,7 +434,7 @@ def main() -> None:
         # answered".
         logger.warning("worker_cannot_send", reason_code="NO_CHATWOOT_TOKEN")
 
-    asyncio.run(_run_both(interactive_deps))
+    run(_run_both(interactive_deps))
 
 
 async def _run_both(deps: OrchestratorDeps) -> None:

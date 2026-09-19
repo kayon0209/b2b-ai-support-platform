@@ -23,14 +23,23 @@ if sys.platform == "win32":
 
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from platform_core import db
 from platform_core.agent_runtime.prompt_router import router as prompt_router
 from platform_core.agent_runtime.router import router as agent_runtime_router
+from platform_core.api import (
+    INTERNAL_ERROR,
+    VALIDATION_FAILED,
+    error_response,
+    new_trace_id,
+)
 from platform_core.audit.router import router as audit_router
 from platform_core.cases.router import router as cases_router
 from platform_core.compliance.router import router as compliance_router
@@ -85,7 +94,68 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await db.dispose_engine()
 
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="B2B AI Support Platform", version="0.1.0", lifespan=lifespan)
+
+
+def _validation_message(exc: RequestValidationError) -> str:
+    """A readable summary of a schema failure.
+
+    Deliberately built from the field path and the message only. FastAPI's
+    default body echoes the offending `input`, which for this service can be
+    a prompt, a document or a bearer token — `docs/security.md` forbids
+    sending any of those back across the wire.
+    """
+    parts: list[str] = []
+    for err in exc.errors():
+        field = ".".join(str(p) for p in err.get("loc", ()) if str(p) != "body")
+        parts.append(f"{field}: {err.get('msg', 'invalid')}" if field else str(err.get("msg")))
+    return "; ".join(parts[:5])
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Schema failures in the same envelope as every other error.
+
+    FastAPI answers these with `{"detail": [...]}`, so the admin UI fell
+    through to its `HTTP 422` fallback and the operator was shown a status
+    code instead of what was wrong with what they typed.
+    """
+    return error_response(
+        VALIDATION_FAILED,
+        _validation_message(exc),
+        status_code=422,
+        trace_id=new_trace_id(),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    """Return the documented error envelope instead of a bare 500.
+
+    `docs/api-contracts.md` promises that every JSON endpoint answers with
+    one of two shapes. An unhandled exception broke that: the client got
+    the text "Internal Server Error" with no `error.code` to switch on and
+    no `trace_id` to quote to support. The details stay in the log — the
+    module contract in `platform_core.api` is explicit that stack traces
+    are never sent to a caller.
+    """
+    trace_id = new_trace_id()
+    logger.exception(
+        "unhandled error trace_id=%s method=%s path=%s",
+        trace_id,
+        request.method,
+        request.url.path,
+    )
+    return error_response(
+        INTERNAL_ERROR,
+        "an unexpected error occurred; quote the trace id to support",
+        status_code=500,
+        trace_id=trace_id,
+    )
+
+
 app.include_router(support_bridge_router)
 app.include_router(audit_router)
 app.include_router(compliance_router)

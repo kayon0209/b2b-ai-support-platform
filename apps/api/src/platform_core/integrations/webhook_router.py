@@ -52,7 +52,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
-from platform_core.db import session_scope
+from platform_core.db import app_role_url, session_scope_with_url
 from platform_core.integrations.credentials import resolve_credentials
 from platform_core.support_bridge import inbox
 from platform_core.support_bridge.webhook_security import (
@@ -88,7 +88,7 @@ async def _resolve_connector(connector_id: uuid.UUID) -> dict[str, Any] | None:
     """
     from sqlalchemy import text
 
-    async with session_scope() as session:
+    async with session_scope_with_url(app_role_url()) as session:
         row = (
             await session.execute(
                 text(
@@ -171,7 +171,7 @@ async def connector_webhook(request: Request, connector_id: uuid.UUID) -> Respon
 
     event_type = str(raw_payload.get("event") or raw_payload.get("webhookEvent") or "unknown")
 
-    async with session_scope() as session:
+    async with session_scope_with_url(app_role_url()) as session:
         from sqlalchemy import text
 
         # The tenant comes from the resolver function above, never from the

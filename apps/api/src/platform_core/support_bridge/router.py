@@ -17,7 +17,7 @@ from fastapi import APIRouter, Request, Response
 from sqlalchemy import text
 
 from platform_core.config import get_settings
-from platform_core.db import session_scope
+from platform_core.db import app_role_url, session_scope_with_url
 from platform_core.support_bridge import inbox, mapping
 from platform_core.support_bridge.webhook_security import (
     DELIVERY_HEADER,
@@ -97,9 +97,19 @@ async def chatwoot_webhook(request: Request) -> Response:
     account = raw_payload.get("account") or raw_payload.get("current_account") or {}
     chatwoot_account_id = str(account.get("id") or "")
 
-    async with session_scope() as session:
+    async with session_scope_with_url(app_role_url()) as session:
         # Tenant from trusted mapping, never from the payload's tenant field.
-        tenant_id = await mapping.resolve_tenant_from_account(session, chatwoot_account_id)
+        # Resolved through the SECURITY DEFINER function (migration 0032):
+        # the mapping row is FORCE-RLS'd, so an unbound app-role SELECT finds
+        # nothing - the same bootstrap chicken-and-egg 0016 and 0026 solved.
+        # The account id arrives from a signature-verified payload, so the
+        # definer read is not an enumeration surface.
+        tenant_id = (
+            await session.execute(
+                text("SELECT resolve_chatwoot_tenant(:account_id)"),
+                {"account_id": chatwoot_account_id},
+            )
+        ).scalar_one_or_none()
         if tenant_id is None:
             return Response(
                 content=json.dumps(_error_body("WEBHOOK_TENANT_UNRESOLVED")),
@@ -107,8 +117,9 @@ async def chatwoot_webhook(request: Request) -> Response:
                 media_type="application/json",
             )
 
-        # Bypass RLS session context for the inbox write: the ingest path is
-        # system-actor. We set a synthetic tenant context for the transaction.
+        # Bind the tenant for the writes: from here on the session is the
+        # non-bypass app role and RLS holds on the INSERT, as on every
+        # interactive request path.
         await session.execute(
             text("SELECT set_config('app.tenant_id', :tid, true)"),
             {"tid": str(tenant_id)},

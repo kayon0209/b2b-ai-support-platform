@@ -34,7 +34,7 @@ from platform_core.evaluation.runner import EvalCase, EvalReport, EvaluationRunn
 from platform_core.retrieval.hybrid import PrincipalScope, RetrievedChunk
 
 from .dataset import EvalCategory, all_cases, cases_for
-from .harness import make_retriever
+from .harness import corpus_key_of, make_retriever
 from .report import build_category_report, summarize
 
 pytestmark = pytest.mark.eval
@@ -68,7 +68,7 @@ async def _oracle_answer(question: str, evidence: list[RetrievedChunk]) -> Draft
 
 
 def _oracle_runner() -> EvaluationRunner:
-    return EvaluationRunner(_oracle_answer, make_retriever())
+    return EvaluationRunner(_oracle_answer, make_retriever(), key_of=corpus_key_of)
 
 
 def _run_dataset() -> EvalReport:

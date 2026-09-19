@@ -59,7 +59,12 @@ export interface Draft {
   published_document_id: string | null;
 }
 
-export type GapStats = Record<string, number>;
+/** GET /v1/knowledge/gaps/stats — by_status maps status → gap count. */
+export interface GapStats {
+  by_status: Record<string, number>;
+  total_gaps: number;
+  total_occurrences: number;
+}
 
 export interface PromptVersion {
   id: string;
@@ -118,6 +123,8 @@ export type MemberRole =
 
 export interface Member {
   user_id: string;
+  /** PK of the membership row — what member commands address. */
+  membership_id: string;
   email: string;
   display_name: string;
   role: string;

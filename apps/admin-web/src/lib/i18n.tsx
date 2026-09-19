@@ -1,0 +1,854 @@
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import type { ReactNode } from "react";
+
+/**
+ * Minimal i18n for the admin console (no dependency, no build surface).
+ *
+ * Design:
+ * - `en` is the source of truth; `zh` is typed `Record<keyof typeof en, string>`,
+ *   so a missing Chinese key fails `tsc` instead of shipping an English
+ *   string inside the Chinese UI.
+ * - `t(key, vars)` substitutes `{name}` placeholders. A key that is missing
+ *   entirely degrades to its last path segment — for API enum values
+ *   ("pending_customer" and friends) that renders the raw value, which is
+ *   the honest fallback for a value the dictionary has never seen.
+ * - Choice persists to localStorage; the default comes from the browser
+ *   language, and `document.documentElement.lang` follows for a11y.
+ */
+
+export type Lang = "en" | "zh";
+
+const en = {
+  // --- common ---------------------------------------------------------------
+  "common.retry": "Retry",
+  "common.cancel": "Cancel",
+  "common.confirm": "Confirm",
+  "common.save": "Save",
+  "common.saving": "Saving…",
+  "common.close": "Close",
+  "common.copy": "Copy",
+  "common.showing": "Showing {shown} of {total}.",
+  "common.total": "{total} total",
+  "common.enabled": "enabled",
+  "common.disabled": "disabled",
+  "common.status": "Status",
+  "common.version": "Version",
+  "common.role": "Role",
+  "common.statusActive": "Active",
+
+  // --- shell (Layout) -------------------------------------------------------
+  "brand.name": "B2B Support",
+  "brand.sub": "Enterprise Admin",
+  "footer.controlPlane": "Control plane · v1",
+  "footer.token": "Token",
+  "controls.theme": "Switch light / dark theme",
+  "controls.lang": "Switch language (中/EN)",
+  "controls.themeTo": "{next}",
+  "controls.themeLight": "Light",
+  "controls.themeDark": "Dark",
+  "nav.ariaLabel": "Main sections",
+  "common.skipToContent": "Skip to main content",
+  "common.previous": "Previous",
+  "common.next": "Next",
+  "common.pageOf": "Page {page}",
+  "common.showingRange": "Showing {from}–{to} of {total}.",
+  "nav.quality": "Quality",
+  "nav.gaps": "Knowledge Gaps",
+  "nav.prompts": "Prompt Release",
+  "nav.flags": "Feature Flags",
+  "nav.cases": "Cases & SLA",
+  "nav.members": "Members",
+  "nav.usage": "Usage & Quota",
+  "nav.branding": "Branding",
+
+  // --- token dialog ---------------------------------------------------------
+  "token.title": "Access token required",
+  "token.body":
+    "Paste the bearer token issued for your account. It is kept in this browser only and can be replaced at any time.",
+  "token.label": "Token",
+  "token.connect": "Connect",
+  "token.checking": "Checking…",
+  "token.errorEmpty": "Paste the access token issued for your account.",
+
+  // --- inline prompt --------------------------------------------------------
+  "prompt.required": "{label} is required.",
+  "prompt.integer": "{label} must be a whole number.",
+  "prompt.min": "{label} must be at least {min}.",
+  "prompt.max": "{label} must be at most {max}.",
+
+  // --- quality dashboard ----------------------------------------------------
+  "quality.title": "Quality Dashboard",
+  "quality.subtitle": "Agent-run outcomes for your tenant, over the selected window.",
+  "quality.window1h": "Last 1h",
+  "quality.window24h": "Last 24h",
+  "quality.window30d": "Last 30d",
+  "quality.loading": "Loading quality metrics…",
+  "quality.empty":
+    "No agent runs in this window. Nothing has been asked of the bot yet — a dashboard full of zeros here means no traffic, not a broken pipeline.",
+  "quality.totalRuns": "Total runs",
+  "quality.completed": "Completed",
+  "quality.abstentionRate": "Abstention rate",
+  "quality.handoffRate": "Handoff rate",
+  "quality.citationCoverage": "Citation coverage",
+  "quality.failed": "Failed",
+  "quality.latencyP50": "Latency P50",
+  "quality.latencyP95": "Latency P95",
+  "quality.supportedResolution": "Supported resolution",
+  "quality.wrongResolution": "Wrong resolution",
+  "quality.resolutionOutcomes": "Resolution outcomes",
+  "quality.casesMeasured": "Cases measured",
+  "quality.resolutionHeld": "Resolution held",
+  "quality.reopened": "Reopened after resolving",
+  "quality.noResolutions":
+    "No Case was resolved or reopened in this window, so there is no resolution outcome to report yet.",
+  "quality.resolutionNote":
+    "Derived from Cases, not runs: a Case that was resolved and never reopened is a resolution that held; one that was reopened is a resolution that did not. Open cases ({open}) are excluded so the rate does not move with backlog.",
+  "quality.outcomeMix": "Outcome mix",
+  "quality.abstained": "Abstained",
+  "quality.handedOff": "Handed off",
+  "quality.untimedRuns": "Untimed runs",
+  "quality.routeDistribution": "Route distribution",
+  "quality.route": "Route",
+  "quality.runs": "Runs",
+  "quality.noRouted": "No routed runs in this window.",
+  "quality.routeUnavailable": "Route data unavailable.",
+  "route.knowledge_qa": "knowledge_qa",
+  "route.human_required": "human_required",
+  "route.out_of_scope": "out_of_scope",
+  "route.business_read": "business_read",
+  "route.business_write": "business_write",
+
+  // --- gap queue ------------------------------------------------------------
+  "gaps.title": "Knowledge Gap Queue",
+  "gaps.subtitle": "Questions the bot could not answer, most-demanded first.",
+  "gaps.statTotal": "Total gaps",
+  "gaps.statOccurrences": "Total occurrences",
+  "gaps.tabGaps": "Gaps",
+  "gaps.tabDrafts": "Drafts",
+  "gaps.statusFilter": "Status",
+  "gaps.loadingGaps": "Loading gaps…",
+  "gaps.loadingDrafts": "Loading drafts…",
+  "gaps.emptyGaps": "No gaps in this state.",
+  "gaps.emptyDrafts": "No drafts yet.",
+  "gaps.headerSample": "Sample question",
+  "gaps.headerReason": "Reason",
+  "gaps.headerFreq": "Freq",
+  "gaps.headerLastSeen": "Last seen",
+  "gaps.headerTitle": "Title",
+  "gaps.headerReviewer": "Reviewer",
+  "gaps.claim": "Claim",
+  "gaps.dismiss": "Dismiss",
+  "gaps.draft": "Draft",
+  "gaps.approve": "Approve",
+  "gaps.reject": "Reject",
+  "gaps.publish": "Publish",
+  "gaps.claimed": "Gap claimed.",
+  "gaps.dismissed": "Gap dismissed.",
+  "gaps.draftCreated": "Draft created.",
+  "gaps.approved": "Draft approved.",
+  "gaps.rejected": "Draft rejected.",
+  "gaps.published": "Draft published to the knowledge space.",
+  "gaps.spacesFailed": "Could not load knowledge spaces, so a target cannot be chosen.",
+  "gaps.status.open": "Open",
+  "gaps.status.acknowledged": "Acknowledged",
+  "gaps.status.drafted": "Drafted",
+  "gaps.status.resolved": "Resolved",
+  "gaps.status.dismissed": "Dismissed",
+  "gaps.status.pending": "Pending",
+  "gaps.status.approved": "Approved",
+  "gaps.dismissTitle": "Dismiss this gap",
+  "gaps.dismissDetail": "The reason is recorded on the gap.",
+  "gaps.reasonLabel": "Reason",
+  "gaps.draftAnswerTitle": "Draft an answer for this gap",
+  "gaps.draftTitleLabel": "Draft title",
+  "gaps.draftBodyLabel": "Draft answer",
+  "gaps.approveTitle": "Approve “{title}”",
+  "gaps.approveDetail": "Approving publishes this draft to the review queue.",
+  "gaps.notesLabel": "Review notes",
+  "gaps.notesOptional": "optional",
+  "gaps.rejectTitle": "Reject “{title}”",
+  "gaps.rejectNotesLabel": "Reason for rejection",
+  "gaps.publishTitle": "Publish “{title}”",
+  "gaps.spaceLabel": "Target knowledge space",
+  "gaps.spaceHint": "No knowledge spaces exist yet — create one before publishing.",
+
+  // --- prompt release -------------------------------------------------------
+  "prompts.title": "Prompt Release",
+  "prompts.subtitle": "Author, evaluate, and promote prompt template versions.",
+  "prompts.templatePlaceholder": "template_name",
+  "prompts.currentlyServing": "Currently serving",
+  "prompts.newDraft": "New draft",
+  "prompts.bodyPlaceholder": "Paste the new prompt body…",
+  "prompts.createDraft": "Create draft",
+  "prompts.draftCreated": "Draft created",
+  "prompts.candidate": "Candidate",
+  "prompts.submitted": "Submitted as candidate",
+  "prompts.promote": "Promote",
+  "prompts.promoted": "Promoted",
+  "prompts.reject": "Reject",
+  "prompts.view": "View",
+  "prompts.hide": "Hide",
+  "prompts.rollback": "Roll back to a previous version…",
+  "prompts.headerVersion": "Version",
+  "prompts.headerState": "State",
+  "prompts.headerBody": "Body",
+  "prompts.stateServing": "serving",
+  "prompts.statePublished": "published",
+  "prompts.stateDraft": "draft",
+  "prompts.empty": "No versions for this template yet.",
+  "prompts.loading": "Loading versions…",
+  "prompts.rejectReason": "Reject reason",
+  "prompts.promoteConfirm": "Promote v{version} to serving?",
+  "prompts.promoteDetail":
+    "Every customer-visible answer changes from this moment.",
+  "prompts.rejectTitle": "Reject v{version}",
+  "prompts.rollbackTitle": "Roll back to a previous version",
+  "prompts.rollbackDetail": "This takes effect immediately.",
+  "prompts.versionLabel": "Version",
+
+  // --- feature flags --------------------------------------------------------
+  "flags.title": "Feature Flags",
+  "flags.subtitle": "Deterministic, canary-gated rollout of platform capabilities.",
+  "flags.defineTitle": "Define a flag",
+  "flags.keyPlaceholder": "flag_key",
+  "flags.descPlaceholder": "description",
+  "flags.define": "Define",
+  "flags.loading": "Loading flags…",
+  "flags.headerKey": "Key",
+  "flags.headerDescription": "Description",
+  "flags.headerRollout": "Rollout",
+  "flags.headerState": "State",
+  "flags.headerCreated": "Created",
+  "flags.enable": "Enable",
+  "flags.disable": "Disable",
+  "flags.setRollout": "Set rollout",
+  "flags.rolloutTitle": "Rollout percent for {key}",
+  "flags.rolloutDetail":
+    "0 disables the flag for everyone; 100 enables it for the whole tenant.",
+  "flags.percentLabel": "Percent (0-100)",
+  "flags.empty": "No feature flags defined.",
+  "flags.invalidKey": "A flag key may contain only letters, digits, dot, underscore and hyphen.",
+  "flags.defined": "Flag {key} defined.",
+  "flags.stateChanged": "{key} is now {state}.",
+  "flags.rolloutSet": "{key} rollout set to {percent}%.",
+
+  // --- cases ----------------------------------------------------------------
+  "cases.title": "Cases & SLA",
+  "cases.subtitle": "Tenant-scoped support cases with SLA clocks.",
+  "cases.caseList": "Case list",
+  "cases.emptyList": "No cases yet.",
+  "cases.selectCase": "Select a case to see details and SLA.",
+  "cases.loadingCases": "Loading cases…",
+  "cases.loadingCase": "Loading case…",
+  "cases.category": "Category",
+  "cases.assignee": "Assignee",
+  "cases.team": "Team",
+  "cases.opened": "Opened",
+  "cases.firstResponseDue": "First response due",
+  "cases.resolutionDue": "Resolution due",
+  "cases.firstResponded": "First responded",
+  "cases.resolvedAt": "Resolved",
+  "cases.commands": "Commands",
+  "cases.recordFirstResponse": "Record first response",
+  "cases.recordFirstResponseConfirm": "Record now as the first response?",
+  "cases.recordFirstResponseDetail":
+    "This starts the first-response SLA clock at the current time and cannot be undone.",
+  "cases.transition": "Transition…",
+  "cases.changePriority": "Change priority…",
+  "cases.assign": "Assign…",
+  "cases.transitionTitle": "Transition to which status?",
+  "cases.targetLabel": "Target status",
+  "cases.priorityTitle": "Change priority",
+  "cases.priorityLabel": "Priority",
+  "cases.assignTitle": "Assign this case",
+  "cases.assignDetail": "Both fields are optional; leaving them empty unassigns.",
+  "cases.assigneeRef": "Assignee ref",
+  "cases.teamRef": "Team ref",
+  "cases.optional": "optional",
+  "cases.commandApplied": 'Command "{command}" applied.',
+  "case.status.new": "New",
+  "case.status.open": "Open",
+  "case.status.pending_customer": "Pending customer",
+  "case.status.escalated": "Escalated",
+  "case.status.resolved": "Resolved",
+  "case.status.closed": "Closed",
+
+  // --- members --------------------------------------------------------------
+  "members.title": "Members",
+  "members.subtitle": "Invite and manage who can access this tenant.",
+  "members.inviteTitle": "Invite a member",
+  "members.invited": "Invitation created for {email}.",
+  "members.roleChanged": "{email}'s role is now updated.",
+  "members.removed": "{email} no longer has access to this tenant.",
+  "members.emailPlaceholder": "person@company.com",
+  "members.sendInvite": "Send invite",
+  "members.inviteCreated": "invite created",
+  "members.copied": "Token copied to clipboard.",
+  "members.headerMember": "Member",
+  "members.headerStatus": "Status",
+  "members.empty": "No members yet.",
+  "members.loading": "Loading members…",
+  "members.changeRole": "Change role",
+  "members.noToken": "no token returned",
+  "member.status.active": "Active",
+  "members.remove": "Remove",
+  "members.removeConfirm": "Remove {email} from this tenant?",
+  "members.removeDetail": "They lose access immediately. Their account is not deleted.",
+  "members.changeRoleConfirm": "Change {email}'s role to {role}?",
+  "members.changeRoleDetail": "Takes effect on their next request.",
+  "role.tenant_owner": "Tenant Owner",
+  "role.security_admin": "Security Admin",
+  "role.support_admin": "Support Admin",
+  "role.knowledge_manager": "Knowledge Manager",
+  "role.support_agent": "Support Agent",
+  "role.support_viewer": "Support Viewer",
+  "role.integration_service": "Integration Service",
+  "role.auditor": "Auditor",
+
+  // --- usage & quota --------------------------------------------------------
+  "usage.title": "Usage & Quota",
+  "usage.subtitle":
+    "Agent runs consumed this calendar month (UTC), and the ceiling on them.",
+  "usage.changeQuota": "Change quota",
+  "usage.quotaPlaceholder": "unlimited",
+  "usage.quotaLabel": "Monthly run quota",
+  "usage.runsUsed": "Runs used",
+  "usage.quota": "Quota",
+  "usage.remaining": "Remaining",
+  "usage.promptTokens": "Prompt tokens",
+  "usage.completionTokens": "Completion tokens",
+  "usage.consumed": "Consumed",
+  "usage.unlimited": "Unlimited",
+  "usage.periodTitle": "This period",
+  "usage.window": "Window",
+  "usage.overQuota": "Over quota — new runs are refused with 429",
+  "usage.acceptingRuns": "Accepting runs",
+  "usage.overQuotaNote":
+    "Usage counts agent runs started in the period. A run enqueued while over quota is refused with a 429 rather than dropped silently, so a caller can tell \"declined for capacity\" from \"no evidence found\".",
+  "usage.quotaError": "Quota must be a whole number of runs, or empty for unlimited.",
+  "usage.quotaCleared": "Quota cleared — this tenant is now unlimited.",
+  "usage.quotaSet": "Quota set to {value} runs per calendar month.",
+  "usage.ledgerTitle": "Billing ledger",
+  "usage.noPermission":
+    "You do not have permission to read billing data. It requires the audit-read role, the same one that grants access to the audit trail — commercial totals are not part of the support role.",
+  "usage.ledgerEntries": "Ledger entries",
+  "usage.usageEntries": "Usage entries",
+  "usage.adjustments": "Adjustments",
+  "usage.totalTokens": "Total tokens",
+  "usage.ledgerNote":
+    "The append-only record an invoice is computed from, keyed by the usage event so an outbox redelivery collapses instead of double-billing. A correction is a new adjustment entry, never an edit — which is why adjustments can differ from the live run count above.",
+  "usage.recordCorrection": "Record a correction",
+  "usage.runId": "run id (uuid)",
+  "usage.promptDelta": "prompt tokens (e.g. -200)",
+  "usage.completionDelta": "completion tokens",
+  "usage.reason": "reason (recorded in the audit trail)",
+  "usage.record": "Record correction",
+  "usage.recording": "Recording…",
+  "usage.correctionRecorded": "Correction recorded.",
+  "usage.duplicate": "This correction was already recorded (the request key was reused), so nothing changed.",
+  "usage.errRunId": "The run id of the misrecorded usage is required.",
+  "usage.errReason": "A reason is required — it is recorded in the audit trail.",
+  "usage.errWhole": "Token deltas must be whole numbers.",
+  "usage.errChange": "A correction must change at least one token count.",
+  "usage.loadUsage": "Loading usage…",
+  "usage.loadLedger": "Loading ledger…",
+
+  // --- branding -------------------------------------------------------------
+  "branding.title": "Branding",
+  "branding.subtitle": "How this tenant appears in the product and to customers.",
+  "branding.settings": "Settings",
+  "branding.preview": "Preview",
+  "branding.displayName": "Display name",
+  "branding.logoUrl": "Logo URL",
+  "branding.primaryColour": "Primary colour",
+  "branding.supportEmail": "Support email",
+  "branding.namePlaceholder": "Acme Support",
+  "branding.logoPlaceholder": "https://cdn.example.com/logo.png",
+  "branding.emailPlaceholder": "help@acme.example",
+  "branding.saved": "Branding saved.",
+  "branding.loading": "Loading branding…",
+  "branding.noLogo": "no logo",
+  "branding.logoFailed": "the URL did not load, so there is nothing to preview.",
+  "branding.unsaved": "Unsaved changes",
+  "branding.untitled": "Untitled tenant",
+  "branding.noSupport": "no support address",
+
+  // --- error boundary & 404 -----------------------------------------------
+  "error.title": "This page could not be displayed",
+  "error.body":
+    "Something went wrong while rendering it. The rest of the console is still usable — retry, or open another section from the sidebar.",
+  "error.retry": "Retry",
+  "error.details": "Technical details",
+  "error.forbidden":
+    "You do not have permission to read this{scope}. It needs a role this account does not hold — ask a tenant owner to grant it, or switch to an account that has it.",
+  "notFound.title": "Page not found",
+  "notFound.body": "There is no page at {path}. It may have been renamed or removed.",
+  "notFound.home": "Go to the quality dashboard",
+};
+
+// A missing Chinese key is a compile error, not a silent English leak.
+const zh: Record<keyof typeof en, string> = {
+  // --- common ---------------------------------------------------------------
+  "common.retry": "重试",
+  "common.cancel": "取消",
+  "common.confirm": "确认",
+  "common.save": "保存",
+  "common.saving": "保存中…",
+  "common.close": "关闭",
+  "common.copy": "复制",
+  "common.showing": "显示 {shown} / 共 {total} 条。",
+  "common.total": "共 {total} 条",
+  "common.enabled": "已启用",
+  "common.disabled": "已停用",
+  "common.status": "状态",
+  "common.version": "版本",
+  "common.role": "角色",
+  "common.statusActive": "活跃",
+
+  // --- shell (Layout) -------------------------------------------------------
+  "nav.ariaLabel": "主导航",
+  "common.skipToContent": "跳到主要内容",
+  "common.previous": "上一页",
+  "common.next": "下一页",
+  "common.pageOf": "第 {page} 页",
+  "common.showingRange": "显示第 {from}–{to} 条，共 {total} 条。",
+  "brand.name": "B2B 智能客服",
+  "brand.sub": "企业管理控制台",
+  "footer.controlPlane": "控制平面 · v1",
+  "footer.token": "令牌",
+  "controls.theme": "切换白天 / 夜间模式",
+  "controls.lang": "切换语言（中/EN）",
+  "controls.themeTo": "{next}",
+  "controls.themeLight": "白天",
+  "controls.themeDark": "夜间",
+  "nav.quality": "质量看板",
+  "nav.gaps": "知识缺口",
+  "nav.prompts": "提示词发布",
+  "nav.flags": "功能开关",
+  "nav.cases": "工单与 SLA",
+  "nav.members": "成员",
+  "nav.usage": "用量与配额",
+  "nav.branding": "品牌",
+
+  // --- token dialog ---------------------------------------------------------
+  "token.title": "需要访问令牌",
+  "token.body":
+    "粘贴为你签发的访问令牌。它只保存在当前浏览器中，随时可以更换。",
+  "token.label": "令牌",
+  "token.connect": "连接",
+  "token.checking": "校验中…",
+  "token.errorEmpty": "请粘贴为你签发的访问令牌。",
+
+  // --- inline prompt --------------------------------------------------------
+  "prompt.required": "{label} 为必填项。",
+  "prompt.integer": "{label} 必须是整数。",
+  "prompt.min": "{label} 不能小于 {min}。",
+  "prompt.max": "{label} 不能大于 {max}。",
+
+  // --- quality dashboard ----------------------------------------------------
+  "quality.title": "质量看板",
+  "quality.subtitle": "所选时间窗口内，本租户的 Agent 运行结果。",
+  "quality.window1h": "近 1 小时",
+  "quality.window24h": "近 24 小时",
+  "quality.window30d": "近 30 天",
+  "quality.loading": "正在加载质量指标…",
+  "quality.empty":
+    "本时间窗口内没有 Agent 运行。还没有任何问题被提出 — 这里全是 0 表示没有流量，而不是流水线故障。",
+  "quality.totalRuns": "总运行数",
+  "quality.completed": "已完成",
+  "quality.abstentionRate": "弃答率",
+  "quality.handoffRate": "转人工率",
+  "quality.citationCoverage": "引用覆盖率",
+  "quality.failed": "失败",
+  "quality.latencyP50": "延迟 P50",
+  "quality.latencyP95": "延迟 P95",
+  "quality.supportedResolution": "有效解决率",
+  "quality.wrongResolution": "错误解决率",
+  "quality.resolutionOutcomes": "解决结果",
+  "quality.casesMeasured": "统计工单数",
+  "quality.resolutionHeld": "解决有效",
+  "quality.reopened": "解决后被重开",
+  "quality.noResolutions": "该窗口内没有已解决或被重开的工单，暂无解决结果可报。",
+  "quality.resolutionNote":
+    "按工单而非运行统计：解决后未被重开的工单计为有效解决，被重开计为无效。未解决工单（{open} 个）不计入，比率不随积压波动。",
+  "quality.outcomeMix": "结果构成",
+  "quality.abstained": "已弃答",
+  "quality.handedOff": "已转人工",
+  "quality.untimedRuns": "未计时运行",
+  "quality.routeDistribution": "路由分布",
+  "quality.route": "路由",
+  "quality.runs": "运行数",
+  "quality.noRouted": "该窗口内没有路由运行。",
+  "quality.routeUnavailable": "路由数据不可用。",
+  "route.knowledge_qa": "知识问答",
+  "route.human_required": "需人工",
+  "route.out_of_scope": "超出范围",
+  "route.business_read": "业务查询",
+  "route.business_write": "业务写入",
+
+  // --- gap queue ------------------------------------------------------------
+  "gaps.title": "知识缺口队列",
+  "gaps.subtitle": "机器人未能回答的问题，按需求频次排序。",
+  "gaps.statTotal": "缺口总数",
+  "gaps.statOccurrences": "累计出现",
+  "gaps.tabGaps": "缺口",
+  "gaps.tabDrafts": "草稿",
+  "gaps.statusFilter": "状态",
+  "gaps.loadingGaps": "正在加载缺口…",
+  "gaps.loadingDrafts": "正在加载草稿…",
+  "gaps.emptyGaps": "该状态下暂无缺口。",
+  "gaps.emptyDrafts": "暂无草稿。",
+  "gaps.headerSample": "示例问题",
+  "gaps.headerReason": "原因",
+  "gaps.headerFreq": "频次",
+  "gaps.headerLastSeen": "最近出现",
+  "gaps.headerTitle": "标题",
+  "gaps.headerReviewer": "评审人",
+  "gaps.claim": "认领",
+  "gaps.dismiss": "驳回",
+  "gaps.draft": "起稿",
+  "gaps.approve": "通过",
+  "gaps.reject": "退回",
+  "gaps.publish": "发布",
+  "gaps.claimed": "缺口已认领。",
+  "gaps.dismissed": "缺口已驳回。",
+  "gaps.draftCreated": "草稿已创建。",
+  "gaps.approved": "草稿已通过。",
+  "gaps.rejected": "草稿已退回。",
+  "gaps.published": "草稿已发布到知识空间。",
+  "gaps.spacesFailed": "无法加载知识空间，因此无法选择发布目标。",
+  "gaps.status.open": "待处理",
+  "gaps.status.acknowledged": "已认领",
+  "gaps.status.drafted": "已起草",
+  "gaps.status.resolved": "已解决",
+  "gaps.status.dismissed": "已驳回",
+  "gaps.status.pending": "待评审",
+  "gaps.status.approved": "已通过",
+  "gaps.dismissTitle": "驳回该缺口",
+  "gaps.dismissDetail": "驳回原因会记录在缺口上。",
+  "gaps.reasonLabel": "原因",
+  "gaps.draftAnswerTitle": "为该缺口起草答案",
+  "gaps.draftTitleLabel": "草稿标题",
+  "gaps.draftBodyLabel": "草稿答案",
+  "gaps.approveTitle": "通过“{title}”",
+  "gaps.approveDetail": "通过后草稿进入复审队列。",
+  "gaps.notesLabel": "评审备注",
+  "gaps.notesOptional": "可选",
+  "gaps.rejectTitle": "退回“{title}”",
+  "gaps.rejectNotesLabel": "退回原因",
+  "gaps.publishTitle": "发布“{title}”",
+  "gaps.spaceLabel": "目标知识空间",
+  "gaps.spaceHint": "尚无知识空间——请先创建一个再发布。",
+
+  // --- prompt release -------------------------------------------------------
+  "prompts.title": "提示词发布",
+  "prompts.subtitle": "编写、评估并发布提示词模板版本。",
+  "prompts.templatePlaceholder": "template_name",
+  "prompts.currentlyServing": "当前生效",
+  "prompts.newDraft": "新建草稿",
+  "prompts.bodyPlaceholder": "粘贴新的提示词正文…",
+  "prompts.createDraft": "创建草稿",
+  "prompts.draftCreated": "草稿已创建",
+  "prompts.candidate": "候选",
+  "prompts.submitted": "已提交为候选",
+  "prompts.promote": "发布",
+  "prompts.promoted": "已发布",
+  "prompts.reject": "退回",
+  "prompts.view": "查看",
+  "prompts.hide": "收起",
+  "prompts.rollback": "回滚到历史版本…",
+  "prompts.headerVersion": "版本",
+  "prompts.headerState": "状态",
+  "prompts.headerBody": "正文",
+  "prompts.stateServing": "生效中",
+  "prompts.statePublished": "已发布",
+  "prompts.stateDraft": "草稿",
+  "prompts.empty": "该模板尚无版本。",
+  "prompts.loading": "正在加载版本…",
+  "prompts.rejectReason": "退回原因",
+  "prompts.promoteConfirm": "将 v{version} 发布为生效版本？",
+  "prompts.promoteDetail": "从这一刻起，所有面向客户的回答都将随之改变。",
+  "prompts.rejectTitle": "退回 v{version}",
+  "prompts.rollbackTitle": "回滚到历史版本",
+  "prompts.rollbackDetail": "立即生效。",
+  "prompts.versionLabel": "版本",
+
+  // --- feature flags --------------------------------------------------------
+  "flags.title": "功能开关",
+  "flags.subtitle": "确定性的、金丝雀门控的平台能力放量。",
+  "flags.defineTitle": "定义开关",
+  "flags.keyPlaceholder": "flag_key",
+  "flags.descPlaceholder": "描述",
+  "flags.define": "定义",
+  "flags.loading": "正在加载功能开关…",
+  "flags.headerKey": "键",
+  "flags.headerDescription": "描述",
+  "flags.headerRollout": "放量",
+  "flags.headerState": "状态",
+  "flags.headerCreated": "创建时间",
+  "flags.enable": "启用",
+  "flags.disable": "停用",
+  "flags.setRollout": "设置放量",
+  "flags.rolloutTitle": "{key} 的放量百分比",
+  "flags.rolloutDetail": "0 表示对所有人停用；100 表示对整个租户启用。",
+  "flags.percentLabel": "百分比（0-100）",
+  "flags.empty": "尚无功能开关。",
+  "flags.invalidKey": "开关键只能包含字母、数字、点、下划线和连字符。",
+  "flags.defined": "开关 {key} 已定义。",
+  "flags.stateChanged": "{key} 已设为{state}。",
+  "flags.rolloutSet": "{key} 放量比例已设为 {percent}%。",
+
+  // --- cases ----------------------------------------------------------------
+  "cases.title": "工单与 SLA",
+  "cases.subtitle": "租户范围内的支持工单与 SLA 时钟。",
+  "cases.caseList": "工单列表",
+  "cases.emptyList": "暂无工单。",
+  "cases.selectCase": "选择一个工单查看详情与 SLA。",
+  "cases.loadingCases": "正在加载工单…",
+  "cases.loadingCase": "正在加载工单…",
+  "cases.category": "分类",
+  "cases.assignee": "负责人",
+  "cases.team": "团队",
+  "cases.opened": "创建时间",
+  "cases.firstResponseDue": "首次响应截止",
+  "cases.resolutionDue": "解决截止",
+  "cases.firstResponded": "首次响应",
+  "cases.resolvedAt": "解决时间",
+  "cases.commands": "操作",
+  "cases.recordFirstResponse": "记录首次响应",
+  "cases.recordFirstResponseConfirm": "将当前时间记为首次响应？",
+  "cases.recordFirstResponseDetail": "这会把首次响应 SLA 时钟记为当前时间，且无法撤销。",
+  "cases.transition": "流转…",
+  "cases.changePriority": "调整优先级…",
+  "cases.assign": "指派…",
+  "cases.transitionTitle": "流转到哪个状态？",
+  "cases.targetLabel": "目标状态",
+  "cases.priorityTitle": "调整优先级",
+  "cases.priorityLabel": "优先级",
+  "cases.assignTitle": "指派工单",
+  "cases.assignDetail": "两项均可留空；留空即取消指派。",
+  "cases.assigneeRef": "负责人标识",
+  "cases.teamRef": "团队标识",
+  "cases.optional": "可选",
+  "cases.commandApplied": "命令“{command}”已执行。",
+  "case.status.new": "新建",
+  "case.status.open": "处理中",
+  "case.status.pending_customer": "等待客户",
+  "case.status.escalated": "已升级",
+  "case.status.resolved": "已解决",
+  "case.status.closed": "已关闭",
+
+  // --- members --------------------------------------------------------------
+  "members.title": "成员",
+  "members.subtitle": "邀请并管理可访问本租户的成员。",
+  "members.inviteTitle": "邀请成员",
+  "members.invited": "已为 {email} 创建邀请。",
+  "members.roleChanged": "{email} 的角色已更新。",
+  "members.removed": "{email} 已失去本租户的访问权限。",
+  "members.emailPlaceholder": "person@company.com",
+  "members.sendInvite": "发送邀请",
+  "members.inviteCreated": "邀请已创建",
+  "members.copied": "令牌已复制到剪贴板。",
+  "members.headerMember": "成员",
+  "members.headerStatus": "状态",
+  "members.empty": "暂无成员。",
+  "members.loading": "正在加载成员…",
+  "members.changeRole": "修改角色",
+  "members.noToken": "未返回令牌",
+  "member.status.active": "活跃",
+  "members.remove": "移除",
+  "members.removeConfirm": "将 {email} 从本租户移除？",
+  "members.removeDetail": "对方将立即失去访问权限，其账号不会被删除。",
+  "members.changeRoleConfirm": "将 {email} 的角色改为 {role}？",
+  "members.changeRoleDetail": "在其下一次请求时生效。",
+  "role.tenant_owner": "租户所有者",
+  "role.security_admin": "安全管理员",
+  "role.support_admin": "支持管理员",
+  "role.knowledge_manager": "知识管理员",
+  "role.support_agent": "支持坐席",
+  "role.support_viewer": "支持观察者",
+  "role.integration_service": "集成服务",
+  "role.auditor": "审计员",
+
+  // --- usage & quota --------------------------------------------------------
+  "usage.title": "用量与配额",
+  "usage.subtitle": "本自然月（UTC）消耗的 Agent 运行数，以及其上限。",
+  "usage.changeQuota": "修改配额",
+  "usage.quotaPlaceholder": "不设上限",
+  "usage.quotaLabel": "每月运行配额",
+  "usage.runsUsed": "已用运行数",
+  "usage.quota": "配额",
+  "usage.remaining": "剩余",
+  "usage.promptTokens": "输入 token",
+  "usage.completionTokens": "输出 token",
+  "usage.consumed": "已用比例",
+  "usage.unlimited": "不设上限",
+  "usage.periodTitle": "本期",
+  "usage.window": "窗口",
+  "usage.overQuota": "已超配额 —— 新运行将被 429 拒绝",
+  "usage.acceptingRuns": "正常接单",
+  "usage.overQuotaNote":
+    "用量统计的是本期内启动的 Agent 运行。超配额时入队的运行会收到 429 拒绝而非静默丢弃，调用方因此能区分“因容量被拒”与“未找到证据”。",
+  "usage.quotaError": "配额必须是整数次运行，或留空表示不限。",
+  "usage.quotaCleared": "配额已清除 —— 该租户现在不限量。",
+  "usage.quotaSet": "配额已设为每自然月 {value} 次运行。",
+  "usage.ledgerTitle": "计费账本",
+  "usage.noPermission":
+    "你没有读取计费数据的权限。它需要审计读取角色（与访问审计日志相同的角色）—— 商业数据不属于支持角色。",
+  "usage.ledgerEntries": "账本条目",
+  "usage.usageEntries": "用量条目",
+  "usage.adjustments": "修正条目",
+  "usage.totalTokens": "总 token",
+  "usage.ledgerNote":
+    "账本是计算账单的依据，以用量事件为键，outbox 重投不会重复计费。修正是新增一条修正分录，从不改写 —— 因此修正后可能与上方的实时运行数不同。",
+  "usage.recordCorrection": "登记修正",
+  "usage.runId": "运行 id（uuid）",
+  "usage.promptDelta": "输入 token（如 -200）",
+  "usage.completionDelta": "输出 token",
+  "usage.reason": "原因（记入审计日志）",
+  "usage.record": "登记修正",
+  "usage.recording": "登记中…",
+  "usage.correctionRecorded": "修正已登记。",
+  "usage.duplicate": "该修正已登记过（请求键被复用），未产生任何变更。",
+  "usage.errRunId": "必须填写被误记用量的运行 id。",
+  "usage.errReason": "必须填写原因 —— 它会记入审计日志。",
+  "usage.errWhole": "token 增减量必须是整数。",
+  "usage.errChange": "修正至少要改动一个 token 计数。",
+  "usage.loadUsage": "正在加载用量…",
+  "usage.loadLedger": "正在加载账本…",
+
+  // --- branding -------------------------------------------------------------
+  "branding.title": "品牌",
+  "branding.subtitle": "本租户在产品中与对客户呈现的形象。",
+  "branding.settings": "设置",
+  "branding.preview": "预览",
+  "branding.displayName": "显示名称",
+  "branding.logoUrl": "Logo 地址",
+  "branding.primaryColour": "主色",
+  "branding.supportEmail": "支持邮箱",
+  "branding.namePlaceholder": "某某客服",
+  "branding.logoPlaceholder": "https://cdn.example.com/logo.png",
+  "branding.emailPlaceholder": "help@acme.example",
+  "branding.saved": "品牌信息已保存。",
+  "branding.loading": "正在加载品牌信息…",
+  "branding.noLogo": "无 Logo",
+  "branding.logoFailed": "该 URL 无法加载，因此没有可预览的内容。",
+  "branding.unsaved": "有未保存的修改",
+  "branding.untitled": "未命名租户",
+  "branding.noSupport": "未设置支持邮箱",
+
+  // --- error boundary & 404 -----------------------------------------------
+  "error.title": "此页面无法显示",
+  "error.body":
+    "渲染时发生错误。控制台其余部分仍可正常使用 — 可重试，或从侧边栏打开其它页面。",
+  "error.retry": "重试",
+  "error.details": "技术细节",
+  "error.forbidden":
+    "你没有权限读取此项{scope}。这需要当前账号不具备的角色 — 请联系租户所有者授权，或切换到具备该角色的账号。",
+  "notFound.title": "页面不存在",
+  "notFound.body": "{path} 没有对应的页面，可能已被重命名或移除。",
+  "notFound.home": "返回质量看板",
+};
+
+export type Dict = typeof en;
+export type DictKey = keyof Dict;
+
+function interpolate(template: string, vars?: Record<string, string | number>): string {
+  if (!vars) return template;
+  return template.replace(/\{(\w+)\}/g, (match, name: string) =>
+    name in vars ? String(vars[name]) : match,
+  );
+}
+
+interface LangState {
+  lang: Lang;
+  setLang: (lang: Lang) => void;
+  t: (key: DictKey, vars?: Record<string, string | number>) => string;
+}
+
+const LangContext = createContext<LangState | null>(null);
+
+const STORAGE_KEY = "b2b_lang";
+
+function initialLang(): Lang {
+  const saved = localStorage.getItem(STORAGE_KEY);
+  if (saved === "zh" || saved === "en") return saved;
+  return navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
+export function LangProvider({ children }: { children: ReactNode }) {
+  const [lang, setLangState] = useState<Lang>(initialLang);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, lang);
+    // The a11y contract: a screen reader must be told which language to
+    // speak, which a `lang` attribute is the only way to express.
+    document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+  }, [lang]);
+
+  const setLang = useCallback((next: Lang) => setLangState(next), []);
+
+  const t = useCallback(
+    (key: DictKey, vars?: Record<string, string | number>): string => {
+      const template = lang === "zh" ? zh[key] : en[key];
+      if (template === undefined) {
+        // Unknown key: degrade to the value itself (API enums read as
+        // themselves) instead of rendering a bare dotted path.
+        return key.split(".").pop() ?? key;
+      }
+      return interpolate(template, vars);
+    },
+    [lang],
+  );
+
+  const value = useMemo(() => ({ lang, setLang, t }), [lang, setLang, t]);
+  return <LangContext.Provider value={value}>{children}</LangContext.Provider>;
+}
+
+export function useLang(): LangState {
+  const state = useContext(LangContext);
+  if (state === null) {
+    // A page rendering outside the provider is a wiring bug; failing loudly
+    // beats rendering half-translated.
+    throw new Error("useLang must be used inside <LangProvider>");
+  }
+  return state;
+}
+
+/**
+ * `useLang` for code that must render even when the provider is missing or
+ * is itself what failed.
+ *
+ * The error boundary and the route error element render outside the shell,
+ * so `useLang` would throw there and turn a recoverable page error into a
+ * blank screen — the exact failure this guards against. This reads the same
+ * context but falls back to the persisted language instead of throwing.
+ */
+export function useLangSafe(): LangState {
+  const state = useContext(LangContext);
+  const fallbackLang = state === null ? initialLang() : state.lang;
+  const t = useMemo(
+    () =>
+      (key: DictKey, vars?: Record<string, string | number>): string => {
+        const template = fallbackLang === "zh" ? zh[key] : en[key];
+        if (template === undefined) return key.split(".").pop() ?? key;
+        return interpolate(template, vars);
+      },
+    [fallbackLang],
+  );
+  return useMemo(
+    () => ({
+      lang: fallbackLang,
+      setLang: state?.setLang ?? (() => undefined),
+      t,
+    }),
+    [fallbackLang, state, t],
+  );
+}

@@ -62,7 +62,7 @@ router = APIRouter(prefix="/v1/tool-proposals", tags=["tool-gateway"])
 PROPOSAL_NOT_FOUND = "PROPOSAL_NOT_FOUND"
 TOOL_EXECUTOR_MISSING = "TOOL_EXECUTOR_MISSING"
 TOOL_EXECUTION_ERROR = "TOOL_EXECUTION_ERROR"
-TOOL_INPUT_INVALID = "TOOL_ARGS_INVALID"
+TOOL_ARGS_INVALID = "TOOL_ARGS_INVALID"
 
 # Gateway code -> HTTP status. A code absent from this map is a server-side
 # programming error and becomes a 500 with a generic code, never a silent
@@ -70,7 +70,7 @@ TOOL_INPUT_INVALID = "TOOL_ARGS_INVALID"
 _STATUS_BY_CODE: dict[str, int] = {
     "TOOL_NOT_REGISTERED": 404,
     "TOOL_PROHIBITED": 403,
-    "TOOL_ARGS_INVALID": 400,
+    TOOL_ARGS_INVALID: 400,
     "PROPOSAL_NOT_FOUND": 404,
     "PROPOSAL_NOT_CONFIRMABLE": 409,
     "PROPOSAL_NOT_EXECUTABLE": 409,
@@ -254,6 +254,7 @@ async def propose_tool_call(request: Request, body: ToolProposeIn) -> Any:
                 role=ctx.role or "unknown",
                 idempotency_key=idem,
                 permission_allowed=True,
+                required_action=required_action.value,
             )
         except ToolGatewayError as exc:
             await audit_service.record(

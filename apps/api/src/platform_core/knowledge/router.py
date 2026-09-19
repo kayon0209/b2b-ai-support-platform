@@ -5,6 +5,7 @@
     GET  /v1/knowledge/versions/{id}              fetch one version's status
     POST /v1/knowledge/versions/{id}/ready        mark ingestion complete
     POST /v1/knowledge/versions/{id}/download-url mint a short-lived download URL
+    GET  /v1/knowledge/spaces                     list spaces (draft publish targets)
 
 Why this router exists
 ----------------------
@@ -28,18 +29,21 @@ would put document content through the API's memory, its logs, and its request
 timeouts, and would make revocation meaningless.
 """
 
+import time
 import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from platform_core.api import error_response, require_write_idempotency, tenant_session
 from platform_core.config import get_settings
 from platform_core.identity import tenant_context
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.knowledge import service
+from platform_core.knowledge.models import KnowledgeSpace
 from platform_policy import Action, Decision, PolicyEngine, Principal
 
 router = APIRouter(prefix="/v1/knowledge", tags=["knowledge"])
@@ -212,6 +216,27 @@ async def upload_document(
     }
 
 
+@router.get("/spaces")
+async def list_spaces(request: Request) -> Any:
+    """Knowledge spaces, for draft publish targeting and similar pickers.
+
+    Exists because the gap-queue publish flow needs to name a space and an
+    operator has no other way to look up a space id than this list.
+    """
+    ctx = _ctx_of(request)
+    denial = _gate(request, ctx, Action.KNOWLEDGE_READ, "knowledge.read")
+    if denial is not None:
+        return denial
+
+    async with tenant_session(ctx) as session:
+        rows = (
+            (await session.execute(select(KnowledgeSpace).order_by(KnowledgeSpace.name)))
+            .scalars()
+            .all()
+        )
+    return {"items": [{"id": str(row.id), "name": row.name} for row in rows], "total": len(rows)}
+
+
 @router.get("/documents/{document_id}/versions")
 async def list_document_versions(request: Request, document_id: str) -> Any:
     ctx = _ctx_of(request)
@@ -343,3 +368,94 @@ async def create_download_url(
         "url": url,
         "expires_seconds": min(requested, get_settings().presign_expiry_seconds),
     }
+
+
+# --- Alias management (plan 1.3) --------------------------------------------
+
+
+class AliasIn(BaseModel):
+    term: str = Field(min_length=1, max_length=127)
+    alias: str = Field(min_length=1, max_length=127)
+    # Multiplier scale, matching the DB CHECK `weight > 0 AND weight <= 2`:
+    # 1.0 is neutral, 2.0 doubles a term's pull. (An earlier draft spoke
+    # percent and crashed on its own default against that CHECK.)
+    weight: float = Field(default=1.0, gt=0, le=2)
+
+
+@router.get("/aliases")
+async def list_aliases(request: Request) -> Any:
+    """The tenant's alias table, as (term, alias, weight) rows."""
+    ctx = _ctx_of(request)
+    denial = _gate(request, ctx, Action.KNOWLEDGE_READ, "knowledge.read")
+    if denial is not None:
+        return denial
+
+    from platform_core.knowledge.models import KnowledgeAlias
+
+    async with tenant_session(ctx) as session:
+        rows = (
+            (await session.execute(select(KnowledgeAlias).order_by(KnowledgeAlias.alias)))
+            .scalars()
+            .all()
+        )
+    return {
+        "items": [{"term": r.term, "alias": r.alias, "weight": float(r.weight)} for r in rows],
+        "total": len(rows),
+    }
+
+
+@router.post("/aliases")
+async def upsert_alias(request: Request, body: AliasIn) -> Any:
+    """Create or update one alias. Upsert, because a corrected mapping should
+    replace the wrong one, not fight it on the unique constraint."""
+    ctx = _ctx_of(request)
+    denial = _gate(request, ctx, Action.KNOWLEDGE_UPLOAD, "knowledge.upload")
+    if denial is not None:
+        return denial
+
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from platform_core.knowledge.models import KnowledgeAlias
+
+    async with tenant_session(ctx) as session:
+        stmt = (
+            pg_insert(KnowledgeAlias)
+            .values(
+                tenant_id=ctx.tenant_id,
+                term=body.term.strip().lower(),
+                alias=body.alias.strip().lower(),
+                weight=body.weight,
+                created_at=int(time.time()),
+            )
+            .on_conflict_do_update(
+                # Migration 0033 created `uq_aliases_tenant_alias` as a UNIQUE
+                # INDEX, and `ON CONFLICT ON CONSTRAINT` only accepts a table
+                # constraint — inferring on the indexed columns is the form
+                # that works against both.
+                index_elements=["tenant_id", "alias"],
+                set_={"term": body.term.strip().lower(), "weight": body.weight},
+            )
+        )
+        await session.execute(stmt)
+    return {"status": "ok"}
+
+
+@router.delete("/aliases/{alias}")
+async def delete_alias(request: Request, alias: str) -> Any:
+    ctx = _ctx_of(request)
+    denial = _gate(request, ctx, Action.KNOWLEDGE_UPLOAD, "knowledge.upload")
+    if denial is not None:
+        return denial
+
+    from sqlalchemy import delete as sa_delete
+
+    from platform_core.knowledge.models import KnowledgeAlias
+
+    async with tenant_session(ctx) as session:
+        await session.execute(
+            sa_delete(KnowledgeAlias).where(
+                KnowledgeAlias.tenant_id == ctx.tenant_id,
+                KnowledgeAlias.alias == alias.strip().lower(),
+            )
+        )
+    return {"status": "ok"}

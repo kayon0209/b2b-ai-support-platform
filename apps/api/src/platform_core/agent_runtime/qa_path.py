@@ -13,9 +13,14 @@ import hashlib
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from platform_core.retrieval.hybrid import RetrievedChunk
+
+if TYPE_CHECKING:
+    # `conversation` is imported for typing only: it imports this module's
+    # stemming helpers, so a module-scope import would be a cycle.
+    from platform_core.agent_runtime.conversation import CompactedContext
 
 
 class CitationError(Exception):
@@ -54,9 +59,23 @@ class ValidationResult:
 class AnswerGenerator(Protocol):
     """Pluggable LLM boundary. Implementations receive redacted, minimized
     context and return a DraftAnswer. Never executed synchronously in the
-    webhook path."""
+    webhook path.
 
-    async def generate(self, question: str, evidence: list[RetrievedChunk]) -> DraftAnswer: ...
+    `context` and `retrieval_query` are keyword-only and optional because they
+    are *additions* to the single-turn contract, not a replacement for it: a
+    generator that ignores them answers exactly as it did before, which is what
+    lets the evaluation harness and the single-turn tests keep working while
+    the production path gains multi-turn context.
+    """
+
+    async def generate(
+        self,
+        question: str,
+        evidence: list[RetrievedChunk],
+        *,
+        context: "CompactedContext | None" = None,
+        retrieval_query: str = "",
+    ) -> DraftAnswer: ...
 
 
 # --- Claim support (metric, not a guard) -----------------------------------
@@ -148,6 +167,51 @@ def claim_contradiction_candidates(draft: DraftAnswer, evidence: list[RetrievedC
     return candidates
 
 
+# --- Red-line commercial commitments (huqiu research, difficulty 4) --------
+#
+# Five things the model must never state on its own: price, delivery date,
+# liability, compensation amount, contract terms. A B2B answer containing
+# one is a commercial commitment made in the company's name without any
+# authorising source. Detected deterministically: a COMMITMENT verb and a
+# COMMERCIAL OBJECT in the same sentence. Measured first (metric), then
+# flag-gated as a guard - same discipline as the contradiction candidates.
+#
+# Both word lists are stems-aware for latin and bigram-friendly for CJK:
+# "承诺" matches inside "我方承诺交期", "guarantee" matches "guaranteed".
+
+_REDLINE_COMMITMENT = re.compile(
+    r"保证|承诺|担保|确保|肯定能|一定能|绝对能|可以保证|"
+    r"we guarantee|we promise|i (?:can )?assure|guaranteed|is guaranteed",
+    re.IGNORECASE,
+)
+_REDLINE_OBJECT = re.compile(
+    r"价格|报价|交期|交付日期|发货时间|赔偿|赔付|退款金额|折扣|库存数量|"
+    r"合同条款|price|pricing|lead time|delivery date|ship date|"
+    r"compensation|refund amount|discount",
+    re.IGNORECASE,
+)
+
+
+def redline_violations(text: str) -> list[str]:
+    """Sentences where the model makes an unauthorised commercial commitment.
+
+    Returns the offending sentences (bounded), so a reported candidate can be
+    judged by eye instead of re-run - the same contract as
+    `claim_contradiction_candidates`. Never raised, only reported: the flag
+    decides whether it blocks the send.
+    """
+    violations: list[str] = []
+    for sentence in re.split(r"[。！？.!?" + chr(10) + "]", text):
+        stripped = sentence.strip()
+        if not stripped:
+            continue
+        if _REDLINE_COMMITMENT.search(stripped) and _REDLINE_OBJECT.search(stripped):
+            violations.append(stripped[:160])
+            if len(violations) >= 5:
+                break
+    return violations
+
+
 def validate_citations(draft: DraftAnswer, evidence: list[RetrievedChunk]) -> ValidationResult:
     """Citation validator (ticket 17).
 
@@ -207,6 +271,20 @@ ABSTAIN_AMBIGUOUS_IDENTITY = "AMBIGUOUS_ACCOUNT_IDENTITY"
 # The customer asked the platform to *do* something, not to explain something.
 # The QA path answers from documents, so it must not answer this at all.
 ABSTAIN_ACTION_REQUEST = "ACTION_REQUEST"
+# The customer asked something the platform has explicitly been told to route
+# to a person (an explicit human request, or a sensitive-data request).
+ABSTAIN_HUMAN_REQUIRED = "HUMAN_REQUIRED"
+ABSTAIN_SENSITIVE_REQUEST = "SENSITIVE_REQUEST"
+# The question was out of scope: not a knowledge question at all (a greeting,
+# or nothing recognizable). There is no corpus that could answer it, so
+# retrieving would only produce noise that looks like evidence.
+ABSTAIN_OUT_OF_SCOPE = "OUT_OF_SCOPE"
+# The question cannot be answered as written but the customer is present and
+# one detail would unblock it. **A clarification, not a handoff**: the
+# distinction is that a handoff ends the AI's involvement and a clarification
+# invites the customer back. Conflating them turns every vague first message
+# into a ticket.
+ABSTAIN_CLARIFICATION = "NEEDS_CLARIFICATION"
 
 
 @dataclass
@@ -558,9 +636,39 @@ def _content_terms(text_input: str) -> set[str]:
     The length filter alone is not enough — "the", "who", "what" pass it and
     would let an unrelated question look grounded. Dropping stopwords first
     makes the overlap signal depend on topic words only.
+
+    CJK text needs different treatment: `\w+` matches a whole Chinese
+    sentence as ONE token, so every character of it rides inside a single
+    term and overlap granularity collapses to "the whole sentence matched or
+    nothing did". CJK runs are therefore segmented into character bigrams —
+    the standard lightweight segmentation, and the same granularity
+    pg_trgm's trigram path works at — so "退款政策" yields 退款/款政/政策
+    and a question about 退款 overlaps a passage about 退款政策 without
+    matching the entire sentence.
     """
     tokens = re.findall(r"\w+", text_input.lower())
-    return {_stem(t) for t in tokens if len(t) > 2 and t not in STOPWORDS}
+    terms: set[str] = set()
+    for token in tokens:
+        if _CJK_RUN.search(token):
+            # Mixed script ("账户abc123"): keep the latin remainder as its own
+            # term and let the CJK run below produce the bigrams.
+            latin = _CJK_RUN.sub("", token)
+            if len(latin) > 2 and latin not in STOPWORDS:
+                terms.add(_stem(latin))
+            continue
+        if len(token) > 2 and token not in STOPWORDS:
+            terms.add(_stem(token))
+    for run in _CJK_RUN.findall(text_input):
+        if len(run) == 1:
+            terms.add(run)
+            continue
+        terms.update(run[i : i + 2] for i in range(len(run) - 1))
+    return terms
+
+
+# CJK ideographs (incl. ext-A) and kana/hangul runs; segmenting these into
+# n-grams is what makes lexical matching work at all for CJK queries.
+_CJK_RUN = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]+")
 
 
 def _query_terms(query: str) -> set[str]:
@@ -676,6 +784,15 @@ ACTION_VERBS = frozenset(
         "charge",
         "reassign",
         "escalate",
+        # Mutations the platform performs on a customer's behalf. "change the
+        # delivery address" is a write the taxonomy must route to the gateway,
+        # not a procedure question: without these, the polite request form
+        # ("can I change...") carried no write signal at all. The evaluation
+        # dataset contains no procedural "change/update/modify" case that must
+        # stay on the knowledge path (checked when these were added).
+        "change",
+        "update",
+        "modify",
     )
 )
 
@@ -956,6 +1073,28 @@ def safe_abstention_text(reason_code: str) -> str:
             "to you. Let me connect you with a human colleague who can confirm "
             "your terms."
         )
+    if reason_code == ABSTAIN_CLARIFICATION:
+        # Asks for the minimum useful detail and stays in the conversation.
+        # The abstention text above offers a human colleague as the *next*
+        # step; here that would be wrong, because nothing has failed - the
+        # question is just incomplete, and sending a customer to a queue for
+        # typing one short message is how a support queue fills up.
+        return (
+            "Could you give me a little more detail? I want to make sure I "
+            "answer the right question."
+        )
+    if reason_code in (ABSTAIN_HUMAN_REQUIRED, ABSTAIN_SENSITIVE_REQUEST):
+        # Does not explain itself beyond "a person will help". Naming *why*
+        # the topic is restricted would confirm to an attacker that the
+        # question hit a sensitive class, which is the enumeration the
+        # platform avoids elsewhere (see `identity.repository`).
+        return "Let me connect you with a human colleague who can help with that."
+    if reason_code == ABSTAIN_OUT_OF_SCOPE:
+        return (
+            "I can help with questions about your account, orders and our "
+            "documented policies. Let me know what you'd like to know, or I "
+            "can connect you with a human colleague."
+        )
     return (
         "I couldn't verify an answer from our authorized knowledge base. "
         "I can connect you with a human colleague, or you can rephrase the "
@@ -1022,3 +1161,12 @@ def _is_identity_dependent(question: str) -> bool:
     # A question about general policy ("how do refunds work") does not
     # need account resolution; "am I eligible" does.
     return bool(q_terms & identity_terms)
+
+
+# Public aliases for the action-request vocabulary. `intent` classifies an
+# inbound message with the same gate `decide_abstention` applies to an answer,
+# so it must reach these without importing private names across the module
+# boundary - the two must not disagree about what counts as a request to act.
+action_verbs = ACTION_VERBS
+object_markers = _OBJECT_MARKERS
+is_action_request = _is_action_request

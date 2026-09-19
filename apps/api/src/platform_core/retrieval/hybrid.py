@@ -1,23 +1,99 @@
-"""Hybrid retrieval service (ticket 14).
+"""Hybrid retrieval service (ticket 14; iteration plan 1.3/1.5/1.7/4.5).
 
 Pipeline (docs/architecture.md search architecture):
-  ACL/tenant pre-filter -> FTS candidates + vector candidates -> rank
-  fusion (RRF) -> optional reranker -> citations
+  ACL/tenant/metadata pre-filter -> FTS + vector + trigram + alias-expanded
+  candidates -> rank fusion (RRF) -> optional authority boost -> optional
+  reranker -> relative score floor -> citations
 
 Scores are ranking diagnostics, never confidence probabilities
 (docs/api-contracts.md). Only active, unexpired, authorized versions are
 retrievable (docs/domain-model.md knowledge rule).
+
+Why four paths
+--------------
+No single lexical or dense path covers the query distribution:
+
+- FTS matches whole tokens: misses typos, fault codes with an OCR'd letter,
+  and every CJK query (`'simple' tsquery` has no CJK segmentation);
+- vector recall is semantic but weak on exact identifiers, where a hash of
+  the wrong token still lands near neighbours;
+- trigram similarity is character-level, which covers typos, fault codes
+  and CJK bigrams, but ranks poorly on long natural-language questions;
+- the alias path injects tenant vocabulary ("GC-500" == "GateWay 500")
+  that no generic embedding can know.
+
+Each path can be disabled independently (`enabled_paths`), and its
+per-candidate ranks are recorded on every result's `ranking` dict, so the
+contribution of one path is measurable by turning it off and diffing the
+recall report — not by arguing about it.
 """
 
+import json
 import struct
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-RRF_K = 60  # standard reciprocal-rank-fusion constant
+RRF_K = 60  # standard reciprocal-rank-fusion constant; config may override
+
+# The retrieval paths, as a closed vocabulary: ranking dicts, metrics and the
+# enabled-paths config all key on these, and a typo in a config value must be
+# a validation error rather than a silently disabled path.
+RETRIEVAL_PATHS: tuple[str, ...] = ("fts", "vector", "trigram", "alias")
+
+# Metadata keys the filter is allowed to constrain on (plan 1.5). Shared with
+# ingest.extract_front_matter's vocabulary: a key not listed here is
+# free-form document metadata, never a retrieval constraint, and a client
+# cannot invent a new one by sending it.
+METADATA_FILTER_KEYS: frozenset[str] = frozenset(
+    {
+        "product",
+        "model",
+        "hardware_version",
+        "firmware_version",
+        "region",
+        "language",
+        "doc_type",
+        "classification",
+        "authority",
+    }
+)
+
+
+@dataclass(frozen=True)
+class MetadataFilter:
+    """Equality constraints matched against chunk metadata via JSONB
+    containment (`metadata @> {...}`), applied in SQL before scoring.
+
+    Built only from allowlisted keys; values are server-side entities
+    (intent extraction, front matter), never raw client filters."""
+
+    conditions: Mapping[str, str]
+
+    def is_empty(self) -> bool:
+        return not self.conditions
+
+    def as_metadata(self) -> dict[str, str]:
+        return dict(self.conditions)
+
+
+def build_metadata_filter(values: Mapping[str, Any] | None) -> MetadataFilter:
+    """Validate and build a filter; unknown keys raise.
+
+    Raising (not silently dropping) is deliberate: a caller passing an
+    unallowlisted key is a code bug that would otherwise turn a targeted
+    retrieval into an unfiltered one with nothing in the logs."""
+    if not values:
+        return MetadataFilter({})
+    unknown = sorted(set(values) - METADATA_FILTER_KEYS)
+    if unknown:
+        raise ValueError(f"metadata filter keys not allowed: {unknown}")
+    conditions = {str(k): str(v).strip().lower() for k, v in values.items() if str(v).strip()}
+    return MetadataFilter(conditions)
 
 
 class Embedder(Protocol):
@@ -45,7 +121,9 @@ class PrincipalScope:
 @dataclass
 class RetrievedChunk:
     chunk_id: uuid.UUID
-    document_version_id: uuid.UUID
+    # None for tool-receipt pseudo-chunks (plan 3.4): the receipt's provenance
+    # is its source_uri, not a document.
+    document_version_id: uuid.UUID | None
     title: str
     section_path: list[str]
     excerpt: str
@@ -122,6 +200,39 @@ class ProviderEmbedder:
         return list(result.vectors[0])
 
 
+async def load_aliases(session: AsyncSession, tenant_id: uuid.UUID) -> list[tuple[str, str, float]]:
+    """Tenant alias rows as (alias, term, weight). Small table, read whole.
+
+    Expansion happens in Python: matching aliases against query tokens here
+    is one query and deterministic, whereas doing it in SQL per token is N
+    queries to arrive at the same answer.
+    """
+    rows = await session.execute(
+        text(
+            "SELECT alias, term, weight FROM knowledge_aliases WHERE tenant_id = CAST(:tid AS uuid)"
+        ),
+        {"tid": str(tenant_id)},
+    )
+    return [(r.alias.lower(), r.term.lower(), float(r.weight)) for r in rows.fetchall()]
+
+
+def expand_with_aliases(query: str, aliases: list[tuple[str, str, float]]) -> tuple[str, list[str]]:
+    """Append canonical terms for aliases present in the query.
+
+    Additive, like `conversation.rewrite_query`: the customer's surface
+    string is kept untouched and canonical terms are appended, so anything
+    that matched before still matches. Returns (expanded_query, applied_terms).
+    """
+    lowered = query.lower()
+    applied: list[str] = []
+    for alias, term, _weight in aliases:
+        if alias and alias in lowered and term not in lowered:
+            applied.append(term)
+    if not applied:
+        return query, []
+    return f"{query} {' '.join(sorted(applied))}", applied
+
+
 async def hybrid_search(
     session: AsyncSession,
     *,
@@ -133,9 +244,17 @@ async def hybrid_search(
     now_ts: int | None = None,
     fts_candidates: int = 40,
     vector_candidates: int = 40,
+    trigram_candidates: int = 40,
+    alias_candidates: int = 20,
+    metadata_filter: MetadataFilter | None = None,
+    enabled_paths: tuple[str, ...] | None = None,
+    rrf_k: int = RRF_K,
+    aliases: list[tuple[str, str, float]] | None = None,
+    authority_boost: Mapping[str, float] | None = None,
     embedder: Embedder | None = None,
 ) -> list[RetrievedChunk]:
-    """Run FTS + vector search under tenant/ACL filter, fuse with RRF.
+    """Run the enabled retrieval paths under tenant/ACL/metadata filter,
+    fuse with RRF, optionally boost by document authority.
 
     The tenant filter is applied in SQL before any candidate is scored
     (pre-filter, not post-filter), per docs/security.md retrieval rules.
@@ -146,27 +265,49 @@ async def hybrid_search(
     `embedder` selects the query vector source. Omitting it falls back to
     the deterministic test embedder so existing call sites and tests keep
     working; production callers must pass a provider-backed embedder.
+
+    `enabled_paths` defaults to every path; passing a subset is how a path's
+    contribution to recall is measured (plan 1.3). An unknown path name
+    raises rather than being ignored — a typo'd config must not silently
+    narrow retrieval.
     """
     import time
 
+    paths = enabled_paths or RETRIEVAL_PATHS
+    unknown = sorted(set(paths) - set(RETRIEVAL_PATHS))
+    if unknown:
+        raise ValueError(f"unknown retrieval paths: {unknown}")
+
     now = now_ts or int(time.time())
-    active_embedder: Embedder = embedder or DeterministicEmbedder()
-    vec = await active_embedder.embed_query(query)
-    space_filter = ""
     params: dict[str, Any] = {
         "tid": str(tenant_id),
         "q": query,
-        "vec": _vector_literal(vec),
         "fts_k": fts_candidates,
-        "vec_k": vector_candidates,
         "now": now,
     }
+
     # space_filter is built from a code-owned constant, never user
     # input; all values flow through bound parameters (S608 suppressed
     # for this file in pyproject).
+    space_filter = ""
     if knowledge_space_ids:
         space_filter = "AND d.space_id = ANY(:space_ids)"
         params["space_ids"] = [str(s) for s in knowledge_space_ids]
+
+    # Metadata filter (plan 1.5): JSONB containment on the chunk row, bound
+    # as a parameter. The filter object was validated at construction, so no
+    # key here is client-invented.
+    metadata_predicate = ""
+    if metadata_filter and not metadata_filter.is_empty():
+        # Match on the chunk's own metadata AND its version's front matter:
+        # the filter's data source is document front matter (ingested into
+        # version metadata), while chunk-level tags (content_kind, ...) live
+        # on the chunk. Either carrying the value makes the chunk match.
+        metadata_predicate = (
+            "AND (c.metadata @> CAST(:meta_filter AS jsonb) "
+            "OR dv.metadata @> CAST(:meta_filter AS jsonb))"
+        )
+        params["meta_filter"] = json.dumps(metadata_filter.as_metadata())
 
     if principal is not None:
         # Fail closed: any resource carrying ACL entries must include a
@@ -184,79 +325,149 @@ async def hybrid_search(
     else:
         acl = ""
 
-    fts_sql = text(
-        f"""
-        SELECT c.id, c.document_version_id, c.section_path, c.text,
-               d.title, dv.object_uri AS source_uri,
-               ts_rank(c.search_vector, websearch_to_tsquery('simple', :q)) AS fts_score
-        FROM chunks c
-        JOIN document_versions dv ON dv.id = c.document_version_id
-        JOIN documents d ON d.id = dv.document_id
+    base_where = f"""
         WHERE c.tenant_id = CAST(:tid AS uuid)
           AND dv.status = 'active'
           AND (dv.effective_at IS NULL OR dv.effective_at <= :now)
           AND (dv.expires_at IS NULL OR dv.expires_at > :now)
           {space_filter}
+          {metadata_predicate}
           {acl}
+    """
+    # `authority` (plan 4.5) travels with every row so the post-fusion boost
+    # reads it from the representative row rather than issuing another query.
+    select_cols = (
+        "c.id, c.document_version_id, c.section_path, c.text, "
+        "d.title, dv.object_uri AS source_uri, dv.metadata->>'authority' AS authority"
+    )
+
+    fts_sql = text(
+        f"""
+        SELECT {select_cols},
+               ts_rank(c.search_vector, websearch_to_tsquery('simple', :q)) AS fts_score
+        FROM chunks c
+        JOIN document_versions dv ON dv.id = c.document_version_id
+        JOIN documents d ON d.id = dv.document_id
+        {base_where}
           AND c.search_vector @@ websearch_to_tsquery('simple', :q)
         ORDER BY fts_score DESC
         LIMIT :fts_k
         """
     )
+
+    trigram_sql = text(
+        f"""
+        SELECT {select_cols},
+               similarity(c.text, :q) AS trigram_score
+        FROM chunks c
+        JOIN document_versions dv ON dv.id = c.document_version_id
+        JOIN documents d ON d.id = dv.document_id
+        {base_where}
+          AND similarity(c.text, :q) > 0.02
+        ORDER BY trigram_score DESC
+        LIMIT :tri_k
+        """
+    )
+    params["tri_k"] = trigram_candidates
+
     vec_sql = text(
         f"""
-        SELECT c.id, c.document_version_id, c.section_path, c.text,
-               d.title, dv.object_uri AS source_uri,
+        SELECT {select_cols},
                1 - (c.embedding <=> CAST(:vec AS vector)) AS vec_score
         FROM chunks c
         JOIN document_versions dv ON dv.id = c.document_version_id
         JOIN documents d ON d.id = dv.document_id
-        WHERE c.tenant_id = CAST(:tid AS uuid)
-          AND dv.status = 'active'
-          AND (dv.effective_at IS NULL OR dv.effective_at <= :now)
-          AND (dv.expires_at IS NULL OR dv.expires_at > :now)
-          {space_filter}
-          {acl}
+        {base_where}
           AND c.embedding IS NOT NULL
         ORDER BY c.embedding <=> CAST(:vec AS vector)
         LIMIT :vec_k
         """
     )
+    params["vec_k"] = vector_candidates
 
-    fts_rows = (await session.execute(fts_sql, params)).mappings().all()
-    vec_rows = (await session.execute(vec_sql, params)).mappings().all()
+    from sqlalchemy.engine import RowMapping
 
-    # Reciprocal rank fusion over the two ranked lists.
-    # chunk id -> {source_name: rank_or_score}; accumulated across sources
+    results: dict[str, list[RowMapping]] = {}
+
+    if "fts" in paths:
+        results["fts"] = list((await session.execute(fts_sql, params)).mappings().all())
+
+    if "vector" in paths:
+        active_embedder: Embedder = embedder or DeterministicEmbedder()
+        vec = await active_embedder.embed_query(query)
+        params["vec"] = _vector_literal(vec)
+        results["vector"] = list((await session.execute(vec_sql, params)).mappings().all())
+
+    if "trigram" in paths:
+        results["trigram"] = list((await session.execute(trigram_sql, params)).mappings().all())
+
+    if "alias" in paths:
+        alias_rows = aliases if aliases is not None else await load_aliases(session, tenant_id)
+        expanded, applied = expand_with_aliases(query, alias_rows)
+        if applied:
+            alias_sql = text(
+                f"""
+                SELECT {select_cols},
+                       ts_rank(c.search_vector, websearch_to_tsquery('simple', :aq)) AS alias_score
+                FROM chunks c
+                JOIN document_versions dv ON dv.id = c.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                {base_where}
+                  AND c.search_vector @@ websearch_to_tsquery('simple', :aq)
+                ORDER BY alias_score DESC
+                LIMIT :alias_k
+                """
+            )
+            alias_params = dict(params)
+            alias_params["aq"] = expanded
+            alias_params["alias_k"] = alias_candidates
+            results["alias"] = list(
+                (await session.execute(alias_sql, alias_params)).mappings().all()
+            )
+
+    # Reciprocal rank fusion over the enabled ranked lists.
+    # chunk id -> accumulated RRF + per-path scores + representative row.
     scores: dict[uuid.UUID, dict[str, Any]] = {}
-    for rank, row in enumerate(fts_rows):
-        cid = row["id"]
-        entry = scores.setdefault(
-            cid,
-            {
-                "row": row,
-                "rrf": 0.0,
-                "fts_score": float(row["fts_score"]),
-                "vec_score": None,
-            },
-        )
-        entry["rrf"] += 1.0 / (RRF_K + rank + 1)
-    for rank, row in enumerate(vec_rows):
-        cid = row["id"]
-        entry = scores.setdefault(
-            cid,
-            {
-                "row": row,
-                "rrf": 0.0,
-                "fts_score": None,
-                "vec_score": float(row["vec_score"]),
-            },
-        )
-        entry["rrf"] += 1.0 / (RRF_K + rank + 1)
-        if entry["fts_score"] is None:
-            entry["vec_score"] = float(row["vec_score"])
+    path_score_keys = {
+        "fts": "fts_score",
+        "vector": "vec_score",
+        "trigram": "trigram_score",
+        "alias": "alias_score",
+    }
+    for path in RETRIEVAL_PATHS:
+        rows = results.get(path)
+        if not rows:
+            continue
+        score_key = path_score_keys[path]
+        for rank, row in enumerate(rows):
+            cid = row["id"]
+            entry = scores.get(cid)
+            if entry is None:
+                entry = scores[cid] = {"row": row, "rrf": 0.0}
+                for key in path_score_keys.values():
+                    entry[key] = None
+            entry["rrf"] += 1.0 / (rrf_k + rank + 1)
+            if entry[score_key] is None and row.get(score_key) is not None:
+                entry[score_key] = float(row[score_key])
 
-    ranked = sorted(scores.items(), key=lambda kv: kv[1]["rrf"], reverse=True)[:top_k]
+    ranked = sorted(scores.items(), key=lambda kv: kv[1]["rrf"], reverse=True)
+
+    # Authority boost (plan 4.5): a post-fusion multiplier, off by default.
+    # Rank order and visibility are untouched — the boost only reorders
+    # already-authorized candidates, so a misconfigured weight can rank a
+    # document wrongly but never surface an unauthorized one.
+    if authority_boost:
+
+        def _boost(entry: dict[str, Any]) -> float:
+            authority = (entry["row"].get("authority") or "").lower()
+            return authority_boost.get(authority, 1.0)
+
+        ranked = sorted(
+            ranked,
+            key=lambda kv: kv[1]["rrf"] * _boost(kv[1]),
+            reverse=True,
+        )
+
     return [
         RetrievedChunk(
             chunk_id=cid,
@@ -269,7 +480,9 @@ async def hybrid_search(
             ranking={
                 "lexical": entry["fts_score"],
                 "vector": entry["vec_score"],
+                "trigram": entry["trigram_score"],
+                "alias": entry["alias_score"],
             },
         )
-        for cid, entry in ranked
+        for cid, entry in ranked[:top_k]
     ]

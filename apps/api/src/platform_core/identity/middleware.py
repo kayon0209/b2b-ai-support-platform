@@ -21,6 +21,7 @@ from typing import Any, cast
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from platform_core.api import AUTH_UNRESOLVED, error_response, new_trace_id
 from platform_core.identity import tenant_context
 from platform_core.identity.tenant_context import TenantContext
 
@@ -116,10 +117,15 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
                 type(exc).__name__,
                 exc,
             )
-            return Response(
-                content='{"error":{"code":"AUTH_UNRESOLVED","retryable":false}}',
+            # Built by the shared helper, not by hand: the hand-written body
+            # carried only `code`, so the client had no `message` to show and
+            # no `trace_id` for the operator to quote to support. Every other
+            # error in the service already has both.
+            return error_response(
+                AUTH_UNRESOLVED,
+                "the bearer token does not resolve to an active membership",
                 status_code=401,
-                media_type="application/json",
+                trace_id=new_trace_id(),
             )
 
         tenant_context.set_tenant_context(ctx)

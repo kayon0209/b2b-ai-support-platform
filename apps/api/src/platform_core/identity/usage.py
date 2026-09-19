@@ -47,7 +47,11 @@ router = APIRouter(prefix="/v1/tenant", tags=["tenant"])
 
 class QuotaIn(BaseModel):
     # None clears the quota (unlimited).
-    monthly_run_quota: int | None = Field(default=None, ge=0)
+    #
+    # The upper bound is the column's, not a product decision: the stored
+    # value is an int4, so anything above 2**31-1 overflows at the database
+    # and came back as an unhandled 500 rather than a refused request.
+    monthly_run_quota: int | None = Field(default=None, ge=0, le=2_147_483_647)
 
 
 class AdjustmentIn(BaseModel):

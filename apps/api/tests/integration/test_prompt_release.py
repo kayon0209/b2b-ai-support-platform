@@ -568,8 +568,42 @@ def test_http_malformed_id_is_not_found_not_a_crash() -> None:
         headers=_headers(),
     )
 
-    assert resp.status_code == 200
+    # A bad id is NOT_FOUND, so 404 - not a 200 carrying an error body, and
+    # not a 500 from a failed cast.
+    assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_refused_release_actions_are_never_200() -> None:
+    """A refused promotion must not look like a success.
+
+    The admin UI decides "did this work?" from the HTTP status alone, so a
+    domain refusal returned as a 200 made it report "Promoted" for a
+    promotion the gate had blocked. This locks the status per refusal class.
+    """
+    from platform_core.api import DOMAIN_ERROR_STATUS
+
+    owner = _client(TENANT, "tenant_owner")
+    created = _create_via_http(owner, "gate-check")
+    version_id = created["id"]
+
+    # No evaluation evidence supplied -> gate refusal.
+    resp = owner.post(
+        f"/v1/prompts/{version_id}/promote",
+        json={"eval_run_id": "e", "scores": [], "regressions": []},
+        headers=_headers(),
+    )
+    assert resp.status_code == DOMAIN_ERROR_STATUS["EVALUATION_REQUIRED"]
+    assert resp.json()["error"]["code"] == "EVALUATION_REQUIRED"
+
+    # Rolling back when nothing is active -> conflict.
+    rollback = owner.post(
+        "/v1/prompts/rollback",
+        json={"template_name": TEMPLATE, "to_version_id": version_id, "reason": "r"},
+        headers=_headers(),
+    )
+    assert rollback.status_code == DOMAIN_ERROR_STATUS["NO_ACTIVE_VERSION"]
+    assert rollback.json()["error"]["code"] == "NO_ACTIVE_VERSION"
 
 
 def test_http_rollback_creates_an_audit_event() -> None:

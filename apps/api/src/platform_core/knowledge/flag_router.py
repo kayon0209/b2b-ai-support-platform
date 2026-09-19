@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from platform_core.api import (
+    domain_error_response,
     error_response,
     require_write_idempotency,
     tenant_session,
@@ -76,15 +77,14 @@ def _denied(action: str, reason: str) -> JSONResponse:
     )
 
 
-def _flag_error(exc: flag_service.FlagError) -> dict[str, Any]:
-    return {
-        "error": {
-            "code": exc.code,
-            "reason": exc.detail or exc.code,
-            "retryable": False,
-        },
-        "trace_id": "",
-    }
+def _flag_error(exc: flag_service.FlagError) -> JSONResponse:
+    """A refused flag action, as a real 4xx.
+
+    This used to return a bare dict, which FastAPI renders with status 200.
+    The admin UI only treats `!res.ok` as failure, so every refusal here was
+    reported to the operator as a success (see platform_core.api.domain_error_response).
+    """
+    return domain_error_response(exc.code, exc.detail)
 
 
 def _ctx_of(request: Request) -> TenantContext:

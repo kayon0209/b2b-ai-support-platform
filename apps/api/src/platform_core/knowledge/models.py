@@ -16,6 +16,7 @@ from sqlalchemy import (
     BigInteger,
     ForeignKey,
     Index,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -191,3 +192,27 @@ class Chunk(Base, PkMixin, TenantMixin):
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default="{}"
     )
+
+
+class KnowledgeAlias(Base, PkMixin, TenantMixin):
+    """A tenant-specific surface form for a canonical corpus term (plan 1.3).
+
+    "GC-500" and "GateWay 500" are the same product only because this tenant
+    says so. UNIQUE (tenant_id, alias) means one surface form maps to exactly
+    one canonical term per tenant: two meanings for one alias would make
+    query expansion a coin flip, so the second insert is refused rather than
+    resolved by row order.
+    """
+
+    __tablename__ = "knowledge_aliases"
+    __table_args__ = (UniqueConstraint("tenant_id", "alias", name="uq_aliases_tenant_alias"),)
+
+    term: Mapped[str] = mapped_column(String(127), nullable=False, index=True)
+    alias: Mapped[str] = mapped_column(String(127), nullable=False)
+    # Expansion weight in (0, 2]: an alias is at best as authoritative as the
+    # term itself, so it can rank a candidate up but never double it. This
+    # mirrors migration 0033's column exactly (numeric(4,2), DEFAULT 1.00,
+    # CHECK (0, 2]) — declaring it percent here coerced every write through
+    # an Integer column and fought the migration's own CHECK constraint.
+    weight: Mapped[float] = mapped_column(Numeric(4, 2), nullable=False, default=1.0)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")

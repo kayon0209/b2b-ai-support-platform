@@ -38,6 +38,7 @@ from platform_core.api import (
     tenant_session,
 )
 from platform_core.audit import service as audit_service
+from platform_core.config import get_settings
 from platform_core.identity.usage import usage_snapshot
 from platform_core.support_bridge import inbox
 from platform_policy import Action
@@ -95,6 +96,34 @@ async def create_agent_run(request: Request, conversation_ref: str, body: AgentR
                 f"monthly agent-run quota ({usage.quota}) is exhausted",
                 status_code=429,
                 details={"quota": usage.quota, "runs_used": usage.runs_used},
+            )
+
+        # Backpressure (plan 5.3): a bounded backlog beats unbounded latency.
+        # Depth is global (all tenants), which is honest - the workers, not
+        # any one tenant, are the shared resource being protected.
+        from sqlalchemy import func as sa_func
+        from sqlalchemy import select as sa_select
+
+        from platform_core.support_bridge.models import InboxEvent, InboxEventStatus
+
+        depth = int(
+            (
+                await session.execute(
+                    sa_select(sa_func.count())
+                    .select_from(InboxEvent)
+                    .where(
+                        InboxEvent.status == InboxEventStatus.RECEIVED.value,
+                    )
+                )
+            ).scalar_one()
+        )
+        max_depth = int(get_settings().queue_max_depth)
+        if depth >= max_depth:
+            return error_response(
+                "QUEUE_SATURATED",
+                f"inbox depth {depth} reached the configured cap ({max_depth}); retry with backoff",
+                status_code=429,
+                details={"depth": depth, "max_depth": max_depth},
             )
 
         # The inbox row is keyed by delivery id, which gives this endpoint

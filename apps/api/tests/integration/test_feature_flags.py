@@ -524,7 +524,9 @@ class TestHttpSurface:
             json={"target_tenant_id": "not-a-uuid", "enabled": True},
             headers=_headers(),
         )
-        assert resp.status_code == 200
+        # A refusal is a 4xx, never a 200 with an error body: a 200 would be
+        # read as success by every client, including the admin UI.
+        assert resp.status_code == 400
         assert resp.json()["error"]["code"] == "INVALID_TENANT_ID"
 
     def test_invalid_rollout_is_rejected_by_schema(self) -> None:

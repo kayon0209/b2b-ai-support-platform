@@ -2,13 +2,15 @@ import { useState } from "react";
 import { apiGet } from "../lib/api";
 import { useAsync } from "../lib/useAsync";
 import type { QualityMetrics, RouteDistribution } from "../lib/types";
-import { Card, ErrorBanner, PageHeader, Spinner, Stat, Badge } from "../components/ui";
+import { Card, EmptyState, PageHeader, Spinner, Stat, Badge } from "../components/ui";
+import { LoadError } from "../components/LoadError";
+import { useLang } from "../lib/i18n";
 import { int, ms, pct } from "../lib/format";
 
-const WINDOWS: { label: string; seconds: number }[] = [
-  { label: "Last 1h", seconds: 3600 },
-  { label: "Last 24h", seconds: 86400 },
-  { label: "Last 30d", seconds: 2_592_000 },
+const WINDOWS: { labelKey: "quality.window1h" | "quality.window24h" | "quality.window30d"; seconds: number }[] = [
+  { labelKey: "quality.window1h", seconds: 3600 },
+  { labelKey: "quality.window24h", seconds: 86_400 },
+  { labelKey: "quality.window30d", seconds: 2_592_000 },
 ];
 
 function toneFor(rate: number, warnAbove: number, badAbove: number) {
@@ -18,6 +20,7 @@ function toneFor(rate: number, warnAbove: number, badAbove: number) {
 }
 
 export function QualityDashboard() {
+  const { t } = useLang();
   const [window, setWindow] = useState(86_400);
 
   const metrics = useAsync<QualityMetrics>(
@@ -32,8 +35,8 @@ export function QualityDashboard() {
   return (
     <div className="page">
       <PageHeader
-        title="Quality Dashboard"
-        subtitle="Agent-run outcomes for your tenant, over the selected window."
+        title={t("quality.title")}
+        subtitle={t("quality.subtitle")}
         actions={
           <div className="segmented">
             {WINDOWS.map((w) => (
@@ -42,76 +45,78 @@ export function QualityDashboard() {
                 className={`segment${w.seconds === window ? " active" : ""}`}
                 onClick={() => setWindow(w.seconds)}
               >
-                {w.label}
+                {t(w.labelKey)}
               </button>
             ))}
           </div>
         }
       />
 
-      {metrics.error ? <ErrorBanner message={metrics.error} onRetry={metrics.reload} /> : null}
-      {routes.error ? <ErrorBanner message={routes.error} onRetry={routes.reload} /> : null}
+      <LoadError error={metrics.error} status={metrics.errorStatus} onRetry={metrics.reload} />
+      <LoadError error={routes.error} status={routes.errorStatus} onRetry={routes.reload} />
 
-      {metrics.loading ? <Spinner label="Loading quality metrics…" /> : null}
+      {metrics.loading ? <Spinner label={t("quality.loading")} /> : null}
+
+      {/* Zero runs and a broken pipeline render identically as a wall of
+          0.0%. Saying which one it is is the difference between "nothing
+          happened yet" and "nothing is working". */}
+      {metrics.data && metrics.data.total_runs === 0 ? (
+        <EmptyState message={t("quality.empty")} />
+      ) : null}
 
       {metrics.data ? (
         <>
           <div className="stat-grid">
             <Card>
-              <Stat label="Total runs" value={int(metrics.data.total_runs)} />
+              <Stat label={t("quality.totalRuns")} value={int(metrics.data.total_runs)} />
             </Card>
             <Card>
               <Stat
-                label="Completed"
+                label={t("quality.completed")}
                 value={int(metrics.data.completed)}
                 tone="good"
               />
             </Card>
             <Card>
               <Stat
-                label="Abstention rate"
+                label={t("quality.abstentionRate")}
                 value={pct(metrics.data.abstention_rate)}
                 tone={toneFor(metrics.data.abstention_rate, 0.1, 0.25)}
               />
             </Card>
             <Card>
               <Stat
-                label="Handoff rate"
+                label={t("quality.handoffRate")}
                 value={pct(metrics.data.handoff_rate)}
                 tone={toneFor(metrics.data.handoff_rate, 0.1, 0.25)}
               />
             </Card>
             <Card>
               <Stat
-                label="Citation coverage"
+                label={t("quality.citationCoverage")}
                 value={pct(metrics.data.citation_coverage)}
-                tone={
-                  metrics.data.citation_coverage !== null &&
-                  metrics.data.citation_coverage < 0.8
-                    ? "warn"
-                    : "good"
-                }
+                tone={metrics.data.citation_coverage < 0.8 ? "warn" : "good"}
               />
             </Card>
             <Card>
-              <Stat label="Failed" value={int(metrics.data.failed)} tone="bad" />
+              <Stat label={t("quality.failed")} value={int(metrics.data.failed)} tone="bad" />
             </Card>
             <Card>
-              <Stat label="Latency P50" value={ms(metrics.data.latency_p50_ms)} />
+              <Stat label={t("quality.latencyP50")} value={ms(metrics.data.latency_p50_ms)} />
             </Card>
             <Card>
-              <Stat label="Latency P95" value={ms(metrics.data.latency_p95_ms)} />
+              <Stat label={t("quality.latencyP95")} value={ms(metrics.data.latency_p95_ms)} />
             </Card>
             <Card>
               <Stat
-                label="Supported resolution"
+                label={t("quality.supportedResolution")}
                 value={pct(metrics.data.supported_resolution_rate)}
                 tone={toneFor(1 - metrics.data.supported_resolution_rate, 0.1, 0.25)}
               />
             </Card>
             <Card>
               <Stat
-                label="Wrong resolution"
+                label={t("quality.wrongResolution")}
                 value={pct(metrics.data.wrong_resolution_rate)}
                 tone={toneFor(metrics.data.wrong_resolution_rate, 0.05, 0.15)}
               />
@@ -119,90 +124,88 @@ export function QualityDashboard() {
           </div>
 
           <div className="grid-2">
-            <Card title="Resolution outcomes">
+            <Card title={t("quality.resolutionOutcomes")}>
               {metrics.data.cases_measured > 0 ? (
                 <ul className="kv">
                   <li>
-                    <span>Cases measured</span>
+                    <span>{t("quality.casesMeasured")}</span>
                     <span>{int(metrics.data.cases_measured)}</span>
                   </li>
                   <li>
-                    <span>Resolution held</span>
+                    <span>{t("quality.resolutionHeld")}</span>
                     <span className="text-good">{int(metrics.data.supported_resolution)}</span>
                   </li>
                   <li>
-                    <span>Reopened after resolving</span>
+                    <span>{t("quality.reopened")}</span>
                     <span className="text-bad">{int(metrics.data.wrong_resolution)}</span>
                   </li>
                 </ul>
               ) : (
-                <p className="muted">
-                  No Case was resolved or reopened in this window, so there is no resolution
-                  outcome to report yet.
-                </p>
+                <p className="muted">{t("quality.noResolutions")}</p>
               )}
               <p className="muted">
-                Derived from Cases, not runs: a Case that was resolved and never reopened is a
-                resolution that held; one that was reopened is a resolution that did not. Open
-                cases ({int(metrics.data.open_cases)}) are excluded so the rate does not move
-                with backlog.
+                {t("quality.resolutionNote", { open: int(metrics.data.open_cases) })}
               </p>
             </Card>
 
-            <Card title="Outcome mix">
+            <Card title={t("quality.outcomeMix")}>
               <ul className="kv">
                 <li>
-                  <span>Completed</span>
+                  <span>{t("quality.completed")}</span>
                   <span>{int(metrics.data.completed)}</span>
                 </li>
                 <li>
-                  <span>Abstained</span>
+                  <span>{t("quality.abstained")}</span>
                   <span>{int(metrics.data.abstained)}</span>
                 </li>
                 <li>
-                  <span>Handed off</span>
+                  <span>{t("quality.handedOff")}</span>
                   <span>{int(metrics.data.handed_off)}</span>
                 </li>
                 <li>
-                  <span>Failed</span>
+                  <span>{t("quality.failed")}</span>
                   <span>{int(metrics.data.failed)}</span>
                 </li>
                 <li>
-                  <span>Untimed runs</span>
+                  <span>{t("quality.untimedRuns")}</span>
                   <span>{int(metrics.data.untimed_runs)}</span>
                 </li>
               </ul>
             </Card>
 
-            <Card title="Route distribution">
+            <Card title={t("quality.routeDistribution")}>
               {routes.data ? (
                 routes.data.route_counts &&
                 Object.keys(routes.data.route_counts).length > 0 ? (
+                  <div className="table-scroll">
                   <table className="table">
                     <thead>
                       <tr>
-                        <th>Route</th>
-                        <th className="num">Runs</th>
+                        <th scope="col">{t("quality.route")}</th>
+                        <th scope="col" className="num">{t("quality.runs")}</th>
                       </tr>
                     </thead>
                     <tbody>
                       {Object.entries(routes.data.route_counts).map(([k, v]) => (
                         <tr key={k}>
                           <td>
-                            <Badge tone="info">{k}</Badge>
+                            <Badge tone="info">
+                              {t(`route.${k}` as Parameters<typeof t>[0])}
+                            </Badge>
                           </td>
                           <td className="num">{int(v)}</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
+                  </div>
                 ) : (
-                  <p className="muted">No routed runs in this window.</p>
+                  <p className="muted">{t("quality.noRouted")}</p>
                 )
               ) : routes.loading ? (
                 <Spinner />
               ) : (
-                <p className="muted">Route data unavailable.</p>
+                <p className="muted">{t("quality.routeUnavailable")}</p>
               )}
             </Card>
           </div>

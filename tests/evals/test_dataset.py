@@ -28,7 +28,7 @@ from .dataset import (
     cases_for,
     corpus_by_key,
 )
-from .harness import chunk_id_for, make_retriever
+from .harness import chunk_id_for, corpus_key_of, make_retriever
 from .report import (
     P0_REASON_CODES,
     build_category_report,
@@ -198,7 +198,7 @@ def _oracle_runner() -> EvaluationRunner:
         claims: dict[int, list[uuid.UUID]] = {0: [top.chunk_id]}
         return DraftAnswer(text=top.excerpt, claims=claims, route="knowledge_qa")
 
-    return EvaluationRunner(answer, make_retriever())
+    return EvaluationRunner(answer, make_retriever(), key_of=corpus_key_of)
 
 
 def test_oracle_run_reports_every_category() -> None:

@@ -366,4 +366,10 @@ def _validate_parameters(body: CaseCommandIn) -> str:
     elif body.command == "assign":
         if not body.parameters.get("assignee_ref") and not body.parameters.get("team_ref"):
             return "assign requires parameters.assignee_ref or parameters.team_ref"
+        # Both columns are String(255); without this bound a longer value
+        # reaches the database and surfaces as a bare 500.
+        for field in ("assignee_ref", "team_ref"):
+            value = body.parameters.get(field)
+            if value is not None and (not isinstance(value, str) or len(value) > 255):
+                return f"parameters.{field} must be a string of at most 255 characters"
     return ""

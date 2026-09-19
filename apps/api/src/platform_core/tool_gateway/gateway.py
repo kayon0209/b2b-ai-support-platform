@@ -165,6 +165,28 @@ def validate_against_schema(args: dict[str, Any], schema: dict[str, Any]) -> Non
         raise ToolGatewayError("TOOL_ARGS_INVALID", exc.message) from exc
 
 
+def _recheck_permission(
+    *, tenant_id: uuid.UUID, actor_id: uuid.UUID, role: str, action: str
+) -> str | None:
+    """Re-evaluate a tool's required action; return a deny reason or None.
+
+    Pure RBAC (no resource): the router's `require_policy` evaluates the
+    same action the same way, so an agreement here is expected and a
+    disagreement means the caller's decision was stale or wrong.
+    """
+    from platform_policy import Action, Decision, PolicyEngine, Principal
+
+    try:
+        parsed = Action(action)
+    except ValueError:
+        return "TOOL_PERMISSION_UNKNOWN"
+    decision = PolicyEngine().check(
+        Principal(tenant_id=str(tenant_id), actor_id=str(actor_id), role=role),
+        parsed,
+    )
+    return None if decision.decision == Decision.ALLOW else decision.reason_code
+
+
 class ToolGateway:
     def __init__(self, session: AsyncSession, executors: dict[str, ToolExecutor]) -> None:
         self._session = session
@@ -181,10 +203,17 @@ class ToolGateway:
         idempotency_key: str,
         permission_allowed: bool,
         permission_reason: str = "OK",
+        required_action: str | None = None,
     ) -> ToolProposal:
         """Create a proposal. The caller supplies the policy decision for
         the required permission (checked against the policy engine);
-        the gateway still enforces registry/schema/confirmation rules."""
+        the gateway still enforces registry/schema/confirmation rules.
+
+        When `required_action` names the policy action the tool needs, the
+        gateway re-evaluates it here: the router computed the decision, this
+        re-check means a future call site cannot widen access by forgetting
+        its own. Omitted by direct unit-test callers that construct the
+        gateway without a full principal."""
         stmt = (
             select(ToolDefinition)
             .where(
@@ -201,6 +230,14 @@ class ToolGateway:
             raise ToolDenied("TOOL_NOT_REGISTERED", tool_name)
         if tool.risk == ToolRisk.PROHIBITED.value:
             raise ToolDenied("TOOL_PROHIBITED", tool_name)
+
+        if permission_allowed and required_action is not None:
+            recheck = _recheck_permission(
+                tenant_id=tenant_id, actor_id=actor_id, role=role, action=required_action
+            )
+            if recheck is not None:
+                permission_allowed = False
+                permission_reason = recheck
 
         validate_against_schema(arguments, tool.input_schema)
         sanitized = sanitize_arguments(arguments)

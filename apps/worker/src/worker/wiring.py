@@ -169,7 +169,11 @@ def build_interactive_deps(
     # shared chat client.
     from platform_core.agent_runtime.generator import LlmAnswerGenerator
 
-    generator = LlmAnswerGenerator(bundle.chat)
+    settings = get_settings()
+    generator = LlmAnswerGenerator(
+        bundle.chat,
+        fallback_model=settings.model_fallback_name if settings.model_fallback_enabled else None,
+    )
 
     return OrchestratorDeps(
         embedder=embedder,

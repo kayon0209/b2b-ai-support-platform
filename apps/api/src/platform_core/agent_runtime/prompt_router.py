@@ -42,6 +42,7 @@ from platform_core.agent_runtime.prompt_release import (
     submit_candidate,
 )
 from platform_core.api import (
+    domain_error_response,
     error_response,
     require_write_idempotency,
     tenant_session,
@@ -121,15 +122,15 @@ def _denied(action: str, reason: str) -> JSONResponse:
     )
 
 
-def _release_error(exc: ReleaseError) -> dict[str, Any]:
-    return {
-        "error": {
-            "code": exc.code,
-            "reason": exc.detail or exc.code,
-            "retryable": False,
-        },
-        "trace_id": "",
-    }
+def _release_error(exc: ReleaseError) -> JSONResponse:
+    """A refused release action, as a real 4xx.
+
+    A promotion refused by the evaluation gate used to come back as a 200
+    carrying an error body, so the admin UI showed the operator a green
+    "Promoted" banner for a promotion that never happened (see
+    platform_core.api.domain_error_response).
+    """
+    return domain_error_response(exc.code, exc.detail)
 
 
 def _ctx_of(request: Request) -> TenantContext:

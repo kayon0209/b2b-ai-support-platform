@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { apiDelete, apiGet, apiPost } from "../lib/api";
+import { newIdempotencyKey } from "../lib/idempotency";
 import { useAsync } from "../lib/useAsync";
 import type { InviteResult, Member } from "../lib/types";
 import {
@@ -7,13 +8,14 @@ import {
   Badge,
   Card,
   EmptyState,
-  ErrorBanner,
   PageHeader,
   Spinner,
+  ListTotal,
 } from "../components/ui";
+import { LoadError } from "../components/LoadError";
 import { usePrompt } from "../components/Prompt";
 import { useAction } from "../lib/useAction";
-import { titleCase } from "../lib/format";
+import { useLang, type DictKey } from "../lib/i18n";
 
 // tenant_owner is the bootstrap role and cannot be assigned through an invite
 // (the API rejects it), so it is not offered here either.
@@ -27,11 +29,8 @@ const ASSIGNABLE_ROLES = [
   "auditor",
 ];
 
-function idem() {
-  return crypto.randomUUID?.() ?? `idem-${Date.now()}-${Math.random()}`;
-}
-
 export function Members() {
+  const { t } = useLang();
   const [email, setEmail] = useState("");
   const [role, setRole] = useState("support_agent");
   const [invite, setInvite] = useState<InviteResult | null>(null);
@@ -45,110 +44,130 @@ export function Members() {
 
   /** Server actions report through `action`, so a failure is not rendered as
    *  plain muted text indistinguishable from a success. */
-  async function run(fn: () => Promise<void>) {
-    await action.run(fn);
+  async function run(fn: () => Promise<void>, okMsg?: string) {
+    return action.run(fn, okMsg);
   }
 
   const onInvite = () =>
     run(async () => {
       if (!email.trim()) return;
+      // Clear the previous result first: a one-time token left on screen
+      // while a *different* address is being invited reads as that
+      // address's token, and it survives a failed attempt too.
+      setInvite(null);
       const res = await apiPost<InviteResult>(
         "/v1/identity/members/invite",
         { email: email.trim(), role },
-        idem(),
+        newIdempotencyKey(),
       );
       setInvite(res);
       setEmail("");
       members.reload();
-    });
+    }, t("members.invited", { email: email.trim() }));
 
   const onChangeRole = (m: Member, next: string) =>
     run(async () => {
-      await apiPost(`/v1/identity/members/${m.user_id}`, { role: next }, idem());
+      // A role change grants or removes powers the moment it lands, and the
+      // select commits on a single click - so it confirms like removal does.
+      const ok = await prompt.confirm(
+        t("members.changeRoleConfirm", {
+          email: m.email,
+          role: t(`role.${next}` as DictKey),
+        }),
+        t("members.changeRole"),
+        t("members.changeRoleDetail"),
+      );
+      if (!ok) {
+        members.reload(); // snap the select back to the stored role
+        return;
+      }
+      await apiPost(`/v1/identity/members/${m.membership_id}`, { role: next }, newIdempotencyKey());
       members.reload();
-    });
+    }, t("members.roleChanged", { email: m.email }));
 
   const onRemove = (m: Member) =>
     run(async () => {
       const ok = await prompt.confirm(
-        `Remove ${m.email} from this tenant?`,
-        "Remove",
-        "They lose access immediately. Their account is not deleted.",
+        t("members.removeConfirm", { email: m.email }),
+        t("members.remove"),
+        t("members.removeDetail"),
       );
       if (!ok) return;
-      await apiDelete(`/v1/identity/members/${m.user_id}`, idem());
+      await apiDelete(`/v1/identity/members/${m.membership_id}`, newIdempotencyKey());
       members.reload();
-    });
+    }, t("members.removed", { email: m.email }));
 
   return (
     <div className="page">
-      <PageHeader
-        title="Members"
-        subtitle="Invite and manage who can access this tenant."
-      />
+      <PageHeader title={t("members.title")} subtitle={t("members.subtitle")} />
 
       {prompt.element}
 
-      <Card title="Invite a member">
+      <Card title={t("members.inviteTitle")}>
         <div className="toolbar">
           <input
             className="text-input"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            placeholder="person@company.com"
+            placeholder={t("members.emailPlaceholder")}
             type="email"
           />
           <label className="field">
-            <span>Role</span>
+            <span>{t("common.role")}</span>
             <select value={role} onChange={(e) => setRole(e.target.value)}>
               {ASSIGNABLE_ROLES.map((r) => (
                 <option key={r} value={r}>
-                  {titleCase(r)}
+                  {t(`role.${r}` as DictKey)}
                 </option>
               ))}
             </select>
           </label>
-          <button className="btn btn-primary" disabled={action.busy || !email.trim()} onClick={onInvite}>
-            Send invite
+          <button
+            className="btn btn-primary"
+            disabled={action.busy || !email.trim()}
+            onClick={onInvite}
+          >
+            {t("members.sendInvite")}
           </button>
         </div>
         {invite ? (
           <div className="serving">
             {invite.invitation_token ? (
               <>
-                <Badge tone="good">invite created</Badge>
+                <Badge tone="good">{t("members.inviteCreated")}</Badge>
                 <code className="serving-body">{invite.invitation_token}</code>
                 <button
                   className="btn btn-ghost"
                   onClick={() => {
                     void navigator.clipboard?.writeText(invite.invitation_token ?? "");
-                    action.succeed("Token copied to clipboard.");
+                    action.succeed(t("members.copied"));
                   }}
                 >
-                  Copy
+                  {t("common.copy")}
                 </button>
               </>
             ) : (
-              <Badge tone="warn">{invite.message ?? "no token returned"}</Badge>
+              <Badge tone="warn">{invite.message ?? t("members.noToken")}</Badge>
             )}
           </div>
         ) : null}
         <ActionFeedback error={action.error} notice={action.notice} />
       </Card>
 
-      {members.error ? <ErrorBanner message={members.error} onRetry={members.reload} /> : null}
-      {members.loading ? <Spinner label="Loading members…" /> : null}
+      <LoadError error={members.error} status={members.errorStatus} onRetry={members.reload} />
+      {members.loading ? <Spinner label={t("members.loading")} /> : null}
       {members.data && members.data.items.length === 0 ? (
-        <EmptyState message="No members yet." />
+        <EmptyState message={t("members.empty")} />
       ) : null}
 
       {members.data && members.data.items.length > 0 ? (
+        <div className="table-scroll">
         <table className="table">
           <thead>
             <tr>
-              <th>Member</th>
-              <th>Role</th>
-              <th>Status</th>
+              <th scope="col">{t("members.headerMember")}</th>
+              <th scope="col">{t("common.role")}</th>
+              <th scope="col">{t("members.headerStatus")}</th>
               <th />
             </tr>
           </thead>
@@ -161,7 +180,7 @@ export function Members() {
                 </td>
                 <td>
                   {m.role === "tenant_owner" ? (
-                    <Badge tone="good">{titleCase(m.role)}</Badge>
+                    <Badge tone="good">{t(`role.${m.role}` as DictKey)}</Badge>
                   ) : (
                     <select
                       value={m.role}
@@ -170,7 +189,7 @@ export function Members() {
                     >
                       {ASSIGNABLE_ROLES.map((r) => (
                         <option key={r} value={r}>
-                          {titleCase(r)}
+                          {t(`role.${r}` as DictKey)}
                         </option>
                       ))}
                     </select>
@@ -178,7 +197,7 @@ export function Members() {
                 </td>
                 <td>
                   <Badge tone={m.status === "active" ? "good" : "neutral"}>
-                    {titleCase(m.status)}
+                    {t(`member.status.${m.status}` as DictKey)}
                   </Badge>
                 </td>
                 <td className="row-actions">
@@ -187,14 +206,16 @@ export function Members() {
                     disabled={action.busy || m.role === "tenant_owner"}
                     onClick={() => onRemove(m)}
                   >
-                    Remove
+                    {t("members.remove")}
                   </button>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
+        </div>
       ) : null}
+      <ListTotal shown={members.data?.items.length ?? 0} total={members.data?.total ?? 0} />
     </div>
   );
 }

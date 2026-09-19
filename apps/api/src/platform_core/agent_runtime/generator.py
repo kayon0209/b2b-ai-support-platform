@@ -17,9 +17,11 @@ import re
 import uuid
 from typing import Any
 
+from platform_core.agent_runtime.conversation import CompactedContext
 from platform_core.agent_runtime.prompts import (
     KNOWLEDGE_QA_PROMPT,
     PromptTemplate,
+    format_conversation,
     format_evidence,
 )
 from platform_core.agent_runtime.qa_path import DraftAnswer
@@ -67,10 +69,15 @@ class LlmAnswerGenerator:
         *,
         template: PromptTemplate | None = None,
         max_tokens: int = MAX_ANSWER_TOKENS,
+        fallback_model: str | None = None,
     ) -> None:
         self._chat = chat
         self._template = template or KNOWLEDGE_QA_PROMPT
         self._max_tokens = max_tokens
+        # Model fallback chain (plan 5.5): primary -> fallback -> propagate.
+        # Off unless the deployment configures a fallback model; a retry on
+        # the SAME model is not a fallback, it is more of the outage.
+        self._fallback_model = fallback_model
 
     @property
     def template(self) -> PromptTemplate:
@@ -98,30 +105,95 @@ class LlmAnswerGenerator:
             resolve[citation_id] = str(chunk.chunk_id)
         return format_evidence(pairs), resolve
 
-    async def generate(self, question: str, evidence: list[RetrievedChunk]) -> DraftAnswer:
+    def _build_conversation(
+        self,
+        context: CompactedContext | None,
+        retrieval_query: str,
+        *,
+        question: str,
+    ) -> str:
+        """Render the conversation block, redacted and bounded.
+
+        Redaction happens *after* rendering rather than per-turn: the
+        compaction step already chose what to keep, and redacting the rendered
+        block is one pass over exactly the text that will leave the process.
+
+        The rewritten-query note is appended inside the block rather than
+        merged into the question so the model can see the difference between
+        what the customer typed and what was searched for. Those are different
+        things and an answer that silently answers the second is the failure
+        mode this makes visible.
+        """
+        if context is None:
+            return ""
+        rendered = context.render()
+        if not rendered.strip():
+            return ""
+        if retrieval_query.strip() and retrieval_query.strip() != question.strip():
+            rendered = f"{rendered}\nSearched for: {retrieval_query.strip()}"
+        safe_block, _ = redact_text(rendered)
+        return format_conversation(safe_block[:MAX_TOTAL_EVIDENCE_CHARS])
+
+    async def generate(
+        self,
+        question: str,
+        evidence: list[RetrievedChunk],
+        *,
+        context: CompactedContext | None = None,
+        retrieval_query: str = "",
+    ) -> DraftAnswer:
         """Return a DraftAnswer with claims mapped to real chunk ids.
 
         Never raises on model misbehaviour: a malformed response yields an
         empty DraftAnswer, and the abstention/validation layer decides what
         the customer sees.
+
+        `context` is the compressed conversation. It is redacted like the
+        question is — the redaction boundary applies to everything crossing the
+        model boundary, and conversation text is the most likely place for a
+        customer to have pasted a card number three turns ago.
+
+        `retrieval_query` is the *rewritten* query, when there is one. It is
+        carried so the model can be told what was actually searched for when
+        the rewrite changed the subject; without it, a rewritten query produces
+        evidence about something the customer did not name and the model has no
+        way to reconcile the two.
         """
         if not evidence:
             return DraftAnswer(text="", claims={}, route="knowledge_qa")
 
         evidence_block, resolve = self._build_evidence(evidence)
         safe_question, _ = redact_text(question)
+        conversation_block = self._build_conversation(context, retrieval_query, question=question)
         prompt = self._template.render(
             evidence=evidence_block,
             question=safe_question[:MAX_EXCERPT_CHARS],
+            conversation=conversation_block,
         )
-        result = await self._chat.complete(
-            [
-                ChatMessage(ProviderRole.SYSTEM, "You answer strictly from provided evidence."),
-                ChatMessage(ProviderRole.USER, prompt),
-            ],
-            max_tokens=self._max_tokens,
-            temperature=0.0,
-        )
+        from platform_core.llm.provider import ModelError
+
+        messages = [
+            ChatMessage(ProviderRole.SYSTEM, "You answer strictly from provided evidence."),
+            ChatMessage(ProviderRole.USER, prompt),
+        ]
+        try:
+            result = await self._chat.complete(
+                messages,
+                max_tokens=self._max_tokens,
+                temperature=0.0,
+            )
+        except ModelError:
+            if self._fallback_model is None:
+                raise
+            from observability_metrics import get_metrics as _gm
+
+            _gm().model_fallback_total.inc()
+            result = await self._chat.complete(
+                messages,
+                max_tokens=self._max_tokens,
+                temperature=0.0,
+                model=self._fallback_model,
+            )
 
         # Computed before parsing: a malformed response still spent tokens.
         usage = self._usage_of(result)

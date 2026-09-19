@@ -90,9 +90,64 @@ class Citation(Base, PkMixin, TenantMixin):
     agent_run_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("agent_runs.id"), nullable=False, index=True
     )
-    document_version_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    # Nullable since 0036: a tool-sourced citation has no document version -
+    # its provenance is source_uri ("tool://...") plus excerpt_hash.
+    document_version_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     chunk_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     excerpt_hash: Mapped[str] = mapped_column(String(127), nullable=False)
     source_uri: Mapped[str] = mapped_column(Text, nullable=False)
     claim_index: Mapped[int] = mapped_column(nullable=False, default=0)
     retrieval_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+
+
+class ConversationTurn(Base, PkMixin, TenantMixin):
+    """One redacted turn of one conversation (iteration plan 2.1).
+
+    The raw message lives only in Chatwoot (docs/security.md). What is
+    persisted here is the REDACTED text: memory must be able to read the
+    words ("my plan is annual") to resolve anaphora, so a hash alone will
+    not do - but storing the unredacted sentence would create a second
+    copy of customer PII that retention then has to track. `text_hash`
+    keeps an integrity anchor over the original bytes.
+    """
+
+    __tablename__ = "conversation_turns"
+    __table_args__ = (UniqueConstraint("id", "tenant_id", name="uq_conversation_turns_id_tenant"),)
+
+    conversation_ref_id: Mapped[uuid.UUID] = mapped_column(nullable=False, index=True)
+    # customer|agent|system|tool (conversation.TurnRole values)
+    role: Mapped[str] = mapped_column(String(15), nullable=False)
+    text_redacted: Mapped[str] = mapped_column(Text, nullable=False)
+    text_hash: Mapped[str] = mapped_column(String(127), nullable=False)
+    ts: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # Correlation marker: "clarify:<reason>" for clarification notices, tool
+    # references for tool turns. Read by the clarify-streak guard.
+    ref: Mapped[str] = mapped_column(String(127), nullable=False, default="")
+    # Source of the turn: "chatwoot" (fetched live) or "platform" (our own
+    # reply). Local rows win when merging with a live fetch.
+    source: Mapped[str] = mapped_column(String(15), nullable=False, default="platform")
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class ContactFact(Base, PkMixin, TenantMixin):
+    """One durable fact about a contact, across conversations (plan 2.5).
+
+    Current statements override history (ON CONFLICT ... DO UPDATE): the
+    customer correcting themselves is the normal case, and "latest wins" is
+    the only conflict rule that needs no arbitration. Only facts extracted
+    from CUSTOMER turns are ever written here - an assistant's own claim
+    must not become its memory (model self-feedback).
+    """
+
+    __tablename__ = "contact_facts"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "contact_ref", "key", name="uq_contact_fact_key"),
+    )
+
+    contact_ref: Mapped[uuid.UUID] = mapped_column(nullable=False, index=True)
+    key: Mapped[str] = mapped_column(String(63), nullable=False)
+    value: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_turn_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    confidence: Mapped[int] = mapped_column(nullable=False, default=100)  # percent
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

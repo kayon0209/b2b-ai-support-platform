@@ -375,7 +375,7 @@ class _UnusedGenerator:
 
     template = KNOWLEDGE_QA_PROMPT
 
-    async def generate(self, question, evidence):  # pragma: no cover
+    async def generate(self, question, evidence, **kwargs):  # pragma: no cover
         raise AssertionError("an abstaining run must never reach the model")
 
 

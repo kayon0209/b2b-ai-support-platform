@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.integrations import dead_letter
 from platform_core.integrations import health as connector_health
+from platform_core.integrations.business_read import READ_TOOL_SCHEMAS
 from platform_core.integrations.credentials import resolve_credentials
 from platform_core.integrations.models import Connector, ConnectorStatus
 from platform_core.integrations.sdk import AUTH_FAILURE_CODES, ConnectorContext
@@ -59,6 +60,13 @@ TOOL_CAPABILITY: dict[str, str] = {
     # on Linear had no ticket path at all before this entry existed.
     "linear.create_issue": "create_issue",
     "im.send_notification": "send_notification",
+    # Read tools (iteration plan 3.2): served by the tenant's business_api
+    # connector. case.read is deliberately absent - it reads the platform's
+    # own Case table and never touches a connector.
+    "order.get_status": "orders_read",
+    "shipment.track": "shipments_read",
+    "billing.get_invoice": "invoices_read",
+    "inventory.check_stock": "inventory_read",
 }
 
 # tool name -> the connectors that can serve it, in preference order.
@@ -74,6 +82,10 @@ TOOL_PROVIDERS: dict[str, tuple[str, ...]] = {
     "crm.update_account": ("crm",),
     "linear.create_issue": ("linear",),
     "im.send_notification": ("im_webhook", "feishu", "teams"),
+    "order.get_status": ("business_api",),
+    "shipment.track": ("business_api",),
+    "billing.get_invoice": ("business_api",),
+    "inventory.check_stock": ("business_api",),
 }
 
 
@@ -361,6 +373,11 @@ def default_factories() -> dict[str, AdapterFactory]:
 
         return TeamsNotificationAdapter(context)
 
+    def _build_business_read(context: ConnectorContext) -> ToolExecutor:
+        from platform_core.integrations.business_read import BusinessReadToolExecutor
+
+        return BusinessReadToolExecutor(context)
+
     return {
         "jira": AdapterFactory(provider="jira", build=_build_jira),
         "crm": AdapterFactory(provider="crm", build=_build_crm),
@@ -368,6 +385,7 @@ def default_factories() -> dict[str, AdapterFactory]:
         "im_webhook": AdapterFactory(provider="im_webhook", build=_build_im),
         "feishu": AdapterFactory(provider="feishu", build=_build_feishu),
         "teams": AdapterFactory(provider="teams", build=_build_teams),
+        "business_api": AdapterFactory(provider="business_api", build=_build_business_read),
     }
 
 
@@ -470,3 +488,127 @@ __all__ = [
     "probe_connector",
     "resolve_executors",
 ]
+
+
+# The platform catalog every tenant gets: name -> (risk, input_schema,
+# required permission actions, requires_confirmation). Seeded idempotently -
+# the registry is deny-by-default, so a tool that exists only in
+# TOOL_CAPABILITY but has no definition row would propose as
+# TOOL_NOT_REGISTERED, which is the failure mode this seeding removes.
+TOOL_CATALOG: dict[str, tuple[str, dict[str, Any], list[str], bool]] = {
+    "jira.create_issue": (
+        "confirmed_write",
+        {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "summary": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["project", "summary"],
+            "additionalProperties": False,
+        },
+        ["tool.write.confirmed"],
+        True,
+    ),
+    "linear.create_issue": (
+        "confirmed_write",
+        {
+            "type": "object",
+            "properties": {
+                "team": {"type": "string"},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["team", "title"],
+            "additionalProperties": False,
+        },
+        ["tool.write.confirmed"],
+        True,
+    ),
+    "crm.update_account": (
+        "confirmed_write",
+        {
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string"},
+                "fields": {"type": "object"},
+            },
+            "required": ["account_id", "fields"],
+            "additionalProperties": False,
+        },
+        ["tool.write.confirmed"],
+        True,
+    ),
+    "im.send_notification": (
+        "low_write",
+        {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string"},
+                "text": {"type": "string"},
+            },
+            "required": ["channel", "text"],
+            "additionalProperties": False,
+        },
+        ["tool.write.low"],
+        False,
+    ),
+    "order.get_status": ("read", READ_TOOL_SCHEMAS["order.get_status"], ["tool.read"], False),
+    "shipment.track": ("read", READ_TOOL_SCHEMAS["shipment.track"], ["tool.read"], False),
+    "billing.get_invoice": (
+        "read",
+        READ_TOOL_SCHEMAS["billing.get_invoice"],
+        ["tool.read"],
+        False,
+    ),
+    "case.read": ("read", READ_TOOL_SCHEMAS["case.read"], ["tool.read"], False),
+    "inventory.check_stock": (
+        "read",
+        READ_TOOL_SCHEMAS["inventory.check_stock"],
+        ["tool.read"],
+        False,
+    ),
+}
+
+
+async def ensure_tool_definitions(session: AsyncSession, *, tenant_id: Any) -> int:
+    """Register missing catalog definitions for a tenant. Idempotent.
+
+    Returns the number of definitions created. Existing rows are never
+    touched: a tenant that deliberately disabled a tool by editing its
+    definition must not be silently repaired over.
+    """
+    import uuid as _uuid
+
+    from platform_core.tool_gateway.models import ToolDefinition
+
+    created = 0
+    for name, (risk, schema, permissions, requires_confirmation) in TOOL_CATALOG.items():
+        existing = (
+            await session.execute(
+                select(ToolDefinition).where(
+                    ToolDefinition.tenant_id == tenant_id,
+                    ToolDefinition.name == name,
+                    ToolDefinition.version == 1,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            continue
+        session.add(
+            ToolDefinition(
+                tenant_id=tenant_id,
+                name=name,
+                version=1,
+                risk=risk,
+                input_schema=schema,
+                output_schema={},
+                required_permissions=permissions,
+                requires_confirmation=requires_confirmation,
+            )
+        )
+        created += 1
+    await session.flush()
+    _ = _uuid
+    return created

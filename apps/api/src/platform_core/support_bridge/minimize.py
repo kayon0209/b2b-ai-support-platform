@@ -53,6 +53,12 @@ def minimize_chatwoot_payload(event_type: str, payload: dict[str, Any]) -> dict[
         extracted["sender_type"] = sender.get("type")
         extracted["sender_id"] = str(sender.get("id")) if sender.get("id") else None
 
+    # Contact id: the durable-facts key (plan 2.5) is per-contact, and the
+    # contact id is the stable handle for "this customer" across messages.
+    contact = payload.get("contact")
+    if isinstance(contact, dict) and contact.get("id") is not None:
+        extracted["contact_id"] = str(contact["id"])
+
     extracted["chatwoot_event"] = event
     return extracted
 

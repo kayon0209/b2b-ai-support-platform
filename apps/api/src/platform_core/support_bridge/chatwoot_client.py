@@ -239,3 +239,49 @@ class ChatwootClient:
                 content = message.get("content")
                 return content if isinstance(content, str) else None
         return None
+
+    async def list_messages(
+        self,
+        *,
+        account_id: str,
+        conversation_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Read a conversation's recent messages (iteration plan 2.2).
+
+        This is the multi-turn history source: memory needs the prior turns,
+        and the platform deliberately does not store raw customer content,
+        so the fetch is live rather than from a local copy. Failure returns
+        [] and the caller degrades to single-turn - multi-turn is an
+        enhancement, never a dependency of answering at all.
+
+        Returns raw dicts; the CALLER redacts before any persistence (the
+        client stays a transport, not a policy layer).
+        """
+        url = (
+            f"{self._base_url}/api/v1/accounts/{account_id}"
+            f"/conversations/{conversation_id}/messages"
+        )
+        self._breaker.before_call()
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                headers=self._headers,
+                timeout=self._timeout,
+            ) as client:
+                resp = await client.get(url)
+        except (httpx.TimeoutException, httpx.TransportError):
+            self._breaker.on_failure()
+            return []
+
+        if resp.status_code >= 300:
+            self._breaker.on_failure()
+            return []
+        self._breaker.on_success()
+
+        payload = resp.json()
+        messages = payload.get("payload") if isinstance(payload, dict) else payload
+        if not isinstance(messages, list):
+            return []
+        rows = [m for m in messages if isinstance(m, dict) and m.get("content")]
+        return rows[-limit:] if limit and len(rows) > limit else rows

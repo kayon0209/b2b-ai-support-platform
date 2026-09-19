@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { apiGet, apiPost, apiPut } from "../lib/api";
+import { newIdempotencyKey } from "../lib/idempotency";
 import { useAction } from "../lib/useAction";
 import { useAsync } from "../lib/useAsync";
 import {
@@ -16,6 +17,8 @@ import {
   Spinner,
   Stat,
 } from "../components/ui";
+import { LoadError } from "../components/LoadError";
+import { useLang } from "../lib/i18n";
 import { dateFromEpochSeconds, int, pct } from "../lib/format";
 
 /**
@@ -34,6 +37,7 @@ import { dateFromEpochSeconds, int, pct } from "../lib/format";
  * permission, and a red "failed to load" would send them to support.
  */
 export function Usage() {
+  const { t } = useLang();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
@@ -68,14 +72,24 @@ export function Usage() {
   const billingForbidden = billing.errorStatus === 403;
 
   async function submitCorrection() {
+    if (!correction.run_id.trim()) {
+      action.fail(t("usage.errRunId"));
+      return;
+    }
+    if (!correction.reason.trim()) {
+      // The server accepts an empty reason, but a financial correction with
+      // no stated cause is un-auditable, so the form insists on one.
+      action.fail(t("usage.errReason"));
+      return;
+    }
     const promptDelta = Number(correction.prompt_tokens_delta || "0");
     const completionDelta = Number(correction.completion_tokens_delta || "0");
     if (!Number.isInteger(promptDelta) || !Number.isInteger(completionDelta)) {
-      action.fail("Token deltas must be whole numbers.");
+      action.fail(t("usage.errWhole"));
       return;
     }
     if (promptDelta === 0 && completionDelta === 0) {
-      action.fail("A correction must change at least one token count.");
+      action.fail(t("usage.errChange"));
       return;
     }
     const ok = await action.run(
@@ -88,17 +102,15 @@ export function Usage() {
             completion_tokens_delta: completionDelta,
             reason: correction.reason.trim(),
           },
-          crypto.randomUUID(),
+          newIdempotencyKey(),
         );
         if (result.duplicate) {
           // A duplicate means the key was reused, so nothing changed. Say so
           // rather than reporting a success the ledger did not record.
-          throw new Error(
-            "This correction was already recorded (the request key was reused), so nothing changed.",
-          );
+          throw new Error(t("usage.duplicate"));
         }
       },
-      "Correction recorded.",
+      t("usage.correctionRecorded"),
     );
     if (ok) {
       setCorrecting(false);
@@ -124,23 +136,23 @@ export function Usage() {
       const trimmed = draft.trim();
       const value = trimmed === "" ? null : Number(trimmed);
       if (value !== null && (!Number.isInteger(value) || value < 0)) {
-        setSaveError("Quota must be a whole number of runs, or empty for unlimited.");
+        setSaveError(t("usage.quotaError"));
         return;
       }
       await apiPut<{ usage: UsageSnapshot }>(
         "/v1/tenant/quota",
         { monthly_run_quota: value },
-        crypto.randomUUID(),
+        newIdempotencyKey(),
       );
       setEditing(false);
       setNotice(
         value === null
-          ? "Quota cleared — this tenant is now unlimited."
-          : `Quota set to ${value.toLocaleString()} runs per calendar month.`,
+          ? t("usage.quotaCleared")
+          : t("usage.quotaSet", { value: value.toLocaleString() }),
       );
       usage.reload();
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : "Could not update the quota.");
+      setSaveError(err instanceof Error ? err.message : t("usage.quotaError"));
     } finally {
       setSaving(false);
     }
@@ -155,150 +167,143 @@ export function Usage() {
   return (
     <div className="page">
       <PageHeader
-        title="Usage & Quota"
-        subtitle="Agent runs consumed this calendar month (UTC), and the ceiling on them."
+        title={t("usage.title")}
+        subtitle={t("usage.subtitle")}
         actions={
           editing ? (
             <div className="row">
               <input
                 className="text-input"
                 inputMode="numeric"
-                placeholder="unlimited"
+                placeholder={t("usage.quotaPlaceholder")}
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
-                aria-label="Monthly run quota"
+                aria-label={t("usage.quotaLabel")}
               />
               <button className="btn" onClick={save} disabled={saving}>
-                {saving ? "Saving…" : "Save"}
+                {saving ? t("common.saving") : t("common.save")}
               </button>
               <button className="btn" onClick={() => setEditing(false)} disabled={saving}>
-                Cancel
+                {t("common.cancel")}
               </button>
             </div>
           ) : (
             <button className="btn" onClick={startEdit} disabled={!snapshot}>
-              Change quota
+              {t("usage.changeQuota")}
             </button>
           )
         }
       />
 
-      {usage.error ? <ErrorBanner message={usage.error} onRetry={usage.reload} /> : null}
+      <LoadError error={usage.error} status={usage.errorStatus} onRetry={usage.reload} />
       {saveError ? <ErrorBanner message={saveError} onRetry={save} /> : null}
       <ActionFeedback error={action.error} notice={action.notice} />
-      {notice ? <div className="banner banner-ok">{notice}</div> : null}
+      {/* Same live-region contract as ActionFeedback: a quiet "saved"
+          confirmation is invisible to a screen reader otherwise. */}
+      {notice ? (
+        <div className="banner banner-ok" role="status">
+          {notice}
+        </div>
+      ) : null}
 
-      {usage.loading && !snapshot ? <Spinner label="Loading usage…" /> : null}
+      {usage.loading && !snapshot ? <Spinner label={t("usage.loadUsage")} /> : null}
 
       {snapshot ? (
         <>
           <div className="stat-grid">
             <Card>
               <Stat
-                label="Runs used"
+                label={t("usage.runsUsed")}
                 value={int(snapshot.runs_used)}
                 tone={snapshot.over_quota ? "bad" : "good"}
               />
             </Card>
             <Card>
               <Stat
-                label="Quota"
-                value={snapshot.quota === null ? "Unlimited" : int(snapshot.quota)}
+                label={t("usage.quota")}
+                value={snapshot.quota === null ? t("usage.unlimited") : int(snapshot.quota)}
               />
             </Card>
             <Card>
               <Stat
-                label="Remaining"
+                label={t("usage.remaining")}
                 value={snapshot.remaining === null ? "—" : int(snapshot.remaining)}
                 tone={snapshot.over_quota ? "bad" : "good"}
               />
             </Card>
             <Card>
-              <Stat label="Prompt tokens" value={int(snapshot.prompt_tokens)} />
+              <Stat label={t("usage.promptTokens")} value={int(snapshot.prompt_tokens)} />
             </Card>
             <Card>
-              <Stat label="Completion tokens" value={int(snapshot.completion_tokens)} />
+              <Stat label={t("usage.completionTokens")} value={int(snapshot.completion_tokens)} />
             </Card>
             <Card>
               <Stat
-                label="Consumed"
+                label={t("usage.consumed")}
                 value={usedShare === null ? "—" : pct(usedShare)}
                 tone={snapshot.over_quota ? "bad" : "good"}
               />
             </Card>
           </div>
 
-          <Card title="This period">
+          <Card title={t("usage.periodTitle")}>
             <ul className="kv">
               <li>
-                <span>Window</span>
+                <span>{t("usage.window")}</span>
                 <span>{period}</span>
               </li>
               <li>
-                <span>Status</span>
+                <span>{t("common.status")}</span>
                 <span>
                   {snapshot.over_quota ? (
-                    <Badge tone="bad">Over quota — new runs are refused with 429</Badge>
+                    <Badge tone="bad">{t("usage.overQuota")}</Badge>
                   ) : (
-                    <Badge tone="good">Accepting runs</Badge>
+                    <Badge tone="good">{t("usage.acceptingRuns")}</Badge>
                   )}
                 </span>
               </li>
             </ul>
-            <p className="muted">
-              Usage counts agent runs started in the period. A run enqueued while over quota is
-              refused with a 429 rather than dropped silently, so a caller can tell "declined for
-              capacity" from "no evidence found".
-            </p>
+            <p className="muted">{t("usage.overQuotaNote")}</p>
           </Card>
         </>
       ) : null}
 
-      <Card title="Billing ledger">
+      <Card title={t("usage.ledgerTitle")}>
         {billingForbidden ? (
-          <p className="muted">
-            You do not have permission to read billing data. It requires the audit-read role,
-            the same one that grants access to the audit trail — commercial totals are not part
-            of the support role.
-          </p>
+          <p className="muted">{t("usage.noPermission")}</p>
         ) : billing.error ? (
           <ErrorBanner message={billing.error} onRetry={billing.reload} />
         ) : billing.loading && !ledger ? (
-          <Spinner label="Loading ledger…" />
+          <Spinner label={t("usage.loadLedger")} />
         ) : ledger ? (
           <>
             <ul className="kv">
               <li>
-                <span>Ledger entries</span>
+                <span>{t("usage.ledgerEntries")}</span>
                 <span>{int(ledger.entries)}</span>
               </li>
               <li>
-                <span>Usage entries</span>
+                <span>{t("usage.usageEntries")}</span>
                 <span>{int(ledger.usage_entries)}</span>
               </li>
               <li>
-                <span>Adjustments</span>
+                <span>{t("usage.adjustments")}</span>
                 <span>{int(ledger.adjustment_entries)}</span>
               </li>
               <li>
-                <span>Prompt tokens</span>
+                <span>{t("usage.promptTokens")}</span>
                 <span>{int(ledger.prompt_tokens)}</span>
               </li>
               <li>
-                <span>Completion tokens</span>
+                <span>{t("usage.completionTokens")}</span>
                 <span>{int(ledger.completion_tokens)}</span>
               </li>
               <li>
-                <span>Total tokens</span>
+                <span>{t("usage.totalTokens")}</span>
                 <span>{int(ledger.total_tokens)}</span>
               </li>
             </ul>
-            <p className="muted">
-              The append-only record an invoice is computed from, keyed by the usage event so an
-              outbox redelivery collapses instead of double-billing. A correction is a new
-              adjustment entry, never an edit — which is why adjustments can differ from the live
-              run count above.
-            </p>
+            <p className="muted">{t("usage.ledgerNote")}</p>
 
             {correcting ? (
               <div className="toolbar">
@@ -306,8 +311,8 @@ export function Usage() {
                   className="text-input"
                   value={correction.run_id}
                   onChange={(e) => setCorrection({ ...correction, run_id: e.target.value })}
-                  placeholder="run id (uuid)"
-                  aria-label="Run id"
+                  placeholder={t("usage.runId")}
+                  aria-label={t("usage.runId")}
                 />
                 <input
                   className="text-input"
@@ -316,8 +321,8 @@ export function Usage() {
                   onChange={(e) =>
                     setCorrection({ ...correction, prompt_tokens_delta: e.target.value })
                   }
-                  placeholder="prompt tokens (e.g. -200)"
-                  aria-label="Prompt tokens delta"
+                  placeholder={t("usage.promptDelta")}
+                  aria-label={t("usage.promptDelta")}
                 />
                 <input
                   className="text-input"
@@ -326,18 +331,18 @@ export function Usage() {
                   onChange={(e) =>
                     setCorrection({ ...correction, completion_tokens_delta: e.target.value })
                   }
-                  placeholder="completion tokens"
-                  aria-label="Completion tokens delta"
+                  placeholder={t("usage.completionDelta")}
+                  aria-label={t("usage.completionDelta")}
                 />
                 <input
                   className="text-input"
                   value={correction.reason}
                   onChange={(e) => setCorrection({ ...correction, reason: e.target.value })}
-                  placeholder="reason (recorded in the audit trail)"
-                  aria-label="Reason"
+                  placeholder={t("usage.reason")}
+                  aria-label={t("usage.reason")}
                 />
                 <button className="btn btn-primary" onClick={submitCorrection} disabled={action.busy}>
-                  {action.busy ? "Recording…" : "Record correction"}
+                  {action.busy ? t("usage.recording") : t("usage.record")}
                 </button>
                 <button
                   className="btn"
@@ -349,7 +354,7 @@ export function Usage() {
               </div>
             ) : (
               <button className="btn" onClick={() => setCorrecting(true)} disabled={billingForbidden}>
-                Record a correction
+                {t("usage.recordCorrection")}
               </button>
             )}
           </>

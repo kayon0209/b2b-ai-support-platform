@@ -30,6 +30,7 @@ a live Keycloak realm is not available in CI - the boundary is faked at the
 seam, and the test says so.
 """
 
+import json
 import os
 import uuid
 
@@ -300,9 +301,13 @@ def test_failure_modes_are_indistinguishable_over_http(client: TestClient) -> No
         resp = client.get("/v1/cases", headers=_token(slug, user))
         responses.append((resp.status_code, resp.json()))
     statuses = {status for status, _ in responses}
-    bodies = {str(body) for _, body in responses}
+    # Compared per-field rather than as whole bodies: the envelope carries a
+    # fresh trace_id per request, which is not a failure reason. What must be
+    # identical is the `error` block — that is where a distinguishing
+    # message ("no such tenant" vs "no such user") would leak.
+    errors = {json.dumps(body.get("error", {}), sort_keys=True) for _, body in responses}
     assert statuses == {401}, f"all failure modes must be 401, got {statuses}"
-    assert len(bodies) == 1, f"failure modes must be indistinguishable, got {bodies}"
+    assert len(errors) == 1, f"failure modes must be indistinguishable, got {errors}"
 
 
 def test_malformed_token_is_not_a_server_error(client: TestClient) -> None:

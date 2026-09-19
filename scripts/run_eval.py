@@ -67,6 +67,22 @@ for _p in (
     sys.path.insert(0, str(REPO_ROOT / _p))
 
 from evals.dataset import CORPUS, all_cases  # noqa: E402
+from evals.dataset import CORPUS as _EVAL_CORPUS  # noqa: E402
+
+# The live pipeline's chunks carry the DOCUMENT TITLE; attribution needs the
+# corpus VERSION KEY, so map title -> key for the fixed corpus.
+_TITLE_TO_KEY = {entry.document_title: entry.version_key for entry in _EVAL_CORPUS}
+
+
+def live_key_of(chunk: object) -> str:
+    from evals.harness import corpus_key_of as _parse
+
+    parsed = _parse(chunk)
+    if parsed in {e.version_key for e in _EVAL_CORPUS}:
+        return parsed
+    return _TITLE_TO_KEY.get(getattr(chunk, "title", ""), "")
+
+
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
 
@@ -337,6 +353,11 @@ def _write_report(
             # fixed case from a lucky one. Reported, never gated.
             "flaky_cases": flaky or {},
         },
+        # Attribution aggregates (plan 4.1): the headline is no longer a
+        # single boolean - a reader can see WHERE the pipeline broke.
+        "attribution_counts": report.attribution_counts,
+        "retrieval_recall_mean": round(report.retrieval_recall_mean, 4),
+        "recall_measured": report.recall_measured,
         "results": [asdict(r) for r in report.results],
     }
     REPORT_PATH.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
@@ -417,7 +438,7 @@ async def main(argv: list[str] | None = None) -> int:
         for sample_index in range(samples):
             if samples > 1:
                 print(f"  sample {sample_index + 1}/{samples}…")
-            report = await EvaluationRunner(answer, retrieve).run(cases)
+            report = await EvaluationRunner(answer, retrieve, key_of=live_key_of).run(cases)
             runs.append(report)
             if samples > 1:
                 # Printed per sample, not just for the last one: the question

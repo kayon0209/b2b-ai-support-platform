@@ -518,6 +518,73 @@ async def list_dead_letters(request: Request, status: str | None = None) -> Any:
         )
 
 
+@dead_letter_router.post("/{item_id}/retry")
+async def retry_dead_letter(request: Request, item_id: uuid.UUID) -> Any:
+    """Queue a dead letter for replay (plan 3.6).
+
+    Raw payloads are never stored (docs/security.md), so "replay" cannot
+    re-issue the original call verbatim - what it CAN do honestly is reset
+    the row to pending and rewind the connector's sync cursor, so the sync
+    engine re-derives the operation from the provider and attempts it again.
+    Ambiguous first attempts are exactly why the cursor only advances on
+    confirmed success; a rewind that re-runs an already-applied change is
+    caught by the provider's own idempotency, not by this endpoint.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return _unresolved()
+    denied = require_policy(ctx, Action.CONNECTOR_ADMIN)
+    if denied is not None:
+        return denied
+    missing_idem = require_write_idempotency(request, Action.CONNECTOR_ADMIN)
+    if missing_idem is not None:
+        return missing_idem
+
+    trace_id = new_trace_id()
+    async with tenant_session(ctx) as session:
+        item = (
+            await session.execute(
+                select(DeadLetterItem).where(
+                    DeadLetterItem.id == item_id, DeadLetterItem.tenant_id == ctx.tenant_id
+                )
+            )
+        ).scalar_one_or_none()
+        if item is None:
+            return error_response(DEAD_LETTER_NOT_FOUND, "dead letter not found", status_code=404)
+
+        changed = False
+        if item.status != "pending":
+            item.status = "pending"
+            item.resolved_at = None
+            changed = True
+        if item.connector_id is not None:
+            from sqlalchemy import update
+
+            from platform_core.integrations.models import SyncCursor
+
+            await session.execute(
+                update(SyncCursor)
+                .where(
+                    SyncCursor.tenant_id == ctx.tenant_id,
+                    SyncCursor.connector_id == item.connector_id,
+                )
+                .values(cursor="")
+            )
+        await audit_service.record(
+            session,
+            ctx=ctx,
+            action="dead_letter.retried",
+            resource_type="dead_letter",
+            resource_id=item.id,
+            decision="allowed" if changed else "no_change",
+            trace_id=trace_id,
+        )
+        await session.commit()
+        return ok_response(
+            {"dead_letter": _dead_letter_out(item), "changed": changed}, trace_id=trace_id
+        )
+
+
 @dead_letter_router.post("/{item_id}/resolve")
 async def resolve_dead_letter(request: Request, item_id: uuid.UUID) -> Any:
     """Mark a dead letter handled. An operator attestation, recorded in audit.

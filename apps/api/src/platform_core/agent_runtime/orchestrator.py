@@ -16,10 +16,10 @@ Design rules:
 """
 
 import hashlib
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import select
@@ -27,7 +27,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger, TraceContext, new_trace_context
 from observability_metrics import get_metrics
+from platform_core.agent_runtime.conversation import (
+    CompactedContext,
+    ConversationMemory,
+    Turn,
+    needs_clarification,
+    normalize_colloquial,
+    rewrite_query,
+)
 from platform_core.agent_runtime.generator import LlmAnswerGenerator
+from platform_core.agent_runtime.intent import (
+    NON_ANSWERABLE_ROUTES,
+    PRE_RETRIEVAL_ROUTES,
+    IntentDetection,
+    Route,
+    Scene,
+    classify,
+)
 from platform_core.agent_runtime.models import (
     AgentRun,
     Citation,
@@ -37,10 +53,17 @@ from platform_core.agent_runtime.models import (
     PromptTemplate as PromptVersionRow,
 )
 from platform_core.agent_runtime.qa_path import (
+    ABSTAIN_CLARIFICATION,
+    ABSTAIN_CONFLICT,
+    ABSTAIN_HUMAN_REQUIRED,
+    ABSTAIN_OUT_OF_SCOPE,
+    ABSTAIN_SENSITIVE_REQUEST,
     AbstentionDecision,
     DraftAnswer,
+    claim_contradiction_candidates,
     decide_abstention,
     excerpt_hash,
+    redline_violations,
     safe_abstention_text,
     validate_citations,
 )
@@ -55,7 +78,13 @@ from platform_core.identity.tenant_context import TenantContext
 from platform_core.knowledge import flag_service
 from platform_core.llm.provider import ModelError
 from platform_core.outbox_service import enqueue
-from platform_core.retrieval.hybrid import Embedder, PrincipalScope, RetrievedChunk
+from platform_core.retrieval.hybrid import (
+    Embedder,
+    MetadataFilter,
+    PrincipalScope,
+    RetrievedChunk,
+    build_metadata_filter,
+)
 from platform_core.retrieval.reranker import Reranker
 
 logger = JsonLogger("platform.agent_runtime")
@@ -75,26 +104,6 @@ POLICY_VERSION = "v1"
 #
 # Default False, so an undefined flag means "keep the fused order".
 RERANK_FLAG_KEY = "agent.rerank_enabled"
-
-
-class Route(StrEnum):
-    """Routing classes from docs/agent.md."""
-
-    KNOWLEDGE_QA = "knowledge_qa"
-    HUMAN_REQUIRED = "human_required"
-    OUT_OF_SCOPE = "out_of_scope"
-
-
-# Terms that must never be answered by the AI regardless of evidence
-# (docs/agent.md SENSITIVE routing class).
-RESTRICTED_TERMS = (
-    "password",
-    "credential",
-    "api key",
-    "social security",
-    "credit card number",
-    "bank account",
-)
 
 
 @dataclass
@@ -125,21 +134,12 @@ class OrchestratorDeps:
     # Applied only when `RERANK_FLAG_KEY` resolves true for the tenant, so the
     # rollout is a per-tenant decision rather than a deployment-wide switch.
     reranker: Reranker | None = None
+    # How much evidence a run builds its answer from. Was a literal `8` at the
+    # call site, which meant it could not be tuned per tenant or per scene
+    # without a code change — and "Top-K 怎么确定" is a question you can only
+    # answer by measuring, which needs it to be configurable.
+    top_k: int = 8
     extra: dict[str, Any] = field(default_factory=dict)
-
-
-def classify_route(question: str) -> str:
-    """Deterministic pre-classification.
-
-    The MVP routes knowledge questions to the QA path and everything that
-    looks like a credential or account-ownership request to a human. Richer
-    intent classification ships with the evaluation-driven milestones; this
-    stays conservative on purpose.
-    """
-    lowered = question.lower()
-    if any(term in lowered for term in RESTRICTED_TERMS):
-        return Route.HUMAN_REQUIRED.value
-    return Route.KNOWLEDGE_QA.value
 
 
 async def retrieve_evidence(
@@ -152,6 +152,9 @@ async def retrieve_evidence(
     top_k: int = 8,
     trace: TraceContext | None = None,
     reranker: Reranker | None = None,
+    metadata_filter: Any | None = None,
+    enabled_paths: tuple[str, ...] | None = None,
+    rerank_cap: int | None = None,
 ) -> list[RetrievedChunk]:
     """Authorized retrieval. Evidence never crosses tenants: the tenant
     filter and ACL narrowing are applied inside hybrid_search before any
@@ -161,15 +164,19 @@ async def retrieve_evidence(
     which is the only safe order: reranking reorders what survived
     authorization, it never decides what is visible. The reranker is passed in
     rather than built here so a caller can canary it per tenant, and so tests
-    can supply one without a provider.
+    can supply one without a provider. `rerank_cap` bounds how many candidates
+    are reranked (plan 1.7): rerank cost is per candidate, and candidates past
+    the second page of results almost never reach the model anyway.
 
     Degradation is the reranker's own contract (`RerankOutcome.degraded`), and
     it is surfaced rather than swallowed: docs/architecture.md permits falling
     back to the fused order only when evaluation allows it, so the fact that
     the primary path did not run has to be observable.
     """
+    from platform_core.config import get_settings
     from platform_core.retrieval.hybrid import hybrid_search
 
+    settings = get_settings()
     started = time.monotonic()
     span = trace.span("retrieval", **{"span.kind": "internal"}) if trace else None
     try:
@@ -177,12 +184,20 @@ async def retrieve_evidence(
             session,
             tenant_id=tenant_id,
             query=query,
-            top_k=top_k,
+            top_k=max(top_k, rerank_cap or 0),
             principal=principal,
             embedder=embedder,
+            fts_candidates=settings.retrieval_fts_candidates,
+            vector_candidates=settings.retrieval_vector_candidates,
+            trigram_candidates=settings.retrieval_trigram_candidates,
+            alias_candidates=settings.retrieval_alias_candidates,
+            metadata_filter=metadata_filter,
+            enabled_paths=enabled_paths,
+            rrf_k=settings.retrieval_rrf_k,
         )
         if reranker is not None and len(chunks) > 1:
-            outcome = await reranker.rerank(query, chunks, top_k=top_k)
+            cap = min(rerank_cap or len(chunks), len(chunks))
+            outcome = await reranker.rerank(query, chunks[:cap], top_k=top_k)
             if outcome.degraded:
                 get_metrics().retrieval_degraded_total.labels(
                     reason_code=outcome.reason_code or "RERANK_DEGRADED"
@@ -306,7 +321,12 @@ async def _persist_citations(
                 Citation(
                     tenant_id=tenant_id,
                     agent_run_id=run_id,
-                    document_version_id=chunk.document_version_id,
+                    # Tool receipts (plan 3.4) cite source_uri, not a document.
+                    document_version_id=(
+                        chunk.document_version_id
+                        if not chunk.source_uri.startswith("tool://")
+                        else None
+                    ),
                     chunk_id=chunk.chunk_id,
                     excerpt_hash=excerpt_hash(chunk.excerpt),
                     source_uri=chunk.source_uri,
@@ -318,6 +338,94 @@ async def _persist_citations(
             break  # one citation row per claim (uq_citation_claim)
     await session.flush()
     return written
+
+
+def _extract_tool_args(tool_name: str, question: str) -> dict[str, str] | None:
+    """Deterministic argument extraction for read tools.
+
+    The required identifier is the FIRST entity-shaped token in the question
+    ("order 88123" -> 88123; "case #12345" -> 12345). Entities are protected
+    from stemming (plan 1.4), so the token that would retrieve is the token
+    that identifies. No entity, no argument - and the caller hands off rather
+    than guessing an id.
+    """
+    from platform_core.agent_runtime.conversation import _entity_terms
+
+    entities = _entity_terms(question)
+    if not entities:
+        return None
+    if tool_name == "case.read":
+        return {"case_ref": entities[0]}
+    if tool_name == "order.get_status":
+        return {"order_id": entities[0]}
+    if tool_name == "shipment.track":
+        return {"shipment_id": entities[0]}
+    if tool_name == "billing.get_invoice":
+        return {"invoice_id": entities[0]}
+    if tool_name == "inventory.check_stock":
+        return {"part_number": entities[0]}
+    return None
+
+
+def _clarify_streak(history: list[Turn]) -> int:
+    """Trailing consecutive clarification notices by the agent.
+
+    Counted from the loaded history: every AGENT turn whose ref marks it as
+    a clarification resets only when some other agent turn (an answer, a
+    handoff notice) follows it. This is what makes "asked twice already"
+    knowable on the third run.
+    """
+    streak = 0
+    for turn in reversed(history):
+        if turn.role.value == "agent" and turn.ref.startswith("clarify"):
+            streak += 1
+            continue
+        if turn.role.value == "agent":
+            break
+    return streak
+
+
+_MODEL_MENTION = re.compile(r"\bmodel\s+([a-z0-9][a-z0-9-]{2,31})", re.IGNORECASE)
+_FIRMWARE_MENTION = re.compile(r"\bfirmware\s+v?([a-z0-9][a-z0-9.-]{1,31})", re.IGNORECASE)
+
+
+async def _load_aliases(
+    session: AsyncSession, tenant_id: uuid.UUID
+) -> list[tuple[str, str, float]]:
+    """Tenant alias rows for query expansion, best-effort.
+
+    A load failure degrades to "no aliases" — expansion is an enrichment,
+    and refusing to answer because the alias table is unreadable inverts the
+    priority between a feature and the product.
+    """
+    from platform_core.retrieval.hybrid import load_aliases
+
+    try:
+        return await load_aliases(session, tenant_id)
+    except Exception as exc:  # noqa: BLE001 - enrichment, not a dependency
+        logger.warning("alias_load_failed", error_code=type(exc).__name__)
+        return []
+
+
+def _non_answerable_reason(route: str, restricted_query: bool) -> str:
+    """The abstention reason for a route that never reaches retrieval.
+
+    Distinguishing the reasons is what makes the handoff explainable
+    afterwards. They are all "do not answer" but they are not the same event:
+    a customer asking for a person is a routing request being honoured, while a
+    sensitive request is a disclosure being refused, and an operator reading
+    the audit log needs to tell them apart.
+    """
+    if restricted_query or route == Route.SENSITIVE.value:
+        return ABSTAIN_SENSITIVE_REQUEST
+    if route == Route.HUMAN_REQUIRED.value:
+        return ABSTAIN_HUMAN_REQUIRED
+    if route == Route.OUT_OF_SCOPE.value:
+        return ABSTAIN_OUT_OF_SCOPE
+    return ABSTAIN_HUMAN_REQUIRED
+
+
+CLARIFICATION_KEEP_LEASE = "clarification"
 
 
 class AgentOrchestrator:
@@ -335,6 +443,7 @@ class AgentOrchestrator:
         self._deps = deps
         self._code_version = code_version
         self._policy_version = policy_version
+        self._top_k = deps.top_k
 
     async def run(
         self,
@@ -348,6 +457,9 @@ class AgentOrchestrator:
         chatwoot_conversation_id: str | None = None,
         expected_lease_version: int | None = None,
         restricted_query: bool = False,
+        history: list[Turn] | None = None,
+        context_budget_chars: int | None = None,
+        known_facts: list[tuple[str, str]] | None = None,
     ) -> RunOutcome:
         """Execute the pipeline for one inbound customer message.
 
@@ -355,6 +467,13 @@ class AgentOrchestrator:
         queued. When supplied, the pre-send gate refuses to dispatch if the
         lease has moved — this is what prevents an AI reply racing a human
         takeover.
+
+        `history` is the prior turns of this conversation, oldest first. It is
+        what makes the run multi-turn: the question is rewritten against it
+        (anaphora resolution) and compressed context from it is placed in front
+        of the model. Omitting it reproduces the previous single-turn
+        behaviour, which is what the evaluation harness and the unit tests
+        rely on — so this is additive, not a behaviour change.
         """
         started = time.monotonic()
         ctx = trace or new_trace_context()
@@ -375,6 +494,9 @@ class AgentOrchestrator:
                 chatwoot_conversation_id=chatwoot_conversation_id,
                 expected_lease_version=expected_lease_version,
                 restricted_query=restricted_query,
+                history=history,
+                context_budget_chars=context_budget_chars,
+                known_facts=known_facts,
             )
         except Exception as exc:
             # An unexpected failure still has to be visible in metrics and in
@@ -407,6 +529,9 @@ class AgentOrchestrator:
         chatwoot_conversation_id: str | None,
         expected_lease_version: int | None,
         restricted_query: bool,
+        history: list[Turn] | None,
+        context_budget_chars: int | None,
+        known_facts: list[tuple[str, str]] | None,
     ) -> RunOutcome:
 
         # --- 1. Acquire/observe the control lease. ---
@@ -416,8 +541,90 @@ class AgentOrchestrator:
         if expected_lease_version is None:
             expected_lease_version = int(lease.lease_version)
 
-        route = classify_route(question)
-        run_span.set_attributes(route=route, **{"lease.version": expected_lease_version})
+        # --- 1b. Classify intent on both axes (scene + kind). ---
+        #
+        # Runs before retrieval because for three of the seven routing classes
+        # there is nothing to retrieve: a request for a human, a sensitive
+        # request and an out-of-scope turn are settled by *who asked*, not by
+        # what the corpus says. Classifying first is what stops the platform
+        # from spending an embedding and a model call to produce an answer it
+        # would then have to suppress.
+        detection = classify(question)
+        route = detection.route.value
+        run_span.set_attributes(
+            route=route,
+            intent_scene=detection.scene.value,
+            intent_kind=detection.primary_kind.value,
+            intent_confidence=round(detection.confidence, 3),
+            intent_multi=detection.multi_intent,
+            **{"lease.version": expected_lease_version},
+        )
+
+        # --- 1c. Multi-turn context. ---
+        #
+        # Compressed before retrieval, because retrieval needs the rewritten
+        # query (step 3) and the rewrite needs the same history. Building the
+        # memory once here means the context the model sees and the query the
+        # index sees are derived from the same turns — two views that cannot
+        # disagree.
+        memory = ConversationMemory(list(history or ()))
+        context = memory.snapshot(question=question)
+        if known_facts:
+            # Cross-conversation facts fill the gaps; a fact stated in THIS
+            # conversation always wins (it is the more recent statement, and
+            # "latest wins" is the whole conflict policy).
+            from dataclasses import replace as _dc_replace
+
+            from platform_core.agent_runtime.conversation import DurableFact
+
+            merged: dict[str, str] = dict(known_facts)
+            for fact in context.durable_facts:
+                merged[fact.key] = fact.value
+            context = _dc_replace(
+                context,
+                durable_facts=tuple(
+                    DurableFact(key=k, value=v, source_turn=-1, ts=0)
+                    for k, v in sorted(merged.items())
+                ),
+            )
+        get_metrics().context_turns_kept.observe(len(context.recent))
+        get_metrics().context_turns_summarized.observe(context.dropped_turns)
+        get_metrics().context_pinned.observe(len(context.pinned))
+        retrieval_query, rewritten = rewrite_query(question, memory.turns)
+
+        # --- 1d. Retrieval shape (plan 1.3/1.4/1.5/1.7). ---
+        # Everything here is config- or flag-driven and defaults to the
+        # pre-iteration behaviour: no aliases applied, no metadata filter,
+        # no score floor, no per-scene top-k.
+        settings = self._settings()
+        top_k = self._top_k_for_scene(detection.scene)
+        enabled_paths: tuple[str, ...] | None = (
+            tuple(p.strip() for p in settings.retrieval_enabled_paths.split(",") if p.strip())
+            or None
+        )
+        aliases = await _load_aliases(self._session, tenant_id)
+        normalization_reason = "DISABLED"
+        if aliases and await self._flag_enabled(settings.flag_query_normalization, tenant_id):
+            retrieval_query, applied = normalize_colloquial(retrieval_query, aliases)
+            normalization_reason = "APPLIED" if applied else "NO_MATCH"
+        run_span.set_attributes(**{"flag.query_normalization": normalization_reason})
+
+        metadata_filter = None
+        metadata_reason = "OFF"
+        if await self._flag_enabled(settings.flag_metadata_filter, tenant_id):
+            metadata_filter = self._metadata_filter_for(question)
+            metadata_reason = "APPLIED" if metadata_filter is not None else "NO_ENTITY"
+        run_span.set_attributes(**{"flag.metadata_filter": metadata_reason})
+        if rewritten:
+            run_span.set_attributes(**{"retrieval.query_rewritten": True})
+        run_span.set_attributes(
+            **{
+                "context.turns_kept": len(context.recent),
+                "context.turns_summarized": context.dropped_turns,
+                "context.pinned": len(context.pinned),
+                "context.topic_shift": context.topic_shift,
+            }
+        )
 
         run = AgentRun(
             tenant_id=tenant_id,
@@ -427,8 +634,10 @@ class AgentOrchestrator:
             # The quality dashboard windows over `started_at`; a run without it
             # is invisible to every metric and only shows up in `untimed_runs`.
             started_at=int(time.time()),
-            model_config=self._model_config(),
-            retrieval_config=self._retrieval_config(),
+            model_config=self._model_config(context=context, detection=detection),
+            retrieval_config=self._retrieval_config(
+                rewritten=rewritten, retrieval_query=retrieval_query
+            ),
             policy_version=self._policy_version,
             code_version=self._code_version,
             trace_id=ctx.trace_id,
@@ -443,14 +652,16 @@ class AgentOrchestrator:
         await self._session.flush()
 
         # --- 2. Restricted and non-knowledge routes never reach the model. ---
-        if restricted_query or route == Route.HUMAN_REQUIRED.value:
+        if restricted_query or route in PRE_RETRIEVAL_ROUTES:
             return await self._finish_abstain(
                 run=run,
                 tenant_id=tenant_id,
                 conversation_ref_id=conversation_ref_id,
                 expected_lease_version=expected_lease_version,
                 decision=AbstentionDecision(
-                    abstain=True, reason_code="RESTRICTED_REQUEST", handoff=True
+                    abstain=True,
+                    reason_code=_non_answerable_reason(route, restricted_query),
+                    handoff=True,
                 ),
                 ctx=ctx,
                 started=started,
@@ -458,6 +669,74 @@ class AgentOrchestrator:
                 chatwoot_account_id=chatwoot_account_id,
                 chatwoot_conversation_id=chatwoot_conversation_id,
             )
+
+        # --- 2b. Clarification, before spending retrieval. ---
+        #
+        # Underspecified is not the same as unanswerable: the customer is
+        # present and one detail unblocks the answer, so the right move is to
+        # ask rather than to hand off. Decided before retrieval because a
+        # question with no recoverable subject retrieves noise, and noise looks
+        # like evidence.
+        needs_ask, ask_reason = needs_clarification(retrieval_query, memory.turns)
+        if needs_ask and route not in NON_ANSWERABLE_ROUTES:
+            if _clarify_streak(history or []) >= self._settings().clarification_max_streak:
+                # Consecutive clarifications without progress: another ask is
+                # a loop, not a conversation. Hand off instead (plan 2.8) -
+                # the customer talks to a human who can untangle what two
+                # rounds of "could you say more" could not.
+                return await self._finish_abstain(
+                    run=run,
+                    tenant_id=tenant_id,
+                    conversation_ref_id=conversation_ref_id,
+                    expected_lease_version=expected_lease_version,
+                    decision=AbstentionDecision(
+                        abstain=True, reason_code="CLARIFICATION_LIMIT", handoff=True
+                    ),
+                    ctx=ctx,
+                    started=started,
+                    question=question,
+                    chatwoot_account_id=chatwoot_account_id,
+                    chatwoot_conversation_id=chatwoot_conversation_id,
+                )
+            return await self._finish_clarify(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                reason_code=ask_reason,
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+
+        # --- 2c. Business read tools (plan 3.2/3.4; flag off by default). ---
+        #
+        # Live data (order status, shipment tracking, invoices, case state)
+        # is decided BEFORE the knowledge path: if a read tool answers it,
+        # retrieval never runs, so a stale indexed copy cannot leak into the
+        # answer. The attempt returns either customer-safe evidence (tool
+        # receipts) or a finished RunOutcome (handoff) - never a guess.
+        tool_evidence: list[RetrievedChunk] = []
+        if route == Route.BUSINESS_READ.value and await self._flag_enabled(
+            settings.flag_business_read_tools, tenant_id
+        ):
+            read_result = await self._attempt_business_read(
+                run=run,
+                tenant_id=tenant_id,
+                question=question,
+                detection=detection,
+                ctx=ctx,
+                started=started,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+            if isinstance(read_result, RunOutcome):
+                return read_result
+            tool_evidence = read_result
 
         # --- 3. Retrieve authorized evidence. ---
         # The reranker is gated per tenant. Evaluating the flag inside the
@@ -467,36 +746,111 @@ class AgentOrchestrator:
             self._session, tenant_id=tenant_id, reranker=self._deps.reranker
         )
         run_span.set_attributes(**{"flag.rerank": rerank_reason})
-        try:
-            evidence = await retrieve_evidence(
-                self._session,
-                tenant_id=tenant_id,
-                query=question,
-                principal=principal,
-                embedder=self._deps.embedder,
-                trace=ctx,
-                reranker=reranker,
-            )
-        except Exception as exc:  # noqa: BLE001 - degradation is a policy choice
-            # Retrieval unavailable: never answer enterprise facts; hand off.
-            logger.error("retrieval_failed", ctx, error_code=type(exc).__name__)
-            return await self._finish_abstain(
-                run=run,
-                tenant_id=tenant_id,
-                conversation_ref_id=conversation_ref_id,
-                expected_lease_version=expected_lease_version,
-                decision=AbstentionDecision(
-                    abstain=True, reason_code="RETRIEVAL_UNAVAILABLE", handoff=True
-                ),
-                ctx=ctx,
-                started=started,
-                question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
-            )
+        filtered_empty = False
+        score_floor_applied = False
+        if tool_evidence:
+            # Tool receipts replace retrieval for this run: the abstention
+            # gate's relevance/conflict heuristics are calibrated for document
+            # excerpts and would misfire on a receipt, which is grounded by
+            # construction (the gateway verified it).
+            evidence = tool_evidence
+            run.retrieval_config = {**(run.retrieval_config or {}), "evidence_source": "tool"}
+        else:
+            try:
+                evidence = await retrieve_evidence(
+                    self._session,
+                    tenant_id=tenant_id,
+                    # The rewritten query, not the raw question: anaphora
+                    # ("how about monthly?") has no subject for the index to
+                    # match, and retrieval runs on the surface string for both
+                    # the FTS and the vector leg. When nothing was rewritten
+                    # this is identical to `question`.
+                    query=retrieval_query,
+                    principal=principal,
+                    embedder=self._deps.embedder,
+                    top_k=top_k,
+                    trace=ctx,
+                    reranker=reranker,
+                    metadata_filter=metadata_filter,
+                    enabled_paths=enabled_paths,
+                    rerank_cap=settings.rerank_candidate_cap,
+                )
+                if metadata_filter is not None and not evidence:
+                    # A filter that matches no metadata at all is
+                    # indistinguishable from "wrong corpus". Fall back to the
+                    # unfiltered search and record the degradation, so a
+                    # metadata typo shows up as a reported narrowing loss
+                    # instead of a confident abstention.
+                    evidence = await retrieve_evidence(
+                        self._session,
+                        tenant_id=tenant_id,
+                        query=retrieval_query,
+                        principal=principal,
+                        embedder=self._deps.embedder,
+                        top_k=top_k,
+                        trace=ctx,
+                        reranker=reranker,
+                        enabled_paths=enabled_paths,
+                        rerank_cap=settings.rerank_candidate_cap,
+                    )
+                    filtered_empty = True
+            except Exception as exc:  # noqa: BLE001 - degradation is a policy choice
+                # Retrieval unavailable: never answer enterprise facts; hand off.
+                logger.error("retrieval_failed", ctx, error_code=type(exc).__name__)
+                return await self._finish_abstain(
+                    run=run,
+                    tenant_id=tenant_id,
+                    conversation_ref_id=conversation_ref_id,
+                    expected_lease_version=expected_lease_version,
+                    decision=AbstentionDecision(
+                        abstain=True, reason_code="RETRIEVAL_UNAVAILABLE", handoff=True
+                    ),
+                    ctx=ctx,
+                    started=started,
+                    question=question,
+                    chatwoot_account_id=chatwoot_account_id,
+                    chatwoot_conversation_id=chatwoot_conversation_id,
+                )
+
+            # --- 3b. Relative score floor (plan 1.7, flag off by default). ---
+            # Candidates below floor_ratio * top_score are not sent to the
+            # model. The threshold is RELATIVE because RRF scores are tiny in
+            # absolute terms - an absolute floor never fires, which is the
+            # exact trap the conflict margin already fell into once. At least
+            # one chunk always survives: the floor narrows evidence, it must
+            # not empty it.
+            if evidence and await self._flag_enabled(settings.flag_score_floor, tenant_id):
+                top_score = max(chunk.score for chunk in evidence)
+                kept = [
+                    c
+                    for c in evidence
+                    if c.score >= settings.retrieval_score_floor_ratio * top_score
+                ]
+                if kept and len(kept) < len(evidence):
+                    evidence = kept
+                    score_floor_applied = True
+
+        # Record the full retrieval lineage on the run (plan 1.7 acceptance:
+        # every dial is auditable per run).
+        if not tool_evidence:
+            run.retrieval_config = {
+                **(run.retrieval_config or {}),
+                "top_k": top_k,
+                "paths": list(enabled_paths or ("fts", "vector", "trigram", "alias")),
+                "query_normalization": normalization_reason,
+                "metadata_filter": metadata_filter.as_metadata() if metadata_filter else None,
+                "metadata_filter_degraded": filtered_empty,
+                "score_floor_applied": score_floor_applied,
+            }
 
         # --- 4. Abstention gate before spending a model call. ---
-        decision = decide_abstention(question, evidence, restricted_query=restricted_query)
+        # Tool receipts bypass the gate: the receipt is the provider's own
+        # verified answer, not a passage whose relevance needs judging.
+        decision = (
+            AbstentionDecision(abstain=False)
+            if tool_evidence
+            else decide_abstention(question, evidence, restricted_query=restricted_query)
+        )
         if decision.abstain:
             return await self._finish_abstain(
                 run=run,
@@ -527,8 +881,33 @@ class AgentOrchestrator:
                 chatwoot_account_id=chatwoot_account_id,
                 chatwoot_conversation_id=chatwoot_conversation_id,
             )
+        # --- 4c. Evidence-first budget (plan 2.7). ---
+        # Evidence and context share one prompt. When they contend, evidence
+        # wins: a shrunken context degrades the answer gracefully, while
+        # truncated evidence produces abstentions or hallucinations. The
+        # reduction is recorded - an audit trail that says "context was
+        # small" turns a quality regression into a diagnosable one.
+        evidence_chars = sum(len(chunk.excerpt) for chunk in evidence)
+        from platform_core.agent_runtime.generator import MAX_TOTAL_EVIDENCE_CHARS
+
+        final_ctx_budget = max(
+            settings.context_min_budget_chars,
+            min(context.budget_chars, MAX_TOTAL_EVIDENCE_CHARS - evidence_chars),
+        )
+        if final_ctx_budget < context.budget_chars:
+            context = memory.compact(budget_chars=final_ctx_budget)
+            get_metrics().context_turns_kept.observe(len(context.recent))
+            get_metrics().context_turns_summarized.observe(context.dropped_turns)
+            run.model_config = {
+                **(run.model_config or {}),
+                "context_budget_reduced_for_evidence": True,
+                "context_budget_chars": final_ctx_budget,
+            }
+
         try:
-            draft = await self._generate_with_telemetry(ctx, question, evidence)
+            draft = await self._generate_with_telemetry(
+                ctx, question, evidence, context=context, retrieval_query=retrieval_query
+            )
             # Record the provider's token accounting on the run. The generator
             # boundary used to drop it, so `token_usage` was always `{}` even
             # though ChatResult carries it (and a malformed model response
@@ -558,6 +937,54 @@ class AgentOrchestrator:
         get_metrics().citation_validation_total.labels(
             status="supported" if validation.ok else "unsupported"
         ).inc()
+        # Citation-supportability guard (plan 4.2, flag off): a claim whose
+        # text negates a term its own cited excerpt affirms. Measured as a
+        # metric for a long time on purpose - the rule has false positives,
+        # and a false positive converts a right answer into an abstention.
+        # Only flips to a guard when an operator turns the flag on per tenant.
+        if (
+            validation.ok
+            and claim_contradiction_candidates(draft, evidence)
+            and await self._flag_enabled(self._settings().flag_citation_guard, tenant_id)
+        ):
+            return await self._finish_abstain(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                decision=AbstentionDecision(
+                    abstain=True, reason_code="UNSUPPORTED_CLAIM", handoff=True
+                ),
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+        # Red-line guard (huqiu research difficulty 4, flag off by default):
+        # a draft that commits the company to a price, a delivery date, a
+        # liability or a compensation amount is a commercial promise no one
+        # authorised. Deterministic scan, so it is auditable; the flag lets
+        # precision be measured before it ever blocks a send.
+        if (
+            validation.ok
+            and redline_violations(draft.text)
+            and await self._flag_enabled(self._settings().flag_redline_guard, tenant_id)
+        ):
+            return await self._finish_abstain(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                decision=AbstentionDecision(
+                    abstain=True, reason_code="REDLINE_COMMERCIAL_COMMITMENT", handoff=True
+                ),
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
         if not validation.ok:
             return await self._finish_abstain(
                 run=run,
@@ -716,12 +1143,24 @@ class AgentOrchestrator:
         )
 
     async def _generate_with_telemetry(
-        self, ctx: TraceContext, question: str, evidence: list[RetrievedChunk]
+        self,
+        ctx: TraceContext,
+        question: str,
+        evidence: list[RetrievedChunk],
+        *,
+        context: CompactedContext | None = None,
+        retrieval_query: str = "",
     ) -> DraftAnswer:
         """Wrap the model call with a span and latency/token/error metrics.
 
         Kept separate from `run()` so the model boundary is measurable
         without threading timing variables through the pipeline body.
+
+        `context` carries the compressed conversation. It is handed to the
+        generator rather than concatenated into `question` because the question
+        is what the model must answer and the context is what it must not
+        contradict — merging them would make "what was asked" and "what was
+        said earlier" indistinguishable in the prompt, and in the audit trail.
 
         Note on "first-token latency": the provider surface
         (`ChatProvider.complete`) is non-streaming, so there is no first
@@ -735,7 +1174,12 @@ class AgentOrchestrator:
         started = time.monotonic()
         span = ctx.span("model.generate", **{"span.kind": "client"})
         try:
-            draft = await self._deps.generator.generate(question, evidence)
+            draft = await self._deps.generator.generate(
+                question,
+                evidence,
+                context=context,
+                retrieval_query=retrieval_query,
+            )
         except ModelError as exc:
             elapsed = time.monotonic() - started
             metrics.observe_model_call(
@@ -754,6 +1198,214 @@ class AgentOrchestrator:
             span.set_attributes(latency_ms=int(elapsed * 1000))
             span.end()
             return draft
+
+    async def _attempt_business_read(
+        self,
+        *,
+        run: AgentRun,
+        tenant_id: uuid.UUID,
+        question: str,
+        detection: IntentDetection,
+        ctx: TraceContext,
+        started: float,
+        conversation_ref_id: uuid.UUID,
+        expected_lease_version: int,
+        chatwoot_account_id: str | None,
+        chatwoot_conversation_id: str | None,
+    ) -> RunOutcome | list[RetrievedChunk]:
+        """Attempt the read-tool path for a BUSINESS_READ run (plan 3.2/3.4).
+
+        Returns tool-receipt evidence on success, or a finished RunOutcome
+        that hands off - the two outcomes, never a fallback that pretends the
+        knowledge corpus holds live data (ADR 0006). Every decision point is
+        audited: selection, proposal, execution.
+        """
+        import json as _json
+
+        from platform_core.tool_gateway.case_read import CaseReadExecutor
+        from platform_core.tool_gateway.gateway import ToolGateway, ToolGatewayError
+        from platform_core.tool_gateway.registry import ConnectorExecutorResolver
+        from platform_core.tool_gateway.selector import select_read_tools
+        from platform_policy import Action, Decision, PolicyEngine, Principal
+
+        candidates = select_read_tools(detection, question)
+        if not candidates:
+            return await self._handoff_for_tool(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                reason_code="TOOL_NO_CANDIDATE",
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+
+        resolver = ConnectorExecutorResolver(
+            self._session, tenant_id=tenant_id, trace_id=ctx.trace_id
+        )
+        executors = await resolver.executors_for([c.tool_name for c in candidates])
+        executors.setdefault("case.read", CaseReadExecutor(self._session))
+        usable = [c for c in candidates if c.tool_name in executors]
+        if not usable:
+            return await self._handoff_for_tool(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                reason_code="TOOL_UNAVAILABLE",
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+        chosen = usable[0]
+        arguments = _extract_tool_args(chosen.tool_name, question)
+        if arguments is None:
+            return await self._handoff_for_tool(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                reason_code="TOOL_ARGUMENT_MISSING",
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+
+        # The AI acts as the integration service for READS: TOOL_READ is the
+        # only action it needs, and the gateway re-checks it (required_action)
+        # so a policy change revoking the role stops the AI mid-path.
+        service_actor = uuid.uuid5(tenant_id, "system:ai-agent")
+        principal = Principal(
+            tenant_id=str(tenant_id), actor_id=str(service_actor), role="integration_service"
+        )
+        allowed = PolicyEngine().check(principal, Action.TOOL_READ).decision == Decision.ALLOW
+        idempotency_key = str(
+            uuid.uuid5(
+                tenant_id,
+                "tool:"
+                + str(run.id)
+                + ":"
+                + chosen.tool_name
+                + ":"
+                + _json.dumps(arguments, sort_keys=True, ensure_ascii=False),
+            )
+        )
+        from platform_core.tool_gateway.registry import ensure_tool_definitions
+
+        await ensure_tool_definitions(self._session, tenant_id=tenant_id)
+        gateway = ToolGateway(self._session, {chosen.tool_name: executors[chosen.tool_name]})
+        try:
+            proposal = await gateway.propose(
+                tenant_id=tenant_id,
+                actor_id=service_actor,
+                tool_name=chosen.tool_name,
+                arguments=arguments,
+                role=principal.role,
+                idempotency_key=idempotency_key,
+                permission_allowed=allowed,
+                required_action=Action.TOOL_READ.value,
+            )
+            execution = await gateway.execute(
+                tenant_id=tenant_id,
+                actor_id=service_actor,
+                proposal_id=proposal.id,
+            )
+        except ToolGatewayError as exc:
+            await audit_service.record(
+                self._session,
+                ctx=TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="system"),
+                action="tool_read.failed",
+                resource_type="tool",
+                resource_id=uuid.uuid5(tenant_id, f"tool:{chosen.tool_name}"),
+                decision="denied",
+                reason_code=exc.code[:63],
+                trace_id=ctx.trace_id,
+            )
+            return await self._handoff_for_tool(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                reason_code="TOOL_EXECUTION_FAILED",
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+
+        if execution.status not in ("executed", "verified"):
+            # UNKNOWN is the honest answer for an ambiguous read: reporting
+            # it as data would be fabrication by omission.
+            return await self._handoff_for_tool(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                reason_code="TOOL_EXECUTION_UNVERIFIED",
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+
+        output = execution.sanitized_output or {}
+        receipt_json = _json.dumps(output, sort_keys=True, ensure_ascii=False, default=str)
+        ref_value = next(iter(arguments.values()), "")
+        receipt_id = uuid.uuid5(tenant_id, f"receipt:{chosen.tool_name}:{idempotency_key}")
+        receipt = RetrievedChunk(
+            chunk_id=receipt_id,
+            document_version_id=None,
+            title=f"tool://{chosen.tool_name}",
+            section_path=[],
+            excerpt=receipt_json[:280],
+            source_uri=f"tool://{chosen.tool_name}/{ref_value}",
+            score=1.0,
+            ranking={"tool": 1.0},
+        )
+        logger.info(
+            "tool_read_executed",
+            ctx,
+            tool_name=chosen.tool_name,
+            run_id=str(run.id),
+            status=str(execution.status),
+        )
+        return [receipt]
+
+    async def _handoff_for_tool(
+        self,
+        *,
+        run: AgentRun,
+        tenant_id: uuid.UUID,
+        conversation_ref_id: uuid.UUID,
+        expected_lease_version: int,
+        reason_code: str,
+        ctx: TraceContext,
+        started: float,
+        question: str,
+        chatwoot_account_id: str | None,
+        chatwoot_conversation_id: str | None,
+    ) -> RunOutcome:
+        return await self._finish_abstain(
+            run=run,
+            tenant_id=tenant_id,
+            conversation_ref_id=conversation_ref_id,
+            expected_lease_version=expected_lease_version,
+            decision=AbstentionDecision(abstain=True, reason_code=reason_code, handoff=True),
+            ctx=ctx,
+            started=started,
+            question=question,
+            chatwoot_account_id=chatwoot_account_id,
+            chatwoot_conversation_id=chatwoot_conversation_id,
+        )
 
     async def _finish_abstain(
         self,
@@ -822,6 +1474,36 @@ class AgentOrchestrator:
                 chatwoot_conversation_id=chatwoot_conversation_id,
                 conversation_ref_id=conversation_ref_id,
             )
+            # Evidence-carrying handoff (plan 5.4): the receiving agent gets
+            # the reason code and the evidence the run gathered, as a PRIVATE
+            # note - the customer never sees it, and the agent does not have
+            # to reconstruct "why did the bot give up" from the audit log.
+            if not send_error and decision.handoff and self._settings().handoff_evidence_enabled:
+                await self._send_handoff_note(
+                    run=run,
+                    question=question,
+                    reason_code=decision.reason_code,
+                    ctx=ctx,
+                    chatwoot_account_id=chatwoot_account_id,
+                    chatwoot_conversation_id=chatwoot_conversation_id,
+                )
+
+        if decision.reason_code == ABSTAIN_CONFLICT:
+            # Conflicting sources become a review-able gap (plan 4.5): the
+            # abstention is honest, but two documents disagreeing is a corpus
+            # defect someone must adjudicate, and an audit line nobody reads
+            # is not adjudication.
+            try:
+                from platform_core.knowledge.gap_service import record_gap
+
+                await record_gap(
+                    self._session,
+                    tenant_id=tenant_id,
+                    question=question,
+                    reason_code=decision.reason_code,
+                )
+            except Exception:  # noqa: BLE001 - the gap is enrichment
+                logger.warning("gap_record_failed", ctx, reason_code=decision.reason_code)
 
         if decision.handoff:
             await lease_service.release_to_queue(
@@ -850,6 +1532,7 @@ class AgentOrchestrator:
             reason_code=decision.reason_code,
             notice_sent=not send_error,
         )
+        self._observe_cost(run)
         get_metrics().observe_run(
             outcome="handed_off" if decision.handoff else "abstained",
             route=run.route,
@@ -863,6 +1546,150 @@ class AgentOrchestrator:
             answer_text=notice,
             abstain_reason=decision.reason_code,
             handoff=decision.handoff,
+            send_blocked_reason=send_error,
+            latency_ms=run.latency_ms,
+            trace_id=ctx.trace_id,
+        )
+
+    def _observe_cost(self, run: AgentRun) -> None:
+        """Estimated run cost in cents (plan 5.1). Pricing is config, usage
+        is the provider's own accounting - neither is invented here."""
+        usage = run.token_usage or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        if not prompt_tokens and not completion_tokens:
+            return
+        cfg = self._settings()
+        cost = (
+            prompt_tokens * cfg.cost_prompt_cents_per_1k / 1000.0
+            + completion_tokens * cfg.cost_completion_cents_per_1k / 1000.0
+        )
+        get_metrics().run_cost_cents.observe(max(0.0, cost))
+
+    async def _send_handoff_note(
+        self,
+        *,
+        run: AgentRun,
+        question: str,
+        reason_code: str,
+        ctx: TraceContext,
+        chatwoot_account_id: str | None,
+        chatwoot_conversation_id: str | None,
+    ) -> None:
+        """Private note for the receiving agent: reason + evidence refs."""
+        if self._deps.sender is None or not chatwoot_account_id or not chatwoot_conversation_id:
+            return
+        # No raw content: the hash links to the audit log, which is the
+        # record a reviewer is allowed to read.
+        note = (
+            f"[handoff] reason_code={reason_code}"
+            f" | question_hash={getattr(run, 'input_hash', '')}"
+            f" | run_id={run.id}"
+        )
+        try:
+            await self._deps.sender.send_message(  # type: ignore[attr-defined]
+                account_id=chatwoot_account_id,
+                conversation_id=chatwoot_conversation_id,
+                content=note,
+                command_id=f"run:{run.id}:note",
+                private=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - the note is best-effort
+            logger.warning("handoff_note_failed", ctx, error_code=type(exc).__name__)
+
+    async def _finish_clarify(
+        self,
+        *,
+        run: AgentRun,
+        tenant_id: uuid.UUID,
+        conversation_ref_id: uuid.UUID,
+        expected_lease_version: int,
+        reason_code: str,
+        ctx: TraceContext,
+        started: float,
+        question: str,
+        chatwoot_account_id: str | None,
+        chatwoot_conversation_id: str | None,
+    ) -> RunOutcome:
+        """Ask the customer for the missing detail; keep the conversation.
+
+        The one structural difference from `_finish_abstain` is that this does
+        **not** release the lease. A clarification expects a reply, and
+        releasing the lease to the queue would hand the conversation to a human
+        who now has to ask the same question the platform just asked — so the
+        customer would be asked twice and the ticket would be waited on by
+        nobody.
+
+        It still goes through the pre-send lease re-check: a human may have
+        taken over between arrival and here, and a clarification sent after a
+        human already replied is the duplicate the lease exists to stop.
+        """
+        run.status = RunStatus.ABSTAINED.value
+        run.abstain_reason = ABSTAIN_CLARIFICATION[:127]
+        run.latency_ms = int((time.monotonic() - started) * 1000)
+        await self._session.flush()
+
+        notice = safe_abstention_text(ABSTAIN_CLARIFICATION)
+
+        send_error = ""
+        try:
+            await lease_service.assert_can_send(
+                self._session,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_version=expected_lease_version,
+            )
+        except LeaseConflict as exc:
+            send_error = f"LEASE_CONFLICT: {exc}"
+            logger.warning("clarification_blocked", ctx, reason_code=str(exc))
+            get_metrics().lease_conflicts_total.inc()
+        else:
+            send_error = await self._dispatch(
+                run=run,
+                tenant_id=tenant_id,
+                draft_text=notice,
+                ctx=ctx,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+                conversation_ref_id=conversation_ref_id,
+            )
+
+        await audit_service.record(
+            self._session,
+            ctx=TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="service"),
+            action="agent_run.clarification_requested",
+            resource_type="agent_run",
+            resource_id=run.id,
+            decision="abstained",
+            reason_code=reason_code[:63],
+            after={"handoff": False, "notice_sent": not send_error},
+            trace_id=ctx.trace_id,
+        )
+        logger.info(
+            "run_clarification_requested",
+            ctx,
+            route=run.route,
+            reason_code=reason_code,
+            notice_sent=not send_error,
+        )
+        # Counted as an abstention, not a handoff: the conversation is still
+        # the AI's, and a clarification that showed up in the handoff rate
+        # would make the platform look like it is giving up far more often
+        # than it is.
+        get_metrics().observe_run(
+            outcome="abstained",
+            route=run.route,
+            latency_seconds=run.latency_ms / 1000.0,
+            abstain_reason=ABSTAIN_CLARIFICATION,
+        )
+        del question
+        return RunOutcome(
+            run_id=run.id,
+            status=RunStatus.ABSTAINED,
+            route=run.route,
+            answer_text=notice,
+            abstain_reason=ABSTAIN_CLARIFICATION,
+            handoff=False,
             send_blocked_reason=send_error,
             latency_ms=run.latency_ms,
             trace_id=ctx.trace_id,
@@ -906,9 +1733,28 @@ class AgentOrchestrator:
         del tenant_id, conversation_ref_id
         return ""
 
-    def _model_config(self) -> dict[str, Any]:
+    def _model_config(
+        self,
+        *,
+        context: CompactedContext | None = None,
+        detection: IntentDetection | None = None,
+    ) -> dict[str, Any]:
+        """Versioned lineage for this run, plus the multi-turn audit snapshot.
+
+        `docs/agent.md` requires every run to record prompt, model, retrieval,
+        policy, tool schema and code versions so an answer can be reproduced.
+        The conversation block is added here rather than in a new column
+        because it is *reproduction input*, exactly like the retrieval config:
+        two runs that differ in what context the model saw are not the same
+        run, and the difference has to be visible somewhere that survives.
+
+        Text is deliberately absent — `CompactedContext.as_dict` reports counts
+        and keys only. The audit log owns what was said; duplicating customer
+        content here would create a second thing to redact and a second thing
+        to retain.
+        """
         gen = self._deps.generator
-        return {
+        config: dict[str, Any] = {
             "model": getattr(self._deps.extra.get("chat"), "_chat_model", "unknown")
             if self._deps.extra
             else "unknown",
@@ -916,10 +1762,80 @@ class AgentOrchestrator:
             "prompt_version": gen.template.version if gen else 0,
             "temperature": 0.0,
         }
+        if detection is not None:
+            config["intent"] = detection.as_dict()
+        if context is not None:
+            config["conversation"] = context.as_dict()
+        return config
 
-    def _retrieval_config(self) -> dict[str, Any]:
-        return {
+    async def _flag_enabled(self, key: str, tenant_id: uuid.UUID) -> bool:
+        decision = await flag_service.evaluate(
+            self._session, flag_key=key, tenant_id=tenant_id, default=False
+        )
+        return decision.enabled
+
+    @staticmethod
+    def _settings() -> Any:
+        from platform_core.config import get_settings
+
+        return get_settings()
+
+    def _top_k_for_scene(self, scene: Scene) -> int:
+        """Scene-tiered evidence breadth (plan 1.7).
+
+        Policy and pre-sales questions are answered by *combining* passages,
+        so they want the widest evidence set; a technical fault question is
+        usually decided by one error-code page, where extra candidates only
+        dilute the prompt and the rerank budget.
+        """
+        cfg = self._settings()
+        if scene in (Scene.BILLING, Scene.PRE_SALES, Scene.ACCOUNT_SECURITY):
+            return int(cfg.retrieval_top_k_policy)
+        if scene is Scene.TECHNICAL_SUPPORT:
+            return int(cfg.retrieval_top_k_technical)
+        return int(cfg.retrieval_top_k)
+
+    @staticmethod
+    def _metadata_filter_for(question: str) -> MetadataFilter | None:
+        """Metadata constraints from entities the question names explicitly.
+
+        Only phrases that *name* a dimension ("model EC-504", "firmware 2.3.1")
+        produce a filter — a bare identifier elsewhere in the sentence is far
+        too weak a signal to narrow retrieval on, and a wrongly narrowed
+        retrieval is how the platform confidently answers from the wrong
+        variant. No mention, no filter: wide recall is the safe default
+        (plan 1.5's key trade-off).
+        """
+        values: dict[str, str] = {}
+        model = _MODEL_MENTION.search(question)
+        if model:
+            values["model"] = model.group(1).lower()
+        firmware = _FIRMWARE_MENTION.search(question)
+        if firmware:
+            values["firmware_version"] = firmware.group(1).lower().rstrip(".")
+        if not values:
+            return None
+        try:
+            return build_metadata_filter(values)
+        except ValueError:
+            return None
+
+    def _retrieval_config(
+        self, *, rewritten: bool = False, retrieval_query: str = ""
+    ) -> dict[str, Any]:
+        """Retrieval lineage.
+
+        `query_rewritten` and `rewritten_query` are recorded because a
+        retrieval miss is otherwise unexplainable: given the same corpus and
+        the same customer question, a run that searched for something else
+        looks like a retrieval bug when it was a context decision.
+        """
+        config: dict[str, Any] = {
             "strategy": "hybrid_rrf",
             "embedder": type(self._deps.embedder).__name__ if self._deps.embedder else "none",
-            "top_k": 8,
+            "top_k": self._top_k,
         }
+        if rewritten:
+            config["query_rewritten"] = True
+            config["rewritten_query"] = retrieval_query[:255]
+        return config

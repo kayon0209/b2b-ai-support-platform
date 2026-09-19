@@ -212,6 +212,7 @@ def test_sweep_executes_against_real_schema() -> None:
         "document_versions_expired",
         "dead_letters_pruned",
         "inbox_events_pruned",
+        "conversation_turns_pruned",
     }
 
 

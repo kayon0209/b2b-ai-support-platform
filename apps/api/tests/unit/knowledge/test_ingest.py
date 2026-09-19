@@ -3,6 +3,7 @@
 import pytest
 
 from platform_core.knowledge.ingest import (
+    MAX_CHUNK_CHARS,
     InvalidTransition,
     chunk_sections,
     parse_markdown_sections,
@@ -208,3 +209,57 @@ def test_parse_document_binary_not_text() -> None:
     # Random binary bytes that are not valid UTF-8
     with pytest.raises(IngestionError, match="not decodable"):
         parse_document("text/plain", b"\xff\xfe\x00\x01\x80\x90")
+
+
+def test_tiny_adjacent_sections_are_merged() -> None:
+    """The docstring promises this and it used not to happen: MIN_CHUNK_CHARS
+    was declared and never read, so a document of one-line sections produced
+    one near-empty chunk per line. Each of those gets its own embedding with
+    almost no context in it, which makes the index worse and bigger rather
+    than raising anything.
+    """
+    sections = [
+        Section(path=["Refunds"], text="Annual plans: 30 days."),
+        Section(path=["Refunds"], text="Monthly plans: 14 days."),
+    ]
+    chunks = chunk_sections(sections)
+    assert len(chunks) == 1
+    assert "Annual plans" in chunks[0].text and "Monthly plans" in chunks[0].text
+    assert chunks[0].path == ["Refunds"]
+
+
+def test_tiny_sections_from_different_headings_do_not_merge() -> None:
+    """Merging across headings would put a citation on a passage that says
+    something else, which is worse than a small chunk.
+    """
+    sections = [
+        Section(path=["Refunds"], text="30 days."),
+        Section(path=["Shipping"], text="Two days."),
+    ]
+    chunks = chunk_sections(sections)
+    assert len(chunks) == 2
+
+
+def test_a_tiny_section_that_would_overflow_stays_separate() -> None:
+    """MIN_CHUNK_CHARS never overrides MAX_CHUNK_CHARS: a long neighbour must
+    not be pushed over the limit just to absorb a small chunk."""
+    # A neighbour close enough to the limit that absorbing "tiny" would push it
+    # over. MAX_CHUNK_CHARS wins, so the small chunk stays on its own.
+    neighbour = "x" * (MAX_CHUNK_CHARS - 2)
+    sections = [
+        Section(path=["P"], text=neighbour),
+        Section(path=["P"], text="tiny"),
+    ]
+    chunks = chunk_sections(sections)
+    assert len(chunks) == 2
+    assert all(len(c.text) <= MAX_CHUNK_CHARS for c in chunks)
+
+
+def test_empty_sections_are_not_emitted() -> None:
+    sections = [
+        Section(path=["A"], text="real content here"),
+        Section(path=["A"], text="   "),
+    ]
+    chunks = chunk_sections(sections)
+    assert len(chunks) == 1
+    assert chunks[0].text.strip() == "real content here"

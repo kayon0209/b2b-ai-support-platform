@@ -69,15 +69,31 @@ def create_engine(database_url: str | None = None) -> AsyncEngine:
     return create_async_engine(url, pool_pre_ping=True, pool_size=10, max_overflow=10)
 
 
-engine: AsyncEngine | None = None
+# Engines are cached per URL and reused across requests: a pool that is built
+# and disposed per session scope pays a fresh TCP connection + Postgres
+# authentication on every request, and `pool_size` would never hold a
+# connection. Keyed by URL so the owner role and the app role each get their
+# own pool, and so a test pointing at a different database never shares one.
+_engines: dict[str, AsyncEngine] = {}
+
+
+def get_engine(database_url: str | None = None) -> AsyncEngine:
+    """Return the cached engine for a URL, creating it on first use."""
+    url = database_url or get_settings().database_url
+    engine = _engines.get(url)
+    if engine is None:
+        engine = create_engine(url)
+        _engines[url] = engine
+    return engine
+
+
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
-    global engine, _session_factory
+    global _session_factory
     if _session_factory is None:
-        engine = create_engine()
-        _session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        _session_factory = async_sessionmaker(get_engine(), expire_on_commit=False)
     return _session_factory
 
 
@@ -97,27 +113,26 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 @asynccontextmanager
 async def session_scope_with_url(database_url: str) -> AsyncIterator[AsyncSession]:
     """Session scope against an explicit URL (e.g. the non-bypass app role).
-    The bootstrap owner is a superuser and would bypass RLS entirely."""
-    scoped_engine = create_engine(database_url)
-    factory = async_sessionmaker(scoped_engine, expire_on_commit=False)
-    try:
-        async with factory() as session:
-            try:
-                yield session
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                raise
-    finally:
-        await scoped_engine.dispose()
+    The bootstrap owner is a superuser and would bypass RLS entirely.
+
+    The engine comes from the per-URL cache: creating and disposing one per
+    call turned every request into a fresh connection + teardown."""
+    factory = async_sessionmaker(get_engine(database_url), expire_on_commit=False)
+    async with factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def dispose_engine() -> None:
-    global engine, _session_factory
-    if engine is not None:
+    global _session_factory
+    for engine in _engines.values():
         await engine.dispose()
-        engine = None
-        _session_factory = None
+    _engines.clear()
+    _session_factory = None
 
 
 def app_role_url() -> str:

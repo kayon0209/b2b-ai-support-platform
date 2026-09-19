@@ -1,5 +1,6 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { useLang } from "../lib/i18n";
 
 /**
  * In-page prompts, replacing `window.prompt` / `window.confirm`.
@@ -25,8 +26,15 @@ export interface PromptField {
   label: string;
   placeholder?: string;
   initial?: string;
-  /** Render a select instead of a text input. */
-  options?: readonly string[];
+  /**
+   * Render a select instead of a text input.
+   *
+   * A bare string is both the value and the label. Pass `{ value, label }`
+   * when the label is not unique or not what the API wants: selecting a
+   * knowledge space by its *name* and then looking the id up in a map meant
+   * two spaces with the same name silently published to the wrong one.
+   */
+  options?: readonly (string | PromptOption)[];
   /** Reject a non-integer value before submitting. */
   integer?: boolean;
   /** Reject an empty value before submitting. */
@@ -34,6 +42,15 @@ export interface PromptField {
   /** Range check for `integer` fields. */
   min?: number;
   max?: number;
+}
+
+export interface PromptOption {
+  value: string;
+  label: string;
+}
+
+function optionOf(option: string | PromptOption): PromptOption {
+  return typeof option === "string" ? { value: option, label: option } : option;
 }
 
 export interface PromptSpec {
@@ -54,27 +71,13 @@ export interface PromptHandle {
   element: ReactNode;
 }
 
-function validate(fields: readonly PromptField[], values: PromptValues): string | null {
-  for (const field of fields) {
-    const raw = (values[field.name] ?? "").trim();
-    if (field.required && !raw) {
-      return `${field.label} is required.`;
-    }
-    if (field.integer && raw !== "") {
-      const n = Number(raw);
-      if (!Number.isInteger(n)) return `${field.label} must be a whole number.`;
-      if (field.min !== undefined && n < field.min) return `${field.label} must be at least ${field.min}.`;
-      if (field.max !== undefined && n > field.max) return `${field.label} must be at most ${field.max}.`;
-    }
-  }
-  return null;
-}
-
 export function usePrompt(): PromptHandle {
+  const { t } = useLang();
   const [spec, setSpec] = useState<PromptSpec | null>(null);
   const [values, setValues] = useState<PromptValues>({});
   const [error, setError] = useState<string | null>(null);
   const resolver = useRef<((result: PromptValues | null) => void) | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
 
   const settle = useCallback((result: PromptValues | null) => {
     const resolve = resolver.current;
@@ -103,10 +106,59 @@ export function usePrompt(): PromptHandle {
     [ask],
   );
 
+  const validate = (fields: readonly PromptField[], values: PromptValues): string | null => {
+    for (const field of fields) {
+      const raw = (values[field.name] ?? "").trim();
+      if (field.required && !raw) {
+        return t("prompt.required", { label: field.label });
+      }
+      if (field.integer && raw !== "") {
+        const n = Number(raw);
+        if (!Number.isInteger(n)) return t("prompt.integer", { label: field.label });
+        if (field.min !== undefined && n < field.min)
+          return t("prompt.min", { label: field.label, min: field.min });
+        if (field.max !== undefined && n > field.max)
+          return t("prompt.max", { label: field.label, max: field.max });
+      }
+    }
+    return null;
+  };
+
   const fields = spec?.fields ?? [];
 
+  // Move focus into the prompt when it opens. Without this the keyboard user
+  // is left on the button they pressed, with the dialog somewhere else on
+  // the page, and has to tab across everything in between to answer it.
+  useEffect(() => {
+    if (!spec) return;
+    const node = dialogRef.current;
+    if (!node) return;
+    const first = node.querySelector<HTMLElement>(
+      "input, select, textarea, .btn-primary",
+    );
+    (first ?? node).focus();
+  }, [spec]);
+
   const element = spec ? (
-    <div className="prompt" role="group" aria-label={spec.title}>
+    <div
+      className="prompt"
+      // role="dialog" and not "group": a screen reader has to announce this
+      // as a thing that appeared and expects an answer, not as a passive
+      // region of the page it happens to be reading.
+      role="dialog"
+      aria-modal="false"
+      aria-label={spec.title}
+      ref={dialogRef}
+      onKeyDown={(e) => {
+        // Escape is the one dismissal a keyboard user expects to work
+        // everywhere. Cancelling is safe: the promise resolves null and the
+        // caller treats that exactly like pressing Cancel.
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          settle(null);
+        }
+      }}
+    >
       <div className="prompt-head">
         <strong>{spec.title}</strong>
       </div>
@@ -123,11 +175,14 @@ export function usePrompt(): PromptHandle {
                   onChange={(e) => setValues((v) => ({ ...v, [field.name]: e.target.value }))}
                 >
                   {!field.required ? <option value="">—</option> : null}
-                  {field.options.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
+                  {field.options.map((option) => {
+                    const { value, label } = optionOf(option);
+                    return (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    );
+                  })}
                 </select>
               ) : (
                 <input
@@ -159,10 +214,10 @@ export function usePrompt(): PromptHandle {
             settle(values);
           }}
         >
-          {spec.confirmLabel ?? "Confirm"}
+          {spec.confirmLabel ?? t("common.confirm")}
         </button>
         <button className="btn" onClick={() => settle(null)}>
-          Cancel
+          {t("common.cancel")}
         </button>
       </div>
     </div>

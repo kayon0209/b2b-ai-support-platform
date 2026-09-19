@@ -329,13 +329,42 @@ async def ingest_version(
         raise _Retryable(f"object storage unavailable: {type(exc).__name__}") from exc
 
     text = ingest.parse_document(version.content_type, raw)
+
+    # Front matter (plan 1.5): a leading `---` block carries the metadata the
+    # retrieval filter consumes (model/firmware/region/...). Stripped here so
+    # it never reaches the chunk text, where it would be both noise and a
+    # duplicate of the column the filter actually reads.
+    text, doc_metadata = ingest.extract_front_matter(text)
+
+    # Cleaning (plan 4.6) runs before sectioning so page furniture is gone
+    # before heading detection and every later step sees the same bytes.
+    from platform_core.config import get_settings
+
+    settings = get_settings()
+    cleaning_report = ingest.CleaningReport()
+    if settings.cleaning_enabled:
+        text, cleaning_report = ingest.clean_text(
+            text, strip_boilerplate=settings.cleaning_strip_boilerplate
+        )
+
     sections = ingest.parse_markdown_sections(text)
     if not sections:
         raise IngestionError("no sections found in the document")
 
-    chunks = ingest.chunk_sections(sections)
+    chunk_config = ingest.ChunkingConfig(
+        max_chars=settings.chunking_max_chars,
+        min_chars=settings.chunking_min_chars,
+        overlap_chars=settings.chunking_overlap_chars,
+    )
+    chunks = ingest.chunk_sections(sections, chunk_config)
     if not chunks:
         raise IngestionError("chunking produced no chunks")
+    if settings.cleaning_enabled and settings.cleaning_dedupe_chunks:
+        chunks, deduped = ingest.dedupe_chunks(chunks)
+        cleaning_report.duplicate_chunks_removed = deduped
+        if not chunks:
+            raise IngestionError("cleaning removed every chunk (duplicate document?)")
+    cleaning_report.chunks_total = len(chunks)
 
     await _advance(session, version.version_id, IngestionStatus.EMBEDDING)
     texts = [c.text[:MAX_EMBED_CHARS] for c in chunks]
@@ -361,7 +390,10 @@ async def ingest_version(
                 ordinal=ordinal,
                 text=chunk.text,
                 text_hash=service.content_hash(chunk.text.encode()),
-                metadata_json={"embedding_model": getattr(embedder, "model_name", None)},
+                metadata_json={
+                    "embedding_model": getattr(embedder, "model_name", None),
+                    **chunk.meta,
+                },
             )
         )
         # `search_vector` is GENERATED ALWAYS AS ... STORED, so it is
@@ -383,7 +415,16 @@ async def ingest_version(
     await session.execute(
         update(DocumentVersion)
         .where(DocumentVersion.id == version.version_id)
-        .values(status="active", metadata_json=_merged_metadata(version, chunks=len(chunks)))
+        .values(
+            status="active",
+            metadata_json=_merged_metadata(
+                version,
+                chunks=len(chunks),
+                chunking=chunk_config.as_metadata(),
+                cleaning=cleaning_report.as_metadata(),
+                document_metadata=doc_metadata,
+            ),
+        )
     )
     return len(chunks)
 
@@ -446,8 +487,27 @@ async def _advance(session: AsyncSession, version_id: uuid.UUID, target: Ingesti
     await session.flush()
 
 
-def _merged_metadata(version: ClaimedVersion, *, chunks: int) -> dict[str, Any]:
-    return {"ingested_chunks": chunks, "pipeline_version": ingest.PIPELINE_VERSION}
+def _merged_metadata(
+    version: ClaimedVersion,
+    *,
+    chunks: int,
+    chunking: dict[str, Any] | None = None,
+    cleaning: dict[str, Any] | None = None,
+    document_metadata: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "ingested_chunks": chunks,
+        "pipeline_version": ingest.PIPELINE_VERSION,
+    }
+    if chunking is not None:
+        meta["chunking"] = chunking
+    if cleaning is not None:
+        meta["cleaning"] = cleaning
+    if document_metadata:
+        # Front-matter keys are the retrieval filter's vocabulary; top-level
+        # so `metadata @> {...}` predicates stay simple.
+        meta.update(document_metadata)
+    return meta
 
 
 async def mark_failed(session: AsyncSession, version_id: uuid.UUID, error: str) -> None:

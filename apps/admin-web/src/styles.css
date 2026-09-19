@@ -36,10 +36,49 @@
   --neutral: #5c6570;
   --neutral-soft: #eef0f3;
 
+  --banner-error-border: #f0c3bf;
+  --banner-ok-border: #b7e0c9;
+  --shadow-color: rgba(28, 33, 40, 0.06);
+
   --radius: 8px;
   --radius-sm: 4px;
-  --shadow: 0 1px 2px rgba(28, 33, 40, 0.06);
+  --shadow: 0 1px 2px var(--shadow-color);
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* Dark theme: a variable override, so no component branches on theme. The
+   soft tone backgrounds become translucent tints of their own colour — a
+   pastel-on-dark reads as washed out, while a 20% tint keeps the badge
+   readable against the dark surface. */
+[data-theme="dark"] {
+  --bg: #12161c;
+  --surface: #1a2027;
+  --surface-2: #20272f;
+  --border: #2c343d;
+  --border-strong: #3d4750;
+
+  --text: #e6e9ed;
+  --text-muted: #98a2ad;
+  --text-inverse: #ffffff;
+
+  --accent: #4d84f2;
+  --accent-hover: #6397f5;
+  --accent-soft: rgba(77, 132, 242, 0.16);
+
+  --good: #4cc38a;
+  --good-soft: rgba(76, 195, 138, 0.16);
+  --warn: #e0a63a;
+  --warn-soft: rgba(224, 166, 58, 0.16);
+  --bad: #ef6a60;
+  --bad-soft: rgba(239, 106, 96, 0.16);
+  --info: #4d84f2;
+  --info-soft: rgba(77, 132, 242, 0.16);
+  --neutral: #98a2ad;
+  --neutral-soft: rgba(152, 162, 173, 0.16);
+
+  --banner-error-border: rgba(239, 106, 96, 0.4);
+  --banner-ok-border: rgba(76, 195, 138, 0.4);
+  --shadow-color: rgba(0, 0, 0, 0.4);
 }
 
 * {
@@ -120,6 +159,36 @@ h3 {
   font-size: 12px;
 }
 
+.shell-controls {
+  display: flex;
+  gap: 6px;
+  padding: 0 6px;
+}
+
+/* Two equal halves: theme and language are peers, and a full-width pair
+   reads as "settings row" rather than two stray buttons. */
+.shell-toggle {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.05);
+  color: #c9d1d9;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.shell-toggle:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #f0f3f6;
+}
+
 .nav {
   display: flex;
   flex-direction: column;
@@ -156,6 +225,9 @@ h3 {
 }
 
 .sidebar-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin-top: auto;
   padding: 0 10px;
   font-size: 11px;
@@ -165,6 +237,40 @@ h3 {
 .content {
   min-width: 0;
   padding: 24px 28px 48px;
+}
+
+/* Visible only when focused: the first tab stop on every page, so a keyboard
+   user does not have to walk the whole sidebar to reach the content. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 20;
+  padding: 8px 14px;
+  border-radius: 0 0 var(--radius-sm) 0;
+  background: var(--accent);
+  color: var(--text-inverse);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.skip-link:focus {
+  left: 0;
+}
+
+.error-details {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+.error-details pre {
+  margin: 8px 0 0;
+  padding: 10px;
+  overflow-x: auto;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* --- Page scaffolding ----------------------------------------------------- */
@@ -263,12 +369,116 @@ h3 {
   align-items: start;
 }
 
+/* --- Mobile --------------------------------------------------------------- */
+/*
+ * Below 900px the two-column shell collapses to one, and the sidebar has to
+ * stop being a full-height block: eight nav items plus the brand pushed the
+ * first screen's content entirely below the fold, and with no way to
+ * collapse it the operator scrolled past the whole menu on every page.
+ */
+
+/* The collapse control is only meaningful once the shell has collapsed. */
+.nav-toggle {
+  display: none;
+}
+
 @media (max-width: 900px) {
   .app-shell {
     grid-template-columns: 1fr;
   }
 
   .grid-case {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    gap: 12px;
+    padding: 12px 14px;
+  }
+
+  .nav-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.06);
+    color: #c9d1d9;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  /* Collapsed by default so content is reachable without scrolling. */
+  .nav,
+  .shell-controls {
+    display: none;
+  }
+
+  .nav-open .nav,
+  .nav-open .shell-controls {
+    display: flex;
+  }
+
+  /* Two columns of inputs at phone width are unusable. */
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .content {
+    padding: 16px 14px 40px;
+  }
+
+  .toolbar {
+    flex-wrap: wrap;
+  }
+
+  /* A grid or flex item defaults to `min-width: auto`, so one wide child
+     (a long unbroken value, an input with an intrinsic size) silently
+     widens the whole page instead of being constrained by it. */
+  .card,
+  .grid-2,
+  .form-grid,
+  .toolbar,
+  .branding-preview,
+  .serving,
+  .serving-body {
+    min-width: 0;
+  }
+
+  /* Label beside input does not survive a phone: the pair's combined
+     min-content width (label text + the input's intrinsic ~20 characters)
+     is wider than the screen, so the whole page is dragged out with it.
+     Stacking them makes the row as narrow as the viewport allows. */
+  .field {
+    min-width: 0;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+  }
+
+  .field input,
+  .field select,
+  .field .text-input {
+    width: 100%;
+    min-width: 0;
+  }
+
+  /* Tenant-supplied text (a display name, a logo URL) is arbitrary and can
+     be one long unbreakable token. */
+  .branding-name,
+  .branding-preview,
+  .cell-strong,
+  .cell-code {
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 640px) {
+  .grid-2 {
     grid-template-columns: 1fr;
   }
 }
@@ -364,6 +574,23 @@ h3 {
   cursor: not-allowed;
 }
 
+/* One visible focus style for every interactive element. Without it the
+   ring comes from the UA and does not match the accent colour, and the
+   borderless controls (segments, ghost buttons, nav links) are hard to see
+   focused at all. */
+.btn:focus-visible,
+.segment:focus-visible,
+.shell-toggle:focus-visible,
+.nav-toggle:focus-visible,
+.nav-item:focus-visible,
+.case-row:focus-visible,
+.skip-link:focus-visible,
+a:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .btn-primary {
   border-color: var(--accent);
   background: var(--accent);
@@ -451,7 +678,11 @@ h3 {
 }
 
 .text-input {
-  min-width: 200px;
+  /* A fixed 200px floor forced the layout viewport wider than a phone
+     screen whenever two inputs shared a row; letting it shrink (and
+     letting the toolbar wrap) keeps the page inside the viewport. */
+  min-width: 0;
+  max-width: 100%;
 }
 
 .text-area {
@@ -471,6 +702,17 @@ h3 {
 }
 
 /* --- Tables --------------------------------------------------------------- */
+
+/* A six-column table cannot fit a phone. Scrolling the table alone keeps the
+   page itself inside the viewport instead of widening the whole document. */
+.table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.table-scroll .table {
+  min-width: 560px;
+}
 
 .table {
   width: 100%;
@@ -672,7 +914,7 @@ h3 {
 }
 
 .banner-error {
-  border-color: #f0c3bf;
+  border-color: var(--banner-error-border);
   background: var(--bad-soft);
   color: var(--bad);
 }
@@ -681,7 +923,7 @@ h3 {
    cannot be mistaken for a failure at a glance, which is the one thing an
    operator scanning the page must not do. */
 .banner-ok {
-  border-color: #b7e0c9;
+  border-color: var(--banner-ok-border);
   background: var(--good-soft);
   color: var(--good);
 }

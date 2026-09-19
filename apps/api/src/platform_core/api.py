@@ -79,6 +79,67 @@ def error_response(
     )
 
 
+# --- Domain errors ---------------------------------------------------------
+#
+# A refused business action (a duplicate flag key, a promote with no
+# evaluation report) must come back as a 4xx, never as a 200 carrying an
+# error body. Three routers used to build `{"error": ...}` by hand and
+# return it as a plain dict, which FastAPI renders with status 200 — so the
+# admin UI's `unwrap()` treated a refusal as a success and reported
+# "Promoted" for a promotion that never happened.
+#
+# The mapping lives here, next to `error_response`, so the status for a code
+# is decided once and every caller agrees.
+
+DOMAIN_ERROR_STATUS: dict[str, int] = {
+    # Request was malformed or missing something the caller can fix.
+    "EMPTY_PROMPT_BODY": 400,
+    "EMPTY_DRAFT": 400,
+    "INVALID_KEY": 400,
+    "INVALID_PERCENT": 400,
+    "KEY_REQUIRED": 400,
+    "KEY_TOO_LONG": 400,
+    "REASON_REQUIRED": 400,
+    "TEMPLATE_MISMATCH": 400,
+    # Resource does not exist (or is not visible to this tenant).
+    "NOT_FOUND": 404,
+    # The resource exists but is in a state that forbids the action.
+    "ALREADY_ACTIVE": 409,
+    "ALREADY_EXISTS": 409,
+    "ALREADY_PUBLISHED": 409,
+    "ALREADY_RESOLVED": 409,
+    "ALREADY_REVIEWED": 409,
+    "DRAFT_NOT_APPROVED": 409,
+    "NO_ACTIVE_VERSION": 409,
+    "SELF_APPROVAL": 409,
+    "SELF_TARGET": 409,
+    # Well-formed request, refused by a release gate.
+    "EVALUATION_REQUIRED": 422,
+    "P0_REGRESSION": 422,
+    "PLATFORM_GATE_FAILED": 422,
+}
+
+
+def domain_error_response(
+    code: str,
+    message: str = "",
+    *,
+    trace_id: str = "",
+) -> JSONResponse:
+    """A refused business action, as a real 4xx in the standard envelope.
+
+    Unknown codes fall back to 400 rather than 200: a code that is not in
+    the table is a refusal someone forgot to classify, and answering 200 to
+    it is the one outcome that is always wrong.
+    """
+    return error_response(
+        code,
+        message or code,
+        status_code=DOMAIN_ERROR_STATUS.get(code, 400),
+        trace_id=trace_id,
+    )
+
+
 def ok_response(payload: dict[str, Any], *, trace_id: str = "") -> dict[str, Any]:
     """Attach `trace_id` to a success payload.
 

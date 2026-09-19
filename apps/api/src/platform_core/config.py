@@ -108,6 +108,106 @@ class Settings(BaseSettings):
     # loss, so they get their own, more generous budget.
     rate_limit_webhook_requests: int = 1200
 
+    # --- Chunking and ingestion (iteration plan 1.1/1.6/4.6) ------------------
+    # Defaults recorded in each document version's metadata together with the
+    # pipeline version, so a chunk-set is always reproducible from its row.
+    # The tuning report (scripts/tune_chunking.py) is the source these derive
+    # from; changing a default here must update that report.
+    chunking_max_chars: int = 1200
+    chunking_min_chars: int = 50
+    # Paragraph-level overlap: the tail of the previous chunk is carried into
+    # the next so cross-paragraph arguments survive the cut.
+    chunking_overlap_chars: int = 150
+    # Cleaning steps (4.6). Each is individually switchable; counts of what
+    # each step changed are written into version metadata.
+    cleaning_enabled: bool = True
+    cleaning_dedupe_chunks: bool = True
+    cleaning_strip_boilerplate: bool = True
+
+    # --- Retrieval (iteration plan 1.3/1.5/1.7) -------------------------------
+    # Per-path candidate budgets. Each path can be disabled independently
+    # (retrieval_enabled_paths) so its contribution to recall is measurable.
+    retrieval_fts_candidates: int = 40
+    retrieval_vector_candidates: int = 40
+    retrieval_trigram_candidates: int = 40
+    retrieval_alias_candidates: int = 20
+    retrieval_enabled_paths: str = "fts,vector,trigram,alias"
+    retrieval_rrf_k: int = 60
+    retrieval_top_k: int = 8
+    # Scene-tiered top-k: policy questions want wide evidence, fault-code
+    # questions want narrow precision.
+    retrieval_top_k_policy: int = 12
+    retrieval_top_k_technical: int = 6
+    # Rerank only the top-N fused candidates (never more than 2x top_k).
+    rerank_candidate_cap: int = 16
+    # Post-fusion relative score floor: candidates below
+    # floor_ratio * top_score are not sent to the model. Relative, because
+    # RRF scores are tiny in absolute terms - an absolute floor never fires.
+    retrieval_score_floor_ratio: float = 0.55
+    # Document authority (4.5) feeds a post-fusion ranking boost. Off until
+    # the corpus carries authority values; weights are per-authority
+    # multipliers as JSON, e.g. {"official":1.15,"wiki":1.0,"customer":0.9}.
+    retrieval_authority_boost_enabled: bool = False
+    retrieval_authority_boost_json: str = ""
+
+    # --- Multi-turn memory (iteration plan 2.1-2.8) ---------------------------
+    context_budget_chars: int = 1500
+    # Evidence wins budget contention: an answer must stay grounded, while a
+    # shrunken context degrades gracefully.
+    context_min_budget_chars: int = 300
+    context_recent_turns: int = 6
+    context_max_turns: int = 50
+    # Consecutive clarification rounds before the run hands off instead of
+    # asking again - an ask-loop is a dead conversation with extra steps.
+    clarification_max_streak: int = 2
+    # Chatwoot history fetch (2.2). Failure degrades to single-turn; it never
+    # blocks the run.
+    history_fetch_limit: int = 20
+    history_fetch_timeout_seconds: float = 3.0
+    # Local redacted turns are pruned after N days (retention policy), and
+    # Chatwoot stays the system of record for raw content.
+    conversation_turn_days: int = 90
+
+    # --- Cost, concurrency and fallback (iteration plan 5.1/5.3/5.5) ----------
+    # Hard limits per run. Hitting one degrades the run (handoff with a
+    # recorded event) rather than silently looping retries - the most
+    # expensive sessions are always the retry loops.
+    run_max_llm_calls: int = 10
+    run_token_budget: int = 12000
+    # Model fallback chain: primary -> fallback -> abstain. Off until a
+    # fallback model is configured and drilled.
+    model_fallback_enabled: bool = False
+    model_fallback_name: str | None = None
+    # Process-wide admission limits for the two contended resources.
+    concurrency_model_limit: int = 8
+    concurrency_retrieval_limit: int = 16
+    # Inbox depth above which new runs are refused with 429 instead of
+    # queueing - bounded backlog beats unbounded latency.
+    queue_max_depth: int = 500
+    # Exponential-backoff jitter: without it every caller retries in the same
+    # beat and the retry storm is synchronised. 0 disables.
+    retry_jitter_ratio: float = 0.3
+    # Estimated model pricing for the cost metric, cents per 1k tokens.
+    cost_prompt_cents_per_1k: float = 0.15
+    cost_completion_cents_per_1k: float = 0.60
+    # Evidence-carrying handoff notes (5.4): private Chatwoot note with the
+    # reason code and evidence references, readable by the receiving agent.
+    handoff_evidence_enabled: bool = False
+
+    # --- Feature flags for new behaviour (constraint 4) -----------------------
+    # Every behaviour change below defaults OFF and flips per tenant through
+    # the flag service, following agent.rerank_enabled.
+    flag_business_read_tools: str = "agent.business_read_enabled"
+    flag_citation_guard: str = "agent.citation_guard_enabled"
+    flag_query_normalization: str = "agent.query_normalization_enabled"
+    flag_metadata_filter: str = "retrieval.metadata_filter_enabled"
+    flag_score_floor: str = "retrieval.score_floor_enabled"
+    flag_priority_claim: str = "worker.priority_claim_enabled"
+    flag_redline_guard: str = "agent.redline_guard_enabled"
+    # Priority claiming is a deployment-level decision (the claim query is
+    # cross-tenant), so it is a plain switch rather than a tenant flag.
+    priority_claim_enabled: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:

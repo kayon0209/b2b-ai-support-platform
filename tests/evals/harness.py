@@ -18,7 +18,6 @@ pass by retrieving content it should never have been given.
 
 from __future__ import annotations
 
-import re
 import uuid
 from collections.abc import Awaitable, Callable
 
@@ -33,25 +32,19 @@ RetrieveFn = Callable[[str, PrincipalScope], Awaitable[list[RetrievedChunk]]]
 # exists so the rule is explicit and testable rather than a hardcoded `False`.
 PRIVILEGED_PRINCIPALS: frozenset[str] = frozenset()
 
-_STOPWORDS = frozenset(
-    {"the", "a", "an", "is", "are", "do", "does", "i", "you", "to", "of", "for", "in", "on", "my"}
-)
-
 
 def _terms(text: str) -> set[str]:
-    tokens = re.findall(r"\w+", text.lower())
-    out: set[str] = set()
-    for token in tokens:
-        if len(token) <= 2 or token in _STOPWORDS:
-            continue
-        # Same crude fold the abstention gate uses, so the two agree on
-        # what counts as a shared term.
-        for suffix in ("s", "es", "ing", "ed"):
-            if token.endswith(suffix) and len(token) > len(suffix) + 2:
-                token = token[: -len(suffix)]
-                break
-        out.add(token)
-    return out
+    """The PRODUCTION term extractor, not a copy.
+
+    This used to be a hand-rolled English-only tokenizer that "agreed" with
+    the abstention gate by imitation. The imitation broke the moment the
+    production side learned CJK bigrams: Chinese eval queries tokenised as
+    whole sentences and retrieved nothing. Importing the real one makes the
+    agreement structural - the two sides cannot drift again.
+    """
+    from platform_core.agent_runtime.qa_path import _content_terms
+
+    return _content_terms(text)
 
 
 def _visible(entry: CorpusEntry, scope: PrincipalScope) -> bool:
@@ -116,3 +109,16 @@ def make_retriever() -> RetrieveFn:
 def chunk_id_for(version_key: str) -> uuid.UUID:
     """Stable chunk id for a corpus entry, for citation assertions."""
     return uuid.uuid5(uuid.NAMESPACE_URL, f"eval:{version_key}")
+
+
+def corpus_key_of(chunk: RetrievedChunk) -> str:
+    """Map a retrieved chunk back to its corpus version key (plan 4.1).
+
+    The eval retriever encodes the key in `source_uri` (`minio://eval/<key>`),
+    which is the same pattern the real pipeline uses for object URIs - the
+    key is parseable, not guessed.
+    """
+    prefix = "minio://eval/"
+    if chunk.source_uri.startswith(prefix):
+        return chunk.source_uri[len(prefix) :]
+    return chunk.title

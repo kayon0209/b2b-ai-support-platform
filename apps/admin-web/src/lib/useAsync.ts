@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "./types";
 
 export interface AsyncState<T> {
@@ -31,6 +31,21 @@ export function useAsync<T>(
   const [nonce, setNonce] = useState(0);
 
   const reload = useCallback(() => setNonce((n) => n + 1), []);
+
+  // Drop the previous result when the query itself changes (a different
+  // status filter, a different case id). Keeping it meant the table showed
+  // rows belonging to the *previous* query while the new one was in flight,
+  // which reads as "my filter did nothing".
+  //
+  // A manual `reload()` deliberately keeps the current rows: replacing them
+  // with a spinner on every refresh makes the page flicker for no reason.
+  const depKey = JSON.stringify(deps);
+  const lastDepKey = useRef(depKey);
+  useEffect(() => {
+    if (lastDepKey.current === depKey) return;
+    lastDepKey.current = depKey;
+    setData(null);
+  }, [depKey]);
 
   useEffect(() => {
     let active = true;

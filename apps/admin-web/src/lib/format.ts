@@ -21,9 +21,3 @@ export function dateFromEpochSeconds(epoch: number | null | undefined): string {
   const d = new Date(epoch * 1000);
   return d.toLocaleString();
 }
-
-export function titleCase(value: string): string {
-  return value
-    .replace(/[_-]/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}

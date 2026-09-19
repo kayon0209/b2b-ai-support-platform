@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger, new_trace_context
 from observability_metrics import get_metrics
+from platform_core.agent_runtime.conversation import Turn
 from platform_core.agent_runtime.models import RunStatus
 from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
@@ -86,20 +87,46 @@ class ClaimedEvent:
     received_at: int = 0
 
 
-async def claim_events(session: AsyncSession, *, batch: int = 20) -> list[ClaimedEvent]:
+async def claim_events(
+    session: AsyncSession, *, batch: int = 20, priority: bool = False
+) -> list[ClaimedEvent]:
     """Atomically claim unprocessed inbox rows.
 
     SKIP LOCKED + in-place status change means two workers can run safely
     without double-processing; the status transition is the claim token.
+
+    `priority` (plan 5.3) claims events whose conversation has an ESCALATED
+    case first: a customer who has already been escalated is waiting on the
+    platform's weakest moment, and FIFO alone would let a burst of fresh
+    questions keep them waiting. Remaining capacity fills with normal FIFO.
     """
-    stmt = (
-        select(InboxEvent)
-        .where(InboxEvent.status == InboxEventStatus.RECEIVED.value)
-        .order_by(InboxEvent.received_at)
-        .limit(batch)
-        .with_for_update(skip_locked=True)
-    )
-    rows = (await session.execute(stmt)).scalars().all()
+    rows: list[InboxEvent] = []
+    if priority:
+        escalated = (
+            select(InboxEvent)
+            .where(
+                InboxEvent.status == InboxEventStatus.RECEIVED.value,
+                InboxEvent.conversation_ref_id.in_(select(case_conversation_ref())),
+            )
+            .order_by(InboxEvent.received_at)
+            .limit(batch)
+            .with_for_update(skip_locked=True)
+        )
+        rows = list((await session.execute(escalated)).scalars().all())
+    remaining = batch - len(rows)
+    if remaining > 0:
+        claimed_ids = [r.id for r in rows]
+        stmt = (
+            select(InboxEvent)
+            .where(
+                InboxEvent.status == InboxEventStatus.RECEIVED.value,
+                *([InboxEvent.id.not_in(claimed_ids)] if claimed_ids else []),
+            )
+            .order_by(InboxEvent.received_at)
+            .limit(remaining)
+            .with_for_update(skip_locked=True)
+        )
+        rows = rows + list((await session.execute(stmt)).scalars().all())
     if not rows:
         return []
     await session.execute(
@@ -169,6 +196,33 @@ async def reclaim_stale_processing(
     return result.rowcount or 0  # type: ignore[attr-defined]
 
 
+def case_conversation_ref() -> Any:
+    """Select conversation_ref_id of cases in ESCALATED state.
+
+    The ref lives on the CaseConversation join table, so this is a join, not
+    a column read. Expressed as a subquery so the claim stays one statement
+    under SKIP LOCKED.
+    """
+    from sqlalchemy import and_
+
+    from platform_core.cases.models import Case, CaseConversation, CaseEscalation
+
+    return (
+        select(CaseConversation.conversation_ref_id)
+        .join(
+            Case,
+            and_(
+                Case.id == CaseConversation.case_id,
+                Case.tenant_id == CaseConversation.tenant_id,
+            ),
+        )
+        # "Escalated" means the SLA ladder fired at least one rung for the
+        # case (escalations are append-only, migration 0029): a breach
+        # already happened and the customer is still waiting.
+        .where(Case.id.in_(select(CaseEscalation.case_id)))
+    )
+
+
 def _conversation_ref(event: ClaimedEvent) -> uuid.UUID | None:
     """Resolve the platform conversation ref from the minimized payload.
 
@@ -224,6 +278,157 @@ def is_customer_message(event: ClaimedEvent) -> bool:
     return message_type.strip().lower() in CUSTOMER_MESSAGE_TYPES
 
 
+async def load_history(
+    session: AsyncSession, event: ClaimedEvent, deps: OrchestratorDeps
+) -> list[Turn]:
+    """Prior turns of this conversation, oldest first (plan 2.2/2.3).
+
+    Merge policy, in priority order:
+
+    1. Local redacted turns are authoritative for their window - they were
+       written by this platform and already redacted.
+    2. Live Chatwoot messages fill the OLDER window (before the oldest local
+       turn) and the whole history when nothing is stored yet. Chatwoot is
+       the system of record for raw content; the local store is a bounded
+       redacted cache, not a competitor.
+
+    Failure anywhere degrades to whatever was loaded: multi-turn is an
+    enhancement, and a run that cannot fetch history still answers the
+    question in front of it.
+    """
+    from platform_core.agent_runtime import conversation_store
+    from platform_core.agent_runtime.conversation import ConversationMemory, TurnRole
+    from platform_core.config import get_settings
+    from platform_core.evaluation.pii import redact_text
+
+    conversation_ref_id = _conversation_ref(event)
+    if conversation_ref_id is None:
+        return []
+    settings = get_settings()
+    memory = ConversationMemory()
+
+    async def _admit(turn: Turn) -> None:
+        # Trim through `ConversationMemory.add`, not by slicing: the memory's
+        # pin rules are what decide which old turn is safe to drop, and a
+        # dropped PIN is the one outcome worth waking someone up about.
+        evicted = memory.add(turn)
+        if evicted:
+            get_metrics().context_pins_evicted.inc(evicted)
+            logger.warning("context_pins_evicted", count=evicted)
+
+    local = await conversation_store.load_turns(
+        session,
+        tenant_id=event.tenant_id,
+        conversation_ref_id=conversation_ref_id,
+        limit=settings.context_max_turns,
+    )
+    for turn in local:
+        await _admit(turn)
+
+    reader = deps.reader
+    fetch = getattr(reader, "list_messages", None)
+    if fetch is None:
+        return memory.turns
+    account_id = str(event.minimized_payload.get("chatwoot_account_id") or "")
+    conversation_id = str(event.minimized_payload.get("conversation_id") or "")
+    if not (account_id and conversation_id):
+        return memory.turns
+    try:
+        messages = await fetch(
+            account_id=account_id,
+            conversation_id=conversation_id,
+            limit=settings.history_fetch_limit,
+        )
+    except Exception:  # noqa: BLE001 - degradation is the documented contract
+        return memory.turns
+
+    oldest_local_ts = min((t.ts for t in local if t.ts), default=0)
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        message_type = str(message.get("message_type") or message.get("sender_type") or "")
+        role = TurnRole.CUSTOMER if message_type == "incoming" else TurnRole.AGENT
+        text = message.get("content")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        created_at = int(message.get("created_at") or 0)
+        # Skip everything the local window already covers (and the current
+        # message itself, which the orchestrator treats as the question).
+        if local and created_at >= oldest_local_ts:
+            continue
+        redacted, _count = redact_text(text)
+        await _admit(Turn(role=role, text=redacted, ts=created_at))
+    return memory.turns
+
+
+async def _persist_memory(
+    session: AsyncSession,
+    *,
+    event: ClaimedEvent,
+    question: str,
+    outcome: Any,
+) -> None:
+    """Persist the redacted turns and any durable facts (plan 2.1/2.5).
+
+    Rides the same transaction as the run: a crash mid-run rolls the turns
+    back with the run, so a reclaimed event can never double-persist memory.
+    Only CUSTOMER turns feed fact extraction - the agent's own statements
+    must never become its memory (model self-feedback).
+    """
+    from platform_core.agent_runtime import conversation_store
+    from platform_core.agent_runtime.conversation import (
+        Turn,
+        TurnRole,
+        extract_durable_facts,
+    )
+    from platform_core.agent_runtime.qa_path import ABSTAIN_CLARIFICATION
+
+    conversation_ref_id = _conversation_ref(event)
+    if conversation_ref_id is None:
+        return
+    now = int(time.time())
+    customer_turn = Turn(role=TurnRole.CUSTOMER, text=question, ts=now)
+    turn_id = await conversation_store.append_turn(
+        session,
+        tenant_id=event.tenant_id,
+        conversation_ref_id=conversation_ref_id,
+        turn=customer_turn,
+        source="chatwoot",
+    )
+    if outcome.status.value == "completed" and outcome.answer_text:
+        await conversation_store.append_turn(
+            session,
+            tenant_id=event.tenant_id,
+            conversation_ref_id=conversation_ref_id,
+            turn=Turn(role=TurnRole.AGENT, text=outcome.answer_text, ts=now + 1),
+            source="platform",
+        )
+    elif outcome.status.value == "abstained" and outcome.abstain_reason:
+        ref = "clarify:" + outcome.abstain_reason
+        if outcome.abstain_reason != ABSTAIN_CLARIFICATION:
+            ref = "abstain:" + outcome.abstain_reason
+        await conversation_store.append_turn(
+            session,
+            tenant_id=event.tenant_id,
+            conversation_ref_id=conversation_ref_id,
+            turn=Turn(role=TurnRole.AGENT, text=outcome.answer_text, ts=now + 1, ref=ref),
+            source="platform",
+        )
+
+    contact_id = event.minimized_payload.get("contact_id")
+    if not contact_id:
+        return
+    facts = extract_durable_facts([customer_turn])
+    await conversation_store.upsert_facts(
+        session,
+        tenant_id=event.tenant_id,
+        contact_ref=conversation_store.contact_ref_from_external(event.tenant_id, str(contact_id)),
+        facts=conversation_store.fact_tuples(facts),
+        source_turn_id=turn_id,
+        now=now,
+    )
+
+
 async def process_event(
     session: AsyncSession,
     event: ClaimedEvent,
@@ -265,6 +470,8 @@ async def process_event(
         # the customer's question is never acceptable.
         return None
 
+    from platform_core.agent_runtime import conversation_store
+
     ctx = TenantContext(tenant_id=event.tenant_id, actor_id=None, actor_kind="system")
     await apply_rls_tenant(session, ctx)
 
@@ -274,6 +481,17 @@ async def process_event(
         metrics.inbox_claim_age_seconds.observe(max(0.0, time.time() - event.received_at))
 
     orchestrator = AgentOrchestrator(session, deps)
+    history = await load_history(session, event, deps)
+    known_facts: list[tuple[str, str]] = []
+    contact_id_early = event.minimized_payload.get("contact_id")
+    if contact_id_early:
+        known_facts = await conversation_store.load_facts(
+            session,
+            tenant_id=event.tenant_id,
+            contact_ref=conversation_store.contact_ref_from_external(
+                event.tenant_id, str(contact_id_early)
+            ),
+        )
     outcome = await orchestrator.run(
         tenant_id=event.tenant_id,
         conversation_ref_id=conversation_ref_id,
@@ -282,7 +500,11 @@ async def process_event(
         trace=trace,
         chatwoot_account_id=str(event.minimized_payload.get("chatwoot_account_id") or ""),
         chatwoot_conversation_id=str(event.minimized_payload.get("conversation_id") or ""),
+        history=history,
+        known_facts=known_facts,
     )
+    await _persist_memory(session, event=event, question=question, outcome=outcome)
+
     metrics.inbox_events_total.labels(result=outcome.status.value).inc()
     logger.info(
         "event_processed",
@@ -316,7 +538,11 @@ async def drain_once(
         logger.warning("stale_claims_reclaimed", count=reclaimed)
         get_metrics().stale_claims_reclaimed_total.inc(reclaimed)
 
-    events = await claim_events(session, batch=batch)
+    from platform_core.config import get_settings
+
+    events = await claim_events(
+        session, batch=batch, priority=get_settings().priority_claim_enabled
+    )
     processed = 0
     for event in events:
         try:

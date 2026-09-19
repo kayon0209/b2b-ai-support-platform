@@ -115,6 +115,10 @@ class RetentionPolicy:
     dead_letter_days: int = 14
     # Inbox events archived after N days.
     inbox_event_days: int = 90
+    # Redacted conversation turns pruned after N days (iteration plan 2.1):
+    # Chatwoot is the system of record for raw content, so the local memory
+    # copy is a cache and must not outlive its usefulness.
+    conversation_turn_days: int = 90
 
 
 DEFAULT_RETENTION = RetentionPolicy()
@@ -191,4 +195,16 @@ async def sweep_expired_data(
         )
     )
     counts["inbox_events_pruned"] = _affected(result)
+
+    # 4) conversation turns past retention -> delete (redacted cache, plan 2.1)
+    turn_cutoff = now - policy.conversation_turn_days * 86400
+    from platform_core.agent_runtime.models import ConversationTurn
+
+    result = await session.execute(
+        delete(ConversationTurn).where(
+            ConversationTurn.tenant_id == tenant_id,
+            ConversationTurn.ts < turn_cutoff,
+        )
+    )
+    counts["conversation_turns_pruned"] = _affected(result)
     return counts

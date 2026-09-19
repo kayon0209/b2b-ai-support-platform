@@ -46,6 +46,19 @@ class ConnectorAuthExpired(ConnectorError):
 
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+def _jitter_ratio() -> float:
+    """Jitter ratio from settings, imported lazily: the SDK is usable from
+    contexts (scripts) where settings are irrelevant."""
+    try:
+        from platform_core.config import get_settings
+
+        return float(get_settings().retry_jitter_ratio)
+    except Exception:  # noqa: BLE001 - defaults stay safe without settings
+        return 0.3
+
+
 AUTH_FAILURE_STATUS = {401, 403}
 
 # The error *codes* an adapter reports for a rejected credential. Declared
@@ -151,60 +164,66 @@ class ConnectorAdapter(ABC):
         attempts = 0
         last_error: ConnectorError | None = None
 
-        for attempt, delay in enumerate(retry_delays(max_retries)):
-            attempts = attempt + 1
-            try:
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(
-                        connect=connect_timeout,
-                        read=total_timeout,
-                        write=total_timeout,
-                        pool=total_timeout,
-                    )
-                ) as client:
+        # One client per call, shared across retries: a client per attempt
+        # paid a fresh TCP + TLS handshake on every retry without reusing
+        # any connection it had already warmed up.
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=connect_timeout,
+                read=total_timeout,
+                write=total_timeout,
+                pool=total_timeout,
+            )
+        ) as client:
+            jitter = _jitter_ratio()
+            for attempt, delay in enumerate(retry_delays(max_retries, jitter_ratio=jitter)):
+                attempts = attempt + 1
+                try:
                     resp = await client.request(
                         method, url, headers=headers, json=json_body, params=params
                     )
-                if resp.status_code < 300:
-                    self.breaker.on_success()
-                    return ExecutionResult(
-                        ok=True,
-                        data=self._safe_json(resp),
-                        latency_ms=int((time.monotonic() - started) * 1000),
-                        attempts=attempts,
-                    )
-                if resp.status_code in AUTH_FAILURE_STATUS:
+                    if resp.status_code < 300:
+                        self.breaker.on_success()
+                        return ExecutionResult(
+                            ok=True,
+                            data=self._safe_json(resp),
+                            latency_ms=int((time.monotonic() - started) * 1000),
+                            attempts=attempts,
+                        )
+                    if resp.status_code in AUTH_FAILURE_STATUS:
+                        self.breaker.on_failure()
+                        return ExecutionResult(
+                            ok=False,
+                            error_code="CONNECTOR_AUTH_EXPIRED",
+                            latency_ms=int((time.monotonic() - started) * 1000),
+                            attempts=attempts,
+                        )
+                    if resp.status_code == 429:
+                        last_error = ConnectorUnavailable("rate_limited")
+                        self.breaker.on_failure()
+                        retry_after = resp.headers.get("Retry-After")
+                        wait = (
+                            float(retry_after) if retry_after and retry_after.isdigit() else delay
+                        )
+                        await _sleep(wait)
+                        continue
+                    if resp.status_code in RETRYABLE_STATUS:
+                        last_error = ConnectorUnavailable(f"status {resp.status_code}")
+                        self.breaker.on_failure()
+                        await _sleep(delay)
+                        continue
                     self.breaker.on_failure()
                     return ExecutionResult(
                         ok=False,
-                        error_code="CONNECTOR_AUTH_EXPIRED",
+                        error_code=f"CONNECTOR_REJECTED_{resp.status_code}",
                         latency_ms=int((time.monotonic() - started) * 1000),
                         attempts=attempts,
                     )
-                if resp.status_code == 429:
-                    last_error = ConnectorUnavailable("rate_limited")
+                except (httpx.TimeoutException, httpx.TransportError) as exc:
+                    last_error = ConnectorUnavailable(type(exc).__name__)
                     self.breaker.on_failure()
-                    retry_after = resp.headers.get("Retry-After")
-                    wait = float(retry_after) if retry_after and retry_after.isdigit() else delay
-                    await _sleep(wait)
-                    continue
-                if resp.status_code in RETRYABLE_STATUS:
-                    last_error = ConnectorUnavailable(f"status {resp.status_code}")
-                    self.breaker.on_failure()
-                    await _sleep(delay)
-                    continue
-                self.breaker.on_failure()
-                return ExecutionResult(
-                    ok=False,
-                    error_code=f"CONNECTOR_REJECTED_{resp.status_code}",
-                    latency_ms=int((time.monotonic() - started) * 1000),
-                    attempts=attempts,
-                )
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last_error = ConnectorUnavailable(type(exc).__name__)
-                self.breaker.on_failure()
-                if attempt < max_retries:
-                    await _sleep(delay)
+                    if attempt < max_retries:
+                        await _sleep(delay)
 
         latency = int((time.monotonic() - started) * 1000)
         code = last_error.code if last_error else "CONNECTOR_UNKNOWN"

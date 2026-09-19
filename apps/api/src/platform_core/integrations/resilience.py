@@ -7,6 +7,7 @@ semantics (docs/integrations.md connector execution behavior).
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 
 class CircuitState(StrEnum):
@@ -57,6 +58,30 @@ class CircuitBreaker:
         self._opened_at = time.monotonic()
 
 
-def retry_delays(max_retries: int, *, base: float = 0.25, cap: float = 4.0) -> list[float]:
-    """Exponential backoff without jitter: 0.25, 0.5, 1, 2, 4... capped."""
-    return [min(base * (2**attempt), cap) for attempt in range(max_retries + 1)]
+def retry_delays(
+    max_retries: int,
+    *,
+    base: float = 0.25,
+    cap: float = 4.0,
+    jitter_ratio: float = 0.0,
+    rng: Any | None = None,
+) -> list[float]:
+    """Exponential backoff: 0.25, 0.5, 1, 2, 4... capped.
+
+    `jitter_ratio` (plan 5.3) scales each delay by a random factor in
+    [1 - ratio, 1]. Without jitter every caller retries on the same beat and
+    the retry storm is synchronised - the failure that takes down a
+    provider's recovery window exactly when it reopens. `rng` is injectable
+    so tests can assert on deterministic sequences; production uses random.
+    """
+    import random
+
+    random_source = rng if rng is not None else random
+    delays = [min(base * (2**attempt), cap) for attempt in range(max_retries + 1)]
+    if jitter_ratio <= 0:
+        return delays
+    return [delay * (1.0 - jitter_ratio * random_source.random()) for delay in delays]
+
+
+def _typing_placeholder() -> None:  # pragma: no cover - keeps Any import honest
+    return None

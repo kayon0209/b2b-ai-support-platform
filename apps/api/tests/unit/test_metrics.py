@@ -287,3 +287,34 @@ def test_render_metrics_default_uses_process_registry() -> None:
     assert isinstance(body, bytes)
     assert b"platform_agent_runs_total" in body
     reset_default_metrics()
+
+
+# --- Label registry and the Route enum must not drift ----------------------
+
+
+def test_every_route_is_a_valid_metric_label() -> None:
+    """A new Route that the registry does not know about makes `observe_run`
+    raise, so the run it was measuring never gets recorded at all - the metric
+    disappears exactly when a new kind of traffic appears, which is when you
+    most want to see it. This keeps the two sets in step.
+    """
+    from platform_core.agent_runtime.intent import Route
+
+    allowed = set(platform_range_labels("run_route"))
+    missing = {r.value for r in Route} - allowed
+    assert not missing, f"add to RUN_ROUTES in observability_metrics.py: {sorted(missing)}"
+
+
+def test_observe_run_accepts_every_route() -> None:
+    """The other half: each Route is not merely listed but usable."""
+    from platform_core.agent_runtime.intent import Route
+
+    metrics = PlatformMetrics()
+    for route in Route:
+        metrics.observe_run(outcome="completed", route=route.value, latency_seconds=0.1)
+
+    body = render_metrics(metrics).decode("utf-8")
+    for route in Route:
+        # The counter's label is `route`; `run_route` is the vocabulary *kind*
+        # validated by `observe_run`, not the rendered label name.
+        assert f'route="{route.value}"' in body

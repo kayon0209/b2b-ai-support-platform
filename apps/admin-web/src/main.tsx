@@ -2,12 +2,14 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { createBrowserRouter, Navigate, RouterProvider } from "react-router-dom";
 
+import { RouteError } from "./components/ErrorBoundary";
 import { Layout } from "./components/Layout";
 import { Branding } from "./pages/Branding";
 import { Cases } from "./pages/Cases";
 import { FeatureFlags } from "./pages/FeatureFlags";
 import { GapQueue } from "./pages/GapQueue";
 import { Members } from "./pages/Members";
+import { NotFound } from "./pages/NotFound";
 import { PromptRelease } from "./pages/PromptRelease";
 import { QualityDashboard } from "./pages/QualityDashboard";
 import { Usage } from "./pages/Usage";
@@ -22,6 +24,11 @@ const router = createBrowserRouter([
   {
     path: "/",
     element: <Layout />,
+    // Catches a failure in the shell itself (the sidebar, the language
+    // provider). A failure inside a page is caught by the boundary around
+    // <Outlet/>, so the shell stays on screen and the operator can still
+    // navigate away.
+    errorElement: <RouteError />,
     children: [
       { index: true, element: <Navigate to="/quality" replace /> },
       { path: "quality", element: <QualityDashboard /> },
@@ -32,7 +39,7 @@ const router = createBrowserRouter([
       { path: "members", element: <Members /> },
       { path: "usage", element: <Usage /> },
       { path: "branding", element: <Branding /> },
-      { path: "*", element: <Navigate to="/quality" replace /> },
+      { path: "*", element: <NotFound /> },
     ],
   },
 ]);

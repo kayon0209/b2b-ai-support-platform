@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
+import { newIdempotencyKey } from "../lib/idempotency";
 import { useAction } from "../lib/useAction";
 import { useAsync } from "../lib/useAsync";
 import type { Draft, Gap, GapStats } from "../lib/types";
@@ -8,12 +9,14 @@ import {
   Badge,
   Card,
   EmptyState,
-  ErrorBanner,
   PageHeader,
+  ListTotal,
   Spinner,
 } from "../components/ui";
+import { LoadError } from "../components/LoadError";
 import { usePrompt } from "../components/Prompt";
-import { dateFromEpochSeconds, int, titleCase } from "../lib/format";
+import { useLang, type DictKey } from "../lib/i18n";
+import { dateFromEpochSeconds, int } from "../lib/format";
 
 const STATUSES = ["open", "acknowledged", "drafted", "resolved", "dismissed"];
 
@@ -36,6 +39,7 @@ function toneForStatus(status: string): "neutral" | "info" | "warn" | "good" | "
 }
 
 export function GapQueue() {
+  const { t } = useLang();
   const [tab, setTab] = useState<"gaps" | "drafts">("gaps");
   const [status, setStatus] = useState<string>("open");
 
@@ -51,36 +55,49 @@ export function GapQueue() {
     [],
   );
   const stats = useAsync<GapStats>(() => apiGet<GapStats>(`/v1/knowledge/gaps/stats`), []);
+  const spaces = useAsync<{ items: { id: string; name: string }[]; total: number }>(
+    () => apiGet<{ items: { id: string; name: string }[]; total: number }>(
+      `/v1/knowledge/spaces`,
+    ),
+    [],
+  );
   const action = useAction();
   const prompt = usePrompt();
 
-  async function act(path: string, body?: unknown) {
-    const ok = await action.run(() => apiPost(path, body).then(() => undefined));
+  async function act(path: string, body?: unknown, okMsg?: string) {
+    const ok = await action.run(
+      () => apiPost(path, body, newIdempotencyKey()).then(() => undefined),
+      // Every write here used to run with no success message: a gap that
+      // stayed on screen after "Dismiss" (its new status keeps it in the
+      // list) looked exactly like a click that had done nothing.
+      okMsg,
+    );
     if (ok) {
       gaps.reload();
       drafts.reload();
       stats.reload();
     }
+    return ok;
   }
 
   return (
     <div className="page">
       <PageHeader
-        title="Knowledge Gap Queue"
-        subtitle="Questions the bot could not answer, most-demanded first."
+        title={t("gaps.title")}
+        subtitle={t("gaps.subtitle")}
         actions={
           <div className="segmented">
             <button
               className={`segment${tab === "gaps" ? " active" : ""}`}
               onClick={() => setTab("gaps")}
             >
-              Gaps
+              {t("gaps.tabGaps")}
             </button>
             <button
               className={`segment${tab === "drafts" ? " active" : ""}`}
               onClick={() => setTab("drafts")}
             >
-              Drafts
+              {t("gaps.tabDrafts")}
             </button>
           </div>
         }
@@ -91,9 +108,21 @@ export function GapQueue() {
 
       {stats.data ? (
         <div className="stat-grid stat-grid-sm">
-          {Object.entries(stats.data).map(([k, v]) => (
-            <Card key={k}>
-              <StatLite label={titleCase(k)} value={int(v)} />
+          <Card>
+            <StatLite label={t("gaps.statTotal")} value={int(stats.data.total_gaps)} />
+          </Card>
+          <Card>
+            <StatLite
+              label={t("gaps.statOccurrences")}
+              value={int(stats.data.total_occurrences)}
+            />
+          </Card>
+          {Object.entries(stats.data.by_status).map(([statusKey, count]) => (
+            <Card key={statusKey}>
+              <StatLite
+                label={t(`gaps.status.${statusKey}` as DictKey)}
+                value={int(count)}
+              />
             </Card>
           ))}
         </div>
@@ -103,32 +132,33 @@ export function GapQueue() {
         <>
           <div className="toolbar">
             <label className="field">
-              <span>Status</span>
+              <span>{t("gaps.statusFilter")}</span>
               <select value={status} onChange={(e) => setStatus(e.target.value)}>
                 {STATUSES.map((s) => (
                   <option key={s} value={s}>
-                    {titleCase(s)}
+                    {t(`gaps.status.${s}` as DictKey)}
                   </option>
                 ))}
               </select>
             </label>
           </div>
 
-          {gaps.error ? <ErrorBanner message={gaps.error} onRetry={gaps.reload} /> : null}
-          {gaps.loading ? <Spinner label="Loading gaps…" /> : null}
+          <LoadError error={gaps.error} status={gaps.errorStatus} onRetry={gaps.reload} />
+          {gaps.loading ? <Spinner label={t("gaps.loadingGaps")} /> : null}
           {gaps.data && gaps.data.items.length === 0 ? (
-            <EmptyState message="No gaps in this state." />
+            <EmptyState message={t("gaps.emptyGaps")} />
           ) : null}
 
           {gaps.data && gaps.data.items.length > 0 ? (
+            <div className="table-scroll">
             <table className="table">
               <thead>
                 <tr>
-                  <th>Sample question</th>
-                  <th>Reason</th>
-                  <th className="num">Freq</th>
-                  <th>Status</th>
-                  <th>Last seen</th>
+                  <th scope="col">{t("gaps.headerSample")}</th>
+                  <th scope="col">{t("gaps.headerReason")}</th>
+                  <th scope="col" className="num">{t("gaps.headerFreq")}</th>
+                  <th scope="col">{t("common.status")}</th>
+                  <th scope="col">{t("gaps.headerLastSeen")}</th>
                   <th />
                 </tr>
               </thead>
@@ -141,76 +171,102 @@ export function GapQueue() {
                     </td>
                     <td className="num">{int(g.frequency)}</td>
                     <td>
-                      <Badge tone={toneForStatus(g.status)}>{titleCase(g.status)}</Badge>
+                      <Badge tone={toneForStatus(g.status)}>
+                        {t(`gaps.status.${g.status}` as DictKey)}
+                      </Badge>
                     </td>
                     <td className="muted">{dateFromEpochSeconds(g.last_seen_at)}</td>
                     <td className="row-actions">
                       <button
                         className="btn"
                         disabled={g.status !== "open"}
-                        onClick={() => act(`/v1/knowledge/gaps/${g.id}/acknowledge`)}
+                        onClick={() =>
+                          act(
+                            `/v1/knowledge/gaps/${g.id}/acknowledge`,
+                            undefined,
+                            t("gaps.claimed"),
+                          )
+                        }
                       >
-                        Claim
+                        {t("gaps.claim")}
                       </button>
                       <button
                         className="btn"
                         disabled={g.status === "resolved" || g.status === "dismissed"}
                         onClick={async () => {
                           const values = await prompt.ask({
-                            title: "Dismiss this gap",
-                            confirmLabel: "Dismiss",
-                            detail: "The reason is recorded on the gap.",
-                            fields: [{ name: "reason", label: "Reason", required: true }],
+                            title: t("gaps.dismissTitle"),
+                            confirmLabel: t("gaps.dismiss"),
+                            detail: t("gaps.dismissDetail"),
+                            fields: [
+                              { name: "reason", label: t("gaps.reasonLabel"), required: true },
+                            ],
                           });
-                          if (values) act(`/v1/knowledge/gaps/${g.id}/dismiss`, { reason: values.reason });
+                          if (values)
+                            act(
+                              `/v1/knowledge/gaps/${g.id}/dismiss`,
+                              { reason: values.reason },
+                              t("gaps.dismissed"),
+                            );
                         }}
                       >
-                        Dismiss
+                        {t("gaps.dismiss")}
                       </button>
                       <button
                         className="btn"
                         disabled={g.status === "resolved"}
                         onClick={async () => {
                           const values = await prompt.ask({
-                            title: "Draft an answer for this gap",
-                            confirmLabel: "Create draft",
+                            title: t("gaps.draftAnswerTitle"),
+                            confirmLabel: t("prompts.createDraft"),
                             fields: [
-                              { name: "title", label: "Draft title", required: true },
-                              { name: "body", label: "Draft answer", required: true },
+                              {
+                                name: "title",
+                                label: t("gaps.draftTitleLabel"),
+                                required: true,
+                              },
+                              {
+                                name: "body",
+                                label: t("gaps.draftBodyLabel"),
+                                required: true,
+                              },
                             ],
                           });
                           if (values) {
-                            act(`/v1/knowledge/gaps/${g.id}/drafts`, {
-                              title: values.title,
-                              body: values.body,
-                            });
+                            act(
+                              `/v1/knowledge/gaps/${g.id}/drafts`,
+                              { title: values.title, body: values.body },
+                              t("gaps.draftCreated"),
+                            );
                           }
                         }}
                       >
-                        Draft
+                        {t("gaps.draft")}
                       </button>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+            </div>
           ) : null}
+          <ListTotal shown={gaps.data?.items.length ?? 0} total={gaps.data?.total ?? 0} />
         </>
       ) : (
         <>
-          {drafts.error ? <ErrorBanner message={drafts.error} onRetry={drafts.reload} /> : null}
-          {drafts.loading ? <Spinner label="Loading drafts…" /> : null}
+          <LoadError error={drafts.error} status={drafts.errorStatus} onRetry={drafts.reload} />
+          {drafts.loading ? <Spinner label={t("gaps.loadingDrafts")} /> : null}
           {drafts.data && drafts.data.items.length === 0 ? (
-            <EmptyState message="No drafts yet." />
+            <EmptyState message={t("gaps.emptyDrafts")} />
           ) : null}
-
           {drafts.data && drafts.data.items.length > 0 ? (
+            <div className="table-scroll">
             <table className="table">
               <thead>
                 <tr>
-                  <th>Title</th>
-                  <th>Status</th>
-                  <th>Reviewer</th>
+                  <th scope="col">{t("gaps.headerTitle")}</th>
+                  <th scope="col">{t("common.status")}</th>
+                  <th scope="col">{t("gaps.headerReviewer")}</th>
                   <th />
                 </tr>
               </thead>
@@ -220,7 +276,7 @@ export function GapQueue() {
                     <td className="cell-strong">{d.title}</td>
                     <td>
                       <Badge tone={d.status === "approved" ? "good" : "info"}>
-                        {titleCase(d.status)}
+                        {t(`gaps.status.${d.status}` as DictKey)}
                       </Badge>
                     </td>
                     <td className="muted">{d.reviewed_by ?? "—"}</td>
@@ -230,73 +286,102 @@ export function GapQueue() {
                         disabled={d.status !== "pending"}
                         onClick={async () => {
                           const values = await prompt.ask({
-                            title: `Approve “${d.title}”`,
-                            confirmLabel: "Approve",
-                            detail: "Approving publishes this draft to the review queue.",
+                            title: t("gaps.approveTitle", { title: d.title }),
+                            confirmLabel: t("gaps.approve"),
+                            detail: t("gaps.approveDetail"),
                             fields: [
-                              { name: "notes", label: "Review notes", placeholder: "optional" },
+                              {
+                                name: "notes",
+                                label: t("gaps.notesLabel"),
+                                placeholder: t("gaps.notesOptional"),
+                              },
                             ],
                           });
                           if (values) {
-                            act(`/v1/knowledge/drafts/${d.id}/review`, {
-                              approve: true,
-                              notes: values.notes ?? "",
-                            });
+                            act(
+                              `/v1/knowledge/drafts/${d.id}/review`,
+                              { approve: true, notes: values.notes ?? "" },
+                              t("gaps.approved"),
+                            );
                           }
                         }}
                       >
-                        Approve
+                        {t("gaps.approve")}
                       </button>
                       <button
                         className="btn"
                         disabled={d.status !== "pending"}
                         onClick={async () => {
                           const values = await prompt.ask({
-                            title: `Reject “${d.title}”`,
-                            confirmLabel: "Reject",
-                            fields: [{ name: "notes", label: "Reason for rejection" }],
+                            title: t("gaps.rejectTitle", { title: d.title }),
+                            confirmLabel: t("gaps.reject"),
+                            fields: [{ name: "notes", label: t("gaps.rejectNotesLabel") }],
                           });
                           if (values) {
-                            act(`/v1/knowledge/drafts/${d.id}/review`, {
-                              approve: false,
-                              notes: values.notes ?? "",
-                            });
+                            act(
+                              `/v1/knowledge/drafts/${d.id}/review`,
+                              { approve: false, notes: values.notes ?? "" },
+                              t("gaps.rejected"),
+                            );
                           }
                         }}
                       >
-                        Reject
+                        {t("gaps.reject")}
                       </button>
                       <button
                         className="btn"
                         disabled={d.status !== "approved"}
                         onClick={async () => {
+                          const spaceItems = spaces.data?.items ?? [];
                           const values = await prompt.ask({
-                            title: `Publish “${d.title}”`,
-                            confirmLabel: "Publish",
+                            title: t("gaps.publishTitle", { title: d.title }),
+                            confirmLabel: t("gaps.publish"),
+                            detail: spaces.error
+                              ? t("gaps.spacesFailed")
+                              : spaceItems.length === 0
+                                ? t("gaps.spaceHint")
+                                : undefined,
                             fields: [
                               {
                                 name: "space_id",
-                                label: "Target knowledge space id",
+                                label: t("gaps.spaceLabel"),
+                                // Value is the id: names are not unique, and
+                                // resolving name -> id afterwards could pick
+                                // the wrong space or none at all.
+                                options: spaceItems.map((sp) => ({
+                                  value: sp.id,
+                                  label: sp.name,
+                                })),
                                 required: true,
                               },
                             ],
                           });
-                          if (values) {
-                            act(`/v1/knowledge/drafts/${d.id}/publish`, {
-                              space_id: values.space_id,
-                              version_label: "v1",
-                            });
+                          if (values?.space_id) {
+                            act(
+                              `/v1/knowledge/drafts/${d.id}/publish`,
+                              { space_id: values.space_id, version_label: "v1" },
+                              t("gaps.published"),
+                            );
                           }
                         }}
                       >
-                        Publish
+                        {t("gaps.publish")}
                       </button>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+            </div>
           ) : null}
+          {/* Publishing needs the space list. If that read failed, say so
+              rather than opening a picker that is empty for the wrong
+              reason — an empty list and a failed list look identical. */}
+          {spaces.error ? <p className="muted">{t("gaps.spacesFailed")}</p> : null}
+          <ListTotal
+            shown={drafts.data?.items.length ?? 0}
+            total={drafts.data?.total ?? 0}
+          />
         </>
       )}
     </div>

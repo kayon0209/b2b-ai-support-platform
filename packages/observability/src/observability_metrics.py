@@ -44,7 +44,19 @@ from prometheus_client import CollectorRegistry, Counter, Histogram
 # correlated without a translation table.
 
 RUN_OUTCOMES = ("completed", "abstained", "handed_off", "failed", "running")
-RUN_ROUTES = ("knowledge_qa", "human_required", "out_of_scope")
+# All seven routing classes from `agent_runtime.intent.Route`. A route outside
+# this set is a programming error, so `observe_run` refuses to invent a label
+# for it. `test_every_route_is_a_valid_metric_label` asserts the two stay in
+# step: add a Route and this tuple must move with it.
+RUN_ROUTES = (
+    "knowledge_qa",
+    "case_status",
+    "business_read",
+    "business_write",
+    "sensitive",
+    "out_of_scope",
+    "human_required",
+)
 # Abstention reason codes plus the failure codes the orchestrator synthesises
 # before the abstention gate is reached. Kept in sync with qa_path /
 # orchestrator literals; a value outside this set is a programming error, not
@@ -161,6 +173,18 @@ class PlatformMetrics:
             buckets=_LATENCY_BUCKETS,
             registry=r,
         )
+        self.model_fallback_total = Counter(
+            "platform_model_fallback_total",
+            "Model calls retried on the fallback model after the primary failed.",
+            registry=r,
+        )
+        self.run_cost_cents = Histogram(
+            "platform_run_cost_cents",
+            "Estimated per-run model cost in cents (config-driven pricing). "
+            "p95 matters: the most expensive sessions are the retry loops.",
+            buckets=(0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0),
+            registry=r,
+        )
         self.model_errors_total = Counter(
             "platform_model_errors_total",
             "Model calls that raised a mapped ModelError, by code.",
@@ -192,6 +216,35 @@ class PlatformMetrics:
         self.stale_claims_reclaimed_total = Counter(
             "platform_stale_claims_reclaimed_total",
             "Inbox rows returned to RECEIVED after a worker died mid-run.",
+            registry=r,
+        )
+
+        # --- Multi-turn context (docs/agent.md context layers 4 and 7) ---
+        # Per-run counts, so histograms not counters: the question a dashboard
+        # asks is "how much context does a typical run carry", and the tail of
+        # that distribution is the interesting part.
+        self.context_turns_kept = Histogram(
+            "platform_context_turns_kept",
+            "Recent turns carried verbatim into the model prompt.",
+            buckets=(0, 1, 2, 4, 6, 8, 12, 20, 30),
+            registry=r,
+        )
+        self.context_turns_summarized = Histogram(
+            "platform_context_turns_summarized",
+            "Older turns compressed into the summary block.",
+            buckets=(0, 1, 2, 4, 8, 16, 32, 50),
+            registry=r,
+        )
+        self.context_pinned = Histogram(
+            "platform_context_pinned",
+            "Obligation lines pinned verbatim regardless of budget.",
+            buckets=(0, 1, 2, 4, 8, 16),
+            registry=r,
+        )
+        self.context_pins_evicted = Counter(
+            "platform_context_pins_evicted",
+            "Pinned obligation lines that fell out of the bounded turn window. "
+            "A nonzero rate means the platform dropped a commitment it had made.",
             registry=r,
         )
 

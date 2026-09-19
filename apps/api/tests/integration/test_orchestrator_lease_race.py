@@ -180,7 +180,7 @@ class _FixedGenerator:
         self.template = KNOWLEDGE_QA_PROMPT
         self.calls = 0
 
-    async def generate(self, question, evidence):
+    async def generate(self, question, evidence, **kwargs):
         from platform_core.agent_runtime.qa_path import DraftAnswer
 
         self.calls += 1
@@ -427,9 +427,12 @@ def test_restricted_request_never_reaches_model_and_hands_off() -> None:
 
     outcome, generator, sender, owner = _run(scenario())
 
-    assert outcome.route == "human_required"
+    # docs/agent.md's SENSITIVE routing class: the intent classifier names a
+    # credential/ownership request `sensitive` (it used to be folded into
+    # `human_required`). The behaviour below is the contract, not the label.
+    assert outcome.route == "sensitive"
     assert outcome.status.value == "abstained"
-    assert outcome.abstain_reason == "RESTRICTED_REQUEST"
+    assert outcome.abstain_reason == "SENSITIVE_REQUEST"
     assert outcome.handoff is True
     # The model was never consulted, and the lease moved to the human queue.
     assert generator.calls == 0

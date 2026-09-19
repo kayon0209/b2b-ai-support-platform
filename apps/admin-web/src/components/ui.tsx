@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useLang } from "../lib/i18n";
 
 export function Spinner({ label }: { label?: string }) {
   return (
@@ -16,12 +17,13 @@ export function ErrorBanner({
   message: string;
   onRetry?: () => void;
 }) {
+  const { t } = useLang();
   return (
     <div className="banner banner-error" role="alert">
       <span>{message}</span>
       {onRetry ? (
         <button className="btn btn-ghost" onClick={onRetry}>
-          Retry
+          {t("common.retry")}
         </button>
       ) : null}
     </div>
@@ -49,13 +51,14 @@ export function ActionFeedback({
   notice?: string | null;
   onRetry?: () => void;
 }) {
+  const { t } = useLang();
   if (error) {
     return (
       <div className="banner banner-error" role="alert">
         <span>{error}</span>
         {onRetry ? (
           <button className="btn btn-ghost" onClick={onRetry}>
-            Retry
+            {t("common.retry")}
           </button>
         ) : null}
       </div>
@@ -105,6 +108,23 @@ export function Card({
       {title ? <h2 className="card-title">{title}</h2> : null}
       {children}
     </section>
+  );
+}
+
+/**
+ * Footer under a list capped by the API's limit, so truncation is visible
+ * instead of silent: the envelope's `total` was fetched and then thrown
+ * away, and a queue that holds more than the page shows reads as empty.
+ */
+export function ListTotal({ shown, total }: { shown: number; total: number }) {
+  const { t } = useLang();
+  if (total <= 0) return null;
+  return (
+    <p className="muted">
+      {shown < total
+        ? t("common.showing", { shown, total })
+        : t("common.total", { total })}
+    </p>
   );
 }
 

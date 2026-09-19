@@ -22,8 +22,6 @@ from platform_policy import Action, Decision, PolicyEngine, Principal
 
 router = APIRouter(prefix="/v1/audit-events", tags=["audit"])
 
-AUDIT_READ_ROLES = {"auditor", "security_admin", "tenant_owner"}
-
 
 class AuditEventOut(BaseModel):
     id: str

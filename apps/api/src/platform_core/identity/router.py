@@ -68,6 +68,7 @@ INVITE_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 
 class MemberOut(BaseModel):
     user_id: str
+    membership_id: str
     email: str
     display_name: str
     role: str
@@ -103,6 +104,11 @@ def _role_value(role: MembershipRole | str) -> str:
 def _member_out(user: User, membership: Membership) -> MemberOut:
     return MemberOut(
         user_id=str(user.id),
+        # The membership PK is what POST/DELETE /v1/identity/members/{id}
+        # address (identity/router.py resolves `session.get(Membership, ...)`).
+        # The user id is a different key; handing the UI only the user id made
+        # every role change and removal 404 with "membership not found".
+        membership_id=str(membership.id),
         email=user.primary_email,
         display_name=user.display_name,
         role=_role_value(membership.role),

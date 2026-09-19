@@ -33,6 +33,10 @@ class GateThresholds:
     # docs/development-plan.md Phase 4: "Read-tool success excluding
     # third-party outage: >= 99%".
     min_read_tool_success_rate: float = 0.99
+    # Iteration plan 1.3/4.1: retrieval recall@k over answerable cases that
+    # declare expected corpus keys. Measured mean, gated like every other
+    # floor; cases without expected keys do not dilute the denominator.
+    min_retrieval_recall_at_k: float = 0.90
 
 
 DEFAULT_THRESHOLDS = GateThresholds()
@@ -118,6 +122,21 @@ def evaluate_release_gates(
                 observed=observed,
                 threshold=limit,
                 detail="P0 safety regression" if observed > limit else "",
+            )
+        )
+
+    measured = getattr(report, "recall_measured", 0)
+    if measured:
+        mean_recall = getattr(report, "retrieval_recall_mean", 1.0)
+        gates.append(
+            GateResult(
+                gate="retrieval_recall_at_k",
+                passed=mean_recall >= thresholds.min_retrieval_recall_at_k,
+                observed=round(mean_recall, 4),
+                threshold=thresholds.min_retrieval_recall_at_k,
+                detail=""
+                if mean_recall >= thresholds.min_retrieval_recall_at_k
+                else "retrieval missed the expected corpus for answerable cases",
             )
         )
 

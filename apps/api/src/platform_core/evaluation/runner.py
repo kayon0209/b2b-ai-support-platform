@@ -54,6 +54,10 @@ class EvalCase:
     restricted_query: bool = False
     expected_handoff: bool = False
     allowed_tools: tuple[str, ...] = ()
+    # Corpus keys this question SHOULD retrieve (iteration plan 4.1). Empty
+    # for abstention/adversarial cases - the gate must not credit a retrieval
+    # miss on a question that should never have retrieved at all.
+    expected_version_keys: tuple[str, ...] = ()
     case_id: str = ""
 
     def __post_init__(self) -> None:
@@ -83,6 +87,13 @@ class CaseResult:
     forbidden_hit: bool = False
     required_missing: bool = False
     latency_ms: int = 0
+    # Attribution (plan 4.1): PASS / RETRIEVAL_MISS / GENERATION_ERROR /
+    # ABSTENTION_ERROR. The whole point of the eval is to stop reporting a
+    # bare boolean that cannot tell "the index missed it" from "the model
+    # ignored it".
+    attribution: str = ""
+    recall_at_k: float | None = None
+    retrieved_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -103,6 +114,23 @@ class EvalReport:
     results: list[CaseResult] = field(default_factory=list)
 
     @property
+    def recall_measured(self) -> int:
+        return sum(1 for r in self.results if r.recall_at_k is not None)
+
+    @property
+    def retrieval_recall_mean(self) -> float:
+        values = [r.recall_at_k for r in self.results if r.recall_at_k is not None]
+        return sum(values) / len(values) if values else 1.0
+
+    @property
+    def attribution_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for r in self.results:
+            if r.attribution:
+                counts[r.attribution] = counts.get(r.attribution, 0) + 1
+        return counts
+
+    @property
     def abstention_correct_rate(self) -> float:
         n = self.abstention_correct + self.abstention_false
         return self.abstention_correct / n if n else 1.0
@@ -116,10 +144,23 @@ class EvalReport:
 
 
 class EvaluationRunner:
-    def __init__(self, answer_fn: AnswerFn, retrieve_fn: RetrieveFn) -> None:
-        """retrieve_fn(question, principal_scope) -> list[RetrievedChunk]."""
+    def __init__(
+        self,
+        answer_fn: AnswerFn,
+        retrieve_fn: RetrieveFn,
+        *,
+        key_of: Callable[[RetrievedChunk], str] | None = None,
+    ) -> None:
+        """retrieve_fn(question, principal_scope) -> list[RetrievedChunk].
+
+        `key_of` maps a retrieved chunk to its corpus version key, so
+        attribution can compare what came back against what SHOULD have come
+        back. Defaults to the chunk title; the eval harness supplies the
+        real key mapping because only it knows the corpus it built.
+        """
         self._answer_fn = answer_fn
         self._retrieve_fn = retrieve_fn
+        self._key_of = key_of or (lambda chunk: chunk.title)
 
     async def run_case(self, case: EvalCase) -> CaseResult:
         started = time.monotonic()
@@ -176,6 +217,27 @@ class EvaluationRunner:
                 result.passed = False
                 result.forbidden_hit = True
                 result.reason_codes.append("FORBIDDEN_CLAIM_PRESENT")
+
+        # --- Attribution (plan 4.1). ---
+        # Computed for every case so a regression report can be sorted by
+        # WHERE the pipeline broke, not just THAT it broke.
+        retrieved = [self._key_of(chunk) for chunk in evidence]
+        result.retrieved_keys = sorted({k for k in retrieved if k})
+        if case.expected_version_keys:
+            hits = sum(1 for k in case.expected_version_keys if k in result.retrieved_keys)
+            result.recall_at_k = hits / len(case.expected_version_keys)
+        if case.must_abstain:
+            result.attribution = (
+                "PASS"
+                if result.passed
+                else ("ABSTENTION_ERROR" if not decision.abstain else "GENERATION_ERROR")
+            )
+        elif case.expected_version_keys and result.recall_at_k == 0.0:
+            result.attribution = "RETRIEVAL_MISS"
+        elif not result.passed:
+            result.attribution = "ABSTENTION_ERROR" if result.abstained else "GENERATION_ERROR"
+        else:
+            result.attribution = "PASS"
 
         result.latency_ms = int((time.monotonic() - started) * 1000)
         return result

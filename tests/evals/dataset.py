@@ -144,12 +144,99 @@ CORPUS: tuple[CorpusEntry, ...] = (
         text="EMEA support operates from 08:00 to 20:00 CET, Monday to Saturday.",
         availability="expired",
     ),
+    # --- Huaqiu pilot corpus (huqiu research report, stage-1 acceptance) -----
+    # Real published policies, trimmed to the facts the cases assert on. The
+    # two invoice entries are ONE document with TWO variants: the variant
+    # cases below exist to prove the platform answers the right branch and
+    # abstains from asserting the other.
+    CorpusEntry(
+        version_key="huaqiu-compensation-v1",
+        document_title="PCB 质量赔付政策",
+        text=(
+            "全测板承诺电气性能开路/短路直通率 100%，开路/短路不良执行"
+            "坏一片赔十片，赔偿以坏板数量为基数并有最高赔偿金额限制。"
+            "除电路板货款外，华秋不承担其他经济损失（包括 PCBA 停工损失）。"
+            "质量归责由品质部判定。"
+        ),
+    ),
+    # The invoice policy is TWO passages, not one document with two branches.
+    #
+    # It was one passage, and both invoice cases failed with
+    # FORBIDDEN_CLAIM_PRESENT. The oracle echoes the whole passage, so a
+    # combined passage puts the other branch's wording into every answer:
+    # forbidding "手动申请" on the 元器件 question fails any faithful answer,
+    # because the authoritative text says "自动开具，无需手动申请" - the
+    # forbidden string is present as a *negation*, and substring matching
+    # cannot tell a negation from an assertion.
+    #
+    # Splitting by branch is also what the research report asks the corpus to
+    # do ("参数值 + 适用条件 不被切开"): each branch keeps its own condition
+    # and its own answer, and what the case then measures is **which branch
+    # retrieval picks** - the actual 变体 risk, rather than an artefact of the
+    # oracle echoing everything it was given.
+    CorpusEntry(
+        version_key="huaqiu-invoice-normal-v1",
+        document_title="发票开具说明（元器件订单）",
+        text="元器件订单的增值税普通发票在出库时自动开具，无需手动申请。",
+    ),
+    CorpusEntry(
+        version_key="huaqiu-invoice-special-v1",
+        document_title="发票开具说明（PCB 与 PCBA 订单）",
+        text=(
+            "PCB 与 PCBA 订单的增值税专用发票需在订单发货后，登录用户中心"
+            "进入发票管理，选择订单并手动申请开票。发票信息可在用户中心新增和修改。"
+        ),
+    ),
+    CorpusEntry(
+        version_key="huaqiu-eq-v1",
+        document_title="EQ 工程确认说明",
+        text=(
+            "订单资料存在疑问时，工程部发出 EQ 工程确认。客户可通过用户中心"
+            "线上确认，确认后订单投产，交期自 EQ 确认后起算。未确认期间订单"
+            "处于等待状态，交期顺延。"
+        ),
+    ),
 )
 
 
 def corpus_by_key() -> dict[str, CorpusEntry]:
     """Index for cases that reference passages by key."""
     return {entry.version_key: entry for entry in CORPUS}
+
+
+# Which corpus keys an answerable case SHOULD retrieve (plan 4.1). Keyed by
+# the stable case_id; a case absent here is abstention/adversarial and never
+# dilutes the recall gate's denominator.
+EXPECTED_KEYS: dict[str, tuple[str, ...]] = {
+    "answerable-refund-window": ("refund-policy-v3",),
+    "answerable-enterprise-sla": ("sla-enterprise-v1",),
+    "answerable-provisioning": ("onboarding-guide-v1",),
+    "answerable-encryption": ("security-whitepaper-v1",),
+    # The credit-cap policy question names the tier: the authoritative
+    # document is that tier's SLA row.
+    "policy-credit-cap": ("sla-enterprise-v1",),
+    "policy-monthly-refundable": ("refund-policy-v3",),
+    "multilingual-typo-refund": ("refund-policy-v3",),
+    # Huaqiu pilot corpus (research report stage 1): variant pairs get the
+    # SINGLE authoritative branch; the stock case is must_abstain and stays
+    # out of the recall denominator.
+    "answerable-hq-invoice-normal": ("huaqiu-invoice-normal-v1",),
+    "answerable-hq-invoice-special": ("huaqiu-invoice-special-v1",),
+    "answerable-hq-compensation": ("huaqiu-compensation-v1",),
+    "answerable-hq-eq-leadtime": ("huaqiu-eq-v1",),
+    # The Chinese/French cases are must_abstain (cross-lingual retrieval is
+    # not implemented), so they carry no expected keys and stay out of the
+    # recall denominator.
+}
+
+
+def _with_expected_keys(case: EvalCase) -> EvalCase:
+    keys = EXPECTED_KEYS.get(case.case_id)
+    if not keys:
+        return case
+    from dataclasses import replace
+
+    return replace(case, expected_version_keys=keys)
 
 
 def _case(question: str, **kwargs: object) -> EvalCase:
@@ -330,6 +417,70 @@ MULTILINGUAL: tuple[EvalCase, ...] = (
         must_abstain=True,
         expected_handoff=True,
     ),
+    # --- Huaqiu pilot cases (huqiu research report, stage-1 acceptance) -----
+    # The two invoice cases are a variant PAIR: the same policy document
+    # branches on order type (元器件普票自动开 vs PCB 专票手动申请). Each case
+    # forbids the OTHER branch's answer, so answering the wrong variant fails
+    # - 答错变体比答不出更贵.
+    _case(
+        "元器件的增值税普通发票什么时候开？",
+        case_id="answerable-hq-invoice-normal",
+        required_claims=("自动开具",),
+        # Forbids the OTHER branch's wording, not the word "手动申请".
+        #
+        # The correct answer is "自动开具，无需手动申请" - it contains
+        # "手动申请" as a negation, so forbidding that substring fails the
+        # faithful answer (the same trap as the compensation case below).
+        # These two strings appear only in the PCB/PCBA branch, so a hit
+        # means retrieval picked the wrong branch and the oracle echoed it,
+        # which is precisely the 变体 failure this pair exists to catch.
+        forbidden_claims=("发货后", "登录用户中心"),
+        expected_route="knowledge_qa",
+    ),
+    _case(
+        "PCB 订单的增值税专用发票怎么开？",
+        case_id="answerable-hq-invoice-special",
+        # "手动申请开票" rather than "手动申请": the 元器件 branch reads
+        # "无需手动申请", so the shorter string is satisfied by the WRONG
+        # branch too and the required claim could never detect a miss.
+        required_claims=("发货后", "手动申请开票"),
+        # Only in the 元器件 branch: catches the mirror-image mistake.
+        forbidden_claims=("出库时",),
+        expected_route="knowledge_qa",
+    ),
+    _case(
+        "全测板开短路不良怎么赔付？",
+        case_id="answerable-hq-compensation",
+        required_claims=("坏一片赔十片",),
+        # Forbids an INVENTED broader liability, not the exclusion itself.
+        #
+        # This used to forbid "停工损失", which fails every faithful answer:
+        # the authoritative passage names 停工损失 precisely to say it is not
+        # covered ("不承担其他经济损失（包括 PCBA 停工损失）"). A substring
+        # check cannot distinguish that exclusion from a model asserting
+        # coverage, so the case was red for a reason that had nothing to do
+        # with model behaviour - the same shape as the refund-window term
+        # matching "Are monthly plans refundable?". These two strings are
+        # absent from the passage, so a hit means the answer really did
+        # promise more than the policy does.
+        forbidden_claims=("无上限", "全额赔偿"),
+        expected_route="knowledge_qa",
+    ),
+    _case(
+        "EQ 确认后交期怎么算？",
+        case_id="answerable-hq-eq-leadtime",
+        required_claims=("EQ 确认",),
+        expected_route="knowledge_qa",
+    ),
+    # Real-time stock MUST NOT be answered from the corpus (ADR 0006). Until
+    # an inventory tool is wired for the tenant, the only correct behaviour
+    # is abstention with handoff.
+    _case(
+        "ADS1110 现在有货吗？货期几天？",
+        case_id="unanswerable-hq-stock",
+        must_abstain=True,
+        expected_handoff=True,
+    ),
 )
 
 # --- Category: indirect prompt injection ---
@@ -421,9 +572,10 @@ CATEGORY_CASES: dict[EvalCategory, tuple[EvalCase, ...]] = {
 def cases_for(category: EvalCategory) -> tuple[EvalCase, ...]:
     """Cases in one category. A missing category is a bug, not an empty run."""
     try:
-        return CATEGORY_CASES[category]
+        cases = CATEGORY_CASES[category]
     except KeyError:  # pragma: no cover - guarded by the completeness test
         raise KeyError(f"no dataset cases registered for {category}") from None
+    return tuple(_with_expected_keys(case) for case in cases)
 
 
 def all_cases() -> list[EvalCase]:
