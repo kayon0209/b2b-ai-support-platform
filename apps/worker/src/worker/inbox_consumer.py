@@ -253,11 +253,17 @@ async def resolve_question(event: ClaimedEvent, deps: OrchestratorDeps) -> str |
     account_id = event.minimized_payload.get("chatwoot_account_id")
     conversation_id = event.minimized_payload.get("conversation_id")
     reader = deps.reader
-    if reader is None or not (message_id and account_id and conversation_id):
+    # Only the message id is universally required. `account_id` and
+    # `conversation_id` are Chatwoot coordinates, and a question typed into
+    # the platform's own chat surface has no Chatwoot account behind it —
+    # requiring them here made every platform-originated run silently skip
+    # (event claimed and marked completed, run left queued, no answer).
+    # The reader decides which coordinates it actually needs.
+    if reader is None or not message_id:
         return None
     body = await reader.fetch_message(  # type: ignore[attr-defined]
-        account_id=str(account_id),
-        conversation_id=str(conversation_id),
+        account_id=str(account_id or ""),
+        conversation_id=str(conversation_id or ""),
         message_id=str(message_id),
     )
     if not isinstance(body, str) or not body.strip():

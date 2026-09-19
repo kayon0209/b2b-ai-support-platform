@@ -244,13 +244,21 @@ export function CustomerChat() {
 
     void (async () => {
       try {
-        await apiPost(
+        // Two steps, both idempotent. First persist the question so the
+        // platform has its own copy; then queue the run, pointing it at
+        // that turn. The orchestrator reads the question back by id, and
+        // for platform-originated turns that id resolves locally rather
+        // than through Chatwoot.
+        const saved = await apiPost<{ turn_id: string }>(
           `/v1/customer/conversations/${conversationRef}/messages`,
           { text: body },
           newIdempotencyKey(),
         );
-        // The turn is persisted server-side, so pull it back rather than
-        // leaving the optimistic bubble as the only copy.
+        await apiPost(
+          `/v1/conversations/${conversationRef}/agent-runs`,
+          { trigger_message_ref: saved.turn_id, mode: "customer_reply" },
+          newIdempotencyKey(),
+        );
         await loadTimeline();
       } catch {
         setTyping(false);

@@ -34,6 +34,7 @@ from platform_core.config import get_settings
 from platform_core.llm.factory import get_model_bundle
 from platform_core.retrieval.hybrid import ProviderEmbedder
 from platform_core.retrieval.reranker import Reranker
+from worker.local_reader import LocalFirstReader
 
 
 class WorkerConfigurationError(SystemExit):
@@ -142,7 +143,11 @@ def build_interactive_deps(
         # whether Chatwoot is reachable.
         client = ChatwootClient()
         sender = client
-        reader = client
+        # Wrapped, not replaced: questions typed into the platform's own
+        # chat surface have no Chatwoot message behind them, so the reader
+        # must be able to serve a locally persisted turn before falling
+        # back to Chatwoot.
+        reader = LocalFirstReader(client)
     elif require_sender:
         raise WorkerConfigurationError(
             "APP_CHATWOOT_API_TOKEN is required to send customer replies; "
