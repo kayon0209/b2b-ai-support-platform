@@ -73,20 +73,13 @@ CUSTOMER_MESSAGE_TYPES = {"incoming"}
 # explicitly; the AI never inherits a human's scope.
 AI_PRINCIPAL = PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",))
 
-# `_dispatch` refuses when a run carries no Chatwoot coordinates, and the
-# orchestrator marks that run FAILED. A conversation the platform itself
-# owns - the customer typed into our own chat surface - has no Chatwoot
-# conversation by construction, so every platform-originated answer ended
-# FAILED and, because the only writer of the agent turn requires
-# `completed`, was never published at all: the customer saw a perpetual
-# "typing" state and no reply.
-#
-# This is the one failure reason where the platform surface *is* the
-# delivery channel, so the answer is genuinely safe to show. It must never
-# be widened to OUTBOUND_FAILED or OUTBOUND_AMBIGUOUS, where a real send was
-# attempted and may have reached nobody - publishing an answer the customer
-# did not receive is worse than showing none.
-OUTBOUND_TARGET_MISSING = "OUTBOUND_TARGET_MISSING"
+# `AI_PRINCIPAL` is declared above; nothing else belongs in this module's
+# constants - in particular, do not reintroduce a special case here for a
+# run that failed to send. `_dispatch` now treats "no Chatwoot account" as
+# "no external channel", so a platform-native conversation completes and is
+# persisted by the normal path. A surviving OUTBOUND_TARGET_MISSING means a
+# half-configured Chatwoot target, and publishing that answer would claim a
+# delivery that never happened.
 
 
 @dataclass
@@ -501,27 +494,13 @@ async def _persist_memory(
             turn=Turn(role=TurnRole.AGENT, text=outcome.answer_text, ts=now + 1, ref=ref),
             source="platform",
         )
-    elif (
-        outcome.status.value == "failed"
-        and outcome.send_blocked_reason == OUTBOUND_TARGET_MISSING
-        and outcome.answer_text
-    ):
-        # The answer exists but had nowhere to go. Recording it is what makes
-        # a platform-native conversation work at all; see the rationale on
-        # the constant. Tagged with the reason so the timeline can tell a
-        # delivered answer from one that only ever reached our own surface.
-        await conversation_store.append_turn(
-            session,
-            tenant_id=event.tenant_id,
-            conversation_ref_id=conversation_ref_id,
-            turn=Turn(
-                role=TurnRole.AGENT,
-                text=outcome.answer_text,
-                ts=now + 1,
-                ref="outbound:" + outcome.send_blocked_reason,
-            ),
-            source="platform",
-        )
+    # No branch here for a run that failed to send. A conversation the
+    # platform owns no longer fails at all - `_dispatch` treats "no Chatwoot
+    # account" as "no external channel", so it completes and lands in the
+    # branch above. What is left of OUTBOUND_TARGET_MISSING is a half-configured
+    # target, where we did mean to reach Chatwoot and could not; publishing
+    # that answer to our own surface would claim a delivery that never
+    # happened for a customer who is not looking here.
 
     contact_id = event.minimized_payload.get("contact_id")
     if not contact_id:

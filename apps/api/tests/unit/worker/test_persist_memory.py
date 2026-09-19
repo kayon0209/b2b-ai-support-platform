@@ -1,25 +1,18 @@
-"""Unit tests: an answer that had nowhere to go must still be shown.
+"""Unit tests: what the worker writes back into a conversation.
 
-Regression tests for "the event completes, the run is marked failed, and the
-customer never sees a reply" on platform-originated conversations.
+The bug this file was born from is fixed one layer up now. A platform-native
+conversation used to fail in `_dispatch` (`OUTBOUND_TARGET_MISSING`, because
+the event carries a `conversation_id` but no `chatwoot_account_id`), the run
+was marked FAILED, and the answer was never persisted - because the agent
+turn is only written for a COMPLETED run. `_dispatch` now reads a missing
+account id as "no external channel" and lets the run complete, so the answer
+arrives here through the ordinary path.
 
-The chain, as observed against the live stack:
-
-1. A customer types into the platform's own chat surface. No Chatwoot
-   conversation exists behind it, so the inbox event carries a
-   `conversation_id` but no `chatwoot_account_id`.
-2. The orchestrator generates an answer, then `_dispatch` refuses to send it
-   (`OUTBOUND_TARGET_MISSING`) and marks the run FAILED.
-3. `_persist_memory` only ever wrote an agent turn for a COMPLETED run, so
-   the answer was produced, never persisted, and the timeline the chat
-   surface polls stayed empty forever.
-
-The fix is deliberately narrow. Only a run that produced an answer *and* was
-blocked for want of a destination is published, because for a conversation
-the platform owns, the platform surface is the delivery channel. A run
-blocked because a real send failed, or because the outcome of a send is
-unknown, must stay silent: showing a customer an answer they never received
-is worse than showing none.
+What these tests pin is therefore the policy of that ordinary path, and the
+boundary around it: an answer is published when the run completed, an
+abstention is published with the reason the customer can act on, and nothing
+is published for a run whose send failed or whose outcome is unknown -
+showing a customer an answer they never received is worse than showing none.
 """
 
 import uuid
@@ -33,7 +26,7 @@ from platform_core.agent_runtime import conversation_store
 from platform_core.agent_runtime.conversation import Turn
 from platform_core.agent_runtime.models import RunStatus
 from platform_core.agent_runtime.orchestrator import RunOutcome
-from worker.inbox_consumer import OUTBOUND_TARGET_MISSING, ClaimedEvent, _persist_memory
+from worker.inbox_consumer import ClaimedEvent, _persist_memory
 
 TENANT_ID = uuid.UUID("17ab2c52-7d95-5fba-a06c-b5641393831e")
 
@@ -111,25 +104,23 @@ async def test_completed_run_publishes_the_answer() -> None:
     assert _agent_texts() == ["09:00 to 18:00."]
 
 
-async def test_answer_with_no_outbound_destination_is_still_published() -> None:
-    """The regression: a platform-native conversation has no Chatwoot target.
+async def test_a_half_configured_target_is_not_published() -> None:
+    """A half-configured Chatwoot target must not be published either.
 
-    The answer exists and the customer is looking at our own surface, so
-    refusing to record it loses the answer for no reason at all.
+    The account is known but the conversation is not, so we did mean to
+    reach Chatwoot and could not. The customer is not looking at our own
+    surface, and recording the answer here would claim a delivery that never
+    happened.
     """
     await _persist_memory(
         _SESSION,
         event=_event(),
         question="What are your support hours?",
         outcome=_outcome(
-            RunStatus.FAILED, answer_text="09:00 to 18:00.", reason=OUTBOUND_TARGET_MISSING
+            RunStatus.FAILED, answer_text="09:00 to 18:00.", reason="OUTBOUND_TARGET_MISSING"
         ),
     )
-    assert _agent_texts() == ["09:00 to 18:00."]
-    # Tagged, so the timeline can tell a delivered answer from one that only
-    # ever reached our own surface.
-    refs = [ref for role, _text, ref, _src in RECORDED if role == "agent"]
-    assert refs == ["outbound:" + OUTBOUND_TARGET_MISSING]
+    assert _agent_texts() == []
 
 
 @pytest.mark.parametrize("reason", ["OUTBOUND_FAILED", "OUTBOUND_AMBIGUOUS", ""])
@@ -155,7 +146,7 @@ async def test_no_answer_means_no_agent_turn() -> None:
         _SESSION,
         event=_event(),
         question="What are your support hours?",
-        outcome=_outcome(RunStatus.FAILED, answer_text="", reason=OUTBOUND_TARGET_MISSING),
+        outcome=_outcome(RunStatus.FAILED, answer_text="", reason="OUTBOUND_FAILED"),
     )
     assert _agent_texts() == []
 
