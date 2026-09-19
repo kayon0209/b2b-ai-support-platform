@@ -36,6 +36,7 @@ from platform_core.agent_runtime.orchestrator import AgentOrchestrator, Orchestr
 from platform_core.db import app_role_url, session_scope_with_url
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
 from platform_core.retrieval.hybrid import PrincipalScope
+from platform_core.support_bridge.conversation_ref import conversation_ref_for
 from platform_core.support_bridge.models import InboxEvent, InboxEventStatus
 
 logger = JsonLogger("platform.worker")
@@ -246,11 +247,18 @@ def _conversation_ref(event: ClaimedEvent) -> uuid.UUID | None:
     We derive a stable UUIDv5 from (tenant, chatwoot conversation id) so the
     same conversation always maps to the same control-lease row without a
     schema change to the inbox table.
+
+    The derivation is shared, not reimplemented here: the API's customer and
+    run endpoints answer questions about the same conversation, and a second
+    copy of the rule is how they end up disagreeing about which conversation
+    they are talking about.
     """
     external = event.minimized_payload.get("conversation_id")
-    if not external:
+    if not isinstance(external, str) or not external.strip():
         return None
-    return uuid.uuid5(event.tenant_id, f"chatwoot:conversation:{external}")
+    # Passed through untrimmed: the shared helper hashes the id exactly as
+    # given, and trimming here would move stored conversations.
+    return conversation_ref_for(event.tenant_id, external)
 
 
 async def _local_turn_text(message_id: object) -> str | None:
@@ -546,12 +554,37 @@ async def process_event(
     # events). Such rows are acked without an agent run.
     conversation_ref_id = _conversation_ref(event)
     if conversation_ref_id is None:
+        # Logged, not silent. A missing or non-string `conversation_id` used
+        # to return here with no trace at all, which is indistinguishable
+        # from "the worker never ran" - and it cost hours of chasing a
+        # reader that was never broken.
+        logger.warning(
+            "event_skipped_no_conversation_ref",
+            delivery_id=event.delivery_id,
+            event_type=event.event_type,
+            conversation_id=str(event.minimized_payload.get("conversation_id") or ""),
+        )
+        get_metrics().inbox_events_total.labels(result="no_conversation_ref").inc()
         return None
 
     question = await resolve_question(event, deps)
     if question is None:
         # No readable body: record the row and leave it. Answering without
         # the customer's question is never acceptable.
+        #
+        # Also logged rather than silent: this is the branch that produces
+        # "the event completed but no run exists", and without a line here
+        # there is nothing to distinguish it from a worker that is simply
+        # not running.
+        logger.warning(
+            "event_skipped_unreadable_question",
+            delivery_id=event.delivery_id,
+            conversation_ref_id=str(conversation_ref_id),
+            # Metadata only - never the customer's text.
+            message_id=str(event.minimized_payload.get("message_id") or ""),
+            has_chatwoot_account=bool(event.minimized_payload.get("chatwoot_account_id")),
+        )
+        get_metrics().inbox_events_total.labels(result="unreadable_question").inc()
         return None
 
     from platform_core.agent_runtime import conversation_store

@@ -41,6 +41,9 @@ from platform_core.audit import service as audit_service
 from platform_core.config import get_settings
 from platform_core.identity.usage import usage_snapshot
 from platform_core.support_bridge import inbox
+from platform_core.support_bridge.conversation_ref import (
+    conversation_ref_for as conversation_ref_for,
+)
 from platform_policy import Action
 
 router = APIRouter(prefix="/v1/conversations", tags=["agent-runtime"])
@@ -80,9 +83,15 @@ async def create_agent_run(request: Request, conversation_ref: str, body: AgentR
         )
 
     try:
-        conversation_ref_id = parse_uuid(conversation_ref, field="conversation_ref")
+        external_ref = parse_uuid(conversation_ref, field="conversation_ref")
     except ValueError as exc:
         return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+    # Derived, not the path value verbatim: the worker answers under the
+    # derived id, so a run queued under the raw id is filed in a different
+    # conversation from the one that produces the answer - which is exactly
+    # why a listing of "runs for this conversation" used to show only the
+    # queued placeholder and never the run that answered.
+    conversation_ref_id = conversation_ref_for(ctx.tenant_id, str(external_ref))
 
     trace_id = new_trace_id()
     async with tenant_session(ctx) as session:
@@ -220,9 +229,14 @@ async def list_agent_runs(
         return denied
 
     try:
-        conversation_ref_id = parse_uuid(conversation_ref, field="conversation_ref")
+        external_ref = parse_uuid(conversation_ref, field="conversation_ref")
     except ValueError as exc:
         return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+    # Same derivation as the create path and as the worker, so this listing
+    # can actually see the runs that answered. Rows queued before the two
+    # agreed were stored under the raw id and are no longer listed here;
+    # they were unreachable placeholders anyway.
+    conversation_ref_id = conversation_ref_for(ctx.tenant_id, str(external_ref))
 
     async with tenant_session(ctx) as session:
         rows = (

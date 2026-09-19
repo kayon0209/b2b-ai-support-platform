@@ -43,6 +43,7 @@ from platform_core.api import (
     tenant_session,
 )
 from platform_core.evaluation.pii import redact_text
+from platform_core.support_bridge.conversation_ref import conversation_ref_for
 from platform_core.support_bridge.minimize import payload_hash
 from platform_policy import Action
 
@@ -57,8 +58,11 @@ def _conversation_ref(tenant_id: uuid.UUID, external: str) -> uuid.UUID:
     own raw UUID would write turns under one id while the worker reads and
     answers under another — the answer gets produced and then never found.
     Deriving the same way here keeps one id for the whole exchange.
+
+    Both sides now call the shared helper rather than repeating the rule, so
+    they cannot drift apart again.
     """
-    return uuid.uuid5(tenant_id, f"chatwoot:conversation:{external}")
+    return conversation_ref_for(tenant_id, external)
 
 
 class TurnOut(BaseModel):
