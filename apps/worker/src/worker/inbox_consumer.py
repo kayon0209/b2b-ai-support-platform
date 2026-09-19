@@ -410,7 +410,18 @@ async def load_history(
             conversation_id=conversation_id,
             limit=settings.history_fetch_limit,
         )
-    except Exception:  # noqa: BLE001 - degradation is the documented contract
+    except Exception as exc:  # noqa: BLE001 - degradation is the documented contract
+        # Degrade, but never silently. Losing the Chatwoot history is meant to
+        # be survivable - the run still answers the question in front of it -
+        # yet an unlogged failure here looks identical to a conversation with
+        # no history, so a broken reader would never be noticed.
+        logger.warning(
+            "history_fetch_failed",
+            error_code=type(exc).__name__,
+            error=str(exc),
+            delivery_id=event.delivery_id,
+            local_turns=len(memory.turns),
+        )
         return memory.turns
 
     oldest_local_ts = min((t.ts for t in local if t.ts), default=0)
@@ -459,12 +470,17 @@ async def _persist_memory(
         return
     now = int(time.time())
     customer_turn = Turn(role=TurnRole.CUSTOMER, text=question, ts=now)
+    # `source` names where the turn actually came from. A question typed into
+    # the platform's own chat surface is not a Chatwoot message, and labelling
+    # it one credits a system of record that never held it - which then reads
+    # as a second, duplicate question on the timeline.
+    turn_source = "chatwoot" if event.minimized_payload.get("chatwoot_account_id") else "platform"
     turn_id = await conversation_store.append_turn(
         session,
         tenant_id=event.tenant_id,
         conversation_ref_id=conversation_ref_id,
         turn=customer_turn,
-        source="chatwoot",
+        source=turn_source,
     )
     if outcome.status.value == "completed" and outcome.answer_text:
         await conversation_store.append_turn(

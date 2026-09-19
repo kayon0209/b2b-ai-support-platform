@@ -160,6 +160,32 @@ async def test_no_answer_means_no_agent_turn() -> None:
     assert _agent_texts() == []
 
 
+async def test_the_turn_source_names_where_the_question_came_from() -> None:
+    """A platform-typed question is not a Chatwoot message.
+
+    Labelling it one credits a system of record that never held it, and the
+    timeline then shows the same question twice - once from each "source".
+    """
+    await _persist_memory(
+        _SESSION,
+        event=_event(),
+        question="What are your support hours?",
+        outcome=_outcome(RunStatus.FAILED, answer_text="", reason="OUTBOUND_FAILED"),
+    )
+    assert [(t[0], t[3]) for t in RECORDED] == [("customer", "platform")]
+
+    RECORDED.clear()
+    from_platform = _event()
+    from_platform.minimized_payload["chatwoot_account_id"] = "3"
+    await _persist_memory(
+        _SESSION,
+        event=from_platform,
+        question="What are your support hours?",
+        outcome=_outcome(RunStatus.FAILED, answer_text="", reason="OUTBOUND_FAILED"),
+    )
+    assert [(t[0], t[3]) for t in RECORDED] == [("customer", "chatwoot")]
+
+
 async def test_the_customer_turn_is_always_recorded() -> None:
     """The question is persisted even when the agent produces nothing.
 
