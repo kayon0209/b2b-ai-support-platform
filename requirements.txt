@@ -58,7 +58,7 @@ prometheus-client>=0.21
 
 # --- Contracts and utilities -----------------------------------------------
 jsonschema>=4.23
-pyyaml>=6.0
+pyyaml>=6.0.3
 httpx>=0.27
 tenacity>=9.0
 uuid6>=2024.7.10
