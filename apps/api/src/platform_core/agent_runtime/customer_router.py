@@ -23,6 +23,7 @@ than silently publishing conversations.
 """
 
 import time
+import uuid
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
@@ -46,6 +47,18 @@ from platform_core.support_bridge.minimize import payload_hash
 from platform_policy import Action
 
 router = APIRouter(prefix="/v1/customer", tags=["customer"])
+
+
+def _conversation_ref(tenant_id: uuid.UUID, external: str) -> uuid.UUID:
+    """The conversation id the worker actually uses.
+
+    `inbox_consumer._conversation_ref` derives a stable id from the external
+    conversation id rather than using it verbatim, so a caller that keeps its
+    own raw UUID would write turns under one id while the worker reads and
+    answers under another — the answer gets produced and then never found.
+    Deriving the same way here keeps one id for the whole exchange.
+    """
+    return uuid.uuid5(tenant_id, f"chatwoot:conversation:{external}")
 
 
 class TurnOut(BaseModel):
@@ -80,10 +93,7 @@ async def conversation_timeline(
     if denied is not None:
         return denied
 
-    try:
-        ref_id = parse_uuid(conversation_ref, field="conversation_ref")
-    except ValueError as exc:
-        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+    ref_id = _conversation_ref(ctx.tenant_id, conversation_ref)
 
     async with tenant_session(ctx) as session:
         rows = (
@@ -148,10 +158,7 @@ async def post_message(request: Request, conversation_ref: str, body: MessageIn)
             status_code=400,
         )
 
-    try:
-        ref_id = parse_uuid(conversation_ref, field="conversation_ref")
-    except ValueError as exc:
-        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+    ref_id = _conversation_ref(ctx.tenant_id, conversation_ref)
 
     redacted, _count = redact_text(body.text)
     digest = payload_hash(body.text.encode())
