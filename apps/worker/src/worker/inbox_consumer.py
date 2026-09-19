@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger, new_trace_context
@@ -33,6 +33,7 @@ from observability_metrics import get_metrics
 from platform_core.agent_runtime.conversation import Turn
 from platform_core.agent_runtime.models import RunStatus
 from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
+from platform_core.db import app_role_url, session_scope_with_url
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
 from platform_core.retrieval.hybrid import PrincipalScope
 from platform_core.support_bridge.models import InboxEvent, InboxEventStatus
@@ -237,6 +238,28 @@ def _conversation_ref(event: ClaimedEvent) -> uuid.UUID | None:
     return uuid.uuid5(event.tenant_id, f"chatwoot:conversation:{external}")
 
 
+async def _local_turn_text(message_id: object) -> str | None:
+    """Redacted text of a platform-persisted turn, or None.
+
+    Goes through the `resolve_turn_text` SECURITY DEFINER function because
+    this runs outside an HTTP request: there is no `app.tenant_id` binding,
+    and under FORCE RLS a direct select would return nothing silently.
+    """
+    try:
+        turn_id = uuid.UUID(str(message_id))
+    except (ValueError, AttributeError, TypeError):
+        # Not a local turn id — a Chatwoot message id, most likely.
+        return None
+    try:
+        async with session_scope_with_url(app_role_url()) as session:
+            row = (
+                await session.execute(text("SELECT resolve_turn_text(:m)"), {"m": turn_id})
+            ).scalar_one_or_none()
+    except Exception:  # noqa: BLE001 - fall through to the Chatwoot read
+        return None
+    return row if isinstance(row, str) and row.strip() else None
+
+
 async def resolve_question(event: ClaimedEvent, deps: OrchestratorDeps) -> str | None:
     """Obtain the customer question text for this event.
 
@@ -250,6 +273,15 @@ async def resolve_question(event: ClaimedEvent, deps: OrchestratorDeps) -> str |
         return content
 
     message_id = event.minimized_payload.get("message_id")
+
+    # Questions typed into the platform's own chat surface are persisted
+    # locally (see POST /v1/customer/conversations/{ref}/messages) and have
+    # no Chatwoot message to fetch. Try that copy first — it is addressed by
+    # turn id, so no Chatwoot coordinates are needed.
+    local = await _local_turn_text(message_id)
+    if local is not None:
+        return local
+
     account_id = event.minimized_payload.get("chatwoot_account_id")
     conversation_id = event.minimized_payload.get("conversation_id")
     reader = deps.reader
