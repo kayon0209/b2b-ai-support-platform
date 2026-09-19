@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
+from observability_metrics import get_metrics
 from platform_core.billing.service import handle_usage_recorded
 from platform_core.db import session_scope
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
@@ -163,11 +164,17 @@ class OutboxRelay:
 
             handler = self.handlers.get(row.event_type)
             if handler is None:
-                logger.info(
+                # Warning, not info. This is an event the platform published
+                # and then dropped on the floor - a producer with no consumer.
+                # It is still retired so the queue drains, but "sent" is a
+                # claim about the queue and not about delivery, so the fact
+                # that it went nowhere has to be countable somewhere.
+                logger.warning(
                     "outbox_event_unhandled",
                     event_type=row.event_type,
                     event_id=str(row.event_id),
                 )
+                get_metrics().outbox_unhandled_total.labels(event_type=row.event_type).inc()
                 await mark_sent(session, row.id)
                 stats.unhandled += 1
                 continue
