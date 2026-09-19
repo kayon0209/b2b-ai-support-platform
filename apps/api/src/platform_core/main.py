@@ -32,6 +32,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from platform_core import db
+from platform_core.agent_runtime.customer_router import router as customer_router
 from platform_core.agent_runtime.prompt_router import router as prompt_router
 from platform_core.agent_runtime.router import router as agent_runtime_router
 from platform_core.api import (
@@ -162,6 +163,7 @@ app.include_router(compliance_router)
 app.include_router(cases_router)
 app.include_router(retrieval_router)
 app.include_router(agent_runtime_router)
+app.include_router(customer_router)
 app.include_router(tool_gateway_router)
 app.include_router(quality_router)
 app.include_router(prompt_router)

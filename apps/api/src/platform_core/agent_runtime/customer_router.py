@@ -1,0 +1,154 @@
+"""Read-only endpoints for the customer-facing chat surface.
+
+Why this exists
+---------------
+The admin console could already see *that* a run happened (route, status,
+abstention reason), but nothing could read the conversation itself: the
+answer text was only ever handed to Chatwoot and dropped. `conversation_turns`
+(iteration plan 2.1) now persists each redacted turn, so a customer-facing
+screen can finally render the exchange.
+
+Kept in its own module on purpose: `intent.py`, `conversation.py` and
+`qa_path.py` are under active development elsewhere, and this adds no
+behaviour to the write path — it only reads what is already stored.
+
+Authentication
+--------------
+These endpoints currently resolve a tenant from the normal bearer token and
+require `CASE_READ`. That is a placeholder, not the design: there is no
+customer identity yet, so a real deployment must swap this for a
+per-conversation token before this is exposed to customers. Leaving the
+existing policy gate in place means the endpoints fail closed today rather
+than silently publishing conversations.
+"""
+
+
+from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel
+from sqlalchemy import select
+
+from platform_core.agent_runtime.models import Citation, ConversationTurn
+from platform_core.api import (
+    VALIDATION_FAILED,
+    error_response,
+    get_context,
+    new_trace_id,
+    ok_response,
+    parse_uuid,
+    require_policy,
+    tenant_session,
+)
+from platform_policy import Action
+
+router = APIRouter(prefix="/v1/customer", tags=["customer"])
+
+
+class TurnOut(BaseModel):
+    role: str
+    text: str
+    at: int
+    source: str
+
+
+class CitationOut(BaseModel):
+    source_uri: str
+    claim_index: int
+    excerpt_hash: str
+
+
+@router.get("/conversations/{conversation_ref}/timeline")
+async def conversation_timeline(
+    request: Request,
+    conversation_ref: str,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> object:
+    """The redacted exchange for one conversation, oldest first.
+
+    Tenant scoping is RLS, not a filter: the query runs inside
+    `tenant_session`, so a conversation belonging to another tenant simply
+    returns nothing rather than leaking.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return error_response("AUTH_UNRESOLVED", "tenant context not resolved", status_code=401)
+    denied = require_policy(ctx, Action.CASE_READ)
+    if denied is not None:
+        return denied
+
+    try:
+        ref_id = parse_uuid(conversation_ref, field="conversation_ref")
+    except ValueError as exc:
+        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+
+    async with tenant_session(ctx) as session:
+        rows = (
+            (
+                await session.execute(
+                    select(ConversationTurn)
+                    .where(ConversationTurn.conversation_ref_id == ref_id)
+                    .order_by(ConversationTurn.ts.asc(), ConversationTurn.id.asc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    items = [
+        TurnOut(
+            role=r.role,
+            text=r.text_redacted,
+            at=r.ts,
+            source=getattr(r, "source", "") or "",
+        ).model_dump()
+        for r in rows
+    ]
+    return ok_response({"items": items}, trace_id=new_trace_id())
+
+
+@router.get("/agent-runs/{run_id}/citations")
+async def run_citations(
+    request: Request,
+    run_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> object:
+    """Sources a run's answer was drawn from.
+
+    Exposed so the customer can check the answer rather than trust it — the
+    whole point of generating with citations in the first place.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return error_response("AUTH_UNRESOLVED", "tenant context not resolved", status_code=401)
+    denied = require_policy(ctx, Action.CASE_READ)
+    if denied is not None:
+        return denied
+
+    try:
+        run_uuid = parse_uuid(run_id, field="run_id")
+    except ValueError as exc:
+        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+
+    async with tenant_session(ctx) as session:
+        rows = (
+            (
+                await session.execute(
+                    select(Citation)
+                    .where(Citation.agent_run_id == run_uuid)
+                    .order_by(Citation.claim_index.asc(), Citation.id.asc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    items = [
+        CitationOut(
+            source_uri=r.source_uri,
+            claim_index=r.claim_index,
+            excerpt_hash=r.excerpt_hash,
+        ).model_dump()
+        for r in rows
+    ]
+    return ok_response({"items": items}, trace_id=new_trace_id())

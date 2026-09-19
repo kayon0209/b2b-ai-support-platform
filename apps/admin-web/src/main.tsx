@@ -4,8 +4,11 @@ import { createBrowserRouter, Navigate, RouterProvider } from "react-router-dom"
 
 import { RouteError } from "./components/ErrorBoundary";
 import { Layout } from "./components/Layout";
+import { LangProvider } from "./lib/i18n";
+import { Approvals } from "./pages/Approvals";
 import { Branding } from "./pages/Branding";
 import { Cases } from "./pages/Cases";
+import { CustomerChat } from "./pages/CustomerChat";
 import { FeatureFlags } from "./pages/FeatureFlags";
 import { GapQueue } from "./pages/GapQueue";
 import { Members } from "./pages/Members";
@@ -19,6 +22,10 @@ import "./styles.css";
  * Route table mirrors the sidebar in components/Layout.tsx. Every page talks
  * to an endpoint that already exists on the control plane; the admin UI adds
  * no backend surface of its own.
+ *
+ * `/chat` is deliberately OUTSIDE the layout — it is the customer-facing
+ * surface, not the operator console. Hiding it inside Layout would show
+ * the admin sidebar to the very person we are trying to help.
  */
 const router = createBrowserRouter([
   {
@@ -36,11 +43,24 @@ const router = createBrowserRouter([
       { path: "prompts", element: <PromptRelease /> },
       { path: "flags", element: <FeatureFlags /> },
       { path: "cases", element: <Cases /> },
+      { path: "approvals", element: <Approvals /> },
       { path: "members", element: <Members /> },
       { path: "usage", element: <Usage /> },
       { path: "branding", element: <Branding /> },
       { path: "*", element: <NotFound /> },
     ],
+  },
+  {
+    // Customer-facing chat. Top-level so it never inherits the operator
+    // sidebar. Wrapped in its own LangProvider because it is no longer a
+    // child of the Layout that carries the admin shell's provider.
+    path: "/chat",
+    element: (
+      <LangProvider>
+        <CustomerChat />
+      </LangProvider>
+    ),
+    errorElement: <RouteError />,
   },
 ]);
 
