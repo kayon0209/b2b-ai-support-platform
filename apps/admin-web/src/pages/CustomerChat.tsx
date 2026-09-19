@@ -245,10 +245,13 @@ export function CustomerChat() {
     void (async () => {
       try {
         await apiPost(
-          `/v1/conversations/${conversationRef}/agent-runs`,
-          { trigger_message_ref: nextId(), mode: "customer_reply" },
+          `/v1/customer/conversations/${conversationRef}/messages`,
+          { text: body },
           newIdempotencyKey(),
         );
+        // The turn is persisted server-side, so pull it back rather than
+        // leaving the optimistic bubble as the only copy.
+        await loadTimeline();
       } catch {
         setTyping(false);
         waitingRef.current = false;
