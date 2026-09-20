@@ -10,6 +10,17 @@ An **AI control plane**, not a chat product. Customer → **Chatwoot** (external
 context) → signed webhook → Support Bridge → this repo; return leg `AI --REST--> Chatwoot`.
 This repo = `apps/admin-web` + `/v1/*` admin APIs + one webhook entry.
 
+## Before you claim a change is verified
+
+**`ruff check` passing does not mean CI passes.** `.github/workflows/ci.yml` runs
+`ruff check` **and** `ruff format --check` over `apps packages scripts tests
+pytest_plugins_release`; running only the first produced a green-looking session whose
+pipeline would have failed (7 unformatted files, 6 commits, found 2026-09-20). Run both.
+
+**Local HTTP debugging: `curl --noproxy "*"`.** A host proxy (`HTTP_PROXY=:55940`) answers
+requests to `localhost` with `502 upstream connect failed`, which reads as a broken route
+in your own service. Bypass it before concluding anything is down.
+
 ## Environment
 
 - Repo `D:/360Downloads/360驱动大师目录/b2b-ai-support-plan/b2b-ai-support-plan`.
