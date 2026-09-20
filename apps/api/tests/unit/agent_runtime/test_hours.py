@@ -8,6 +8,8 @@ there, and refusing to answer a tenant who never said when they are open.
 
 from datetime import UTC, datetime
 
+import pytest
+
 from platform_core.agent_runtime.hours import is_open, next_open_label, offline_notice
 
 
@@ -71,3 +73,30 @@ def test_the_offline_notice_makes_no_promise_about_speed() -> None:
     assert "09:00" in notice
     for forbidden in ("shortly", "right away", "immediately", "a moment"):
         assert forbidden not in notice
+
+
+def test_the_window_comes_from_settings_not_constants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wiring, not the arithmetic.
+
+    Every other test passes a window explicitly, so a settings field that is
+    never read would still leave this file green. This one sets the
+    configuration and asks the real clock question - which is the only way to
+    catch a default that silently overrides what a tenant configured.
+    """
+    from platform_core.agent_runtime import hours
+    from platform_core.config import get_settings
+
+    monkeypatch.setenv("APP_SUPPORT_OPEN_HOUR", "9")
+    monkeypatch.setenv("APP_SUPPORT_CLOSE_HOUR", "18")
+    get_settings.cache_clear()
+    try:
+        assert hours.is_open(_at(3)) is False
+        assert hours.is_open(_at(12)) is True
+        assert hours.next_open_label(_at(3)) == "09:00"
+        assert "09:00" in hours.offline_notice()
+    finally:
+        # Restored for the next test: settings are cached process-wide, and a
+        # window left configured here would leak into every later assertion.
+        get_settings.cache_clear()
