@@ -175,17 +175,15 @@ async def _execute(*, draft_text: str):
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
     async with factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT}
-        )
+        await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT})
         lease = await lease_service.acquire_or_get(session, tenant_id=tid, conversation_ref_id=conv)
         await session.commit()
 
     async with factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT}
+        await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT})
+        orch = AgentOrchestrator(
+            session, OrchestratorDeps(sender=sender, generator=_FixedGenerator(draft_text))
         )
-        orch = AgentOrchestrator(session, OrchestratorDeps(sender=sender, generator=_FixedGenerator(draft_text)))
         outcome = await orch.run(
             tenant_id=tid,
             conversation_ref_id=conv,

@@ -168,7 +168,10 @@ def test_binding_the_same_contact_twice_is_a_conflict_not_a_crash() -> None:
     escaped as a 500 carrying a constraint name.
     """
     owner = _client(TENANT, "tenant_owner")
-    assert owner.post(_url(), json={"external_contact_id": CONTACT}, headers=_headers()).status_code == 200
+    assert (
+        owner.post(_url(), json={"external_contact_id": CONTACT}, headers=_headers()).status_code
+        == 200
+    )
 
     again = owner.post(_url(), json={"external_contact_id": CONTACT}, headers=_headers())
 
@@ -188,7 +191,10 @@ def test_binding_to_an_account_that_is_not_this_tenants_is_not_found() -> None:
 def test_one_tenant_cannot_read_anothers_bindings() -> None:
     """RLS at the endpoint, not just in the service."""
     owner = _client(TENANT, "tenant_owner")
-    assert owner.post(_url(), json={"external_contact_id": CONTACT}, headers=_headers()).status_code == 200
+    assert (
+        owner.post(_url(), json={"external_contact_id": CONTACT}, headers=_headers()).status_code
+        == 200
+    )
 
     other = _client(OTHER_TENANT, "tenant_owner")
     listed = other.get(f"/v1/identity/accounts/{ACCOUNT}/contacts", headers=_headers())

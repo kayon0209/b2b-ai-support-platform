@@ -97,9 +97,7 @@ def _seed() -> None:
             ),
             {"t": TENANT, "c": CASE_A, "conv": CONVERSATION},
         )
-        for ordinal, (role, body) in enumerate(
-            (("customer", "板子短路了"), ("agent", AGENT_TEXT))
-        ):
+        for ordinal, (role, body) in enumerate((("customer", "板子短路了"), ("agent", AGENT_TEXT))):
             conn.execute(
                 text(
                     "INSERT INTO conversation_turns (id, tenant_id, conversation_ref_id, "

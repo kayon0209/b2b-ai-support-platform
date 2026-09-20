@@ -38,6 +38,7 @@ from platform_core.agent_runtime.conversation import (
     rewrite_query,
 )
 from platform_core.agent_runtime.generator import LlmAnswerGenerator
+from platform_core.agent_runtime.hours import is_open, offline_notice
 from platform_core.agent_runtime.intent import (
     NON_ANSWERABLE_ROUTES,
     PRE_RETRIEVAL_ROUTES,
@@ -2075,6 +2076,14 @@ class AgentOrchestrator:
         await self._session.flush()
 
         notice = safe_abstention_text(decision.reason_code)
+        # 7.5: never promise a person who is not there. The reason code still
+        # says why the run stopped - that is for the receiving agent and the
+        # audit log - but the customer is told the truth about when someone
+        # will look at it. Only for handoffs: a clarification that says "we
+        # are closed" would strand a customer who could have answered and been
+        # answered.
+        if decision.handoff and not is_open():
+            notice = offline_notice()
 
         # Send the notice **before** releasing the lease, because the lease
         # gate below refuses once the owner is the queue. Releasing first was
