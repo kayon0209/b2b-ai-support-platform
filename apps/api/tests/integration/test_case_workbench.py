@@ -177,3 +177,51 @@ def test_a_role_without_case_read_is_refused() -> None:
     resp = nobody.get(f"/v1/cases/{CASE_A}/workbench", headers=_headers())
 
     assert resp.status_code == 403, f"got {resp.status_code}: {resp.text[:200]}"
+
+
+def test_the_bundle_lists_the_accounts_other_contacts() -> None:
+    """Feature list 2.1, in the place it pays off.
+
+    One company, several channels, one Chatwoot contact per channel. The
+    binding already knows they are the same account; if the workbench does not
+    show that, an agent reads the email from last week and the message from
+    this morning as two different customers and asks the same questions twice.
+    """
+    import sqlalchemy as sa
+
+    account_id = "01900000-0000-7000-8000-0000000000f1"
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO enterprise_accounts (id, tenant_id, name, tier, "
+                "contract_status, attributes, created_at, updated_at) VALUES "
+                "(:i, :t, 'Multi Channel Co', 'enterprise', 'active', '{}'::jsonb, 0, 0) "
+                "ON CONFLICT DO NOTHING"
+            ),
+            {"i": account_id, "t": TENANT},
+        )
+        conn.execute(
+            sa.text("UPDATE cases SET enterprise_account_id = :a WHERE id = :c AND tenant_id = :t"),
+            {"a": account_id, "c": CASE_A, "t": TENANT},
+        )
+        for contact in ("email-contact", "wechat-contact"):
+            conn.execute(
+                sa.text(
+                    "INSERT INTO enterprise_account_contacts (id, tenant_id, "
+                    "enterprise_account_id, external_contact_id, created_at) VALUES "
+                    "(gen_random_uuid(), :t, :a, :c, 0) ON CONFLICT DO NOTHING"
+                ),
+                {"t": TENANT, "a": account_id, "c": contact},
+            )
+    admin.dispose()
+
+    body = (
+        _client(TENANT, "support_agent")
+        .get(f"/v1/cases/{CASE_A}/workbench", headers=_headers())
+        .json()
+    )
+
+    assert "email-contact" in body["account_contacts"]
+    assert "wechat-contact" in body["account_contacts"]
+    assert body["account_tier"] == "enterprise"

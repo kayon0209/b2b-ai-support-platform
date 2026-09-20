@@ -313,6 +313,7 @@ async def case_workbench(request: Request, case_id: str) -> Any:
         ).all()
 
         tier: str | None = None
+        contacts: list[str] = []
         if case.enterprise_account_id is not None:
             # Through the identity seam, not by importing its models.
             from platform_core.identity import org
@@ -322,11 +323,20 @@ async def case_workbench(request: Request, case_id: str) -> Any:
             )
             if facts is not None:
                 tier = facts[0]
+            # Feature list 2.1: one company reaches us through several
+            # channels, and each channel is a different Chatwoot contact. The
+            # binding already says they are the same account; showing them is
+            # what stops an agent treating the email from last week and the
+            # WeChat message from this morning as two different customers.
+            contacts = await org.list_contacts(
+                session, tenant_id=ctx.tenant_id, account_id=case.enterprise_account_id
+            )
 
     return ok_response(
         {
             "case": _serialize(case),
             "account_tier": tier,
+            "account_contacts": contacts,
             "conversation": conversation,
             "ai_suggestion": suggestion,
             "related_cases": {
