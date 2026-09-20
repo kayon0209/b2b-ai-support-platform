@@ -64,6 +64,8 @@ SLUG_TOO_LONG = "SLUG_TOO_LONG"
 NAME_REQUIRED = "NAME_REQUIRED"
 SLUG_TAKEN = "SLUG_TAKEN"
 ACCOUNT_CRM_REF_TAKEN = "ACCOUNT_CRM_REF_TAKEN"
+ACCOUNT_NOT_FOUND = "ACCOUNT_NOT_FOUND"
+CONTACT_ALREADY_BOUND = "CONTACT_ALREADY_BOUND"
 
 # Every code `org.py` can raise, mapped to the status it deserves. `ORG_CYCLE`
 # and the parent codes are 409: the request is well-formed, and it conflicts
@@ -76,6 +78,12 @@ _STATUS_BY_CODE: dict[str, int] = {
     ORG_DEPTH_EXCEEDED: 409,
     SLUG_TAKEN: 409,
     ACCOUNT_CRM_REF_TAKEN: 409,
+    # The account is not this tenant's: indistinguishable from "no such
+    # account", which is the point (see `org.account_sla_facts`).
+    ACCOUNT_NOT_FOUND: 404,
+    # The contact is already bound. The request is well-formed, it conflicts
+    # with existing state - not a malformed body.
+    CONTACT_ALREADY_BOUND: 409,
     TIER_INVALID: 400,
     CONTRACT_STATUS_INVALID: 400,
     SLUG_INVALID: 400,

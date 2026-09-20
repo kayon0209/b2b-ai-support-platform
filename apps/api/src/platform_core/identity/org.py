@@ -119,6 +119,10 @@ _CONFLICTS: tuple[tuple[str, str], ...] = (
     ("deeper than 32 levels", "ORG_DEPTH_EXCEEDED"),
     ("fk_enterprise_accounts_parent_same_tenant", "ORG_PARENT_NOT_FOUND"),
     ("fk_departments_parent_same_tenant", "ORG_PARENT_NOT_FOUND"),
+    # One contact, one account. Without this the duplicate-bind path would
+    # re-raise an unmatched IntegrityError: a 500 carrying a driver message,
+    # for what is an ordinary conflict a caller can act on.
+    ("uq_account_contact_external", "CONTACT_ALREADY_BOUND"),
 )
 
 
