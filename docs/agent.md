@@ -77,6 +77,42 @@ That is still worth doing: without it the QA path answers a bare "确认" from t
 corpus, or asks a customer who has just answered the platform's question to say
 more. Both are plainly wrong, and neither is a handoff.
 
+### Claims against the company (L6 争议归责)
+
+A customer demanding compensation, a refund, a return or an escalation is not
+asking what the policy says — they are claiming under it. The research report
+classes these **L6, 必须转人工** and forbids the AI from any 归责表态 or 赔付承诺,
+so there is no answer for the QA path to produce. Such a run abstains with
+reason `COMPLAINT_REQUIRES_HUMAN` and hands off, before retrieval, before the
+write path and before the clarification gate.
+
+Detection is `agent_runtime.complaint` (lexical, narrow, with a question veto),
+and it keys on the **claim**, not on `Scene.COMPLAINT`. That was measured, not
+assumed: the scene pattern counts "still not" and "third time" as complaint
+signals, so `"my order has still not arrived"` and `"The shipment still not
+updated"` both classify as `COMPLAINT` — a scene gate sends an order-status
+question to a human queue instead of to `order.get_status`. The scene is
+therefore not consulted.
+
+What stays answerable is the question *about* the same topic, which the report
+puts at **L1** (检索 + 引用): `全测板开短路不良怎么赔付？` asks how compensation
+works and is answered from the corpus; `板子短路了，我要索赔` claims under it and
+is not. The veto is the discriminator, and it is the part most likely to be
+removed by someone simplifying this later — `test_agent_complaint_handoff.py`
+fails if it is.
+
+This gate is deliberately **not** behind a feature flag, unlike the EQ branch
+above. That branch adds a behaviour a tenant opts into; this one removes an
+answer the report classes as a red line, and a red line behind a default-off
+flag is not a control.
+
+Not implemented, and recorded as a boundary rather than left implicit: the
+report also asks the AI to collect structured evidence (order number, batch,
+defect count, photos). The handoff notice asks for the order number and photos
+because a person receives them either way, but there is no structured intake
+form, so nothing parses or stores them as fields. Building the intake without
+the form would be a capability with no consumer.
+
 ## Evidence policy
 
 - Retrieval runs only after tenant and ACL filters are constructed.

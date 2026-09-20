@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger, TraceContext, new_trace_context
 from observability_metrics import get_metrics
+from platform_core.agent_runtime.complaint import is_complaint_claim
 from platform_core.agent_runtime.confirmation import is_confirmation
 from platform_core.agent_runtime.conversation import (
     CompactedContext,
@@ -56,6 +57,7 @@ from platform_core.agent_runtime.models import (
 )
 from platform_core.agent_runtime.qa_path import (
     ABSTAIN_CLARIFICATION,
+    ABSTAIN_COMPLAINT_REQUIRES_HUMAN,
     ABSTAIN_CONFLICT,
     ABSTAIN_HUMAN_REQUIRED,
     ABSTAIN_OUT_OF_SCOPE,
@@ -769,6 +771,43 @@ class AgentOrchestrator:
                     chatwoot_account_id=chatwoot_account_id,
                     chatwoot_conversation_id=chatwoot_conversation_id,
                 )
+
+        # --- 2b-complaint. A claim against the company (L6 争议归责). ---
+        #
+        # A customer demanding compensation, a refund, a return or an
+        # escalation is not asking what the policy says - they are claiming
+        # under it. The research report puts that at L6 (必须转人工) and forbids
+        # the AI from any 归责表态 or 赔付承诺, so there is no answer for the QA
+        # path to produce: the run hands off before retrieval, before the write
+        # path and before the clarification gate.
+        #
+        # Before the clarification gate specifically because asking someone who
+        # has just claimed compensation to "give me a little more detail" is
+        # not information gathering, it is making them repeat a grievance.
+        #
+        # Deliberately **not** behind a feature flag, unlike the EQ branch
+        # above. That branch adds a behaviour a tenant must opt into; this one
+        # removes an answer the report classes as a red line, and gating a red
+        # line behind a default-off flag is what left the complaint path
+        # answering in the first place.
+        if is_complaint_claim(question):
+            run_span.set_attributes(**{"route.override": "complaint_requires_human"})
+            return await self._finish_abstain(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                decision=AbstentionDecision(
+                    abstain=True,
+                    reason_code=ABSTAIN_COMPLAINT_REQUIRES_HUMAN,
+                    handoff=True,
+                ),
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
 
         needs_ask, ask_reason = needs_clarification(retrieval_query, memory.turns)
         if needs_ask and route not in NON_ANSWERABLE_ROUTES:

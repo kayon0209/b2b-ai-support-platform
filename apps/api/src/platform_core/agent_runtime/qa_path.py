@@ -285,6 +285,12 @@ ABSTAIN_OUT_OF_SCOPE = "OUT_OF_SCOPE"
 # invites the customer back. Conflating them turns every vague first message
 # into a ticket.
 ABSTAIN_CLARIFICATION = "NEEDS_CLARIFICATION"
+# The customer is claiming a remedy (compensation, refund, return, escalation)
+# rather than asking how it works. L6 争议归责 in the research report: a payout
+# is an authority decision, and the report's red line forbids the AI from any
+# 归责表态 or 赔付承诺 - so the run does not answer, it hands off. Detected by
+# `agent_runtime/complaint.py`, which documents why the scene axis is not used.
+ABSTAIN_COMPLAINT_REQUIRES_HUMAN = "COMPLAINT_REQUIRES_HUMAN"
 
 
 @dataclass
@@ -1113,6 +1119,23 @@ def safe_abstention_text(reason_code: str) -> str:
             "I can help with questions about your account, orders and our "
             "documented policies. Let me know what you'd like to know, or I "
             "can connect you with a human colleague."
+        )
+    if reason_code == ABSTAIN_COMPLAINT_REQUIRES_HUMAN:
+        # Says a person will decide it, without saying what they will decide:
+        # the report's red line is 绝不可做归责表态或赔付承诺, so this text
+        # neither admits fault nor names an outcome. The generic fallback would
+        # ask the customer to "rephrase the question", which to someone claiming
+        # compensation reads as being sent away - and it would be false anyway,
+        # since nothing failed to be found: answering at all is what is wrong.
+        #
+        # The evidence request is the AI's documented remaining role here
+        # (report 2.2 scenario D: 收集结构化证据), and costs nothing to ask.
+        return (
+            "Thank you for raising this. Compensation and quality claims are "
+            "decided by a person rather than by me, so I have passed this to a "
+            "human colleague who has this conversation's context. If you can "
+            "share the order number and photos of the issue, that will help "
+            "them review it."
         )
     return (
         "I couldn't verify an answer from our authorized knowledge base. "
