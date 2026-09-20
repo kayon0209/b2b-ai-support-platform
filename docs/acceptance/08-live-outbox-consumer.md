@@ -1,7 +1,38 @@
 # A live outbox/ingestion consumer shares the local database
 
-Status: **open, environmental.** Not a defect in the platform code.
-Found: 2026-09-19. Last confirmed: 2026-09-20.
+Status: **resolved 2026-09-20.** Cause identified and stopped.
+Found: 2026-09-19 by a race in the relay suite; identified: 2026-09-20.
+
+## Resolution
+
+The consumer was **four orphan `worker.runner` host processes**, left behind by
+earlier agent sessions and running for roughly 30 hours. They were claiming the
+outbox *and* ingestion queues the whole time.
+
+They were orphans because of how agent shells behave: **an agent that stops its
+shell does not stop the python child it started.** The shell exits, the worker
+keeps running, and nothing in `docker ps` shows it — which is why the search
+below looked in the wrong places for a day.
+
+Stopping them resolved every flaky test seen that day:
+
+- the full suite went `PYTEST_EXIT=0` (1558 tests, `release_check` exit 0);
+- `test_outbox_relay.py` went from **8 skipped to 8 passed**.
+
+To find them (and to find them again, if this recurs):
+
+```bash
+netstat -ano | grep ":5435"      # never ":5435|5432" - that also matches 54323
+```
+
+That lists the PIDs holding connections to the platform database. A python
+process that holds DB connections but listens on no port is worker-shaped; read
+its command line with `psutil` to confirm, then **kill the process tree** — not
+just the shell that spawned it.
+
+The diagnosis below is kept as written on 2026-09-19, because the evidence chain
+is what made the eventual identification quick, and because the same symptoms
+from a different cause would need the same checks.
 
 ## What is happening
 
@@ -101,6 +132,11 @@ work being incomplete — it is the measurement environment being dirty.
 
 ## First actions for whoever picks this up
 
+> **Superseded by the resolution above** — this section is what was tried before
+> the cause was known, and it did not find it. Kept because the third option
+> (probe the queues directly) is the step that would have worked fastest, and
+> the first two ate most of a day.
+
 1. Find and stop the consumer. Candidates, in order of likelihood:
 
    ```powershell
@@ -114,6 +150,13 @@ work being incomplete — it is the measurement environment being dirty.
 
    Note every checkout on this machine points at `localhost:5435`, so a
    worker started from a different working copy looks like a ghost here.
+
+   **What was actually true**: not a container and not a shell — orphan python
+   children of finished agent sessions. `docker ps -a` showing everything
+   Exited proves nothing, and a process listing is only useful if it survives
+   the shell that started it. The reliable probe is the queue itself: insert a
+   `queued` row and re-read it seconds later; a climbing `attempts` counter is
+   a live consumer regardless of what any process or container list says.
 
 2. Re-run the two suites that were being blocked:
 
