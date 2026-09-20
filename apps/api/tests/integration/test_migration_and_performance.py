@@ -93,7 +93,7 @@ TENANT_TABLES = (
 # migration chain is exercised end-to-end here (down to base and back up on a
 # fresh database), and a new revision that is not reversible fails this test
 # rather than surfacing during a production rollback.
-EXPECTED_MIGRATIONS = 37
+EXPECTED_MIGRATIONS = 39
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

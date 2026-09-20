@@ -162,8 +162,15 @@ def _cleanup(admin: Any) -> None:
             ),
             {"names": list(names)},
         )
+        # `tenant_id IS NULL` because this module seeds only the global
+        # catalog rows. Without it the teardown deleted every tenant's
+        # definition of the same name - running this file against a shared
+        # dev database removed the real `jira.create_issue` row a pilot
+        # tenant was using, and the next request answered TOOL_NOT_REGISTERED
+        # for a tool that had been working. A teardown must not reach outside
+        # what the test created.
         conn.execute(
-            text("DELETE FROM tool_definitions WHERE name = ANY(:names)"),
+            text("DELETE FROM tool_definitions WHERE name = ANY(:names) AND tenant_id IS NULL"),
             {"names": list(names)},
         )
         conn.execute(
@@ -573,6 +580,164 @@ def test_execute_without_executor_reports_missing_executor() -> None:
     assert after["proposal"]["status"] not in ("executed", "verified")
 
 
+# --- 7b. Listing proposals (the agent's write path needs a carrier) --------
+#
+# The agent can propose a confirmed write and then stop. Without a way to
+# enumerate proposals, a human would have to be told the proposal id out of
+# band to act on it - which makes "the agent prepared this, approve it" a
+# notification nobody can follow up rather than a workflow.
+
+
+def test_listing_proposals_shows_what_was_prepared() -> None:
+    client = _client(TENANT_A, "support_admin")
+    marker = f"list-{uuid.uuid4().hex[:8]}"
+    for index in (0, 1):
+        resp = client.post(
+            "/v1/tool-proposals",
+            headers={**_auth(), "Idempotency-Key": f"{marker}-{index}"},
+            json={"tool_name": LOW_RISK_TOOL, "arguments": {"note": f"{marker}-{index}"}},
+        )
+        assert resp.status_code == 200, resp.text
+
+    listed = client.get("/v1/tool-proposals", headers=_auth())
+    assert listed.status_code == 200, listed.text
+    body = listed.json()
+    assert body["limit"] == 50 and body["offset"] == 0
+    assert body["total"] >= 2
+
+    # Scoped to this test's own rows: the module fixture cleans up once, so
+    # earlier tests' proposals are legitimately still listed.
+    mine = [i for i in body["items"] if str(i["arguments"].get("note", "")).startswith(marker)]
+    assert len(mine) == 2, body["items"]
+    # Newest first. UUIDv7 keys sort by creation time, so the ordering is a
+    # property of the key rather than of a timestamp column kept in step.
+    assert mine[0]["arguments"]["note"] == f"{marker}-1"
+    for item in mine:
+        assert item["tool_name"] == LOW_RISK_TOOL
+        assert item["risk"] == "low_write"
+        assert item["effective_status"] == item["status"]
+
+
+def test_listing_proposals_is_tenant_scoped() -> None:
+    """Tenant B's list must not contain tenant A's proposals."""
+    marker = f"scope-{uuid.uuid4().hex[:8]}"
+    proposed = _client(TENANT_A, "support_admin").post(
+        "/v1/tool-proposals",
+        headers={**_auth(), "Idempotency-Key": marker},
+        json={"tool_name": LOW_RISK_TOOL, "arguments": {"note": marker}},
+    )
+    assert proposed.status_code == 200, proposed.text
+
+    b_listed = _client(TENANT_B, "support_admin").get("/v1/tool-proposals", headers=_auth())
+    assert b_listed.status_code == 200, b_listed.text
+    leaked = [
+        i
+        for i in b_listed.json()["items"]
+        if str(i["arguments"].get("note", "")).startswith(marker)
+    ]
+    assert leaked == [], "a proposal crossed the tenant boundary"
+
+
+def test_listing_proposals_requires_case_read() -> None:
+    """knowledge_manager holds knowledge.read but no case.read.
+
+    Listing is not a harmless read: it exposes the arguments of writes in
+    flight, which is case content, so it is gated on the same action as
+    reading a case.
+    """
+    resp = _client(TENANT_A, "knowledge_manager").get("/v1/tool-proposals", headers=_auth())
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "POLICY_DENIED"
+
+
+def test_an_overdue_proposal_reports_as_expired() -> None:
+    """The timeout half of "confirm it, or the proposal voids itself".
+
+    A proposal past its expiry is not `authorized` in any sense a human can
+    use - `confirm` and `execute` both refuse it. Reporting the stored value
+    would offer an operator an approval that cannot be given, and they would
+    only discover that by trying.
+    """
+    client = _client(TENANT_A, "support_admin")
+    marker = f"expire-{uuid.uuid4().hex[:8]}"
+    proposed = client.post(
+        "/v1/tool-proposals",
+        headers={**_auth(), "Idempotency-Key": marker},
+        json={"tool_name": LOW_RISK_TOOL, "arguments": {"note": marker}},
+    )
+    assert proposed.status_code == 200, proposed.text
+    proposal_id = proposed.json()["proposal"]["proposal_id"]
+
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text("UPDATE tool_proposals SET expires_at = 1 WHERE id = :i"),
+            {"i": proposal_id},
+        )
+    admin.dispose()
+
+    listed = client.get("/v1/tool-proposals", headers=_auth()).json()
+    item = next(i for i in listed["items"] if i["proposal_id"] == proposal_id)
+    # The stored value is left alone: the row is not mutated by being read.
+    assert item["status"] == "authorized"
+    assert item["effective_status"] == "expired"
+
+    # And the single-proposal view carries it too. It did not at first - the
+    # field was added to the list only - and the admin UI's detail panel reads
+    # a proposal from this endpoint, so it saw `undefined`, disabled both of
+    # its buttons, and looked like a permissions problem. Asserting it here is
+    # what stops that being reintroduced.
+    one = client.get(f"/v1/tool-proposals/{proposal_id}", headers=_auth()).json()
+    assert one["proposal"]["effective_status"] == "expired"
+
+    # And the relabelling is not cosmetic - the proposal really is dead.
+    confirm = client.post(f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={})
+    assert confirm.status_code == 409
+    assert confirm.json()["error"]["code"] == "PROPOSAL_EXPIRED"
+
+
+def test_the_status_filter_agrees_with_effective_status() -> None:
+    """`?status=authorized` must mean "still approvable", not "stored so".
+
+    The console's whole job on this screen is "what is waiting on me?", so a
+    filter that returned proposals whose own label in the same response reads
+    `expired` — and which `confirm` refuses — would be worse than no filter.
+    """
+    client = _client(TENANT_A, "support_admin")
+    marker = f"filt-{uuid.uuid4().hex[:8]}"
+    ids = {}
+    for name in ("live", "stale"):
+        resp = client.post(
+            "/v1/tool-proposals",
+            headers={**_auth(), "Idempotency-Key": f"{marker}-{name}"},
+            json={"tool_name": LOW_RISK_TOOL, "arguments": {"note": f"{marker}-{name}"}},
+        )
+        assert resp.status_code == 200, resp.text
+        ids[name] = resp.json()["proposal"]["proposal_id"]
+
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text("UPDATE tool_proposals SET expires_at = 1 WHERE id = :i"),
+            {"i": ids["stale"]},
+        )
+    admin.dispose()
+
+    pending = client.get("/v1/tool-proposals?status=authorized", headers=_auth())
+    assert pending.status_code == 200, pending.text
+    pending_ids = {i["proposal_id"] for i in pending.json()["items"]}
+    assert ids["live"] in pending_ids
+    assert ids["stale"] not in pending_ids, "an expired proposal was listed as approvable"
+    # Nothing under this filter may contradict its own label.
+    assert all(i["effective_status"] == "authorized" for i in pending.json()["items"])
+
+    expired = client.get("/v1/tool-proposals?status=expired", headers=_auth())
+    assert expired.status_code == 200, expired.text
+    expired_ids = {i["proposal_id"] for i in expired.json()["items"]}
+    assert ids["stale"] in expired_ids
+    assert ids["live"] not in expired_ids
+
+
 # --- 8. Connector-backed execution ----------------------------------------
 #
 # The tests above prove the gateway refuses correctly. These prove the
@@ -945,3 +1110,238 @@ def test_created_agent_run_has_a_started_at() -> None:
     )
     assert metrics.status_code == 200, metrics.text
     assert metrics.json()["total_runs"] >= 1
+
+
+# --- Tool catalog (docs/api-contracts.md tool catalog API) -----------------
+
+
+def test_the_catalog_lists_what_this_tenant_can_propose() -> None:
+    """The console offers a choice of tool from here.
+
+    It reads the catalog rather than carrying its own list, so a tool added to
+    `TOOL_CATALOG` appears without a front-end change. Before this endpoint the
+    Approvals screen could only act on proposals that already existed, which
+    meant raising one required `curl` - not a workflow.
+
+    Read as `tenant_owner`, which is the role that can propose a write at all:
+    `support_agent` holds `CASE_READ/CASE_CREATE/CASE_UPDATE/KNOWLEDGE_READ/
+    TOOL_READ` and no write grant, so its catalog is read tools only. That is
+    asserted in `test_the_catalog_hides_tools_the_caller_cannot_propose`, and it
+    is why this one does not use a support agent.
+    """
+    client = _client(TENANT_A, "tenant_owner")
+
+    resp = client.get("/v1/tools", headers=_auth())
+
+    assert resp.status_code == 200, resp.text
+    items = {i["name"]: i for i in resp.json()["items"]}
+    assert JIRA_TOOL in items
+    jira = items[JIRA_TOOL]
+    assert jira["risk"] == "confirmed_write"
+    assert jira["requires_confirmation"] is True
+    assert jira["input_schema"]["type"] == "object"
+    assert "properties" in jira["input_schema"]
+
+
+def test_the_catalog_includes_platform_internal_tools() -> None:
+    """`case.eq_confirm` has no connector, and the console must still offer it.
+
+    A tool the catalog advertises that no surface can execute is exactly the
+    defect the registry's platform-tool path fixed; this is the other half -
+    a tool nobody can *propose* is equally unusable.
+
+    The definition is seeded here rather than through `ensure_tool_definitions`.
+    That routine registers the *whole* catalog for a tenant, which collides with
+    the permissive `jira.create_issue` this module seeds globally - it turned
+    every propose call in the file into `TOOL_ARGS_INVALID`, because the
+    tenant-scoped row outranks the global one. A test that needs one row should
+    create one row.
+
+    That `case.eq_confirm` is in `TOOL_CATALOG` is asserted separately in the
+    registry unit tests; this is about the endpoint surfacing a tool that has no
+    provider at all.
+    """
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO tool_definitions (id, tenant_id, name, version, risk, "
+                "input_schema, output_schema, required_permissions, timeout_ms, "
+                "idempotent, requires_confirmation) VALUES "
+                "(gen_random_uuid(), :t, 'case.eq_confirm', 1, 'confirmed_write', "
+                "CAST(:inschema AS jsonb), '{}'::jsonb, '[]'::jsonb, 10000, true, true)"
+            ),
+            {
+                "t": TENANT_A,
+                "inschema": '{"type":"object","properties":{"case_ref":{"type":"string"}},'
+                '"required":["case_ref"],"additionalProperties":false}',
+            },
+        )
+    admin.dispose()
+
+    client = _client(TENANT_A, "tenant_owner")
+    try:
+        resp = client.get("/v1/tools", headers=_auth())
+        items = {i["name"]: i for i in resp.json()["items"]}
+        assert "case.eq_confirm" in items
+        eq = items["case.eq_confirm"]
+        assert eq["requires_confirmation"] is True
+        assert eq["input_schema"]["required"] == ["case_ref"]
+        # Tenant-scoped, which is how a tenant overrides the shared catalog.
+        assert eq["tenant_scoped"] is True
+    finally:
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            conn.execute(
+                text(
+                    "DELETE FROM tool_definitions WHERE tenant_id = :t AND name = 'case.eq_confirm'"
+                ),
+                {"t": TENANT_A},
+            )
+        admin.dispose()
+
+
+def test_the_catalog_omits_prohibited_tools() -> None:
+    """A choice the API always rejects is not a choice.
+
+    Listing it would turn the form into an error generator: the operator picks
+    it, the propose call returns 403, and nothing explained why beforehand.
+    """
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO tool_definitions (id, tenant_id, name, version, risk, "
+                "input_schema, output_schema, required_permissions, timeout_ms, "
+                "idempotent, requires_confirmation) VALUES "
+                "(gen_random_uuid(), NULL, 'm2_test_prohibited', 1, 'prohibited', "
+                "'{}'::jsonb, '{}'::jsonb, '[]'::jsonb, 10000, true, true)"
+            )
+        )
+    admin.dispose()
+
+    client = _client(TENANT_A, "tenant_owner")
+    try:
+        resp = client.get("/v1/tools", headers=_auth())
+        names = {i["name"] for i in resp.json()["items"]}
+        assert "m2_test_prohibited" not in names
+    finally:
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            conn.execute(text("DELETE FROM tool_definitions WHERE name = 'm2_test_prohibited'"))
+        admin.dispose()
+
+
+def test_the_catalog_hides_tools_the_caller_cannot_propose() -> None:
+    """A choice the API always rejects is not a choice.
+
+    Two things disqualify a tool from the list: the `prohibited` class, and a
+    risk class whose action the caller does not hold. The second one matters
+    more than it looks, because the write grants are narrow: `support_agent`
+    holds `TOOL_READ` and no write action, so a support agent's catalog is read
+    tools only and the propose form cannot offer them something that would 403.
+
+    Checked from both sides - hidden from the agent, present for the owner -
+    because a filter that hid the tool from *everyone* would pass a one-sided
+    test.
+    """
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO tool_definitions (id, tenant_id, name, version, risk, "
+                "input_schema, output_schema, required_permissions, timeout_ms, "
+                "idempotent, requires_confirmation) VALUES "
+                "(gen_random_uuid(), NULL, 'm2_test_owner_only', 1, 'human_approval', "
+                "'{}'::jsonb, '{}'::jsonb, '[]'::jsonb, 10000, true, true)"
+            )
+        )
+    admin.dispose()
+
+    try:
+        agent = _client(TENANT_A, "support_agent").get("/v1/tools", headers=_auth())
+        agent_names = {i["name"] for i in agent.json()["items"]}
+        assert "m2_test_owner_only" not in agent_names
+        # And not merely that one tool: the agent holds no write grant, so no
+        # write tool is offered at all. The list is empty here because this
+        # module seeds no `read`-risk definition - which is the assertion, not
+        # an accident of the fixture.
+        assert agent_names == set()
+        assert "jira.create_issue" not in agent_names
+        assert "m2_test_refund" not in agent_names
+        assert "m2_test_add_note" not in agent_names
+
+        owner = _client(TENANT_A, "tenant_owner").get("/v1/tools", headers=_auth())
+        owner_names = {i["name"] for i in owner.json()["items"]}
+        assert "m2_test_owner_only" in owner_names
+        assert "jira.create_issue" in owner_names
+    finally:
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            conn.execute(text("DELETE FROM tool_definitions WHERE name = 'm2_test_owner_only'"))
+        admin.dispose()
+
+
+# --- The agent proposes and cannot be the approver ------------------------
+
+
+def test_the_agent_cannot_approve_its_own_proposal() -> None:
+    """The design's central claim, asserted at the HTTP surface.
+
+    `integration_service` holds `tool.write.confirmed`, so the AI can put a
+    confirmed write in front of a human. It does **not** hold `CASE_UPDATE`,
+    and `CASE_UPDATE` is the only action the confirm route requires - so the AI
+    cannot be the human.
+
+    The gateway deliberately leaves this to the route instead of enforcing a
+    proposer/confirmer split itself (see the note in `ToolGateway.confirm`),
+    which is exactly why the route's policy check is the thing that has to be
+    tested here. Without this test the claim rests on a comment.
+    """
+    agent = _client(TENANT_A, "integration_service")
+    proposed = agent.post(
+        "/v1/tool-proposals",
+        headers={**_auth(), "Idempotency-Key": "agent-self-approve-1"},
+        json={"tool_name": CONFIRMED_TOOL, "arguments": {"amount": 500}},
+    )
+    assert proposed.status_code == 200, proposed.text
+    proposal_id = proposed.json()["proposal"]["proposal_id"]
+
+    refused = agent.post(f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={})
+
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "POLICY_DENIED"
+
+
+def test_a_support_agent_can_approve_what_the_agent_proposed() -> None:
+    """The other half of the same control, and it is not a formality.
+
+    Every other test of this gate covers its *closed* side - no confirmation,
+    no execution. A confirmation path that was broken would pass all of them
+    while making the entire flow unusable, so the open side is asserted too:
+    the agent proposes, a support agent approves, and the proposal becomes
+    executable.
+
+    A support agent is the right approver and the only role that can be: it
+    holds `CASE_UPDATE` and no write grant, so it can approve a write without
+    being able to raise one.
+    """
+    agent = _client(TENANT_A, "integration_service")
+    proposed = agent.post(
+        "/v1/tool-proposals",
+        headers={**_auth(), "Idempotency-Key": "agent-then-human-1"},
+        json={"tool_name": CONFIRMED_TOOL, "arguments": {"amount": 750}},
+    )
+    assert proposed.status_code == 200, proposed.text
+    proposal_id = proposed.json()["proposal"]["proposal_id"]
+    assert proposed.json()["proposal"]["status"] == "authorized"
+
+    approver = _client(TENANT_A, "support_agent")
+    confirmed = approver.post(f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={})
+    assert confirmed.status_code == 200, confirmed.text
+
+    read_back = approver.get(f"/v1/tool-proposals/{proposal_id}", headers=_auth())
+    assert read_back.json()["proposal"]["status"] == "confirmed"
+    # And the confirmation is attributable: the audit trail says who approved,
+    # which is the whole reason the actor is recorded rather than inferred.
+    assert read_back.json()["proposal"]["required_confirmation"] is True

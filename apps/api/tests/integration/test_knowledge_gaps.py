@@ -40,12 +40,24 @@ APP_URL = "postgresql+psycopg://platform_app:platform_app@localhost:5435/platfor
 TENANT = "0190d000-0000-7000-8000-0000000000c1"
 TENANT_OTHER = "0190d000-0000-7000-8000-0000000000c2"
 
-# Ordering matters: drafts and gaps reference spaces and documents.
+# Ordering matters: drafts and gaps reference spaces and documents, and
+# `chunks` references `document_versions` — so chunks have to go before the
+# versions they belong to.
+#
+# They were missing entirely, which made this file poison its own next run:
+# `test_approved_draft_publishes_real_knowledge` publishes a draft, publishing
+# goes through the normal ingestion path and creates real chunks, and the
+# cleanup left them behind. The following run's setup then died on
+# `chunks_document_version_id_fkey` — a setup error in a file that had just
+# been passing, which is the shape of failure that reads as "the suite is
+# flaky" until someone looks at the fixture.
+#
 # One statement per entry: psycopg refuses multiple commands in a single
 # prepared statement.
 _CLEAN: tuple[str, ...] = (
     "DELETE FROM knowledge_drafts WHERE tenant_id IN (:a, :b)",
     "DELETE FROM knowledge_gaps WHERE tenant_id IN (:a, :b)",
+    "DELETE FROM chunks WHERE tenant_id IN (:a, :b)",
     "DELETE FROM document_versions WHERE tenant_id IN (:a, :b)",
     "DELETE FROM documents WHERE tenant_id IN (:a, :b)",
     "DELETE FROM knowledge_sources WHERE tenant_id IN (:a, :b)",

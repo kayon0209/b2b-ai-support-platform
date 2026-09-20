@@ -631,7 +631,7 @@ REQUEST_OPERATIONS = frozenset(
 
 
 def _content_terms(text_input: str) -> set[str]:
-    """Stemmed content words: no stopwords, no tokens of length <= 2.
+    r"""Stemmed content words: no stopwords, no tokens of length <= 2.
 
     The length filter alone is not enough — "the", "who", "what" pass it and
     would let an unrelated question look grounded. Dropping stopwords first
@@ -793,6 +793,25 @@ ACTION_VERBS = frozenset(
         "change",
         "update",
         "modify",
+        # Raising an issue. The write path's ticket tools were reachable only
+        # through "escalate", so "please create a ticket" - the way a customer
+        # actually asks - routed to the knowledge path, which refuses action
+        # requests, and the whole propose-and-confirm flow never ran.
+        #
+        # Added after measuring every candidate against the whole evaluation
+        # dataset: none of the six moves any existing case's route, and the
+        # `expected_route` declarations on the dataset now assert that, so a
+        # future verb cannot move `business-write-refund` or the sensitive
+        # cases without failing the eval. The false-positive risk is a
+        # procedure question ("how do I create X"), which the interrogative
+        # opener guard already excludes - and it is now covered by cases
+        # rather than by argument.
+        "create",
+        "report",
+        "raise",
+        "submit",
+        "file",
+        "open",
     )
 )
 

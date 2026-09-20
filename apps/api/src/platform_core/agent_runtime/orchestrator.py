@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger, TraceContext, new_trace_context
 from observability_metrics import get_metrics
+from platform_core.agent_runtime.confirmation import is_confirmation
 from platform_core.agent_runtime.conversation import (
     CompactedContext,
     ConversationMemory,
@@ -39,6 +40,7 @@ from platform_core.agent_runtime.generator import LlmAnswerGenerator
 from platform_core.agent_runtime.intent import (
     NON_ANSWERABLE_ROUTES,
     PRE_RETRIEVAL_ROUTES,
+    IntentAction,
     IntentDetection,
     Route,
     Scene,
@@ -139,6 +141,11 @@ class OrchestratorDeps:
     # without a code change — and "Top-K 怎么确定" is a question you can only
     # answer by measuring, which needs it to be configurable.
     top_k: int = 8
+    # Adapter factories for the tool paths, injected for the same reason the
+    # generator is: without it the branch that *executes* a low-risk write can
+    # only be exercised against a live external system, so in practice it
+    # would be exercised by nothing. `None` means the shipped adapters.
+    tool_factories: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -364,6 +371,44 @@ def _extract_tool_args(tool_name: str, question: str) -> dict[str, str] | None:
         return {"invoice_id": entities[0]}
     if tool_name == "inventory.check_stock":
         return {"part_number": entities[0]}
+    return None
+
+
+def _extract_write_args(
+    tool_name: str, question: str, defaults: dict[str, str]
+) -> dict[str, str] | None:
+    """Deterministic argument extraction for write tools.
+
+    A write tool's arguments split in two halves, and only one of them is in
+    the conversation. The customer supplies the subject — the sentence they
+    just wrote. The rest (which Jira project, which Slack channel) is the
+    tenant's configuration, resolved by the caller from the connector and
+    passed in as `defaults`.
+
+    No LLM is involved for the same reason it is not involved in tool
+    selection: this decides what gets written to an external system, and a
+    non-deterministic chooser there would make the audit trail describe a
+    coin flip. Both halves must be present — a proposal missing either is one
+    a human has to rewrite from scratch, so handing off is the honest result.
+
+    Returns None when the tool has no deterministic extraction at all. That is
+    a real answer, not a gap: `crm.update_account` takes a free-form field
+    patch, which cannot be derived from an utterance without a model, so a
+    customer asking for one is handed to a person rather than guessed at.
+    """
+    subject = " ".join(question.split())
+    if not subject:
+        return None
+    if tool_name == "jira.create_issue":
+        # `summary` is the schema's required free-text field; the project
+        # arrives from configuration. Deliberately no `description`: the
+        # customer's raw message is not copied into a third-party system
+        # without a human choosing to do so.
+        return {**defaults, "summary": subject[:200]}
+    if tool_name == "linear.create_issue":
+        return {**defaults, "title": subject[:200]}
+    if tool_name == "im.send_notification":
+        return {**defaults, "text": subject[:500]}
     return None
 
 
@@ -677,6 +722,54 @@ class AgentOrchestrator:
         # ask rather than to hand off. Decided before retrieval because a
         # question with no recoverable subject retrieves noise, and noise looks
         # like evidence.
+        # --- 2b-pre. A confirmation the conversation owes. ---
+        #
+        # The one message whose meaning depends on what the conversation is
+        # waiting for rather than on its own words. "确认" carries no verb and no
+        # object, so it never classifies as a write request, and the QA path
+        # would either answer it from the corpus or ask a pointless
+        # clarification - both wrong for a customer who has just answered the
+        # question the platform asked. Checked before the clarification gate for
+        # that reason.
+        #
+        # What the agent does **not** do is record it. `case.eq_confirm` is
+        # `human_approval`, the class the policy engine keeps deliberately
+        # unreachable by the agent at every stage including propose, and the
+        # research report is explicit that the AI relays and collects while the
+        # release is a human decision: the case status is what the factory
+        # reads, so recording a confirmation is one step from releasing
+        # production. So the run hands off, with a reason that says what the
+        # human is being asked to do - which is the AI's actual job in this
+        # flow, not a failure to act.
+        #
+        # Gated on the write flag so a tenant with the EQ flow off sees exactly
+        # the behaviour it saw before this existed.
+        if await self._flag_enabled(self._settings().flag_business_write_tools, tenant_id):
+            if (
+                is_confirmation(question)
+                and await self._pending_eq_confirmation(
+                    tenant_id=tenant_id, conversation_ref_id=conversation_ref_id
+                )
+                is not None
+            ):
+                run_span.set_attributes(**{"route.override": "pending_eq_confirmation"})
+                return await self._finish_abstain(
+                    run=run,
+                    tenant_id=tenant_id,
+                    conversation_ref_id=conversation_ref_id,
+                    expected_lease_version=expected_lease_version,
+                    decision=AbstentionDecision(
+                        abstain=True,
+                        reason_code="EQ_CONFIRMATION_REQUIRES_HUMAN",
+                        handoff=True,
+                    ),
+                    ctx=ctx,
+                    started=started,
+                    question=question,
+                    chatwoot_account_id=chatwoot_account_id,
+                    chatwoot_conversation_id=chatwoot_conversation_id,
+                )
+
         needs_ask, ask_reason = needs_clarification(retrieval_query, memory.turns)
         if needs_ask and route not in NON_ANSWERABLE_ROUTES:
             if _clarify_streak(history or []) >= self._settings().clarification_max_streak:
@@ -737,6 +830,71 @@ class AgentOrchestrator:
             if isinstance(read_result, RunOutcome):
                 return read_result
             tool_evidence = read_result
+
+        # --- 2d. Business write tools (plan 3.5; flag off by default). ---
+        #
+        # Decided before retrieval for the same reason a read is: nothing in
+        # the corpus can answer "did the platform do this", and prose about
+        # refunds must never be mistaken for a refund having been issued.
+        #
+        # What this branch may do is bounded by the tool's own risk class. It
+        # can propose anything the AI's role permits, and it can execute a
+        # `low_write` tool - the class the catalog defines as needing no
+        # confirmation. It can never approve: a tool that requires
+        # confirmation stops at the proposal and the run hands off, so a
+        # person owns the outcome.
+        if route == Route.BUSINESS_WRITE.value and await self._flag_enabled(
+            settings.flag_business_write_tools, tenant_id
+        ):
+            if detection.action is IntentAction.CLARIFY:
+                # `intent.py` degrades a write request below its confidence
+                # threshold to CLARIFY, on the grounds that a write proposed
+                # on a weak signal is one the customer never asked for.
+                # Honour that rather than acting on it - and hand off once
+                # asking has been tried, because a second identical question
+                # is a loop, not a clarification (the limit step 2b applies).
+                if _clarify_streak(history or []) >= settings.clarification_max_streak:
+                    return await self._finish_abstain(
+                        run=run,
+                        tenant_id=tenant_id,
+                        conversation_ref_id=conversation_ref_id,
+                        expected_lease_version=expected_lease_version,
+                        decision=AbstentionDecision(
+                            abstain=True, reason_code="CLARIFICATION_LIMIT", handoff=True
+                        ),
+                        ctx=ctx,
+                        started=started,
+                        question=question,
+                        chatwoot_account_id=chatwoot_account_id,
+                        chatwoot_conversation_id=chatwoot_conversation_id,
+                    )
+                return await self._finish_clarify(
+                    run=run,
+                    tenant_id=tenant_id,
+                    conversation_ref_id=conversation_ref_id,
+                    expected_lease_version=expected_lease_version,
+                    reason_code="WRITE_INTENT_UNCERTAIN",
+                    ctx=ctx,
+                    started=started,
+                    question=question,
+                    chatwoot_account_id=chatwoot_account_id,
+                    chatwoot_conversation_id=chatwoot_conversation_id,
+                )
+            write_result = await self._attempt_business_write(
+                run=run,
+                tenant_id=tenant_id,
+                question=question,
+                detection=detection,
+                ctx=ctx,
+                started=started,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+            if isinstance(write_result, RunOutcome):
+                return write_result
+            tool_evidence = write_result
 
         # --- 3. Retrieve authorized evidence. ---
         # The reranker is gated per tenant. Evaluating the flag inside the
@@ -1222,7 +1380,6 @@ class AgentOrchestrator:
         """
         import json as _json
 
-        from platform_core.tool_gateway.case_read import CaseReadExecutor
         from platform_core.tool_gateway.gateway import ToolGateway, ToolGatewayError
         from platform_core.tool_gateway.registry import ConnectorExecutorResolver
         from platform_core.tool_gateway.selector import select_read_tools
@@ -1244,10 +1401,18 @@ class AgentOrchestrator:
             )
 
         resolver = ConnectorExecutorResolver(
-            self._session, tenant_id=tenant_id, trace_id=ctx.trace_id
+            self._session,
+            tenant_id=tenant_id,
+            factories=self._deps.tool_factories,
+            trace_id=ctx.trace_id,
         )
+        # `case.read` used to be injected here by hand, because the registry
+        # resolved executors only for connector-backed tools. The registry now
+        # builds platform-internal tools itself, which is also what makes them
+        # executable through the HTTP API - the hand-injection worked for this
+        # one caller and left `POST /v1/tool-proposals/{id}/execute` answering
+        # TOOL_EXECUTOR_MISSING for a tool the catalog advertises.
         executors = await resolver.executors_for([c.tool_name for c in candidates])
-        executors.setdefault("case.read", CaseReadExecutor(self._session))
         usable = [c for c in candidates if c.tool_name in executors]
         if not usable:
             return await self._handoff_for_tool(
@@ -1373,6 +1538,272 @@ class AgentOrchestrator:
         )
         logger.info(
             "tool_read_executed",
+            ctx,
+            tool_name=chosen.tool_name,
+            run_id=str(run.id),
+            status=str(execution.status),
+        )
+        return [receipt]
+
+    async def _pending_eq_confirmation(
+        self, *, tenant_id: uuid.UUID, conversation_ref_id: uuid.UUID
+    ) -> str | None:
+        """The EQ case this conversation is waiting on, if there is exactly one.
+
+        Read under the run's RLS-bound transaction, so another tenant's case is
+        invisible rather than filtered afterwards. The explicit tenant filter is
+        defence in depth, not the mechanism.
+
+        **Ambiguity returns None, not the first row.** Two cases waiting on the
+        same conversation means the link does not identify which confirmation
+        the customer is giving, and confirming the wrong one releases
+        production against a spec nobody agreed. Handing off is the honest
+        outcome; picking one is a coin flip with a board order behind it.
+        """
+        from sqlalchemy import and_, select
+
+        from platform_core.cases.models import (
+            Case,
+            CaseCategory,
+            CaseConversation,
+            CaseStatus,
+        )
+
+        rows = (
+            (
+                await self._session.execute(
+                    select(Case.id)
+                    .join(
+                        CaseConversation,
+                        and_(
+                            CaseConversation.case_id == Case.id,
+                            CaseConversation.tenant_id == Case.tenant_id,
+                        ),
+                    )
+                    .where(
+                        Case.tenant_id == tenant_id,
+                        CaseConversation.conversation_ref_id == conversation_ref_id,
+                        Case.category == CaseCategory.EQ_CONFIRMATION.value,
+                        Case.status == CaseStatus.WAITING_CUSTOMER.value,
+                    )
+                    .limit(2)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return str(rows[0]) if len(rows) == 1 else None
+
+    async def _attempt_business_write(
+        self,
+        *,
+        run: AgentRun,
+        tenant_id: uuid.UUID,
+        question: str,
+        detection: IntentDetection,
+        ctx: TraceContext,
+        started: float,
+        conversation_ref_id: uuid.UUID,
+        expected_lease_version: int,
+        chatwoot_account_id: str | None,
+        chatwoot_conversation_id: str | None,
+    ) -> RunOutcome | list[RetrievedChunk]:
+        """Attempt the write path for a BUSINESS_WRITE run (plan 3.5).
+
+        Returns tool-receipt evidence when a write ran and verified, or a
+        finished RunOutcome that hands off. There is no third outcome: a write
+        is never assumed to have happened, and UNKNOWN is never reported as
+        success.
+
+        The safety property this method exists to uphold is that **the agent
+        proposes and never approves**. For a tool whose catalog entry requires
+        confirmation the run ends at the proposal - the row is left
+        `authorized` for a human to confirm in the admin console, and the
+        conversation hands off so a person owns the result. The agent holds no
+        code path to `confirm`, and the gateway refuses a confirmation from the
+        proposing actor regardless, so this is enforced in two places rather
+        than assumed in one.
+
+        Every decision point is audited: selection, proposal, execution.
+        """
+        import json as _json
+
+        from platform_core.tool_gateway.gateway import ToolGateway, ToolGatewayError
+        from platform_core.tool_gateway.registry import (
+            ConnectorExecutorResolver,
+            ensure_tool_definitions,
+            risk_action_for,
+        )
+        from platform_core.tool_gateway.selector import select_write_tools
+        from platform_policy import Decision, PolicyEngine, Principal
+
+        async def _handoff(reason_code: str) -> RunOutcome:
+            return await self._handoff_for_tool(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                reason_code=reason_code,
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+
+        candidates = select_write_tools(detection, question)
+        if not candidates:
+            return await _handoff("TOOL_NO_CANDIDATE")
+
+        resolver = ConnectorExecutorResolver(
+            self._session,
+            tenant_id=tenant_id,
+            factories=self._deps.tool_factories,
+            trace_id=ctx.trace_id,
+        )
+        executors = await resolver.executors_for([c.tool_name for c in candidates])
+        usable = [c for c in candidates if c.tool_name in executors]
+        if not usable:
+            return await _handoff("TOOL_UNAVAILABLE")
+        chosen = usable[0]
+
+        # Half the arguments come from the tenant's connector configuration
+        # rather than from the customer (see WRITE_ARG_DEFAULTS). A tool whose
+        # configured half is unset is not proposed with an invented value - a
+        # ticket filed in the wrong project is worse than one never filed.
+        defaults = await resolver.default_write_arguments(chosen.tool_name)
+        arguments = (
+            None if defaults is None else _extract_write_args(chosen.tool_name, question, defaults)
+        )
+        if arguments is None:
+            return await _handoff("TOOL_ARGUMENT_MISSING")
+
+        await ensure_tool_definitions(self._session, tenant_id=tenant_id)
+        required_action = await risk_action_for(
+            self._session, tenant_id=tenant_id, tool_name=chosen.tool_name
+        )
+        if required_action is None:
+            return await _handoff("TOOL_NOT_REGISTERED")
+
+        # The AI acts as the integration service for writes as it does for
+        # reads, but the action it needs is the tool's own risk class. That is
+        # what makes the role's limits bind here rather than only on the HTTP
+        # caller: `integration_service` holds tool.write.low and
+        # tool.write.confirmed and deliberately NOT tool.human_approval, so a
+        # human_approval tool is refused by policy rather than by an `if` in
+        # this method that a future edit could drop.
+        service_actor = uuid.uuid5(tenant_id, "system:ai-agent")
+        principal = Principal(
+            tenant_id=str(tenant_id), actor_id=str(service_actor), role="integration_service"
+        )
+        allowed = PolicyEngine().check(principal, required_action).decision == Decision.ALLOW
+        idempotency_key = str(
+            uuid.uuid5(
+                tenant_id,
+                "tool:"
+                + str(run.id)
+                + ":"
+                + chosen.tool_name
+                + ":"
+                + _json.dumps(arguments, sort_keys=True, ensure_ascii=False),
+            )
+        )
+        gateway = ToolGateway(self._session, {chosen.tool_name: executors[chosen.tool_name]})
+        try:
+            proposal = await gateway.propose(
+                tenant_id=tenant_id,
+                actor_id=service_actor,
+                tool_name=chosen.tool_name,
+                arguments=arguments,
+                role=principal.role,
+                idempotency_key=idempotency_key,
+                permission_allowed=allowed,
+                required_action=required_action.value,
+            )
+        except ToolGatewayError as exc:
+            await audit_service.record(
+                self._session,
+                ctx=TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="system"),
+                action="tool_write.rejected",
+                resource_type="tool",
+                resource_id=uuid.uuid5(tenant_id, f"tool:{chosen.tool_name}"),
+                decision="denied",
+                reason_code=exc.code[:63],
+                trace_id=ctx.trace_id,
+            )
+            return await _handoff("TOOL_WRITE_DENIED")
+
+        await audit_service.record(
+            self._session,
+            ctx=TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="system"),
+            action="tool_write.proposed",
+            resource_type="tool_proposal",
+            resource_id=proposal.id,
+            decision="completed",
+            reason_code="OK",
+            after={
+                "tool_name": chosen.tool_name,
+                "risk_action": required_action.value,
+                "requires_confirmation": bool(proposal.required_confirmation),
+                "action_hash": proposal.action_hash,
+            },
+            trace_id=ctx.trace_id,
+        )
+
+        if proposal.required_confirmation:
+            # Stop here, on purpose. The proposal is a draft a human completes
+            # and approves; executing it would need an ActionConfirmation this
+            # agent must not be able to write, and telling the customer the
+            # write was done would be a lie. Handing off is what gives the
+            # confirmation something to mean - somebody now owns the outcome,
+            # and the proposal expires in 15 minutes if nobody acts on it.
+            logger.info(
+                "tool_write_awaiting_confirmation",
+                ctx,
+                tool_name=chosen.tool_name,
+                proposal_id=str(proposal.id),
+            )
+            return await _handoff("TOOL_CONFIRMATION_PENDING")
+
+        try:
+            execution = await gateway.execute(
+                tenant_id=tenant_id,
+                actor_id=service_actor,
+                proposal_id=proposal.id,
+            )
+        except ToolGatewayError as exc:
+            await audit_service.record(
+                self._session,
+                ctx=TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="system"),
+                action="tool_write.failed",
+                resource_type="tool_proposal",
+                resource_id=proposal.id,
+                decision="failed",
+                reason_code=exc.code[:63],
+                trace_id=ctx.trace_id,
+            )
+            return await _handoff("TOOL_EXECUTION_FAILED")
+
+        if execution.status not in ("executed", "verified"):
+            # UNKNOWN is the honest answer for a write whose postcondition
+            # could not be determined. Reporting it as done would be the most
+            # expensive lie this platform could tell.
+            return await _handoff("TOOL_EXECUTION_UNVERIFIED")
+
+        output = execution.sanitized_output or {}
+        receipt_json = _json.dumps(output, sort_keys=True, ensure_ascii=False, default=str)
+        receipt = RetrievedChunk(
+            chunk_id=uuid.uuid5(tenant_id, f"receipt:{chosen.tool_name}:{idempotency_key}"),
+            document_version_id=None,
+            title=f"tool://{chosen.tool_name}",
+            section_path=[],
+            excerpt=receipt_json[:280],
+            source_uri=f"tool://{chosen.tool_name}/{proposal.id}",
+            score=1.0,
+            ranking={"tool": 1.0},
+        )
+        logger.info(
+            "tool_write_executed",
             ctx,
             tool_name=chosen.tool_name,
             run_id=str(run.id),
@@ -1712,7 +2143,24 @@ class AgentOrchestrator:
         if self._deps.sender is None:
             # No transport wired (unit/local): treat as un-sent, not failed.
             return ""
-        if not chatwoot_account_id or not chatwoot_conversation_id:
+        if not chatwoot_account_id:
+            # No Chatwoot account means the conversation is not backed by
+            # Chatwoot at all - the customer typed into the platform's own
+            # chat surface, and that surface is the delivery channel. This is
+            # not a failed send, and treating it as one is what made every
+            # such answer vanish: the run was marked FAILED even though the
+            # answer had been produced, and the agent turn is only written
+            # for a COMPLETED run, so nothing was ever persisted or shown.
+            #
+            # Note that `conversation_id` is present on these events too. It
+            # is the external correlation id the conversation ref is derived
+            # from, not evidence that a Chatwoot conversation exists to send
+            # to - the account id is what says the conversation is Chatwoot's.
+            return ""
+        if not chatwoot_conversation_id:
+            # An account with no conversation is a misconfiguration: we did
+            # mean to reach Chatwoot and cannot. That has to fail rather than
+            # report a success nobody can observe.
             return "OUTBOUND_TARGET_MISSING"
 
         command_id = f"run:{run.id}"

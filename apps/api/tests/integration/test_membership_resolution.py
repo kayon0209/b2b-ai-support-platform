@@ -56,7 +56,14 @@ ACTIVE_SLUG = "resolve-active"
 SUSPENDED_SLUG = "resolve-suspended"
 NO_MEMBERSHIP_SLUG = "resolve-nomember"
 
-TENANT = "01900000-0000-7000-8000-0000000000d1"
+# Its own tenant id. This file, `test_cross_tenant_leak_surfaces` and
+# `test_outbox_relay` all used `...d1` while seeding different *slugs*, and
+# each seed guarded on `ON CONFLICT (slug)` - which does not suppress a
+# primary-key conflict. Whichever file ran second lost the race to an existing
+# row and died on `tenants_pkey`, in whichever order the suite happened to
+# collect them. A shared id across files is a hidden coupling; distinct ids
+# make each fixture independent.
+TENANT = "01900000-0000-7000-8000-0000000000d5"
 ACTIVE_TENANT = "01900000-0000-7000-8000-0000000000d2"
 SUSPENDED_TENANT = "01900000-0000-7000-8000-0000000000d3"
 NO_MEMBERSHIP_TENANT = "01900000-0000-7000-8000-0000000000d4"
