@@ -209,6 +209,11 @@ class Settings(BaseSettings):
     flag_score_floor: str = "retrieval.score_floor_enabled"
     flag_priority_claim: str = "worker.priority_claim_enabled"
     flag_redline_guard: str = "agent.redline_guard_enabled"
+    # Shadow mode (9.2): run the whole pipeline, withhold the send. Per tenant
+    # and off by default, because it is a rollout control - it is switched on
+    # for the window where a newly-automated category is being watched, then
+    # off again.
+    flag_shadow_mode: str = "agent.shadow_mode_enabled"
     # Priority claiming is a deployment-level decision (the claim query is
     # cross-tenant), so it is a plain switch rather than a tenant flag.
     priority_claim_enabled: bool = False

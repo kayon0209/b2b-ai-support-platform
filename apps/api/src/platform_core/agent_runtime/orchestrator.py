@@ -1308,16 +1308,39 @@ class AgentOrchestrator:
             )
 
         # --- 9. Dispatch through Chatwoot with an idempotency key. ---
-        send_error = await self._dispatch(
-            run=run,
-            tenant_id=tenant_id,
-            draft_text=draft.text,
-            ctx=ctx,
-            chatwoot_account_id=chatwoot_account_id,
-            chatwoot_conversation_id=chatwoot_conversation_id,
-            conversation_ref_id=conversation_ref_id,
-        )
-        if send_error:
+        #
+        # Shadow mode (feature list 9.2): produce everything, send nothing.
+        # This is how a newly-automated category goes live - the leak analysis
+        # says "these 42 handoffs are evidence gaps", someone writes the
+        # document, and this is the step where you watch what the platform
+        # *would* have said before letting it talk to customers.
+        shadow = await self._flag_enabled(self._settings().flag_shadow_mode, tenant_id)
+        if shadow:
+            # Logged rather than metered for now; the counter belongs with the
+            # rest of the run metrics and is not worth a half-added one here.
+            logger.info(
+                "shadow_suppressed",
+                ctx,
+                run_id=str(run.id),
+                route=route,
+                output_hash=hashlib.sha256(draft.text.encode()).hexdigest()[:16],
+            )
+            send_error = "SHADOW_MODE"
+        else:
+            send_error = await self._dispatch(
+                run=run,
+                tenant_id=tenant_id,
+                draft_text=draft.text,
+                ctx=ctx,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+                conversation_ref_id=conversation_ref_id,
+            )
+        # Deliberately not a failure: the answer exists and was reviewed by
+        # every gate, only the delivery was withheld. Marking it FAILED would
+        # make a shadow run indistinguishable from a broken one, which is the
+        # opposite of what the observation is for.
+        if send_error and not shadow:
             run.status = RunStatus.FAILED.value
             run.latency_ms = int((time.monotonic() - started) * 1000)
             await self._session.flush()
@@ -1396,6 +1419,10 @@ class AgentOrchestrator:
             status=RunStatus.COMPLETED,
             route=route,
             answer_text=draft.text,
+            # Carried even on the success path so a withheld send is visible:
+            # "completed but nothing went out" has to be distinguishable from
+            # "delivered", or a shadow window reads as a silent outage.
+            send_blocked_reason=send_error,
             citation_count=citation_count,
             latency_ms=run.latency_ms,
             trace_id=ctx.trace_id,
