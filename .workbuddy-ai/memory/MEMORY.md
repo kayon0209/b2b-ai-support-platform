@@ -22,8 +22,13 @@ This repo = `apps/admin-web` + `/v1/*` admin APIs + one webhook entry.
 - Roles: `platform` (superuser, bypasses RLS — seed/cleanup), `platform_app` (NOBYPASSRLS).
   `app_role_url()` = database_url with `platform:platform@` → `platform_app:platform_app@`.
 - LLM: Gitee AI `https://ai.gitee.com/v1`; creds in `.env`. `packages/observability/src/observability.py`
-  is top-level `observability`. Chatwoot `admin@example.com`/`Admin@123456`, account 3, inbox 2;
-  webhook must use `host.docker.internal` — `localhost` hits the container itself.
+  is top-level `observability`. Chatwoot login: the local compose stack's seeded
+  admin account (see `infra/compose/docker-compose.yml` for its address); the
+  password is set interactively on first boot and is deliberately not recorded
+  here — a credential in a tracked file is readable by anyone who can read the
+  repo. Retrieve it from the Chatwoot UI or your own password manager. Account 3,
+  inbox 2; webhook must use `host.docker.internal` — `localhost` hits the
+  container itself.
 - GitHub: `git@github.com:kayon0209/b2b-ai-support-platform`, SSH key `~/.ssh/id_ed25519`.
 - **Two sessions share this working tree.** Never `reset --hard`, `checkout --` or
   `clean -fd`: they destroy the other session's uncommitted work. When a file carries

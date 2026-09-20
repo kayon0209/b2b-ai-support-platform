@@ -152,7 +152,9 @@ HEAD: d44420eab511af5a36364c9d74b32d909ef33990
 - 前端 dist: `assets/index-D7XS2NNY.js`（02:34 构建，与当前源码同代）；验收走 dev server（直接服务当前源码）
 
 ### 鉴权
-- 种子令牌（tenant_owner@admin-demo）：`pt_admin-demo_f4b78ee8-5e89-5648-a309-3c5117838c60`
+- 种子令牌（tenant_owner@admin-demo）：`pt_admin-demo_<user-id>` —— 现场由
+  `python scripts/seed_admin_demo.py` 打印。原先此处记录的是推导出的固定值，
+  那等于公开一个可计算的 `tenant_owner` 凭证；种子改为每机随机 id 后该值已失效。
 - 验证：未认证 GET /v1/tenant/usage → 401；带令牌 → 200（usage + quality/metrics）
 
 ### 自检交接件

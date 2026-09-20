@@ -8,7 +8,9 @@
 
 `lib/theme.ts`、`lib/i18n.tsx`、`components/Layout.tsx`、`components/Prompt.tsx`、`components/TokenDialog.tsx`、`pages/{QualityDashboard,GapQueue,Members,FeatureFlags,Cases,Usage}.tsx` 全部在 09:59–10:10 间被修改过。我先后跑了三轮脚本才给出可靠结论：`walk.mjs`（首轮，被并发改写污染）、`final.mjs` + `lang.mjs` + `flag.mjs` + `promote.mjs`（最终决定性复现）。所有 P0/P1 都附当前源下的可复现命令或 Playwright 脚本。
 
-测试期间 token `pt_admin-demo_f4b78ee8-5e89-5648-a309-3c5117838c60` 下残留了 `feature_flag key="ui.acceptance.ok"`（#1 假成功复现副产物；feature_flag 接口无 DELETE）。账号还残留之前注入探针用例名 — escaped 正常，不构成 XSS，但属数据卫生问题（#25）。
+测试期间 token `pt_admin-demo_<user-id>` 下残留了 `feature_flag key="ui.acceptance.ok"`（#1 假成功复现副产物；feature_flag 接口无 DELETE）。账号还残留之前注入探针用例名 — escaped 正常，不构成 XSS，但属数据卫生问题（#25）。
+
+> 注：本文件原记录的是当轮实际使用的 token 值。该值已随种子脚本改为每机随机 id 而失效（其 user id 原先由仓库常量推导，等于公开可计算的凭证），故此处以占位符呈现，记录的事实不变。
 
 ---
 
@@ -22,7 +24,7 @@
   - 前端: `lib/api.ts:87–106` `unwrap()` 只把 `!res.ok` 当失败
 - **复现（已实跑）**
   ```bash
-  T=pt_admin-demo_f4b78ee8-5e89-5648-a309-3c5117838c60
+  T=pt_admin-demo_<user-id>   # 现场取：python scripts/seed_admin_demo.py
   curl -i -X POST -H "Authorization: Bearer $T" -H "Idempotency-Key: x" \
     -H "Content-Type: application/json" -d '{"key":"bad key/#?1","description":""}' \
     http://localhost:8000/v1/flags
