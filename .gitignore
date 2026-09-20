@@ -26,3 +26,7 @@ output/
 
 # 运行日志：由本地跑出来，不是源码，且每次运行都会变。
 docs/acceptance/*.log
+
+# 本机生成的标识（种子脚本的 demo 身份等）。每台机器不同，不该进仓库；
+# `scripts/seed_admin_demo.py` 首次运行会创建它。- 2026-09-20
+.local/
