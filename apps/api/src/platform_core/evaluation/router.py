@@ -21,11 +21,11 @@ from typing import Any
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.api import error_response, tenant_session
-from platform_core.evaluation.metrics import aggregate_quality_metrics
+from platform_core.evaluation.metrics import aggregate_quality_metrics, automation_candidates
 from platform_core.identity import tenant_context
 from platform_core.identity.tenant_context import TenantContext
 from platform_policy import Action, Decision, PolicyEngine, Principal
@@ -57,6 +57,10 @@ class QualityMetricsOut(BaseModel):
     open_cases: int
     supported_resolution_rate: float
     wrong_resolution_rate: float
+    # Leak analysis (feature list 8.1): how many runs reached a person and
+    # why, plus which of those reasons are ours to fix.
+    handoff_reason_counts: dict[str, int] = Field(default_factory=dict)
+    automation_candidates: list[dict[str, object]] = Field(default_factory=list)
 
 
 def _principal_from_ctx(ctx: TenantContext) -> Principal:
@@ -93,6 +97,8 @@ async def _aggregate(
         open_cases=metrics.open_cases,
         supported_resolution_rate=metrics.supported_resolution_rate,
         wrong_resolution_rate=metrics.wrong_resolution_rate,
+        handoff_reason_counts=metrics.handoff_reason_counts,
+        automation_candidates=automation_candidates(metrics),
     )
 
 

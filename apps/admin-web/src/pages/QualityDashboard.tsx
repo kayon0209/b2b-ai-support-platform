@@ -209,6 +209,39 @@ export function QualityDashboard() {
               )}
             </Card>
           </div>
+
+          <div className="grid-2">
+            <Card title={t("quality.leaks")}>
+              {metrics.data.automation_candidates?.length ? (
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>{t("quality.reason")}</th>
+                      <th>{t("quality.count")}</th>
+                      <th>{t("quality.action")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {metrics.data.automation_candidates.map((item) => (
+                      <tr key={item.reason}>
+                        <td>{item.reason}</td>
+                        <td>{int(item.count)}</td>
+                        <td>
+                          <Badge tone={item.automatable ? "good" : "neutral"}>
+                            {item.automatable
+                              ? t("quality.automatable")
+                              : t("quality.keepHuman")}
+                          </Badge>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <p className="muted">{t("quality.noHandoffs")}</p>
+              )}
+            </Card>
+          </div>
         </>
       ) : null}
     </div>

@@ -49,6 +49,12 @@ class QualityMetrics:
     citation_coverage: float = 1.0
     supported_resolution_rate: float = 0.0
     wrong_resolution_rate: float = 0.0
+    # Why runs reached a person, by reason code. This is the leak analysis
+    # (feature list 8.1): "which questions still go to a human, and how many
+    # of them" is the question that decides what to automate next. A single
+    # handoff rate cannot answer it - 30% handoffs that are all complaints and
+    # 30% that are all missing documents need opposite responses.
+    handoff_reason_counts: dict[str, int] = field(default_factory=dict)
 
     def finalize(self) -> "QualityMetrics":
         if self.total_runs:
@@ -65,6 +71,76 @@ class QualityMetrics:
             )
             self.wrong_resolution_rate = round(self.wrong_resolution / self.cases_measured, 4)
         return self
+
+
+# --- What a handoff means ---------------------------------------------------
+#
+# A handoff count alone tells an operator nothing actionable, because the
+# reasons point in opposite directions. Sorting them is the whole value of a
+# leak analysis (feature list 8.1), and getting it wrong is worse than not
+# having it: a dashboard that says "automate 200 handoffs" without saying
+# which kind will get the red lines automated.
+
+# The platform had the answer and chose not to - or the corpus simply does
+# not contain it. Adding a document, or fixing a conflicting one, turns these
+# into answered questions. These are the automation candidates.
+KNOWLEDGE_SHAPED_REASONS = frozenset(
+    {
+        "NO_AUTHORIZED_EVIDENCE",
+        "EVIDENCE_BELOW_THRESHOLD",
+        "CONFLICTING_SOURCES",
+        "CLARIFICATION_LIMIT",
+        "OUT_OF_SCOPE",
+        "UNSUPPORTED_CLAIM",
+    }
+)
+
+# A person must decide, and no amount of documentation changes that. The
+# complaint gate, the commercial-commitment red line, sensitive requests and
+# EQ confirmations are controls - routing them to automation would be undoing
+# the control that produced them.
+HUMAN_BY_POLICY_REASONS = frozenset(
+    {
+        "COMPLAINT_REQUIRES_HUMAN",
+        "STRATEGIC_ACCOUNT_REQUIRES_HUMAN",
+        "REDLINE_COMMERCIAL_COMMITMENT",
+        "SENSITIVE_REQUEST",
+        "HUMAN_REQUIRED",
+        "EQ_CONFIRMATION_REQUIRES_HUMAN",
+    }
+)
+
+# A clarification is not a handoff: the run kept the conversation and asked
+# the customer, who is still there. Counting it as "sent to a human" would
+# inflate the very number someone is about to act on.
+CLARIFICATION_REASONS = frozenset({"NEEDS_CLARIFICATION", "WRITE_INTENT_UNCERTAIN"})
+
+_NO_REASON = "(none)"
+
+
+def automation_candidates(metrics: "QualityMetrics") -> list[dict[str, object]]:
+    """Handoff reasons ranked by volume, each saying whether it is ours to fix.
+
+    `automatable` is the field that makes this a leak analysis rather than a
+    histogram. `True` means the gap is in the corpus and writing a document
+    closes it; `False` means a control decided, and the honest response is
+    capacity planning, not automation. An unknown reason is reported as
+    neither - classifying it by guesswork is how a red line gets automated.
+    """
+    items: list[dict[str, object]] = []
+    for reason, count in sorted(
+        metrics.handoff_reason_counts.items(), key=lambda kv: (-kv[1], kv[0])
+    ):
+        if reason in HUMAN_BY_POLICY_REASONS:
+            automatable, rationale = False, "policy: a person must decide"
+        elif reason in KNOWLEDGE_SHAPED_REASONS:
+            automatable, rationale = True, "evidence gap: a document can close it"
+        else:
+            automatable, rationale = False, "unclassified: review before acting"
+        items.append(
+            {"reason": reason, "count": count, "automatable": automatable, "rationale": rationale}
+        )
+    return items
 
 
 def _percentile(sorted_values: list[int], pct: float) -> int | None:
@@ -105,8 +181,17 @@ async def aggregate_quality_metrics(
             metrics.completed += 1
         elif run.status == RunStatus.ABSTAINED.value:
             metrics.abstained += 1
+            reason = (run.abstain_reason or _NO_REASON).strip() or _NO_REASON
+            # A clarification did not send the customer anywhere, so it is not
+            # a leak and must not appear in the automation queue.
+            if reason not in CLARIFICATION_REASONS:
+                metrics.handoff_reason_counts[reason] = (
+                    metrics.handoff_reason_counts.get(reason, 0) + 1
+                )
         elif run.status == RunStatus.HANDED_OFF.value:
             metrics.handed_off += 1
+            reason = (run.abstain_reason or _NO_REASON).strip() or _NO_REASON
+            metrics.handoff_reason_counts[reason] = metrics.handoff_reason_counts.get(reason, 0) + 1
         elif run.status == RunStatus.FAILED.value:
             metrics.failed += 1
         if run.latency_ms is not None:

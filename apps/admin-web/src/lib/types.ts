@@ -26,6 +26,19 @@ export interface QualityMetrics {
   open_cases: number;
   supported_resolution_rate: number;
   wrong_resolution_rate: number;
+  /**
+   * Leak analysis: how many runs reached a person and why. `automatable`
+   * separates an evidence gap (a document closes it) from a policy decision
+   * (a person must decide) - a histogram without that distinction would put
+   * the red lines on the automation list.
+   */
+  handoff_reason_counts: Record<string, number>;
+  automation_candidates: Array<{
+    reason: string;
+    count: number;
+    automatable: boolean;
+    rationale: string;
+  }>;
 }
 
 export interface RouteDistribution {
