@@ -23,32 +23,48 @@ from datetime import UTC, datetime
 # "no window configured", which is treated as always open rather than as
 # "closed all day" - the less surprising reading, and the one that cannot turn
 # an unconfigured tenant into a silently refusing one.
-OPEN_HOUR = 9
-CLOSE_HOUR = 18
+#
+# The default is deliberately UNCONFIGURED. Shipping a default window silently
+# changes what every tenant's customers are told at night, which nobody asked
+# for - and on the first attempt it did exactly that: the full suite caught
+# three tests whose expected notice changed after 18:00. Settings decide when
+# a team is open, not constants.
+OPEN_HOUR = 0
+CLOSE_HOUR = 0
+
+
+def _window() -> tuple[int, int]:
+    from platform_core.config import get_settings
+
+    settings = get_settings()
+    return int(settings.support_open_hour), int(settings.support_close_hour)
 
 
 def is_open(
     now: datetime | None = None,
     *,
-    open_hour: int = OPEN_HOUR,
-    close_hour: int = CLOSE_HOUR,
+    open_hour: int | None = None,
+    close_hour: int | None = None,
 ) -> bool:
     """True when the configured window covers `now` (UTC)."""
-    if open_hour == close_hour:
+    cfg_open, cfg_close = _window()
+    start = cfg_open if open_hour is None else open_hour
+    end = cfg_close if close_hour is None else close_hour
+    if start == end:
         return True
     moment = now or datetime.now(UTC)
     hour = moment.hour
-    if open_hour < close_hour:
-        return open_hour <= hour < close_hour
+    if start < end:
+        return start <= hour < end
     # A window that wraps midnight (e.g. 22 -> 06).
-    return hour >= open_hour or hour < close_hour
+    return hour >= start or hour < end
 
 
 def next_open_label(
     now: datetime | None = None,
     *,
-    open_hour: int = OPEN_HOUR,
-    close_hour: int = CLOSE_HOUR,
+    open_hour: int | None = None,
+    close_hour: int | None = None,
 ) -> str:
     """The time the queue opens again, as `HH:MM` (UTC).
 
@@ -59,10 +75,12 @@ def next_open_label(
     """
     if is_open(now, open_hour=open_hour, close_hour=close_hour):
         return ""
-    return f"{open_hour:02d}:00"
+    cfg_open, _cfg_close = _window()
+    shown = cfg_open if open_hour is None else open_hour
+    return f"{shown:02d}:00"
 
 
-def offline_notice(open_hour: int = OPEN_HOUR) -> str:
+def offline_notice(open_hour: int | None = None) -> str:
     """What to say instead of "a colleague will help".
 
     States that no one is there, that the message is kept, and when someone
@@ -70,8 +88,10 @@ def offline_notice(open_hour: int = OPEN_HOUR) -> str:
     not cause and does not promise a reply time it cannot bound, because the
     queue depth at opening is not something this platform knows.
     """
+    cfg_open, _cfg_close = _window()
+    shown = cfg_open if open_hour is None else open_hour
     return (
         "Our team is offline at the moment, so no one can pick this up right "
         f"now. Your message has been logged with this conversation, and "
-        f"someone will follow up from {open_hour:02d}:00."
+        f"someone will follow up from {shown:02d}:00."
     )

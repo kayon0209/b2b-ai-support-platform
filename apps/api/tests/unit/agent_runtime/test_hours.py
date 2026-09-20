@@ -16,12 +16,14 @@ def _at(hour: int) -> datetime:
 
 
 def test_the_window_is_inclusive_at_the_start_and_exclusive_at_the_end() -> None:
-    assert is_open(_at(9)) is True
-    assert is_open(_at(17)) is True
+    # Explicit window: the default is unconfigured (always open) by design, so
+    # the boundary is only meaningful against a configured one.
+    assert is_open(_at(9), open_hour=9, close_hour=18) is True
+    assert is_open(_at(17), open_hour=9, close_hour=18) is True
     # 18:00 is the closing hour, so the window has ended by then - saying
     # "open" here would promise someone at the moment they are leaving.
-    assert is_open(_at(18)) is False
-    assert is_open(_at(3)) is False
+    assert is_open(_at(18), open_hour=9, close_hour=18) is False
+    assert is_open(_at(3), open_hour=9, close_hour=18) is False
 
 
 def test_a_window_wrapping_midnight_is_handled() -> None:
@@ -42,15 +44,27 @@ def test_no_window_configured_means_always_open() -> None:
 
 
 def test_the_opening_time_is_reported_only_when_closed() -> None:
-    assert next_open_label(_at(3)) == "09:00"
-    assert next_open_label(_at(12)) == ""
+    assert next_open_label(_at(3), open_hour=9, close_hour=18) == "09:00"
+    assert next_open_label(_at(12), open_hour=9, close_hour=18) == ""
+
+
+def test_the_default_is_unconfigured_and_therefore_always_open() -> None:
+    """The regression that made this test file worth writing.
+
+    The first version shipped a 9-18 default, which silently changed what
+    every tenant's customers were told outside those hours - three unrelated
+    tests failed after 18:00 on the day it landed. A tenant that has not told
+    us its hours must behave exactly as it did before.
+    """
+    for hour in (0, 3, 9, 18, 23):
+        assert is_open(_at(hour)) is True
 
 
 def test_the_offline_notice_makes_no_promise_about_speed() -> None:
     """It says no one is there, that the message is kept, and when - not how
     quickly. Queue depth at opening is not something this platform knows, and
     "shortly" at 03:00 is the exact lie this exists to remove."""
-    notice = offline_notice().lower()
+    notice = offline_notice(9).lower()
 
     assert "offline" in notice
     assert "logged" in notice

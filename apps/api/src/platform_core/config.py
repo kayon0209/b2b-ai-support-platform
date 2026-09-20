@@ -214,6 +214,11 @@ class Settings(BaseSettings):
     # for the window where a newly-automated category is being watched, then
     # off again.
     flag_shadow_mode: str = "agent.shadow_mode_enabled"
+    # When a human is actually available (feature list 7.5), UTC hours.
+    # 0/0 means unconfigured, which reads as always open: a tenant that has
+    # not told us its hours must not gain a new way to refuse its customers.
+    support_open_hour: int = 0
+    support_close_hour: int = 0
     # Priority claiming is a deployment-level decision (the claim query is
     # cross-tenant), so it is a plain switch rather than a tenant flag.
     priority_claim_enabled: bool = False
