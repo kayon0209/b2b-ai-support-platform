@@ -30,3 +30,7 @@ docs/acceptance/*.log
 # 本机生成的标识（种子脚本的 demo 身份等）。每台机器不同，不该进仓库；
 # `scripts/seed_admin_demo.py` 首次运行会创建它。- 2026-09-20
 .local/
+
+# 工作区记忆目录：由本机工具自动维护，内容与本机会话绑定，不进仓库。
+# 项目长期记忆的正本在 `.workbuddy-ai/memory/`（那个是要提交的）。- 2026-09-20
+.workbuddy/
