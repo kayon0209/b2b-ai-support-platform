@@ -25,7 +25,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.api import error_response, tenant_session
-from platform_core.evaluation.metrics import aggregate_quality_metrics, automation_candidates
+from platform_core.evaluation.metrics import (
+    aggregate_quality_metrics,
+    automation_candidates,
+    gap_samples_by_reason,
+)
 from platform_core.identity import tenant_context
 from platform_core.identity.tenant_context import TenantContext
 from platform_policy import Action, Decision, PolicyEngine, Principal
@@ -61,6 +65,9 @@ class QualityMetricsOut(BaseModel):
     # why, plus which of those reasons are ours to fix.
     handoff_reason_counts: dict[str, int] = Field(default_factory=dict)
     automation_candidates: list[dict[str, object]] = Field(default_factory=list)
+    # reason -> the questions customers actually asked, so a candidate can be
+    # acted on. Empty for policy reasons, which are not knowledge gaps and are
+    # deliberately never queued for documentation.
 
 
 def _principal_from_ctx(ctx: TenantContext) -> Principal:
@@ -77,6 +84,15 @@ async def _aggregate(
     metrics = await aggregate_quality_metrics(
         session, tenant_id=tenant_id, window_seconds=window_seconds
     )
+    # Attach the questions behind each reason so the candidate list is a work
+    # queue rather than a histogram. Done here rather than inside
+    # `automation_candidates` so that function stays pure and testable.
+    samples = await gap_samples_by_reason(session, tenant_id=tenant_id)
+    candidates = []
+    for item in automation_candidates(metrics):
+        enriched = dict(item)
+        enriched["sample_questions"] = samples.get(str(item["reason"]), [])
+        candidates.append(enriched)
     return QualityMetricsOut(
         window_seconds=metrics.window_seconds,
         total_runs=metrics.total_runs,
@@ -98,7 +114,7 @@ async def _aggregate(
         supported_resolution_rate=metrics.supported_resolution_rate,
         wrong_resolution_rate=metrics.wrong_resolution_rate,
         handoff_reason_counts=metrics.handoff_reason_counts,
-        automation_candidates=automation_candidates(metrics),
+        automation_candidates=candidates,
     )
 
 

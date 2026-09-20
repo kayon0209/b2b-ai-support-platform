@@ -38,6 +38,9 @@ export interface QualityMetrics {
     count: number;
     automatable: boolean;
     rationale: string;
+    /** The questions customers actually asked, most-frequent first. Empty for
+     * policy reasons, which are not knowledge gaps. */
+    sample_questions: string[];
   }>;
 }
 

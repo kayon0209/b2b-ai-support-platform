@@ -104,6 +104,10 @@ def _seed() -> None:
 def _clear() -> None:
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
+        # knowledge_gaps before the tenant, and before any re-seed: the gap
+        # table is unique per (tenant, question_hash), so a row left behind
+        # turns the next run into a UniqueViolation instead of a test result.
+        conn.execute(text("DELETE FROM knowledge_gaps WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(text("DELETE FROM agent_runs WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(text("DELETE FROM tenants WHERE slug = :slug"), {"slug": SLUG})
     admin.dispose()
@@ -162,3 +166,47 @@ def test_the_candidate_queue_separates_evidence_gaps_from_red_lines() -> None:
     assert [item["reason"] for item in resp.json()["automation_candidates"]][0] == (
         "NO_AUTHORIZED_EVIDENCE"
     )
+
+
+def test_a_candidate_names_the_questions_behind_it() -> None:
+    """A leak analysis you cannot act on is a histogram with opinions.
+
+    "NO_AUTHORIZED_EVIDENCE x 2" tells ops how big the gap is, not what it is,
+    so the candidate carries the questions customers actually asked - the gap
+    queue already has them.
+    """
+    import time as _time
+
+    import sqlalchemy as sa
+    from sqlalchemy import create_engine as sa_engine
+
+    now = int(_time.time())
+    admin = sa_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        for index, question in enumerate(("最小线宽能做多少？", "阻抗公差是多少？")):
+            conn.execute(
+                sa.text(
+                    "INSERT INTO knowledge_gaps (id, tenant_id, question_hash, "
+                    "sample_question, reason_code, status, frequency, first_seen_at, "
+                    "last_seen_at) VALUES (gen_random_uuid(), :t, :h, :q, "
+                    "'NO_AUTHORIZED_EVIDENCE', 'open', :f, :n, :n) "
+                    "ON CONFLICT DO NOTHING"
+                ),
+                {"t": TENANT, "h": f"h-iso-{index}", "q": question, "f": 10 - index, "n": now},
+            )
+    admin.dispose()
+
+    resp = _client().get(
+        "/v1/quality/metrics?window_seconds=3600",
+        headers={"Authorization": "Bearer pt_bootstrap_test"},
+    )
+
+    items = {item["reason"]: item for item in resp.json()["automation_candidates"]}
+    gap = items["NO_AUTHORIZED_EVIDENCE"]
+
+    # Most-frequent first: answer the question customers ask most.
+    assert gap["sample_questions"][0] == "最小线宽能做多少？"
+    # A complaint is a policy decision, not a knowledge gap - the queue never
+    # holds questions for it, and inventing "documentation" for one would be
+    # the wrong fix for a control that is working.
+    assert items["COMPLAINT_REQUIRES_HUMAN"]["sample_questions"] == []

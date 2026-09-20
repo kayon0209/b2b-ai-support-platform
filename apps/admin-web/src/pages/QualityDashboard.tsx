@@ -232,6 +232,13 @@ export function QualityDashboard() {
                               ? t("quality.automatable")
                               : t("quality.keepHuman")}
                           </Badge>
+                          {item.sample_questions.length > 0 ? (
+                            <ul className="leak-samples">
+                              {item.sample_questions.map((q) => (
+                                <li key={q}>{q}</li>
+                              ))}
+                            </ul>
+                          ) : null}
                         </td>
                       </tr>
                     ))}

@@ -1664,3 +1664,15 @@ select:focus-visible {
 .data-card-node-label {
   font-weight: 600;
 }
+
+.leak-samples {
+  list-style: none;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  font-size: 0.8rem;
+}
+
+.leak-samples li {
+  padding: 0.1rem 0;
+  color: var(--muted, #666);
+}

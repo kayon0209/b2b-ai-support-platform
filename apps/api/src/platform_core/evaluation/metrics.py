@@ -118,6 +118,44 @@ CLARIFICATION_REASONS = frozenset({"NEEDS_CLARIFICATION", "WRITE_INTENT_UNCERTAI
 _NO_REASON = "(none)"
 
 
+async def gap_samples_by_reason(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    per_reason: int = 3,
+) -> dict[str, list[str]]:
+    """The actual unanswered questions behind each handoff reason.
+
+    A candidate that says "NO_AUTHORIZED_EVIDENCE x 42" tells an operator how
+    big the gap is and not what it is, and "go document something" is not an
+    instruction anyone can act on. The gap queue already holds the questions
+    that produced those handoffs, so this reads them back by reason - which is
+    what turns the leak analysis into a work queue.
+
+    Ordered by frequency: the question customers asked most is the one worth
+    answering first. Resolved gaps are excluded - they already have an answer.
+    """
+    from platform_core.knowledge.gap_models import GapStatus, KnowledgeGap
+
+    rows = (
+        await session.execute(
+            select(KnowledgeGap.reason_code, KnowledgeGap.sample_question)
+            .where(
+                KnowledgeGap.tenant_id == tenant_id,
+                KnowledgeGap.status != GapStatus.RESOLVED.value,
+            )
+            .order_by(KnowledgeGap.frequency.desc(), KnowledgeGap.last_seen_at.desc())
+        )
+    ).all()
+
+    samples: dict[str, list[str]] = {}
+    for reason_code, question in rows:
+        bucket = samples.setdefault(str(reason_code), [])
+        if len(bucket) < per_reason and question:
+            bucket.append(str(question))
+    return samples
+
+
 def automation_candidates(metrics: "QualityMetrics") -> list[dict[str, object]]:
     """Handoff reasons ranked by volume, each saying whether it is ours to fix.
 
