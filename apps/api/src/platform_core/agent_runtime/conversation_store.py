@@ -179,3 +179,66 @@ def contact_ref_from_external(tenant_id: uuid.UUID, external_contact_id: str) ->
 def fact_tuples(facts: object) -> list[tuple[str, str]]:
     """DurableFact objects -> (key, value) pairs for the store."""
     return [(fact.key, fact.value) for fact in facts]  # type: ignore[attr-defined]
+
+
+async def latest_suggestion(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_ref_id: uuid.UUID,
+) -> tuple[str, list[str]] | None:
+    """The last thing the AI said here, with the sources it cited.
+
+    The agent workbench's reason to exist: a human picking up a handoff should
+    read the proposed answer and its grounding instead of reconstructing both
+    from the audit log. Returns None when the AI never produced anything -
+    which is normal for a conversation opened straight into a human queue.
+
+    Exposed as a function rather than as models because AGENTS.md forbids one
+    module importing another's ORM classes: `cases` calls this and receives
+    strings.
+
+    The text comes from the stored turn, not from `AgentRun`: a run records
+    only `output_hash`, deliberately, so the body lives with the turns.
+    """
+    from platform_core.agent_runtime.models import AgentRun, Citation
+
+    turn = (
+        await session.execute(
+            select(ConversationTurn.text_redacted)
+            .where(
+                ConversationTurn.tenant_id == tenant_id,
+                ConversationTurn.conversation_ref_id == conversation_ref_id,
+                ConversationTurn.role == _role_value(TurnRole.AGENT),
+            )
+            .order_by(ConversationTurn.ts.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    run_id = (
+        await session.execute(
+            select(AgentRun.id)
+            .where(
+                AgentRun.tenant_id == tenant_id,
+                AgentRun.conversation_ref_id == conversation_ref_id,
+            )
+            .order_by(AgentRun.started_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    sources: list[str] = []
+    if run_id is not None:
+        rows = (
+            await session.execute(
+                select(Citation.source_uri)
+                .where(Citation.tenant_id == tenant_id, Citation.agent_run_id == run_id)
+                .order_by(Citation.id)
+            )
+        ).scalars()
+        sources = [str(row) for row in rows]
+
+    if turn is None and not sources:
+        return None
+    return (turn or "", sources)

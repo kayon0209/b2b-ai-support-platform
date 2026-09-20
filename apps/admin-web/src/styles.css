@@ -1541,3 +1541,84 @@ select:focus-visible {
   font-size: 11px;
   color: var(--muted, #6b7280);
 }
+
+/* Agent workbench (feature list 7.6): queue beside context, so the agent
+   reads both without navigating. The two columns are independent scroll
+   areas - a long conversation must not push the queue out of reach. */
+.workbench {
+  display: grid;
+  grid-template-columns: minmax(200px, 280px) 1fr;
+  gap: var(--space-4, 1rem);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .workbench {
+    grid-template-columns: 1fr;
+  }
+}
+
+.workbench-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.workbench-item {
+  display: flex;
+  width: 100%;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem;
+  margin-bottom: 0.25rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.workbench-item:hover {
+  border-color: var(--border, #ccc);
+}
+
+.workbench-item.selected {
+  border-color: var(--accent, #4c6ef5);
+  background: var(--surface-hover, rgba(76, 110, 245, 0.08));
+}
+
+.workbench-subject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workbench-detail {
+  display: grid;
+  gap: var(--space-4, 1rem);
+}
+
+.workbench-detail .timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.workbench-detail .timeline li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border, #eee);
+}
+
+.workbench-detail .sources {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.85rem;
+}

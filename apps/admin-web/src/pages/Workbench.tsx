@@ -1,0 +1,173 @@
+import { useEffect, useState } from "react";
+import { apiGet } from "../lib/api";
+import { useAsync } from "../lib/useAsync";
+import { Badge, Card, EmptyState, ErrorBanner, PageHeader, Spinner } from "../components/ui";
+import { LoadError } from "../components/LoadError";
+import { useLang } from "../lib/i18n";
+
+/**
+ * Agent workbench (feature list 7.6): everything needed to answer without
+ * re-asking. The bundle comes from one endpoint so the panel cannot disagree
+ * with itself - case, conversation, the AI's last proposal with its sources,
+ * and same-category cases are all read in one request.
+ */
+
+interface CaseSummary {
+  case_id: string;
+  subject: string;
+  status: string;
+  category?: string | null;
+}
+
+interface Turn {
+  role: string;
+  text: string;
+}
+
+interface Suggestion {
+  text: string;
+  sources: string[];
+}
+
+interface Workbench {
+  case: CaseSummary;
+  account_tier: string | null;
+  conversation: Turn[];
+  ai_suggestion: Suggestion | null;
+  related_cases: { basis: string; items: CaseSummary[] };
+}
+
+const ROLE_TONE: Record<string, "good" | "warn" | "neutral" | "bad"> = {
+  customer: "neutral",
+  agent: "good",
+  tool: "warn",
+  system: "warn",
+};
+
+export function Workbench() {
+  const { t } = useLang();
+  const [selected, setSelected] = useState<string | null>(null);
+
+  const cases = useAsync(() => apiGet<{ cases: CaseSummary[] }>("/v1/cases"), []);
+  const bundle = useAsync(
+    () =>
+      selected === null
+        ? Promise.resolve(null)
+        : apiGet<Workbench>(`/v1/cases/${selected}/workbench`),
+    [selected],
+  );
+
+  const list = cases.data?.cases ?? [];
+  useEffect(() => {
+    // Preselect the first case so the panel is never empty on arrival -
+    // an agent opening this page wants to work, not to pick a filter first.
+    if (selected === null && list.length > 0) setSelected(list[0].case_id);
+  }, [list, selected]);
+
+  return (
+    <div>
+      <PageHeader title={t("workbench.title")} subtitle={t("workbench.subtitle")} />
+
+      {cases.error ? <LoadError error={cases.error} status={cases.errorStatus} onRetry={cases.reload} /> : null}
+
+      <div className="workbench">
+        <Card title={t("workbench.queue")}>
+          {cases.loading ? <Spinner /> : null}
+          {!cases.loading && list.length === 0 ? (
+            <EmptyState message={t("workbench.noCases")} />
+          ) : null}
+          <ul className="workbench-list">
+            {list.map((item) => (
+              <li key={item.case_id}>
+                <button
+                  type="button"
+                  className={item.case_id === selected ? "workbench-item selected" : "workbench-item"}
+                  onClick={() => setSelected(item.case_id)}
+                >
+                  <span className="workbench-subject">{item.subject}</span>
+                  <Badge tone="neutral">{item.status}</Badge>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </Card>
+
+        <div className="workbench-detail">
+          {bundle.error ? <LoadError error={bundle.error} status={bundle.errorStatus} onRetry={bundle.reload} /> : null}
+          {bundle.loading ? <Spinner /> : null}
+          {!bundle.loading && bundle.data === null ? (
+            <EmptyState message={t("workbench.empty")} />
+          ) : null}
+
+          {bundle.data ? (
+            <>
+              <Card title={t("workbench.customer")}>
+                <p>
+                  <strong>{bundle.data.case.subject}</strong>
+                </p>
+                <p className="muted">
+                  {t("workbench.category")}: {bundle.data.case.category ?? "—"}
+                </p>
+                {bundle.data.account_tier ? (
+                  <Badge tone="warn">{bundle.data.account_tier}</Badge>
+                ) : null}
+              </Card>
+
+              <Card title={t("workbench.conversation")}>
+                {bundle.data.conversation.length === 0 ? (
+                  <EmptyState message={t("workbench.noTurns")} />
+                ) : (
+                  <ol className="timeline">
+                    {bundle.data.conversation.map((turn, index) => (
+                      <li key={index}>
+                        <Badge tone={ROLE_TONE[turn.role] ?? "neutral"}>{turn.role}</Badge>
+                        <span>{turn.text}</span>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </Card>
+
+              <Card title={t("workbench.suggestion")}>
+                {bundle.data.ai_suggestion === null ? (
+                  <EmptyState message={t("workbench.noSuggestion")} />
+                ) : (
+                  <>
+                    <p>{bundle.data.ai_suggestion.text}</p>
+                    {bundle.data.ai_suggestion.sources.length > 0 ? (
+                      <ul className="sources">
+                        {bundle.data.ai_suggestion.sources.map((uri) => (
+                          <li key={uri}>{uri}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="muted">{t("workbench.noSources")}</p>
+                    )}
+                  </>
+                )}
+              </Card>
+
+              <Card
+                title={`${t("workbench.related")} (${bundle.data.related_cases.basis})`}
+              >
+                {bundle.data.related_cases.items.length === 0 ? (
+                  <EmptyState message={t("workbench.noRelated")} />
+                ) : (
+                  <ul>
+                    {bundle.data.related_cases.items.map((item) => (
+                      <li key={item.case_id}>
+                        {item.subject} <Badge tone="neutral">{item.status}</Badge>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </Card>
+            </>
+          ) : null}
+        </div>
+      </div>
+
+      {cases.error ? <ErrorBanner message={String(cases.error)} /> : null}
+    </div>
+  );
+}

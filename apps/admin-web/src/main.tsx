@@ -16,6 +16,7 @@ import { NotFound } from "./pages/NotFound";
 import { PromptRelease } from "./pages/PromptRelease";
 import { QualityDashboard } from "./pages/QualityDashboard";
 import { Usage } from "./pages/Usage";
+import { Workbench } from "./pages/Workbench";
 import "./styles.css";
 
 /**
@@ -43,6 +44,7 @@ const router = createBrowserRouter([
       { path: "prompts", element: <PromptRelease /> },
       { path: "flags", element: <FeatureFlags /> },
       { path: "cases", element: <Cases /> },
+      { path: "workbench", element: <Workbench /> },
       { path: "approvals", element: <Approvals /> },
       { path: "members", element: <Members /> },
       { path: "usage", element: <Usage /> },
