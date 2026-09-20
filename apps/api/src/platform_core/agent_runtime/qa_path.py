@@ -291,6 +291,12 @@ ABSTAIN_CLARIFICATION = "NEEDS_CLARIFICATION"
 # 归责表态 or 赔付承诺 - so the run does not answer, it hands off. Detected by
 # `agent_runtime/complaint.py`, which documents why the scene axis is not used.
 ABSTAIN_COMPLAINT_REQUIRES_HUMAN = "COMPLAINT_REQUIRES_HUMAN"
+# The same claim, from an account whose contract tier says a person owns the
+# relationship (难点 5: 大客户命中 COMPLAINT 一律直转专属人工). The routing outcome
+# is the same - a human takes it - but the reason differs so the queue can tell
+# a key account's complaint from an ordinary one, which is the whole point of
+# tier: two identical messages are not the same event.
+ABSTAIN_STRATEGIC_ACCOUNT_REQUIRES_HUMAN = "STRATEGIC_ACCOUNT_REQUIRES_HUMAN"
 
 
 @dataclass
@@ -1136,6 +1142,16 @@ def safe_abstention_text(reason_code: str) -> str:
             "human colleague who has this conversation's context. If you can "
             "share the order number and photos of the issue, that will help "
             "them review it."
+        )
+    if reason_code == ABSTAIN_STRATEGIC_ACCOUNT_REQUIRES_HUMAN:
+        # Names the account team rather than "a human colleague": for a key
+        # account the report's promise is a named relationship, and sending
+        # them to the general queue is the 服务降级 the report warns about.
+        # Still no outcome promised - the team decides, not this text.
+        return (
+            "Thank you for raising this. I am passing it to your account team, "
+            "who have this conversation's context and will follow up with you "
+            "directly."
         )
     return (
         "I couldn't verify an answer from our authorized knowledge base. "

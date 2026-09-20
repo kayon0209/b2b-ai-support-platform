@@ -28,8 +28,9 @@ constraint is the authority and the pre-check is courtesy.
 
 from __future__ import annotations
 
+import time
 import uuid
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -41,6 +42,7 @@ from platform_core.identity.models import (
     ContractStatus,
     Department,
     EnterpriseAccount,
+    EnterpriseAccountContact,
 )
 from platform_core.identity.tenant_context import TenantContext
 
@@ -176,6 +178,127 @@ async def account_sla_facts(
     if row is None:
         return None
     return (str(row[0]), str(row[1]))
+
+
+class ContactAccountFacts(NamedTuple):
+    """What routing is allowed to know about a contact's account.
+
+    The same narrow-projection rule as `account_sla_facts`: `agent_runtime`
+    needs the tier to decide 转人工优先级 and must not import this module's ORM
+    models, so it gets three plain values. The account id is included because
+    the handoff note names the account the human is being asked about - without
+    it a receiving agent sees "a strategic account" and still has to guess which.
+    """
+
+    account_id: uuid.UUID
+    tier: str
+    contract_status: str
+
+
+async def account_facts_for_contact(
+    session: AsyncSession, *, tenant_id: uuid.UUID, external_contact_id: str
+) -> ContactAccountFacts | None:
+    """The account a Chatwoot contact belongs to, or None if unbound.
+
+    This is the fact tier-driven routing was missing: a conversation arrives as
+    a contact, and nothing could say which contract that contact is under.
+
+    Returns None rather than raising for "no binding", which is the common case
+    - most contacts are not bound to any account, and treating that as an error
+    would make an unbound customer a failure.
+    """
+    row = (
+        await session.execute(
+            select(
+                EnterpriseAccountContact.enterprise_account_id,
+                EnterpriseAccount.tier,
+                EnterpriseAccount.contract_status,
+            )
+            .join(
+                EnterpriseAccount,
+                EnterpriseAccount.id == EnterpriseAccountContact.enterprise_account_id,
+            )
+            .where(
+                EnterpriseAccountContact.tenant_id == tenant_id,
+                EnterpriseAccountContact.external_contact_id == external_contact_id,
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    return ContactAccountFacts(account_id=row[0], tier=str(row[1]), contract_status=str(row[2]))
+
+
+async def bind_contact(
+    session: AsyncSession,
+    *,
+    ctx: TenantContext,
+    account_id: uuid.UUID,
+    external_contact_id: str,
+    actor_id: str | None = None,
+) -> uuid.UUID:
+    """Bind a Chatwoot contact to one of this tenant's accounts.
+
+    One contact, one account: `uq_account_contact_external` enforces it, and a
+    second bind for the same contact is a 409 rather than a silent re-point -
+    moving a contact between accounts is an unbind followed by a bind, so the
+    change is auditable as two events instead of one overwritten row.
+    """
+    exists = await account_sla_facts(session, tenant_id=ctx.tenant_id, account_id=account_id)
+    if exists is None:
+        # Not "ACCOUNT_FORBIDDEN": RLS hides another tenant's row, and naming
+        # the real reason would let this endpoint enumerate which accounts
+        # exist. Same reasoning as `account_sla_facts`' own None.
+        raise OrgError("ACCOUNT_NOT_FOUND", str(account_id))
+
+    row = EnterpriseAccountContact(
+        tenant_id=ctx.tenant_id,
+        enterprise_account_id=account_id,
+        external_contact_id=external_contact_id,
+        created_by=actor_id,
+        created_at=int(time.time()),
+    )
+    session.add(row)
+    await _flush(session)
+    return row.id
+
+
+async def list_contacts(
+    session: AsyncSession, *, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> list[str]:
+    external_ids = (
+        await session.execute(
+            select(EnterpriseAccountContact.external_contact_id).where(
+                EnterpriseAccountContact.tenant_id == tenant_id,
+                EnterpriseAccountContact.enterprise_account_id == account_id,
+            )
+        )
+    ).scalars()
+    return list(external_ids)
+
+
+async def unbind_contact(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+    external_contact_id: str,
+) -> bool:
+    """Remove a binding. Returns False when there was nothing to remove."""
+    row = (
+        await session.execute(
+            select(EnterpriseAccountContact).where(
+                EnterpriseAccountContact.tenant_id == tenant_id,
+                EnterpriseAccountContact.enterprise_account_id == account_id,
+                EnterpriseAccountContact.external_contact_id == external_contact_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return False
+    await session.delete(row)
+    await session.flush()
+    return True
 
 
 async def department_exists(

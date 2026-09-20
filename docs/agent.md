@@ -113,6 +113,33 @@ because a person receives them either way, but there is no structured intake
 form, so nothing parses or stores them as fields. Building the intake without
 the form would be a capability with no consumer.
 
+### Tier: whose complaint this is (难点 5)
+
+Two identical complaints are not the same event if one of them is a key
+account's. When the conversation's contact is bound to an `EnterpriseAccount`
+whose tier is `strategic`/`enterprise` **and** whose contract is `active`, the
+handoff reason becomes `STRATEGIC_ACCOUNT_REQUIRES_HUMAN` and the private note
+names the account and tier, so the receiving team knows whose contract this is.
+The act is the same either way - a person takes over - because the red line
+does not depend on tier.
+
+The binding (`enterprise_account_contacts`) is keyed on the **Chatwoot
+contact**, not on the inbox: an inbox is a channel shared by everyone who walks
+in through it, so binding an inbox would make every customer in that channel a
+key account. The contact id is **not in the webhook payload** - measured over
+every stored event: `contact_id` 0/29, `sender_id` 1/29 - so it is read from the
+message via the Chatwoot API. An unresolvable contact degrades to "unbound",
+never to a failed run: the tier sharpens a handoff that happens regardless.
+
+`contract_status` is checked alongside tier, the same rule `sla_policy_for_tier`
+applies to the SLA clock - a contract that ended no longer buys the dedicated
+route.
+
+Not implemented: the report's 专属对接人 is a named person, and
+`EnterpriseAccount` has no owner field, so the handoff can name the *account*
+but not route to a named individual. Adding that field is a schema decision
+about where the owner of record lives.
+
 ## Evidence policy
 
 - Retrieval runs only after tenant and ACL filters are constructed.

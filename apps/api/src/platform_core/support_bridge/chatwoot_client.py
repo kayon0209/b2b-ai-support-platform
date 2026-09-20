@@ -18,6 +18,23 @@ import httpx
 from platform_core.config import get_settings
 
 
+def _contact_id_from_message(message: dict[str, Any]) -> str | None:
+    """The contact id a Chatwoot message carries, or None for an agent message.
+
+    Pure and separate from the transport so it can be tested without a server:
+    the shape is the part that can be wrong (a message sent *by* an agent has a
+    sender of type `user`, and binding that id would make the platform treat
+    its own staff as a customer account).
+    """
+    sender = message.get("sender")
+    if not isinstance(sender, dict):
+        return None
+    if sender.get("type") != "contact":
+        return None
+    sender_id = sender.get("id")
+    return str(sender_id) if sender_id is not None else None
+
+
 class ChatwootError(Exception):
     """Base for mapped Chatwoot client errors."""
 
@@ -238,6 +255,30 @@ class ChatwootClient:
             if str(message.get("id")) == str(message_id):
                 content = message.get("content")
                 return content if isinstance(content, str) else None
+        return None
+
+    async def fetch_message_contact_id(
+        self,
+        *,
+        account_id: str,
+        conversation_id: str,
+        message_id: str,
+    ) -> str | None:
+        """The contact who sent this message, read from Chatwoot.
+
+        Needed because the **webhook does not carry it**: measured over every
+        stored `inbox_events` row, `contact_id` is present 0/29 times and
+        `sender_id` 1/29, so `minimize.py`'s contact extraction never fires in
+        this deployment. The conversation's contact is therefore resolved from
+        the message we already fetch rather than from the event.
+
+        Returns only the id - no name, no email - because the binding table is
+        keyed on the id and the platform stores no customer content.
+        """
+        messages = await self.list_messages(account_id=account_id, conversation_id=conversation_id)
+        for message in messages:
+            if str(message.get("id")) == str(message_id):
+                return _contact_id_from_message(message)
         return None
 
     async def list_messages(

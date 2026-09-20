@@ -62,6 +62,7 @@ from platform_core.agent_runtime.qa_path import (
     ABSTAIN_HUMAN_REQUIRED,
     ABSTAIN_OUT_OF_SCOPE,
     ABSTAIN_SENSITIVE_REQUEST,
+    ABSTAIN_STRATEGIC_ACCOUNT_REQUIRES_HUMAN,
     AbstentionDecision,
     DraftAnswer,
     claim_contradiction_candidates,
@@ -74,6 +75,7 @@ from platform_core.agent_runtime.qa_path import (
 from platform_core.audit import service as audit_service
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
+from platform_core.identity.org import ContactAccountFacts
 from platform_core.identity.tenant_context import TenantContext
 
 # Flags are read through the service, never by touching its tables: the
@@ -474,6 +476,18 @@ def _non_answerable_reason(route: str, restricted_query: bool) -> str:
 
 CLARIFICATION_KEEP_LEASE = "clarification"
 
+# The contract tiers whose complaints go to the account team rather than the
+# general queue (research report 难点 5). Plain strings rather than the
+# `AccountTier` enum because AGENTS.md forbids importing another module's
+# models, and `org.account_facts_for_contact` already projects to strings.
+#
+# `contract_status` is checked alongside: a churned or suspended contract no
+# longer buys the dedicated route, which is the same rule
+# `sla_policy_for_tier` applies to the SLA clock - one contract attribute
+# should not mean two different things in two places.
+PRIORITY_TIERS = frozenset({"strategic", "enterprise"})
+ACTIVE_CONTRACT = "active"
+
 
 class AgentOrchestrator:
     """One run = one customer question through the documented pipeline."""
@@ -507,6 +521,7 @@ class AgentOrchestrator:
         history: list[Turn] | None = None,
         context_budget_chars: int | None = None,
         known_facts: list[tuple[str, str]] | None = None,
+        contact_id: str | None = None,
     ) -> RunOutcome:
         """Execute the pipeline for one inbound customer message.
 
@@ -544,6 +559,7 @@ class AgentOrchestrator:
                 history=history,
                 context_budget_chars=context_budget_chars,
                 known_facts=known_facts,
+                contact_id=contact_id,
             )
         except Exception as exc:
             # An unexpected failure still has to be visible in metrics and in
@@ -562,6 +578,30 @@ class AgentOrchestrator:
             run_span.end()
             return outcome
 
+    async def _account_facts(
+        self, *, tenant_id: uuid.UUID, contact_id: str
+    ) -> "ContactAccountFacts | None":
+        """The account this contact is bound to, or None when unbound.
+
+        Goes through `identity.org` rather than querying the table: AGENTS.md
+        forbids importing another module's ORM models, and this is the same
+        narrow-projection seam `cases` already uses for `account_sla_facts`.
+
+        A lookup failure degrades to "unbound" on purpose. The tier only
+        sharpens a handoff that happens anyway, so an unreadable binding must
+        never fail the run - the customer would lose the handoff entirely over
+        an enrichment.
+        """
+        from platform_core.identity import org
+
+        try:
+            return await org.account_facts_for_contact(
+                self._session, tenant_id=tenant_id, external_contact_id=contact_id
+            )
+        except Exception as exc:  # noqa: BLE001 - enrichment, not a dependency
+            logger.warning("account_lookup_failed", error_code=type(exc).__name__)
+            return None
+
     async def _run_pipeline(
         self,
         *,
@@ -579,6 +619,7 @@ class AgentOrchestrator:
         history: list[Turn] | None,
         context_budget_chars: int | None,
         known_facts: list[tuple[str, str]] | None,
+        contact_id: str | None,
     ) -> RunOutcome:
 
         # --- 1. Acquire/observe the control lease. ---
@@ -791,6 +832,19 @@ class AgentOrchestrator:
         # line behind a default-off flag is what left the complaint path
         # answering in the first place.
         if is_complaint_claim(question):
+            reason_code = ABSTAIN_COMPLAINT_REQUIRES_HUMAN
+            account_label = None
+            if contact_id:
+                facts = await self._account_facts(tenant_id=tenant_id, contact_id=contact_id)
+                if facts is not None:
+                    run_span.set_attributes(**{"account.tier": facts.tier})
+                    if facts.tier in PRIORITY_TIERS and facts.contract_status == ACTIVE_CONTRACT:
+                        # 难点 5: a key account's complaint goes to the people
+                        # who own that relationship. The handoff is the same
+                        # act; what changes is who is told and how the queue
+                        # prioritises it, which is what tier is *for*.
+                        reason_code = ABSTAIN_STRATEGIC_ACCOUNT_REQUIRES_HUMAN
+                        account_label = f"account_id={facts.account_id} tier={facts.tier}"
             run_span.set_attributes(**{"route.override": "complaint_requires_human"})
             return await self._finish_abstain(
                 run=run,
@@ -799,7 +853,7 @@ class AgentOrchestrator:
                 expected_lease_version=expected_lease_version,
                 decision=AbstentionDecision(
                     abstain=True,
-                    reason_code=ABSTAIN_COMPLAINT_REQUIRES_HUMAN,
+                    reason_code=reason_code,
                     handoff=True,
                 ),
                 ctx=ctx,
@@ -807,6 +861,7 @@ class AgentOrchestrator:
                 question=question,
                 chatwoot_account_id=chatwoot_account_id,
                 chatwoot_conversation_id=chatwoot_conversation_id,
+                handoff_context=account_label,
             )
 
         needs_ask, ask_reason = needs_clarification(retrieval_query, memory.turns)
@@ -1890,6 +1945,7 @@ class AgentOrchestrator:
         question: str,
         chatwoot_account_id: str | None,
         chatwoot_conversation_id: str | None,
+        handoff_context: str | None = None,
     ) -> RunOutcome:
         """Record abstention, release the lease to the human queue, and send
         the customer-safe notice (still behind the lease gate).
@@ -1956,6 +2012,7 @@ class AgentOrchestrator:
                     ctx=ctx,
                     chatwoot_account_id=chatwoot_account_id,
                     chatwoot_conversation_id=chatwoot_conversation_id,
+                    handoff_context=handoff_context,
                 )
 
         if decision.reason_code == ABSTAIN_CONFLICT:
@@ -2045,6 +2102,7 @@ class AgentOrchestrator:
         ctx: TraceContext,
         chatwoot_account_id: str | None,
         chatwoot_conversation_id: str | None,
+        handoff_context: str | None = None,
     ) -> None:
         """Private note for the receiving agent: reason + evidence refs."""
         if self._deps.sender is None or not chatwoot_account_id or not chatwoot_conversation_id:
@@ -2056,6 +2114,10 @@ class AgentOrchestrator:
             f" | question_hash={getattr(run, 'input_hash', '')}"
             f" | run_id={run.id}"
         )
+        if handoff_context:
+            # Which account, so the note is actionable: "a strategic account
+            # complained" without a name still leaves the agent guessing.
+            note = f"{note} | {handoff_context}"
         try:
             await self._deps.sender.send_message(  # type: ignore[attr-defined]
                 account_id=chatwoot_account_id,

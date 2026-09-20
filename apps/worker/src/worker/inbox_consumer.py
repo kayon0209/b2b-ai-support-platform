@@ -516,6 +516,49 @@ async def _persist_memory(
     )
 
 
+async def _resolve_contact_id(event: ClaimedEvent, deps: OrchestratorDeps) -> str | None:
+    """Who sent this message, for account lookup. None when unknowable.
+
+    The webhook payload is tried first, but it does not carry the contact in
+    this deployment - measured over every stored event: `contact_id` 0/29,
+    `sender_id` 1/29. So the fallback reads it from the message via the
+    Chatwoot API, which is the only place it exists.
+
+    Returning None is normal, not an error: an unbound contact is most
+    contacts, and routing simply proceeds without a tier.
+    """
+    payload_contact = event.minimized_payload.get("contact_id")
+    if payload_contact:
+        return str(payload_contact)
+
+    sender = deps.sender
+    message_id = event.minimized_payload.get("message_id")
+    account_id = event.minimized_payload.get("chatwoot_account_id")
+    conversation_id = event.minimized_payload.get("conversation_id")
+    if not (message_id and account_id and conversation_id):
+        return None
+
+    from platform_core.support_bridge.chatwoot_client import ChatwootClient
+
+    if not isinstance(sender, ChatwootClient):
+        # A test double has no API to ask. Degrading to "no contact" keeps the
+        # run going instead of failing the event on a missing capability.
+        return None
+    try:
+        return await sender.fetch_message_contact_id(
+            account_id=str(account_id),
+            conversation_id=str(conversation_id),
+            message_id=str(message_id),
+        )
+    except Exception as exc:  # noqa: BLE001 - enrichment, not a dependency
+        logger.warning(
+            "contact_resolve_failed",
+            delivery_id=event.delivery_id,
+            error_code=type(exc).__name__,
+        )
+        return None
+
+
 async def process_event(
     session: AsyncSession,
     event: ClaimedEvent,
@@ -595,7 +638,7 @@ async def process_event(
     orchestrator = AgentOrchestrator(session, deps)
     history = await load_history(session, event, deps)
     known_facts: list[tuple[str, str]] = []
-    contact_id_early = event.minimized_payload.get("contact_id")
+    contact_id_early = await _resolve_contact_id(event, deps)
     if contact_id_early:
         known_facts = await conversation_store.load_facts(
             session,
@@ -614,6 +657,7 @@ async def process_event(
         chatwoot_conversation_id=str(event.minimized_payload.get("conversation_id") or ""),
         history=history,
         known_facts=known_facts,
+        contact_id=str(contact_id_early) if contact_id_early else None,
     )
     await _persist_memory(session, event=event, question=question, outcome=outcome)
 
