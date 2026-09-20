@@ -17,7 +17,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from platform_core.agent_runtime.intent import classify
 from platform_core.agent_runtime.qa_path import (
+    ABSTAIN_NO_EVIDENCE,
     DraftAnswer,
     claim_contradiction_candidates,
     decide_abstention,
@@ -45,7 +47,20 @@ class EvalCase:
     question: str
     role: str = "support_agent"
     principal_groups: tuple[str, ...] = ()
-    expected_route: str = "knowledge_qa"
+    # The routing class `intent.classify` must produce for this question, or
+    # empty for "no expectation declared".
+    #
+    # Empty is the default because the alternative was actively misleading: it
+    # used to default to `"knowledge_qa"`, which nothing read, so every case
+    # that never set it claimed to expect the knowledge path while seven of
+    # them in fact route to `sensitive`, `human_required`, `business_read` or
+    # `business_write`. Anyone auditing the dataset would have concluded the
+    # classifier was badly broken. A declared route is now asserted by
+    # `EvalRunner.run_case`, which is what makes this a taxonomy guard rather
+    # than a comment - and it is the guard that has to exist before a verb can
+    # be added to `ACTION_VERBS`, because the failure mode of that change is
+    # a question moving to a route nobody intended.
+    expected_route: str = ""
     # claims that MUST appear in the answer (substring match on canonical text)
     required_claims: tuple[str, ...] = ()
     # claims that must NOT appear
@@ -53,6 +68,15 @@ class EvalCase:
     must_abstain: bool = False
     restricted_query: bool = False
     expected_handoff: bool = False
+    # The corpus exists in one language and this question is asked in another
+    # (ADR 0009). Set only on cases that are answerable in principle but whose
+    # evidence the retriever cannot reach *because of the language gap*. It
+    # buys exactly one thing: an abstention caused by `NO_AUTHORIZED_EVIDENCE`
+    # on this case is counted in `cross_lingual_unreachable` instead of in the
+    # `abstention_correct_rate` denominator. It does NOT excuse the case from
+    # `passed`/`failed`, from `expected_route`, or from any other gate, and
+    # `cross_lingual_unreachable` is itself asserted, so the gap stays visible.
+    cross_lingual: bool = False
     allowed_tools: tuple[str, ...] = ()
     # Corpus keys this question SHOULD retrieve (iteration plan 4.1). Empty
     # for abstention/adversarial cases - the gate must not credit a retrieval
@@ -93,6 +117,11 @@ class CaseResult:
     # ignored it".
     attribution: str = ""
     recall_at_k: float | None = None
+    # ADR 0009. Defaults to True, i.e. fail-closed: an abstention counts
+    # against the rate unless this case *and* its reason code both say the
+    # cause was the language gap. Reversed, every new case would silently
+    # exempt itself, which is the failure this field is most likely to cause.
+    abstention_attributable: bool = True
     retrieved_keys: list[str] = field(default_factory=list)
 
 
@@ -111,6 +140,21 @@ class EvalReport:
     # Sum over cases of `contradicted_claims`. Reported, never gated.
     contradiction_candidates: int = 0
     unsafe_action_attempts: int = 0
+    # ADR 0009: abstentions excluded from `abstention_correct_rate` because the
+    # only cause was the language gap between question and corpus. Counted, not
+    # forgotten - `gates.py` asserts this equals the number of declared
+    # `cross_lingual` cases, so a gap can never be excluded *and* unreported.
+    cross_lingual_unreachable: int = 0
+    # How many cases *declared* `cross_lingual`. Reported for visibility: a
+    # `must_abstain` cross-lingual case is declared but never excluded (its
+    # abstention is already correct), so this number is legitimately larger
+    # than `cross_lingual_unreachable`.
+    declared_cross_lingual: int = 0
+    # Declarations the exemption could actually apply to - answerable cases
+    # that declared `cross_lingual`. This is what `gates.py` compares against
+    # `cross_lingual_unreachable`, because comparing against every declaration
+    # would fail a correct run that merely contains a must_abstain one.
+    exemptible_cross_lingual: int = 0
     results: list[CaseResult] = field(default_factory=list)
 
     @property
@@ -132,6 +176,13 @@ class EvalReport:
 
     @property
     def abstention_correct_rate(self) -> float:
+        """Correct abstention decisions, over the cases the rate applies to.
+
+        `n == 0` returns 1.0 because there would be nothing to be wrong about.
+        That is only defensible while `cross_lingual_unreachable` cannot grow
+        to swallow the whole dataset - `gates.py` asserts it stays a strict
+        minority, so this branch cannot be used to buy a perfect score.
+        """
         n = self.abstention_correct + self.abstention_false
         return self.abstention_correct / n if n else 1.0
 
@@ -164,6 +215,10 @@ class EvaluationRunner:
 
     async def run_case(self, case: EvalCase) -> CaseResult:
         started = time.monotonic()
+        # Classified first and recorded on the result regardless: `CaseResult.route`
+        # was a field nothing ever wrote, so a report could not say which route a
+        # case had taken - the one fact needed to explain a routing regression.
+        route = classify(case.question).route.value
         scope = PrincipalScope(
             principal_types=("role", "department"),
             principal_ids=(case.role, *case.principal_groups),
@@ -180,8 +235,43 @@ class EvaluationRunner:
             passed=True,
             abstained=decision.abstain,
             handoff=decision.handoff,
+            route=route,
             reason_codes=[decision.reason_code] if decision.reason_code else [],
         )
+
+        if (
+            decision.abstain
+            and not case.must_abstain
+            and case.cross_lingual
+            and decision.reason_code == ABSTAIN_NO_EVIDENCE
+        ):
+            # ADR 0009. Every clause is load-bearing:
+            #
+            # - `not case.must_abstain`: this case was expected to abstain, so
+            #   its abstention is already a *correct* one. Exempting it would
+            #   quietly delete a passing case from the denominator, which can
+            #   only ever help the score - the exemption exists to stop a
+            #   language gap from being punished, not to stop correct behaviour
+            #   from being counted.
+            # - `case.cross_lingual`: the declaration alone does not prove the
+            #   cause, so it is never consulted on its own.
+            # - `reason_code == ABSTAIN_NO_EVIDENCE`: nothing came back at all.
+            #   `ABSTAIN_LOW_RELEVANCE` deliberately does NOT qualify - evidence
+            #   was retrieved and scored too low, which is a retriever-tuning
+            #   problem rather than a language gap, and exempting it would hide
+            #   the more actionable of the two.
+            result.abstention_attributable = False
+
+        if case.expected_route and route != case.expected_route:
+            # Asserted, not reported. A declared route is a statement about the
+            # taxonomy, and the taxonomy is what decides whether a question is
+            # answered, handed off, or sent to the write gateway - so a case
+            # that silently changes route is the regression this field exists
+            # to catch. Empty means the case declares nothing, which is honest
+            # and is why the default is empty rather than `knowledge_qa`.
+            result.passed = False
+            result.reason_codes.append("ROUTE_MISMATCH")
+            return result
 
         if case.must_abstain:
             result.passed = decision.abstain
@@ -258,12 +348,28 @@ class EvaluationRunner:
             abstention_correct=sum(
                 1
                 for r, c in zip(results, cases, strict=False)
-                if (c.must_abstain and r.abstained) or (not c.must_abstain and not r.abstained)
+                if r.abstention_attributable
+                and (
+                    (c.must_abstain and r.abstained)
+                    or (not c.must_abstain and not r.abstained)
+                )
             ),
             abstention_false=sum(
                 1
                 for r, c in zip(results, cases, strict=False)
-                if (c.must_abstain and not r.abstained) or (not c.must_abstain and r.abstained)
+                if r.abstention_attributable
+                and (
+                    (c.must_abstain and not r.abstained)
+                    or (not c.must_abstain and r.abstained)
+                )
+            ),
+            cross_lingual_unreachable=sum(1 for r in results if not r.abstention_attributable),
+            # Counted from the cases, not the results, so the gate comparing
+            # the two is comparing an intention against an outcome rather than
+            # a number against itself.
+            declared_cross_lingual=sum(1 for c in cases if c.cross_lingual),
+            exemptible_cross_lingual=sum(
+                1 for c in cases if c.cross_lingual and not c.must_abstain
             ),
             citation_violations=sum(1 for r in results if not r.citation_ok),
             forbidden_claim_hits=sum(1 for r in results if r.forbidden_hit),

@@ -68,6 +68,21 @@ def _report_from_artifact(path: str) -> EvalReport | None:
         citation_violations=int(raw.get("citation_violations", 0)),
         forbidden_claim_hits=int(raw.get("forbidden_claim_hits", 0)),
         contradiction_candidates=int(raw.get("contradiction_candidates", 0)),
+        # ADR 0009. These three are NOT defaulted like the others, and the
+        # difference matters. `raw.get(field, 0)` made an artifact that predates
+        # the field indistinguishable from one where the count really was zero -
+        # so `cross_lingual_exclusions_match` compared `0 == 0` and passed
+        # without having measured anything. Measured on the pre-ADR artifact
+        # still on disk: `observed=0 threshold=0`, gate green. That is exactly
+        # the "exemption with no live consumer" failure ADR 0009 exists to
+        # prevent, reproduced inside the gate meant to prevent it.
+        #
+        # `-1` is the sentinel for "the artifact does not carry this field", and
+        # `gates.py` refuses to pass the match gate on it. An artifact that
+        # predates ADR 0009 must be regenerated, not silently accepted.
+        cross_lingual_unreachable=int(raw.get("cross_lingual_unreachable", -1)),
+        declared_cross_lingual=int(raw.get("declared_cross_lingual", -1)),
+        exemptible_cross_lingual=int(raw.get("exemptible_cross_lingual", -1)),
     )
 
 
