@@ -1213,16 +1213,22 @@ class AgentOrchestrator:
                 chatwoot_account_id=chatwoot_account_id,
                 chatwoot_conversation_id=chatwoot_conversation_id,
             )
-        # Red-line guard (huqiu research difficulty 4, flag off by default):
+        # Red-line guard (华秋 research difficulty 4; feature list 6.1/6.2):
         # a draft that commits the company to a price, a delivery date, a
         # liability or a compensation amount is a commercial promise no one
-        # authorised. Deterministic scan, so it is auditable; the flag lets
-        # precision be measured before it ever blocks a send.
-        if (
-            validation.ok
-            and redline_violations(draft.text)
-            and await self._flag_enabled(self._settings().flag_redline_guard, tenant_id)
-        ):
+        # authorised. Deterministic scan, so it is auditable.
+        #
+        # **No longer flag-gated.** It was, and that was the defect: a control
+        # behind a default-off flag protects only the tenants that remember to
+        # switch it on, and the requirement is a hard one - AI 不定价 is a risk
+        # control, not an opt-in enrichment. The scan is deliberately narrow
+        # (a commitment verb *and* a commercial object in the same sentence),
+        # so it fires on "我们保证交期 7 天" and not on "交期以报价单为准".
+        #
+        # The detections are still counted as candidates by
+        # `qa_path.redline_violations`, which only reports - this is what
+        # blocks the send.
+        if validation.ok and redline_violations(draft.text):
             return await self._finish_abstain(
                 run=run,
                 tenant_id=tenant_id,

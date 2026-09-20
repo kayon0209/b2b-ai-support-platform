@@ -186,7 +186,10 @@ _REDLINE_COMMITMENT = re.compile(
 )
 _REDLINE_OBJECT = re.compile(
     r"价格|报价|交期|交付日期|发货时间|赔偿|赔付|退款金额|折扣|库存数量|"
-    r"合同条款|price|pricing|lead time|delivery date|ship date|"
+    # `delivery` on its own, not only `delivery date`: "we guarantee delivery
+    # by Friday" commits the company just as much as naming a date, and a test
+    # caught the literal-only pattern letting it through.
+    r"合同条款|price|pricing|lead time|delivery|ship date|"
     r"compensation|refund amount|discount",
     re.IGNORECASE,
 )
