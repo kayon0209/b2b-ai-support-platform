@@ -2109,6 +2109,17 @@ class AgentOrchestrator:
         run.latency_ms = int((time.monotonic() - started) * 1000)
         await self._session.flush()
 
+        # 4B: a pricing question is priced by the rule table or by a person,
+        # never by the model. When the table can price it, the band goes to
+        # the agent who will quote - the customer still hears from a human, so
+        # nothing here weakens the AI-never-prices rule.
+        if decision.handoff and run.route == Route.HUMAN_REQUIRED.value:
+            from platform_core.pricing.service import quote_label
+
+            band = quote_label(question)
+            if band is not None:
+                handoff_context = f"{handoff_context} | {band}" if handoff_context else band
+
         notice = safe_abstention_text(decision.reason_code)
         # 7.5: never promise a person who is not there. The reason code still
         # says why the run stopped - that is for the receiving agent and the
