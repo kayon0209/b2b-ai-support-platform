@@ -313,7 +313,7 @@ async def case_workbench(request: Request, case_id: str) -> Any:
         ).all()
 
         tier: str | None = None
-        contacts: list[str] = []
+        contacts: list[dict[str, str | None]] = []
         if case.enterprise_account_id is not None:
             # Through the identity seam, not by importing its models.
             from platform_core.identity import org
@@ -328,9 +328,13 @@ async def case_workbench(request: Request, case_id: str) -> Any:
             # binding already says they are the same account; showing them is
             # what stops an agent treating the email from last week and the
             # WeChat message from this morning as two different customers.
-            contacts = await org.list_contacts(
+            bindings = await org.list_contacts(
                 session, tenant_id=ctx.tenant_id, account_id=case.enterprise_account_id
             )
+            contacts = [
+                {"external_contact_id": b.external_contact_id, "channel": b.channel}
+                for b in bindings
+            ]
 
     return ok_response(
         {

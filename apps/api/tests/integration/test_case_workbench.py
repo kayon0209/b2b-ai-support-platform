@@ -120,9 +120,22 @@ def _clear() -> None:
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
         for tenant in (TENANT, OTHER_TENANT):
+            # Bindings before parents, and before any re-seed: they are unique
+            # per (tenant, contact), so a row left behind makes the next run's
+            # ON CONFLICT DO NOTHING a no-op that silently keeps stale values.
+            conn.execute(
+                text("DELETE FROM enterprise_account_contacts WHERE tenant_id = :t"),
+                {"t": tenant},
+            )
             conn.execute(text("DELETE FROM conversation_turns WHERE tenant_id = :t"), {"t": tenant})
             conn.execute(text("DELETE FROM case_conversations WHERE tenant_id = :t"), {"t": tenant})
             conn.execute(text("DELETE FROM cases WHERE tenant_id = :t"), {"t": tenant})
+            # Accounts last: `cases.enterprise_account_id` is a composite FK to
+            # them, so deleting the account while a case still points at it is
+            # a violation rather than a cascade.
+            conn.execute(
+                text("DELETE FROM enterprise_accounts WHERE tenant_id = :t"), {"t": tenant}
+            )
         for slug in (SLUG, OTHER_SLUG):
             conn.execute(text("DELETE FROM tenants WHERE slug = :slug"), {"slug": slug})
     admin.dispose()
@@ -205,14 +218,14 @@ def test_the_bundle_lists_the_accounts_other_contacts() -> None:
             sa.text("UPDATE cases SET enterprise_account_id = :a WHERE id = :c AND tenant_id = :t"),
             {"a": account_id, "c": CASE_A, "t": TENANT},
         )
-        for contact in ("email-contact", "wechat-contact"):
+        for contact, channel in (("email-contact", "email"), ("wechat-contact", "wechat")):
             conn.execute(
                 sa.text(
                     "INSERT INTO enterprise_account_contacts (id, tenant_id, "
-                    "enterprise_account_id, external_contact_id, created_at) VALUES "
-                    "(gen_random_uuid(), :t, :a, :c, 0) ON CONFLICT DO NOTHING"
+                    "enterprise_account_id, external_contact_id, channel, created_at) "
+                    "VALUES (gen_random_uuid(), :t, :a, :c, :ch, 0) ON CONFLICT DO NOTHING"
                 ),
-                {"t": TENANT, "a": account_id, "c": contact},
+                {"t": TENANT, "a": account_id, "c": contact, "ch": channel},
             )
     admin.dispose()
 
@@ -222,6 +235,7 @@ def test_the_bundle_lists_the_accounts_other_contacts() -> None:
         .json()
     )
 
-    assert "email-contact" in body["account_contacts"]
-    assert "wechat-contact" in body["account_contacts"]
+    contacts = {c["external_contact_id"]: c["channel"] for c in body["account_contacts"]}
+    assert contacts["email-contact"] == "email"
+    assert contacts["wechat-contact"] == "wechat"
     assert body["account_tier"] == "enterprise"

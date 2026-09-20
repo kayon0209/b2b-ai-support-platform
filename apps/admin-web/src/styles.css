@@ -1676,3 +1676,11 @@ select:focus-visible {
   padding: 0.1rem 0;
   color: var(--muted, #666);
 }
+
+.workbench-contacts {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 0.35rem;
+}

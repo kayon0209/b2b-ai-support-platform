@@ -184,6 +184,13 @@ async def account_sla_facts(
     return (str(row[0]), str(row[1]))
 
 
+class ContactBinding(NamedTuple):
+    """One contact bound to an account, with the channel it arrived on."""
+
+    external_contact_id: str
+    channel: str | None
+
+
 class ContactAccountFacts(NamedTuple):
     """What routing is allowed to know about a contact's account.
 
@@ -240,6 +247,7 @@ async def bind_contact(
     account_id: uuid.UUID,
     external_contact_id: str,
     actor_id: str | None = None,
+    channel: str | None = None,
 ) -> uuid.UUID:
     """Bind a Chatwoot contact to one of this tenant's accounts.
 
@@ -259,6 +267,7 @@ async def bind_contact(
         tenant_id=ctx.tenant_id,
         enterprise_account_id=account_id,
         external_contact_id=external_contact_id,
+        channel=channel,
         created_by=actor_id,
         created_at=int(time.time()),
     )
@@ -269,16 +278,26 @@ async def bind_contact(
 
 async def list_contacts(
     session: AsyncSession, *, tenant_id: uuid.UUID, account_id: uuid.UUID
-) -> list[str]:
-    external_ids = (
+) -> list[ContactBinding]:
+    """Every contact bound to this account, with the channel it came in on.
+
+    The channel is part of the answer, not decoration: a list of bare ids
+    leaves a reviewer guessing whether "contact-88231" is an email address or
+    a marketplace handle, which is the difference between recognising a
+    returning customer and not.
+    """
+    rows = (
         await session.execute(
-            select(EnterpriseAccountContact.external_contact_id).where(
+            select(
+                EnterpriseAccountContact.external_contact_id,
+                EnterpriseAccountContact.channel,
+            ).where(
                 EnterpriseAccountContact.tenant_id == tenant_id,
                 EnterpriseAccountContact.enterprise_account_id == account_id,
             )
         )
-    ).scalars()
-    return list(external_ids)
+    ).all()
+    return [ContactBinding(external_contact_id=r[0], channel=r[1]) for r in rows]
 
 
 async def unbind_contact(

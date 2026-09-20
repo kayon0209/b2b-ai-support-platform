@@ -301,6 +301,10 @@ class EnterpriseAccountContact(Base, PkMixin, TenantMixin):
 
     enterprise_account_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     external_contact_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Which door this contact came in through (web|email|wechat|phone|...).
+    # Nullable on purpose: a CRM sync often cannot name one, and a guessed
+    # channel is worse than a blank - it would be believed.
+    channel: Mapped[str | None] = mapped_column(String(31), nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
 

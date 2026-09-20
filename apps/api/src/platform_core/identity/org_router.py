@@ -110,6 +110,9 @@ class ContactIn(BaseModel):
     """
 
     external_contact_id: str = Field(min_length=1, max_length=255)
+    # Optional: a CRM sync often cannot name the channel, and a blank is more
+    # honest than a guess that would then be believed.
+    channel: str | None = Field(default=None, max_length=31)
 
 
 class AccountPatchIn(BaseModel):
@@ -238,7 +241,18 @@ async def list_account_contacts(request: Request, account_id: uuid.UUID) -> Any:
     trace_id = new_trace_id()
     async with tenant_session(ctx) as session:
         contacts = await org.list_contacts(session, tenant_id=ctx.tenant_id, account_id=account_id)
-    return ok_response({"contacts": contacts}, trace_id=trace_id)
+    # Serialised explicitly: a NamedTuple would otherwise go over the wire as
+    # a bare two-element array, and a client reading `contacts[0]["channel"]`
+    # would silently get nothing.
+    return ok_response(
+        {
+            "contacts": [
+                {"external_contact_id": b.external_contact_id, "channel": b.channel}
+                for b in contacts
+            ]
+        },
+        trace_id=trace_id,
+    )
 
 
 @router.post("/accounts/{account_id}/contacts")
@@ -267,6 +281,7 @@ async def bind_account_contact(request: Request, account_id: uuid.UUID, body: Co
                 ctx=ctx,
                 account_id=account_id,
                 external_contact_id=body.external_contact_id,
+                channel=body.channel,
                 actor_id=str(ctx.actor_id) if ctx.actor_id else None,
             )
         except org.OrgError as exc:

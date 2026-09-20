@@ -32,6 +32,9 @@ interface Suggestion {
 interface Workbench {
   case: CaseSummary;
   account_tier: string | null;
+  /** Every contact bound to this account (2.1): one company, one contact per
+   * channel. Without this the same customer looks like several strangers. */
+  account_contacts: Array<{ external_contact_id: string; channel: string | null }>;
   conversation: Turn[];
   ai_suggestion: Suggestion | null;
   related_cases: { basis: string; items: CaseSummary[] };
@@ -110,6 +113,17 @@ export function Workbench() {
                 </p>
                 {bundle.data.account_tier ? (
                   <Badge tone="warn">{bundle.data.account_tier}</Badge>
+                ) : null}
+                {bundle.data.account_contacts.length > 0 ? (
+                  <div className="workbench-contacts">
+                    <span className="muted">{t("workbench.contacts")}:</span>
+                    {bundle.data.account_contacts.map((c) => (
+                      <Badge key={c.external_contact_id} tone="neutral">
+                        {c.channel ? `${c.channel}: ` : ""}
+                        {c.external_contact_id}
+                      </Badge>
+                    ))}
+                  </div>
                 ) : null}
               </Card>
 

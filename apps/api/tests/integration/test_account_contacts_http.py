@@ -126,12 +126,16 @@ def _url() -> str:
 def test_an_owner_can_bind_list_and_unbind() -> None:
     owner = _client(TENANT, "tenant_owner")
 
-    bound = owner.post(_url(), json={"external_contact_id": CONTACT}, headers=_headers())
+    bound = owner.post(
+        _url(),
+        json={"external_contact_id": CONTACT, "channel": "wechat"},
+        headers=_headers(),
+    )
     assert bound.status_code == 200, bound.text[:300]
 
     listed = owner.get(_url(), headers=_headers())
     assert listed.status_code == 200
-    assert listed.json()["contacts"] == [CONTACT]
+    assert listed.json()["contacts"] == [{"external_contact_id": CONTACT, "channel": "wechat"}]
 
     removed = owner.delete(f"{_url()}/{CONTACT}", headers=_headers())
     assert removed.status_code == 200
