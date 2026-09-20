@@ -73,6 +73,7 @@ from platform_core.agent_runtime.qa_path import (
     safe_abstention_text,
     validate_citations,
 )
+from platform_core.agent_runtime.routing import team_for_scene
 from platform_core.audit import service as audit_service
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
@@ -506,6 +507,7 @@ class AgentOrchestrator:
         self._code_version = code_version
         self._policy_version = policy_version
         self._top_k = deps.top_k
+        self._target_team: str | None = None
 
     async def run(
         self,
@@ -640,6 +642,11 @@ class AgentOrchestrator:
         # would then have to suppress.
         detection = classify(question)
         route = detection.route.value
+        # Which team this conversation belongs to (7.3), decided once where
+        # the scene is known and carried on the handoff. Stored on the run's
+        # orchestrator rather than threaded through every call site: there is
+        # one detection per run and six places that can hand off.
+        self._target_team = team_for_scene(detection.scene)
         run_span.set_attributes(
             route=route,
             intent_scene=detection.scene.value,
@@ -2258,6 +2265,10 @@ class AgentOrchestrator:
             f" | question_hash={getattr(run, 'input_hash', '')}"
             f" | run_id={run.id}"
         )
+        if self._target_team:
+            # Which team, so the note lands somewhere specific instead of in a
+            # queue where whoever reads it first is probably the wrong person.
+            note = f"{note} | team={self._target_team}"
         if handoff_context:
             # Which account, so the note is actionable: "a strategic account
             # complained" without a name still leaves the agent guessing.

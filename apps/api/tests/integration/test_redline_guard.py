@@ -225,3 +225,25 @@ def test_the_same_topic_stated_as_policy_is_allowed_through() -> None:
     # evidence, and the guard could block everything without anyone noticing.
     customer_visible = [c["content"] for c in sent if not c["private"]]
     assert any(POLICY_ONLY in content for content in customer_visible), customer_visible
+
+
+def test_a_handoff_note_names_the_team_it_is_for(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The private note is off by default; this test is about its contents.
+    from platform_core.config import get_settings
+
+    monkeypatch.setenv("APP_HANDOFF_EVIDENCE_ENABLED", "true")
+    get_settings.cache_clear()
+    """7.3: "transfer to a human" is not a destination.
+
+    The private note is what the receiving side reads, so the team has to be
+    on it - otherwise every handoff lands in one queue and whoever picks it
+    up first is probably the wrong person.
+
+    The platform recommends; it does not assign. Claiming an assignee would be
+    reporting an outcome this platform cannot observe.
+    """
+    outcome, sent = _run(_execute(draft_text=COMMITTING))
+
+    assert outcome.abstain_reason == "REDLINE_COMMERCIAL_COMMITMENT"
+    notes = [c["content"] for c in sent if c["private"]]
+    assert any("team=" in note for note in notes), notes
