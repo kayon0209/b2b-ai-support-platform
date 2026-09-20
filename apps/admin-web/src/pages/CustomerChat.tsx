@@ -21,9 +21,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
 import { newIdempotencyKey } from "../lib/idempotency";
+import { DataCard } from "../components/DataCard";
 import { useLang } from "../lib/i18n";
 
-type Role = "customer" | "agent" | "system";
+type Role = "customer" | "agent" | "system" | "tool";
 type SendState = "sending" | "sent" | "failed";
 
 interface Citation {
@@ -220,7 +221,10 @@ export function CustomerChat() {
       setMessages(
         rows.map((t) => ({
           id: `s-${t.at}-${t.role}-${t.text.length}`,
-          role: t.role === "customer" ? "customer" : "agent",
+          // A tool receipt is not the assistant speaking. Labelling it "agent"
+          // would put the platform's voice on raw system data.
+          role:
+            t.role === "customer" ? "customer" : t.role === "tool" ? "tool" : "agent",
           text: t.text,
           at: t.at * 1000,
           state: "sent" as SendState,
@@ -376,6 +380,10 @@ export function CustomerChat() {
               <div key={m.id} className={`cw-row ${m.role}`}>
                 {m.role === "system" ? (
                   <div className="cw-system">{m.text}</div>
+                ) : m.role === "tool" ? (
+                  <div className="cw-bubble cw-tool">
+                    <DataCard text={m.text} />
+                  </div>
                 ) : (
                   <div className="cw-bubble">
                     <div className="cw-who">

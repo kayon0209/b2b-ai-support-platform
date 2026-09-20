@@ -1622,3 +1622,45 @@ select:focus-visible {
   padding-left: 1.1rem;
   font-size: 0.85rem;
 }
+
+/* Tool receipts as cards (4A.3): the customer scans for a stage, so the
+   receipt renders as a dated list of nodes rather than as prose. */
+.cw-tool {
+  border-left: 3px solid var(--accent, #4c6ef5);
+}
+
+.data-card {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.data-card-head {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 0.9rem;
+}
+
+.data-card-nodes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.data-card-nodes li {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: space-between;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid var(--border, #eee);
+  font-size: 0.9rem;
+}
+
+.data-card-nodes li:last-child {
+  border-bottom: none;
+}
+
+.data-card-node-label {
+  font-weight: 600;
+}

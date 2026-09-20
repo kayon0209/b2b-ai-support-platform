@@ -1643,7 +1643,109 @@ class AgentOrchestrator:
             run_id=str(run.id),
             status=str(execution.status),
         )
+        # Publish the receipt to the conversation as a TOOL turn.
+        #
+        # Without this the customer only ever sees the model's prose *about*
+        # their order and never the data itself - the platform queries it,
+        # cites it internally, and then describes it in a sentence. That is
+        # feature list 4A.3 (results as cards, not free text) and 4A.4
+        # (freshness), and neither can exist while the receipt stops here.
+        #
+        # The whole receipt is published, not the 280-char excerpt: the excerpt
+        # exists to bound what reaches the model's context, and a card needs the
+        # fields. It is the tool's *sanitized* output, already redacted by the
+        # gateway before it ever got this far.
+        # `source` is VARCHAR(15), so the tool name cannot go there - it goes
+        # in the payload, which is where the card needs it anyway. Discovered
+        # by a test rather than by reading the model, and it would have been a
+        # run-breaking DataError for the longer tool names.
+        published = _json.dumps(
+            {**output, "tool": chosen.tool_name}, sort_keys=True, ensure_ascii=False, default=str
+        )
+        # Turns are stored through `evaluation.pii.redact_text`, which masks
+        # phone-shaped runs - a 10-digit `fetched_at` becomes `[PHONE]` and the
+        # receipt stops being valid JSON. Found by a test, not by reading the
+        # model. Rather than show the customer a corrupted card, publish only
+        # what survives the round trip; a receipt that cannot be trusted is
+        # worse than no card, and the answer still stands on its own.
+        if not self._survives_redaction(published):
+            logger.warning(
+                "receipt_publish_skipped",
+                ctx,
+                tool_name=chosen.tool_name,
+                reason="redaction_corrupts_payload",
+            )
+            return [receipt]
+        await self._publish_receipt(
+            tenant_id=tenant_id,
+            conversation_ref_id=conversation_ref_id,
+            tool_name=chosen.tool_name,
+            receipt_json=published,
+            ts=int(time.time()),
+        )
         return [receipt]
+
+    @staticmethod
+    def _survives_redaction(payload: str) -> bool:
+        """True when the payload is still valid JSON after PII redaction.
+
+        The turn store redacts on write, so the question is not whether the
+        receipt is well-formed now but whether it will be when read back.
+        Anything the redactor rewrites inside a value turns the document into
+        something no parser will accept, and a card built from that would be
+        showing the customer data this platform cannot vouch for.
+        """
+        import json as json_module
+
+        from platform_core.evaluation.pii import redact_text
+
+        try:
+            # `redact_text` returns (text, replacement_count) - taking the
+            # first element matters, and passing the tuple straight to the
+            # parser made every receipt look corrupt.
+            redacted, _count = redact_text(payload)
+            json_module.loads(redacted)
+        except Exception as exc:  # noqa: BLE001 - the check is "is it still JSON"
+            # Logged, not swallowed. This branch is also what a NameError from
+            # the imports above lands in, and an unlogged catch here would make
+            # "no receipts published" look like "no receipts worth publishing".
+            logger.warning("receipt_not_json_after_redaction", error_code=type(exc).__name__)
+            return False
+        return True
+
+    async def _publish_receipt(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        conversation_ref_id: uuid.UUID,
+        tool_name: str,
+        receipt_json: str,
+        ts: int,
+    ) -> None:
+        """Put a tool's result on the timeline where the customer can see it.
+
+        Best-effort on purpose: the answer has already been produced, and a
+        turn-store failure must not turn a completed answer into a failed run.
+        The receipt is evidence the customer is owed, not a dependency of
+        answering.
+        """
+        try:
+            from platform_core.agent_runtime import conversation_store
+            from platform_core.agent_runtime.conversation import Turn, TurnRole
+
+            await conversation_store.append_turn(
+                self._session,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                turn=Turn(role=TurnRole.TOOL, text=receipt_json, ts=ts),
+                source="tool",
+            )
+        except Exception as exc:  # noqa: BLE001 - presentation, not a dependency
+            logger.warning(
+                "receipt_publish_failed",
+                tool_name=tool_name,
+                error_code=type(exc).__name__,
+            )
 
     async def _pending_eq_confirmation(
         self, *, tenant_id: uuid.UUID, conversation_ref_id: uuid.UUID
