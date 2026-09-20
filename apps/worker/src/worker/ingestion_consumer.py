@@ -772,9 +772,13 @@ async def drain_versions(
     steady 1 failure, with five consecutive runs failing 25/26.
 
     One flake survived, and it took a later investigation to identify it. It
-    is **not** a defect in this loop: the database has a live outbox/ingestion
-    consumer that claims rows concurrently with the test process. Symptoms
-    that now fit one cause:
+    is **not** a defect in this loop: a live outbox/ingestion consumer was
+    claiming rows concurrently with the test process. It turned out to be
+    **four orphan `worker.runner` host processes** left by earlier agent
+    sessions, running ~30 hours - not a container and not a shell, which is
+    why a day of looking at `docker ps` found nothing. Stopping them turned
+    this file's 1-failed/25-passed into 26 passed. Symptoms that fit that one
+    cause:
 
     - a failing test differs every run (`test_drain_versions_narrows_the_claim
       _it_issues` twice, then `test_chunks_carry_section_paths_and_ordinals`,
@@ -794,10 +798,11 @@ async def drain_versions(
     binding, so a concurrent consumer competes with a narrowed claim for the
     same row; which one wins is timing, which is why the failing test moves.
 
-    **What to do**: find and stop the external consumer before treating any
-    failure here as a code defect. The evidence chain and the search commands
-    are in `docs/acceptance/08-live-outbox-consumer.md`, and the three checks
-    that reproduce it fastest are:
+    **What to do if it comes back**: stop the consumer before treating any
+    failure here as a code defect. Orphan workers recur - the shell that
+    starts one can exit while the process keeps running - so the full chain,
+    the re-detection command and the false trails are in
+    `docs/acceptance/08-live-outbox-consumer.md`. The three fastest checks:
 
         1. `pytest apps/api/tests/integration/test_outbox_relay.py -rs`
            - the suite's own `_assert_no_live_relay` guard skips itself and
