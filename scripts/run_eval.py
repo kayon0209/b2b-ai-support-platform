@@ -42,6 +42,7 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 # The e2e MinIO container, unless the environment already names a bucket.
 os.environ.setdefault("APP_OBJECT_STORAGE_ENDPOINT", "localhost:19000")
@@ -177,6 +178,33 @@ async def _seed(platform, app, *, slug: str) -> tuple[uuid.UUID, uuid.UUID, uuid
     return tenant_id, open_space, closed_space
 
 
+async def _not_ready(app: Any, tenant_id: uuid.UUID, by_id: dict[uuid.UUID, str]) -> set[str]:
+    """Corpus keys whose version did not reach `ingestion_status = 'ready'`.
+
+    Reads the caller's own version ids under an explicit tenant binding. The
+    binding is not optional: `document_versions` is FORCE-RLS'd, so an unbound
+    SELECT returns zero rows and reports success - which would make this check
+    silently always pass, the exact failure mode it exists to catch.
+    """
+    async with app() as s:
+        await apply_rls_tenant(s, _ctx(tenant_id))
+        rows = (
+            (
+                await s.execute(
+                    text(
+                        "SELECT id, ingestion_status FROM document_versions "
+                        "WHERE id = ANY(CAST(:ids AS uuid[]))"
+                    ),
+                    {"ids": list(by_id)},
+                )
+            )
+            .mappings()
+            .all()
+        )
+    seen = {r["id"] for r in rows if r["ingestion_status"] == "ready"}
+    return {key for vid, key in by_id.items() if vid not in seen}
+
+
 async def _ingest_corpus(
     app, *, tenant_id: uuid.UUID, open_space: uuid.UUID, closed_space: uuid.UUID, embedder
 ) -> dict[str, uuid.UUID]:
@@ -206,40 +234,65 @@ async def _ingest_corpus(
             versions[entry.version_key] = created.version_id
         print(f"  uploaded {entry.version_key} ({entry.availability})", flush=True)
 
-    # One worker pass per document, so a failure names the document it came
-    # from instead of a batch statistic.
+    # Ingest exactly the versions this run uploaded, claiming repeatedly until
+    # each one has left the queue.
     #
-    # The assertion is on *this* version's row, not on `stats.ready == 1`:
-    # `claim_ingestion_versions` has no tenant filter (one bulk worker serves
-    # every tenant, which is correct), so a claimable row left anywhere else in
-    # the database joins the batch and a count-based assertion measures the
-    # wrong thing.
-    from worker.ingestion_consumer import drain_ingestion_once
+    # Why not "one drain per document, and assert on that document's row".
+    # `claim_ingestion_versions` is a global FIFO: it has no tenant filter (one
+    # bulk worker serves every tenant, which is correct) and it takes the
+    # *oldest* N claimable rows anywhere. With `batch` below the queue depth,
+    # the rows past the batch never get a turn, and the loop re-claims from the
+    # same head every round. Measured on a live queue: 13 claimable rows,
+    # `claim(10)` returned 9, and the oldest row was absent - the signature of
+    # `FOR UPDATE SKIP LOCKED` skipping a row another transaction holds.
+    #
+    # The failure it produced was
+    #
+    #     RuntimeError: ingesting refund-policy-v3 left ingestion_status='uploaded'
+    #                    (stats=IngestStats(claimed=8, ready=8, ...))
+    #
+    # for a document that was uploaded, stored, and perfectly ingestable. Note
+    # the shape: `ready=8` is a *batch* summary and says nothing about the row
+    # asked about. The fix is to ask for the right rows instead of hoping the
+    # FIFO reaches them - see `drain_versions` and migration 0039.
+    #
+    # A failure still names the document it came from: `drain_versions` reports
+    # the ids that never settled, so this mapping keeps the readable key.
+    from worker.ingestion_consumer import drain_versions
 
-    for key, version_id in versions.items():
-        async with app() as s:
-            stats = await drain_ingestion_once(s, embedder=embedder, batch=10)
+    by_id = {version_id: key for key, version_id in versions.items()}
+    async with app() as s:
+        try:
+            stats = await drain_versions(s, list(versions.values()), embedder=embedder)
             await s.commit()
-        async with app() as s:
-            await apply_rls_tenant(s, _ctx(tenant_id))
-            row = (
-                (
-                    await s.execute(
-                        text(
-                            "SELECT ingestion_status, status FROM document_versions WHERE id = :v"
-                        ),
-                        {"v": version_id},
-                    )
-                )
-                .mappings()
-                .one()
-            )
-        if row["ingestion_status"] != "ready":
+        except Exception as exc:
+            # Re-read the rows to name the specific documents that did not
+            # settle. `drain_versions` deliberately does not carry the ids in
+            # its exception message beyond a repr, and a reader of this error
+            # wants the corpus *keys* - `refund-policy-v3` is actionable,
+            # `UUID('9a47...')` is not.
+            await s.rollback()
+            stuck = await _not_ready(app, tenant_id, by_id)
             raise RuntimeError(
-                f"ingesting {key} left ingestion_status={row['ingestion_status']!r} "
-                f"(status={row['status']!r}, stats={stats}); every corpus entry must "
-                "be indexed or the run measures nothing"
-            )
+                f"ingesting {sorted(stuck)} left ingestion_status != 'ready'; every "
+                f"corpus entry must be indexed or the run measures nothing ({exc})"
+            ) from exc
+    print(
+        f"  ingested {len(versions)} entries "
+        f"(claimed={stats.claimed}, ready={stats.ready}, deferred={stats.deferred})",
+        flush=True,
+    )
+
+    # Post-condition, checked on the caller's own rows rather than on the batch
+    # statistics: `ready == 13` in a summary cannot tell you that *your*
+    # thirteen are indexed, and the whole point of this script is that the
+    # corpus it is about to query is the corpus it uploaded.
+    not_ready = await _not_ready(app, tenant_id, by_id)
+    if not_ready:
+        raise RuntimeError(
+            f"expected {len(versions)} ready versions, these did not reach ready: "
+            f"{sorted(not_ready)}"
+        )
 
     # `expired` is applied after ingestion because the worker marks a
     # successfully ingested version `active`. Setting it before would be
@@ -333,6 +386,14 @@ def _write_report(
         "failed": report.failed,
         "abstention_correct": report.abstention_correct,
         "abstention_false": report.abstention_false,
+        # ADR 0009: abstentions excluded from the rate above because the
+        # question and the corpus were in different languages, plus how many
+        # cases declared themselves cross-lingual. Both are persisted because
+        # `release_check` compares them - if either is dropped here it reads
+        # back as 0 and the comparison would pass without meaning anything.
+        "cross_lingual_unreachable": report.cross_lingual_unreachable,
+        "declared_cross_lingual": report.declared_cross_lingual,
+        "exemptible_cross_lingual": report.exemptible_cross_lingual,
         "citation_violations": report.citation_violations,
         "forbidden_claim_hits": report.forbidden_claim_hits,
         # ADR 0005: reported, never gated. A claim that negates a term its

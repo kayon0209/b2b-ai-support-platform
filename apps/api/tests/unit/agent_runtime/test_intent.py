@@ -158,6 +158,77 @@ def test_a_policy_question_is_not_a_live_data_query() -> None:
     assert detection.route is Route.KNOWLEDGE_QA
 
 
+# --- Raising an issue is a write, asking how to is not ---------------------
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Please create a ticket for this defect.",
+        "Create a ticket for this bug.",
+        "I want to report a bug in the rev C board.",
+        "Can you raise an issue for this defect?",
+        "Please file a ticket about the silkscreen overlap.",
+    ],
+)
+def test_raising_an_issue_routes_to_the_write_path(question: str) -> None:
+    """The write path's ticket tools were reachable only through "escalate".
+
+    A customer asking in the words they actually use - create, report, raise,
+    file - was routed to the knowledge path, which refuses action requests, so
+    the propose-and-confirm flow never ran at all.
+    """
+    detection = classify(question)
+    assert detection.route is Route.BUSINESS_WRITE, detection.route
+    assert detection.action is IntentAction.PROPOSE_WRITE
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # The shape that makes "create" risky: a procedure question. The
+        # interrogative opener is what keeps it on the knowledge path, and
+        # these cases exist so that guard is tested rather than asserted.
+        #
+        # Not "How do I create an API key?": that one is refused as a
+        # *sensitive* request, because "api key" is in RESTRICTED_TERMS. It is
+        # a real over-refusal of a legitimate procedure question, and it is a
+        # separate decision from this one - loosening the credential terms is a
+        # safety change, so it is left alone and recorded rather than folded
+        # into a taxonomy fix.
+        "How do I create a new workspace?",
+        "What is the process to file a claim for a damaged board?",
+        # A wh-word directly in front of the request frame asks *where*, not
+        # for the action. This was a live false positive: "report" was not a
+        # write verb when `_has_request_frame` was written, so the shape only
+        # appeared once the verb was added.
+        "Where can I report a bug in the dashboard?",
+        "When can I change the delivery address?",
+        "How do I raise a request for a higher quota?",
+    ],
+)
+def test_a_procedure_question_stays_on_the_knowledge_path(question: str) -> None:
+    """Asking *how* to raise an issue is a knowledge question.
+
+    Firing here would hand a perfectly good question to a human, which is the
+    more expensive of the two mistakes - so the guard is the opener, and the
+    verbs added for the write path must not defeat it.
+    """
+    assert classify(question).route is Route.KNOWLEDGE_QA
+
+
+def test_a_request_frame_in_a_later_clause_is_still_a_request() -> None:
+    """The adjacency guard must not swallow the case the frame exists for.
+
+    `_has_request_frame` was written for this sentence: the wh-opener is real,
+    but the request lives in the second clause. Rejecting wh-openers outright
+    would have fixed the false positive by breaking the true positive.
+    """
+    detection = classify("Where is my order, and can I change the delivery address?")
+    assert detection.primary_kind is IntentKind.BUSINESS_ACTION
+    assert detection.route is Route.BUSINESS_WRITE
+
+
 # --- Social and out-of-scope ----------------------------------------------
 
 
@@ -209,3 +280,141 @@ def test_classify_route_matches_the_detection_route() -> None:
     caller using the other."""
     question = "How do I rotate my API key?"
     assert classify_route(question) == classify(question).route.value
+
+
+def test_the_two_route_enums_have_not_drifted_apart() -> None:
+    """`Route` is declared twice, and both declarations are live.
+
+    `agent_runtime.intent` declares it for the classifier; `agent_runtime.models`
+    declares it for the persisted `AgentRun.route` column. The orchestrator
+    imports from both modules, so both are in the same code path.
+
+    They agree today, and nothing made them agree - they were written out
+    separately and happen to match. A class added to one and not the other would
+    be a routing decision the storage layer does not know about, or the reverse,
+    and it would be discovered by reading rather than by a test.
+
+    Asserted rather than merged because the two modules carry very different
+    weights: `models` pulls in SQLAlchemy and the ORM base, `intent` pulls in the
+    taxonomy regexes, and neither import direction is obviously the right one.
+    """
+    from platform_core.agent_runtime.intent import Route as ClassifierRoute
+    from platform_core.agent_runtime.models import Route as StoredRoute
+
+    classifier = {r.value for r in ClassifierRoute}
+    stored = {r.value for r in StoredRoute}
+
+    assert classifier == stored, (
+        "the two Route enums disagree: "
+        f"classifier-only={sorted(classifier - stored)} "
+        f"stored-only={sorted(stored - classifier)}"
+    )
+
+
+# --- Chinese action detection ----------------------------------------------
+#
+# Measured before it was written: `docs/research/chinese-intent-measurement.md`
+# recorded that all 14 Chinese utterances tested landed on `knowledge_qa`,
+# including "我要退款" and "我要投诉", while their English equivalents routed
+# correctly. The classifier's vocabularies are latin-only (`_QUOTE_REQUEST` is
+# the single exception), so this is a vocabulary gap rather than an
+# architecture one.
+#
+# Two design constraints shape these assertions:
+#
+# 1. **The object requirement carries over from English.** `退款` is both a
+#    verb ("我要退款") and a topic ("退款多久到账？"), and Chinese has no word
+#    boundaries, so a regex can only substring-match. The request *frame* is
+#    what separates them, exactly as `_OBJECT_MARKERS` does for English.
+# 2. **The question guard is load-bearing.** The cases below marked "guard"
+#    were added because **mutation testing proved the first set was not
+#    enough**: removing the Chinese question guard left every case green,
+#    because the earlier cases stayed on the knowledge path for incidental
+#    reasons. Those guards each carry a full action frame AND a question shape,
+#    so only the guard can keep them off the write path.
+
+
+def test_chinese_action_requests_reach_the_write_path() -> None:
+    """The core fix. Each of these fell through to `knowledge_qa` before."""
+    for utterance in (
+        "帮我建一张工单",
+        "我要退款",
+        "帮我取消这个订单",
+        "我要投诉质量问题",
+        "麻烦升级给技术",
+        "请把这个订单取消",
+        "帮我改一下收货地址",
+    ):
+        detection = classify(utterance)
+        assert detection.route is Route.BUSINESS_WRITE, (
+            f"{utterance!r} -> {detection.route.value}"
+        )
+        assert detection.action is IntentAction.PROPOSE_WRITE
+
+
+def test_chinese_request_for_a_person_is_honoured() -> None:
+    """`_HUMAN_REQUEST` promises "unconditionally" - for English only, at first.
+
+    Answering a request to reach a person from the corpus overrules a routing
+    decision the customer already made, which is worse than a wrong answer.
+    """
+    for utterance in ("把这张单转给人工", "我需要人工客服"):
+        assert classify(utterance).route is Route.HUMAN_REQUIRED, utterance
+
+
+def test_the_ba_construction_is_detected_on_its_own() -> None:
+    """Object-before-verb, which the frame+verb scan cannot see.
+
+    "把这个订单取消" has no request frame and no ticket or human vocabulary -
+    the `把` pattern is the only thing that can route it. Mutation testing
+    caught that the transfer case above does NOT cover this: it also matches
+    the human-request vocabulary, so deleting the `把` logic left the suite
+    green.
+    """
+    assert classify("把这个订单取消").route is Route.BUSINESS_WRITE
+
+
+def test_the_measure_word_between_verb_and_noun_does_not_break_it() -> None:
+    """Chinese inserts a measure word: "建**一张**工单", not "建工单".
+
+    A verb list would match the latter and miss the way customers write it,
+    which is why the ticket form is a pattern rather than an entry in
+    `_CN_ACTION_VERBS`.
+    """
+    assert classify("帮我建一张工单").route is Route.BUSINESS_WRITE
+    assert classify("开个单子记录一下").route is Route.BUSINESS_WRITE
+
+
+def test_chinese_policy_questions_stay_on_the_knowledge_path() -> None:
+    """The counter-guard, and the half that is easy to lose.
+
+    `退款` / `取消` are exactly the words that appear in both a request and a
+    policy question. Moving these to the write gateway is the failure mode
+    that made `_looks_like_a_write` require an object in English (it sent 8 of
+    23 cases to `business_write` before the requirement was added).
+    """
+    for utterance in (
+        "退款多久到账？",
+        "取消订单的政策是什么？",
+        "质量问题怎么申请赔付？",
+        "怎么申请退款",
+        "如何取消订单",
+    ):
+        assert classify(utterance).route is Route.KNOWLEDGE_QA, utterance
+
+
+def test_chinese_questions_that_carry_a_full_action_frame_are_still_questions() -> None:
+    """The guard cases: frame AND question shape in the same sentence.
+
+    Each of these carries "我要退款" or "帮我取消订单" verbatim - the exact
+    strings that route to the write path above - and then asks about them.
+    The Chinese question guard is the only thing separating the two, so these
+    are what makes its removal observable. They were written after mutation
+    testing showed the three cases in the previous test could not.
+    """
+    for utterance in (
+        "我要退款吗？",
+        "帮我退款要多久？",
+        "帮我取消订单是什么流程",
+    ):
+        assert classify(utterance).route is Route.KNOWLEDGE_QA, utterance

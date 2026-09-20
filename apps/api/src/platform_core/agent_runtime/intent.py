@@ -443,7 +443,13 @@ def _detect_kinds(question: str) -> tuple[list[IntentKind], float, list[IntentSi
         signals.append(IntentSignal("kind", IntentKind.SENSITIVE_REQUEST.value, "sensitive term"))
         return kinds, 0.95, signals
 
-    if _HUMAN_REQUEST.search(question):
+    if _HUMAN_REQUEST.search(question) or _is_cn_human_request(question):
+        # Checked before the write signal and before the quote frame, because
+        # a customer asking for a person has made a routing decision, and
+        # answering instead - by any machinery - overrules them. The Chinese
+        # pattern was missing until the measurement in
+        # `docs/research/chinese-intent-measurement.md` showed "把这张单转给人工"
+        # and "我要投诉" both landing on the knowledge path.
         kinds.append(IntentKind.HUMAN_REQUEST)
         signals.append(
             IntentSignal("kind", IntentKind.HUMAN_REQUEST.value, "explicit human request")
@@ -490,6 +496,17 @@ def _detect_kinds(question: str) -> tuple[list[IntentKind], float, list[IntentSi
         kinds.append(IntentKind.BUSINESS_ACTION)
         signals.append(
             IntentSignal("kind", IntentKind.BUSINESS_ACTION.value, "write verb with object")
+        )
+    elif _is_cn_action_request(question):
+        # The Chinese frame, evaluated last so an utterance that already
+        # matched an English form keeps the sharper rationale. There is no
+        # ambiguity in practice - the two vocabularies do not overlap - and
+        # ordering it here means the English signals stay byte-identical for
+        # every existing case, which is what the evaluation baseline
+        # (16/16 -> 24 cases) depends on.
+        kinds.append(IntentKind.BUSINESS_ACTION)
+        signals.append(
+            IntentSignal("kind", IntentKind.BUSINESS_ACTION.value, "chinese request frame")
         )
 
     if _CASE_RECORD.search(question):
@@ -543,6 +560,15 @@ def _looks_like_a_write(question: str) -> bool:
     return False
 
 
+# The words that open a question about *information* rather than a request for
+# action, and the auxiliaries the request frame is built from. A wh-word
+# directly in front of the frame ("where can I report a bug") makes it the
+# wh-word's question; the same frame in a later clause ("...and can I change
+# the delivery address") is still a request.
+_WH_OPENERS = frozenset({"how", "what", "when", "where", "why", "which", "who", "whose"})
+_REQUEST_AUXILIARIES = frozenset({"can", "could", "will", "would"})
+
+
 def _has_request_frame(question: str) -> bool:
     """`can|could|will|would + I|we + <write verb> + <object marker>`.
 
@@ -556,8 +582,20 @@ def _has_request_frame(question: str) -> bool:
     gate that protects "how do I cancel?" — and that same gate hid the write
     half of "Where is my order, and can I change the delivery address?", a
     request the platform must not silently drop.
+
+    **A wh-word immediately followed by the frame is not a request.** "Where
+    can I report a bug?" asks *where*, and routing it to the write gateway
+    hands a knowledge question to a human. The test is adjacency rather than
+    the opener alone, because the sentence above is exactly a wh-opener whose
+    request lives in a later clause — rejecting wh-openers outright would
+    break the case this function was written for. The defect predates the
+    verbs that made it visible ("where can I change my address?" already
+    misfired); it was found by a guard case written for `report`, which is
+    the argument for writing guard cases rather than reasoning about risk.
     """
     tokens = re.findall(r"[a-z']+", question.lower())
+    if len(tokens) > 1 and tokens[0] in _WH_OPENERS and tokens[1] in _REQUEST_AUXILIARIES:
+        return False
     for index, token in enumerate(tokens[:-2]):
         if token not in {"can", "could", "will", "would"}:
             continue
@@ -568,6 +606,182 @@ def _has_request_frame(question: str) -> bool:
         if _stem(verb) in action_verbs and obj in object_markers:
             return True
     return False
+
+
+# --- Chinese action detection ----------------------------------------------
+#
+# Chinese needs its own mechanism rather than more entries in `ACTION_VERBS`,
+# and that is not a style preference - the English path *cannot* fire on
+# Chinese even with the verbs present:
+#
+# - `is_action_request` requires the token after the verb to be in
+#   `_OBJECT_MARKERS`, which is `{the, a, my, our, this...}`. Chinese has no
+#   such determiners, so `帮我取消这个订单` would fail that check however many
+#   verbs were added;
+# - `_looks_like_a_write` splits on `[a-z']+`, which finds **zero** tokens in a
+#   Chinese sentence, so it returns False before looking at anything;
+# - `\b` word boundaries never match between two CJK characters, so every
+#   `\b...\b` pattern in this module is inapplicable by construction.
+#
+# The evidence for all three is measured in
+# `docs/research/chinese-intent-measurement.md`; the short version is that
+# all 14 Chinese utterances tested routed to `knowledge_qa`, including
+# "我要退款" and "我要投诉".
+#
+# So the request frame is expressed directly, in the shape Chinese actually
+# uses: a first-person desire or an explicit request for help, followed by a
+# write verb, followed by an object.
+#
+# **The object requirement is carried over deliberately.** English needs it
+# (`_looks_like_a_write`'s docstring: without it, 8 of 23 cases moved to
+# business_write because a policy question's *topic* is a write verb), and
+# Chinese needs it more, because Chinese has no word boundaries and a regex
+# can only substring-match. `退款` appears in both "我要退款" (a request) and
+# "退款多久到账？" (a policy question). The frame is what separates them:
+# `我要` + `退款` is a request, while `退款` followed by `多久` is a topic.
+
+# Verbs the platform *performs*. Mirrors the intent of `ACTION_VERBS` for the
+# actions this tenant's flows actually support, rather than translating the
+# whole English list - a verb with no tool behind it would only ever produce a
+# handoff, and the quote vocabulary's lesson (below) is that a term is worth
+# adding when something downstream can act on it.
+_CN_ACTION_VERBS: tuple[str, ...] = (
+    "退款",
+    "退货",
+    "退单",
+    "取消",
+    "退订",
+    "修改",
+    "更改",
+    "变更",
+    "改",
+    "换",
+    "投诉",
+    "举报",
+    "开票",
+    "提交",
+    "申请",
+    "升级",
+    "转人工",
+    "转给人工",
+)
+
+# Raising a ticket. Kept as patterns rather than verbs because Chinese inserts
+# a measure word between the verb and the noun - "建**一张**工单", "开**个**单" -
+# so a verb list would match "建单" but miss the way customers actually write it.
+# `\S{0,3}` is the measure-word gap and is bounded on purpose: an unbounded gap
+# would let "建" and "单" come from different clauses.
+_CN_TICKET_REQUEST = re.compile(
+    r"(?:建|开|创建|提|发起|生成)\S{0,3}(?:工单|单|问题单|ticket)",
+    re.IGNORECASE,
+)
+
+# The `把` construction, which puts the object *before* the verb:
+# "把这张单转给人工" (take this ticket and transfer it), "请把这个订单取消".
+# This is ordinary Chinese word order, not an edge case, so the frame+verb
+# scan above cannot see it: there the verb follows the frame directly.
+#
+# `\S{1,12}` is the object span. Bounded because an unbounded gap would let a
+# `把` in one clause pair with a verb in the next, and 12 characters covers
+# the objects this vocabulary takes ("这个订单", "刚才那张问题工单").
+_CN_BA_CONSTRUCTION = re.compile(
+    r"把\S{1,12}?(?P<verb>" + "|".join(_CN_ACTION_VERBS) + r")"
+)
+
+# First-person desire or explicit request for help. These are the frame; the
+# verb alone is a topic.
+#
+# `我想`/`我要`/`需要` are the desire form (the counterpart of the English
+# `_DESIRE_VERBS`), and `帮我`/`麻烦`/`请` are the request form. `请` is
+# last and is the weakest: "请说明退款政策" is a request for *information*,
+# so it is only honoured when a verb of the platform-acting kind follows
+# immediately.
+_CN_REQUEST_FRAME = re.compile(
+    r"(?:帮我|帮忙|麻烦|我要|我想|我需要|需要|请)"
+    r"(?P<verb>" + "|".join(_CN_ACTION_VERBS) + r")"
+)
+
+# Objects that make a request concrete. Chinese does not need a determiner,
+# but the verb being *followed by something* is what distinguishes an action
+# from a compound noun: `申请退款` is a request, while `退款申请流程` (the
+# refund-application process) is a topic.
+#
+# Matched as "any CJK character follows the verb", which is the closest
+# available analogue to the English object marker. It is deliberately loose:
+# a false positive here only promotes the utterance to the write gateway,
+# where `select_write_tools` still has to find a candidate and the confirmation
+# step still has to be satisfied by a person - whereas a false *negative*
+# leaves a refund request being answered from a policy document.
+_CN_OBJECT = re.compile(r"[\u4e00-\u9fff]")
+
+# A procedure question asks to be told how something works, and must not be
+# read as a request however many verbs and objects it carries - the Chinese
+# counterpart of `_PROCEDURE_QUESTION`. `怎么`/`如何`/`怎样` are the
+# interrogative openers, and `吗`/`呢` are sentence-final question particles
+# that a request never carries.
+_CN_PROCEDURE = re.compile(r"(?:怎么|如何|怎样|什么|哪些|哪|是否|能否|多久|多少|什么时候)")
+_CN_QUESTION_PARTICLE = re.compile(r"[吗呢吧]\s*[?？]?\s*$")
+
+
+def _is_cn_action_request(question: str) -> bool:
+    """A Chinese request for the platform to act.
+
+    Deliberately narrow, in the same spirit as `_is_action_request`: the frame
+    and the verb must both be present, and a question shape disqualifies the
+    utterance outright. The cost of a miss is that the abstention gate still
+    decides on the knowledge path; the cost of a false positive is a policy
+    question routed to the write gateway, which is worse - so the question
+    guard is checked first.
+    """
+    stripped = question.strip()
+    if _CN_PROCEDURE.search(stripped) or _CN_QUESTION_PARTICLE.search(stripped):
+        return False
+    if _CN_TICKET_REQUEST.search(stripped):
+        # The measure-word form, which the frame+verb path cannot see because
+        # "建一张工单" has the verb and the noun separated.
+        return True
+    if _CN_BA_CONSTRUCTION.search(stripped):
+        # Object-before-verb, the way Chinese normally phrases an instruction
+        # about a specific thing: "把这张单转给人工".
+        return True
+    match = _CN_REQUEST_FRAME.search(stripped)
+    if match is None:
+        return False
+    # The verb must be followed by an object inside the same clause, so
+    # "我要退款" fires but a bare `退款` used as a topic does not.
+    rest = stripped[match.end() :]
+    if not rest:
+        # A bare "我要退款" ends at the verb and is still a request: the verb
+        # IS the object ("I want a refund"). Accepted only for the desire
+        # frame, where the customer's own want is the request.
+        return match.group(0).startswith(("我要", "我想", "我需要"))
+    return bool(_CN_OBJECT.match(rest))
+
+
+# The Chinese counterpart of `_HUMAN_REQUEST`. Kept separate from the action
+# vocabulary because asking for a person is a *routing decision the customer
+# has already made*, and `_HUMAN_REQUEST` documents it as honoured
+# "immediately and unconditionally" - which was true for English only.
+_CN_HUMAN_REQUEST = re.compile(r"(?:人工客服|人工|客服|真人|专员|经理|转人工|转给人工|找个?人)")
+
+
+def _is_cn_human_request(question: str) -> bool:
+    """A Chinese request for a person, as opposed to a question about one.
+
+    `转人工` appears in both "转人工客服" (transfer me) and "为什么要转人工"
+    (why does it transfer). Treating the second as a request overrules the
+    customer - the exact failure `_HUMAN_REQUEST`'s "immediately and
+    unconditionally" promise exists to prevent - so the question shape vetoes
+    the match, the same way it does on the write path.
+
+    Kept as a function rather than an inline `and not` so the ordered
+    precedence is local to the Chinese branch: English `_HUMAN_REQUEST` is
+    left untouched, so no existing English case changes its signals.
+    """
+    if not _CN_HUMAN_REQUEST.search(question):
+        return False
+    stripped = question.strip()
+    return not (_CN_PROCEDURE.search(stripped) or _CN_QUESTION_PARTICLE.search(stripped))
 
 
 # A procedure question asks to be *told* how something works. This — not any
