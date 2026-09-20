@@ -78,6 +78,9 @@ from platform_core.rate_limit import (
 )
 from platform_core.retrieval.router import router as retrieval_router
 from platform_core.support_bridge.router import router as support_bridge_router
+from platform_core.tool_gateway.router import (
+    catalog_router as tool_catalog_router,
+)
 from platform_core.tool_gateway.router import router as tool_gateway_router
 
 
@@ -165,6 +168,7 @@ app.include_router(retrieval_router)
 app.include_router(agent_runtime_router)
 app.include_router(customer_router)
 app.include_router(tool_gateway_router)
+app.include_router(tool_catalog_router)
 app.include_router(quality_router)
 app.include_router(prompt_router)
 app.include_router(knowledge_gap_router)

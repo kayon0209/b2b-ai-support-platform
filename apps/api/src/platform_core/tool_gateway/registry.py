@@ -39,6 +39,19 @@ from platform_core.integrations.credentials import resolve_credentials
 from platform_core.integrations.models import Connector, ConnectorStatus
 from platform_core.integrations.sdk import AUTH_FAILURE_CODES, ConnectorContext
 from platform_core.tool_gateway.gateway import ToolExecutor
+from platform_core.tool_gateway.models import ToolRisk
+from platform_policy import Action
+
+# Risk class -> the policy action a caller must hold to propose a tool of that
+# class. Defined once, here, because two callers need it: the HTTP proposal
+# endpoint and the agent's own write path. Two copies would let one of them
+# become a way around the other.
+RISK_ACTION: dict[str, str] = {
+    ToolRisk.READ.value: Action.TOOL_READ.value,
+    ToolRisk.LOW_WRITE.value: Action.TOOL_WRITE_LOW.value,
+    ToolRisk.CONFIRMED_WRITE.value: Action.TOOL_WRITE_CONFIRMED.value,
+    ToolRisk.HUMAN_APPROVAL.value: Action.TOOL_HUMAN_APPROVAL.value,
+}
 
 # A credential reference -> credentials mapping. Injected rather than read
 # here, so this module never touches a secret itself.
@@ -67,6 +80,36 @@ TOOL_CAPABILITY: dict[str, str] = {
     "shipment.track": "shipments_read",
     "billing.get_invoice": "invoices_read",
     "inventory.check_stock": "inventory_read",
+}
+
+# Tools the platform serves from its own tables rather than through a
+# connector, and which therefore have no provider to resolve.
+#
+# They need their own path because `_build` requires a connector for every
+# other tool: `case.read` is in the catalog, the orchestrator can run it
+# (that path injected the executor by hand), and yet
+# `POST /v1/tool-proposals/{id}/execute` answered `TOOL_EXECUTOR_MISSING` for
+# it - a tool the catalog advertises that one surface can run and another
+# cannot. The executors are session-bound, so they read and write under the
+# caller's RLS-bound transaction and another tenant's row is invisible rather
+# than filtered afterwards.
+PLATFORM_TOOLS: frozenset[str] = frozenset(
+    {"case.read", "case.eq_confirm", "case.create"}
+)
+
+# Arguments a write tool requires that the customer never supplies, and the
+# connector-configuration key each one is read from.
+#
+# "Create a Jira issue" needs a project key. The customer does not know it and
+# must not be asked for it: it is the tenant's configuration, not the
+# conversation's content. Reading it from the connector means it is set once by
+# whoever connected the system, and an unset key produces a handoff rather than
+# a guessed key - a write that lands in the wrong project is worse than a write
+# that does not happen.
+WRITE_ARG_DEFAULTS: dict[str, tuple[tuple[str, str], ...]] = {
+    "jira.create_issue": (("project", "default_project"),),
+    "linear.create_issue": (("team", "default_team"),),
+    "im.send_notification": (("channel", "default_channel"),),
 }
 
 # tool name -> the connectors that can serve it, in preference order.
@@ -232,6 +275,31 @@ class ConnectorExecutorResolver:
                 resolved[tool_name] = executor
         return resolved
 
+    async def default_write_arguments(self, tool_name: str) -> dict[str, str] | None:
+        """Configuration-supplied arguments for a write tool.
+
+        Returns `None` when the tool needs a default that no active connector
+        supplies. `None` is deliberately not an empty dict: a caller must hand
+        off rather than propose a write with a missing required argument. The
+        gateway would reject it as `TOOL_ARGS_INVALID`, but only after the
+        proposal row existed, leaving an operator to explain a proposal that
+        could never have run.
+        """
+        wanted = WRITE_ARG_DEFAULTS.get(tool_name)
+        if not wanted:
+            return {}
+        resolved = self.resolve_connector(tool_name, await self._available_connectors())
+        if resolved is None:
+            return None
+        configuration = dict(resolved[1].configuration or {})
+        values: dict[str, str] = {}
+        for argument, key in wanted:
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.strip():
+                return None
+            values[argument] = value
+        return values
+
     async def _available_connectors(self) -> dict[str, Connector]:
         """Active connectors for this tenant, keyed by provider.
 
@@ -260,14 +328,23 @@ class ConnectorExecutorResolver:
             by_provider.setdefault(connector.provider, connector)
         return by_provider
 
-    def _build(self, tool_name: str, available: dict[str, Connector]) -> ToolExecutor | None:
+    @staticmethod
+    def resolve_connector(
+        tool_name: str, available: dict[str, Connector]
+    ) -> tuple[str, Connector] | None:
+        """The (provider, connector) that can serve a tool, or None.
+
+        Extracted from `_build` because the answer is needed twice: to build
+        an executor, and to read the connector's own configuration for the
+        arguments a customer never supplies (see `default_write_arguments`).
+        One implementation means those two can never disagree about which
+        connector a tool belongs to.
+        """
         providers = TOOL_PROVIDERS.get(tool_name)
         capability = TOOL_CAPABILITY.get(tool_name)
         if not providers or capability is None:
             return None
 
-        provider: str | None = None
-        connector: Connector | None = None
         for candidate in providers:
             found = available.get(candidate)
             if found is None:
@@ -278,11 +355,56 @@ class ConnectorExecutorResolver:
             # that can.
             if capability not in (found.capabilities or []):
                 continue
-            provider, connector = candidate, found
-            break
+            return candidate, found
+        return None
 
-        if provider is None or connector is None:
+    def _platform_executor(self, tool_name: str) -> ToolExecutor | None:
+        """Build an executor for a tool the platform serves itself.
+
+        `case.create` is built with the resolver's `tenant_id`, which the
+        request path resolved server-side (never a client payload). The other
+        platform tools need no tenant: `case.read` and `case.eq_confirm` work
+        off rows that already exist, so RLS supplies it, while a create has no
+        row yet and must name the tenant it is writing into.
+        """
+        if self._cache is None:
+            self._cache = {}
+        cached = self._cache.get(tool_name)
+        if cached is not None:
+            return cached
+
+        from platform_core.tool_gateway.case_create import CaseCreateExecutor
+        from platform_core.tool_gateway.case_eq_confirm import CaseEqConfirmExecutor
+        from platform_core.tool_gateway.case_read import CaseReadExecutor
+
+        builders: dict[str, Callable[[AsyncSession], ToolExecutor]] = {
+            "case.read": CaseReadExecutor,
+            "case.eq_confirm": CaseEqConfirmExecutor,
+        }
+        builder = builders.get(tool_name)
+        if builder is not None:
+            executor = builder(self._session)
+            self._cache[tool_name] = executor
+            return executor
+
+        if tool_name == "case.create":
+            executor = CaseCreateExecutor(
+                self._session,
+                tenant_id=self._tenant_id,
+                actor_id=self._ctx.actor_id if self._ctx is not None else None,
+            )
+            self._cache[tool_name] = executor
+            return executor
+
+        return None
+
+    def _build(self, tool_name: str, available: dict[str, Connector]) -> ToolExecutor | None:
+        if tool_name in PLATFORM_TOOLS:
+            return self._platform_executor(tool_name)
+        resolved = self.resolve_connector(tool_name, available)
+        if resolved is None:
             return None
+        provider, connector = resolved
 
         factory = self._factories.get(provider)
         if factory is None:
@@ -483,6 +605,7 @@ __all__ = [
     "ConnectorOutcomeExecutor",
     "TOOL_CAPABILITY",
     "TOOL_PROVIDERS",
+    "WRITE_ARG_DEFAULTS",
     "default_factories",
     "build_adapter",
     "probe_connector",
@@ -563,13 +686,104 @@ TOOL_CATALOG: dict[str, tuple[str, dict[str, Any], list[str], bool]] = {
         False,
     ),
     "case.read": ("read", READ_TOOL_SCHEMAS["case.read"], ["tool.read"], False),
+    # The EQ confirmation (stage 2b). `human_approval`, which is what the
+    # research report asks for in five places ("EQ 放行…必须人工"; "AI 只能转述 +
+    # 收集确认，不能代替放行") and what the policy engine reserves for
+    # tenant_owner.
+    #
+    # It was briefly `confirmed_write`, on the argument that `human_approval`
+    # makes the tool unreachable *by the agent* and the write path built in 2a
+    # could then never propose it. That argument answers the wrong question:
+    # being unreachable by the agent is the point, not the problem.
+    # `packages/policy/engine.py` says the class "must be unreachable by the
+    # agent at every stage, propose included", and the reason is in the flow -
+    # the case status is what the factory reads, so recording a confirmation is
+    # one step from releasing production, and the customer's word in a
+    # conversation is not a release. The AI relays and collects; a person
+    # records it.
+    "case.eq_confirm": (
+        "human_approval",
+        {
+            "type": "object",
+            "properties": {"case_ref": {"type": "string"}},
+            "required": ["case_ref"],
+            "additionalProperties": False,
+        },
+        ["tool.human_approval"],
+        True,
+    ),
     "inventory.check_stock": (
         "read",
         READ_TOOL_SCHEMAS["inventory.check_stock"],
         ["tool.read"],
         False,
     ),
+    # Opening a case (stage 3). `confirmed_write`, not `human_approval`: the
+    # risk inventory in the research report lists only "EQ 放行、赔付、退款" as
+    # `HUMAN_APPROVAL`, and stage 3 says the *adjudication* of a complaint is
+    # human. Creating a case moves nothing in the outside world; it writes a
+    # row. `support_agent` already holds `CASE_CREATE`, so this matches the
+    # existing policy table rather than tightening it. See
+    # `docs/adr/0008-case-create-risk-class.md`.
+    #
+    # `enterprise_account_id` is in `required` on purpose. It selects the SLA
+    # tier and both deadlines, and the tier is snapshotted onto the row, so a
+    # wrong account starts a wrong clock that never self-corrects - and
+    # `create_case` *succeeds* without one, leaving a ticket that can never
+    # escalate. Requiring it here means a proposal missing it is rejected as
+    # `TOOL_ARGS_INVALID` before the proposal row exists.
+    #
+    # `tenant_id` is deliberately absent from the schema: it is resolved
+    # server-side by the executor's resolver, and accepting it as an argument
+    # is the shortcut AGENTS.md forbids.
+    "case.create": (
+        "confirmed_write",
+        {
+            "type": "object",
+            "properties": {
+                "enterprise_account_id": {"type": "string", "minLength": 1},
+                "subject": {"type": "string", "minLength": 1},
+                "description": {"type": "string"},
+                "priority": {"type": "string"},
+                "category": {"type": "string"},
+                "conversation_ref_id": {"type": "string"},
+            },
+            "required": ["enterprise_account_id", "subject"],
+            "additionalProperties": False,
+        },
+        ["tool.write.confirmed"],
+        True,
+    ),
 }
+
+
+async def risk_action_for(
+    session: AsyncSession, *, tenant_id: Any, tool_name: str
+) -> Action | None:
+    """The policy action a tool of this name requires, or None if unregistered.
+
+    Deny-by-default: a name with no definition row has no risk class and is
+    therefore not proposable - the same conclusion the gateway reaches with
+    `TOOL_NOT_REGISTERED`, reached earlier so the caller can hand off instead
+    of writing a proposal row that could never run.
+    """
+    from platform_core.tool_gateway.models import ToolDefinition
+
+    risk = (
+        await session.execute(
+            select(ToolDefinition.risk)
+            .where(
+                (ToolDefinition.tenant_id == tenant_id) | ToolDefinition.tenant_id.is_(None),
+                ToolDefinition.name == tool_name,
+            )
+            .order_by(ToolDefinition.version.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if risk is None:
+        return None
+    value = RISK_ACTION.get(str(risk))
+    return Action(value) if value is not None else None
 
 
 async def ensure_tool_definitions(session: AsyncSession, *, tenant_id: Any) -> int:

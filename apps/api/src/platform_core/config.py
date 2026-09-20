@@ -198,6 +198,11 @@ class Settings(BaseSettings):
     # Every behaviour change below defaults OFF and flips per tenant through
     # the flag service, following agent.rerank_enabled.
     flag_business_read_tools: str = "agent.business_read_enabled"
+    # The agent's write path (plan 3.5). Separate from the read flag on
+    # purpose: a tenant can let the AI answer "where is my order" long before
+    # it lets the AI propose a change to an external system, and rolling the
+    # two out together would make the safe half hostage to the risky one.
+    flag_business_write_tools: str = "agent.business_write_enabled"
     flag_citation_guard: str = "agent.citation_guard_enabled"
     flag_query_normalization: str = "agent.query_normalization_enabled"
     flag_metadata_filter: str = "retrieval.metadata_filter_enabled"

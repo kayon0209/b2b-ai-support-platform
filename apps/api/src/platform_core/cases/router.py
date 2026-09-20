@@ -65,6 +65,11 @@ class CaseCreateIn(BaseModel):
     # The account this Case is about. Determines the SLA policy via the
     # account's contract tier (see `cases.models.sla_policy_for_tier`).
     enterprise_account_id: uuid.UUID | None = None
+    # The conversation this Case came from, when it came from one. Recorded on
+    # `CaseConversation`, which is what lets an escalated case be traced back
+    # to the customer waiting on it - and what priority claiming filters on.
+    # Optional because a Case can be raised from a phone call or an email.
+    conversation_ref_id: uuid.UUID | None = None
 
 
 class CaseCommandIn(BaseModel):
@@ -133,6 +138,7 @@ async def create_case(request: Request, body: CaseCreateIn) -> Any:
                 priority=body.priority,
                 category=body.category,
                 enterprise_account_id=body.enterprise_account_id,
+                conversation_ref_id=body.conversation_ref_id,
             )
         except CaseError as exc:
             # One code for "no such account" and "another tenant's account":

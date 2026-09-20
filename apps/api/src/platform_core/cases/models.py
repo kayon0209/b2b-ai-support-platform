@@ -39,6 +39,26 @@ class CaseStatus(enum.StrEnum):
     REOPENED = "reopened"
 
 
+class CaseCategory(enum.StrEnum):
+    """What kind of work a case represents.
+
+    `Case.category` is a free-form column, so this is a **vocabulary, not a
+    constraint**: naming the values here is what lets a tool, a test and the
+    admin UI agree on them without a migration. An unrecognised value stays
+    readable rather than becoming an error, which is the right trade for a
+    field a tenant may want to extend.
+    """
+
+    GENERAL = "general"
+    # A customer's answer to an engineering question is outstanding, and
+    # production waits on it. The case sits in WAITING_CUSTOMER until the
+    # customer confirms; recording that confirmation is what
+    # `case.eq_confirm` does, and it is deliberately restricted to cases
+    # carrying this category so the tool cannot be pointed at an ordinary
+    # ticket.
+    EQ_CONFIRMATION = "eq_confirmation"
+
+
 # Explicit transition table (docs/domain-model.md case states).
 TRANSITIONS: dict[CaseStatus, set[CaseStatus]] = {
     CaseStatus.NEW: {CaseStatus.TRIAGED, CaseStatus.CLOSED},

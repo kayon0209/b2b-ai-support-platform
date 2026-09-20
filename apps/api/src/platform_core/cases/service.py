@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from platform_core.cases.models import (
     DEFAULT_SLA,
     Case,
+    CaseConversation,
     CaseEscalation,
     CaseStatus,
     check_transition,
@@ -47,6 +48,7 @@ class CaseService:
         category: str = "general",
         actor_id: uuid.UUID | None = None,
         enterprise_account_id: uuid.UUID | None = None,
+        conversation_ref_id: uuid.UUID | None = None,
     ) -> Case:
         """Open a Case, deriving its SLA clocks from the account's contract.
 
@@ -57,6 +59,16 @@ class CaseService:
         cannot see the other tenant's row, an unknown id and a foreign id both
         report `ACCOUNT_NOT_FOUND` - so this cannot be used to discover which
         accounts exist elsewhere.
+
+        `conversation_ref_id` is the same defect one table over, and the reason
+        it is fixed here rather than in a linking endpoint: `CaseConversation`
+        had a reader (`inbox_consumer.case_conversation_ref`) and **no writer
+        anywhere**, so the join it feeds could only ever be empty. That join is
+        what priority claiming filters on, which means
+        `worker.priority_claim_enabled` silently did nothing when it was on -
+        the flag changed no behaviour and reported no error. Passing the origin
+        conversation at creation is the only moment the platform reliably
+        knows the link.
         """
         now = int(time.time())
 
@@ -110,6 +122,19 @@ class CaseService:
             elapsed_running_seconds=0,
             first_response=False,
         )
+        if conversation_ref_id is not None:
+            # `origin` rather than `follow_up`: this conversation is where the
+            # case came from. A later link (a customer reopening the subject in
+            # a new thread) is a different relationship and a different call.
+            self._session.add(
+                CaseConversation(
+                    tenant_id=tenant_id,
+                    case_id=case.id,
+                    conversation_ref_id=conversation_ref_id,
+                    relationship="origin",
+                )
+            )
+            await self._session.flush()
         return case
 
     async def apply_command(
