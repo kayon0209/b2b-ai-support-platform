@@ -1,0 +1,22 @@
+desktop_errors_after_load: []
+http_errors_after_load: []
+cases_null_requests: before=0 afterClickAndClose=0 (rows=21)
+prompt_escape: opened=1 focusWentTo=INPUT.text-input escapeCloses=true
+unknown_route_lands_on: http://localhost:5174/definitely-not-a-page
+untranslated[quality]: ["AI","6,922 ms","50,000 ms","sensitive"]
+untranslated[gaps]: ["AI"]
+untranslated[prompts]: ["AI","You are the support agent.\nRule 1: cite authorized evidence.\nRound-6 fix verification draft."]
+untranslated[flags]: ["AI","acceptance.probe.flag","created by acceptance round-6 fix","double.click.1789790277553","double.click.1789791465394","ui.acceptance.ok","UPPER_CASE","probe"]
+untranslated[cases]: ["Skip to main content","AI","B2B Support","Enterprise Admin","Main sections","Dark","Quality","Knowledge Gaps","Prompt Release","Feature Flags","Cases & SLA","Approvals","Members","Usage & Quota","Branding","Control plane · v1","Token","Tenant-scoped support cases with SLA clocks.","New case","Case list","EQ 0813448-B: confirm stackup (from console)","New","EQ 0813448: confirm stackup before production","in_progress","EQ 9226442-B: confirm stackup (from console)"]
+untranslated[members]: ["AI","Viewer Demo","viewer-demo@example.com","Admin Demo","admin-demo@example.com"]
+untranslated[usage]: ["AI"]
+untranslated[branding]: ["AI","<img src=x onerror=alert(2)>Acme & Co","· admin-demo"]
+mobile[quality]: {"layoutViewport":390,"sidebarH":156,"tableW":560,"tableOverflows":true,"hasHScroll":false}
+mobile[gaps]: {"layoutViewport":390,"sidebarH":296,"tableW":null,"tableOverflows":null,"hasHScroll":false}
+mobile[prompts]: {"layoutViewport":390,"sidebarH":215,"tableW":560,"tableOverflows":true,"hasHScroll":false}
+mobile[flags]: {"layoutViewport":390,"sidebarH":156,"tableW":560,"tableOverflows":true,"hasHScroll":false}
+mobile[cases]: {"layoutViewport":390,"sidebarH":156,"tableW":null,"tableOverflows":null,"hasHScroll":false}
+mobile[members]: {"layoutViewport":390,"sidebarH":244,"tableW":560,"tableOverflows":true,"hasHScroll":false}
+mobile[usage]: {"layoutViewport":390,"sidebarH":156,"tableW":null,"tableOverflows":null,"hasHScroll":false}
+mobile[branding]: {"layoutViewport":390,"sidebarH":230,"tableW":null,"tableOverflows":null,"hasHScroll":false}
+dark_theme_attr: dark

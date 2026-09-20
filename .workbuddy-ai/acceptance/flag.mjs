@@ -1,0 +1,30 @@
+import { chromium } from "playwright-core";
+const B="http://localhost:5174", T=process.env.API_TOKEN;
+if(!T){console.error("API_TOKEN is unset. Run: python scripts/seed_admin_demo.py");process.exit(2);}
+const C="C:/Program Files/Google/Chrome/Application/chrome.exe";
+const br=await chromium.launch({executablePath:C,headless:true});
+const c=await br.newContext({viewport:{width:1440,height:940}});
+await c.addInitScript((t)=>{localStorage.setItem("b2b_token",t);localStorage.setItem("b2b_lang","en");},T);
+c.setDefaultTimeout(8000); const p=await c.newPage();
+const net=[]; p.on("response",(r)=>{ if(r.url().includes("/v1/flags")) net.push(r.status()+" "+r.request().method()+" "+new URL(r.url()).pathname); });
+await p.goto(B+"/flags",{waitUntil:"domcontentloaded"}); await p.waitForTimeout(1800);
+const k=await p.locator("input[placeholder='flag_key']").count();
+const d=await p.locator("button",{hasText:/^Define$/}).count();
+console.log("keyInput=",k,"defineBtn=",d);
+await p.locator("input[placeholder='flag_key']").first().fill("bad key/#?1");
+await p.locator("button",{hasText:/^Define$/}).first().click();
+await p.waitForTimeout(2500);
+console.log("banners=",JSON.stringify(await p.locator(".banner").allInnerTexts()));
+console.log("net=",JSON.stringify(net));
+console.log("rows=",await p.locator("table tbody tr").count());
+console.log("keyInputValueAfter=",await p.locator("input[placeholder='flag_key']").first().inputValue());
+// now a valid key, to see whether success is confirmed
+net.length=0;
+await p.locator("input[placeholder='flag_key']").first().fill("ui.acceptance.ok");
+await p.locator("button",{hasText:/^Define$/}).first().click();
+await p.waitForTimeout(2500);
+console.log("valid: banners=",JSON.stringify(await p.locator(".banner").allInnerTexts()));
+console.log("valid: net=",JSON.stringify(net));
+console.log("valid: rows=",await p.locator("table tbody tr").count());
+console.log("valid: inputCleared=",(await p.locator("input[placeholder='flag_key']").first().inputValue())==="");
+await br.close();

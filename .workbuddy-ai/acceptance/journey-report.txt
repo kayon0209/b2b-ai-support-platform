@@ -1,0 +1,35 @@
+page[quality]: title="Quality · B2B Support"
+page[gaps]: title="Knowledge Gaps · B2B Support"
+page[prompts]: title="Prompt Release · B2B Support"
+page[flags]: title="Feature Flags · B2B Support"
+page[cases]: title="Cases & SLA · B2B Support"
+page[members]: title="Members · B2B Support"
+page[usage]: title="Usage & Quota · B2B Support"
+page[branding]: title="Branding · B2B Support"
+http_errors: []
+js_errors: []
+p0_refused_promote: promoteDisabled=false banners=["promotion requires an evaluation report; none was supplied"]
+p1_flag_key: inlineError=["A flag key may contain only letters, digits, dot, underscore and hyphen."] defineDisabled=true
+p1_cases_null: count=0 rows=7
+p1_prompt_a11y: opened=1 role=dialog focus=INPUT escapeCloses=true
+p0_404: url=http://localhost:5175/definitely-not-a-page hasNotFound=true
+p2_favicon: status=200
+p3_a11y: {"skipLink":true,"navAria":"Main sections","mainId":"main","thMissingScope":0}
+zh[quality]: zhChars=266 title="质量看板 · B2B 智能客服"
+zh[gaps]: zhChars=114 title="知识缺口 · B2B 智能客服"
+zh[prompts]: zhChars=99 title="提示词发布 · B2B 智能客服"
+zh[flags]: zhChars=138 title="功能开关 · B2B 智能客服"
+zh[cases]: zhChars=98 title="工单与 SLA · B2B 智能客服"
+zh[members]: zhChars=163 title="成员 · B2B 智能客服"
+zh[usage]: zhChars=241 title="用量与配额 · B2B 智能客服"
+zh[branding]: zhChars=100 title="品牌 · B2B 智能客服"
+p3_theme_label_zh: ["🌙\n夜间","🌐\nEN"]
+mobile[quality]: {"vp":390,"sidebarH":156,"navVisible":false,"toggleVisible":true}
+mobile[gaps]: {"vp":390,"sidebarH":296,"navVisible":false,"toggleVisible":true}
+mobile[prompts]: {"vp":390,"sidebarH":215,"navVisible":false,"toggleVisible":true}
+mobile[flags]: {"vp":390,"sidebarH":156,"navVisible":false,"toggleVisible":true}
+mobile[cases]: {"vp":390,"sidebarH":194,"navVisible":false,"toggleVisible":true}
+mobile[members]: {"vp":390,"sidebarH":244,"navVisible":false,"toggleVisible":true}
+mobile[usage]: {"vp":390,"sidebarH":156,"navVisible":false,"toggleVisible":true}
+mobile[branding]: {"vp":390,"sidebarH":230,"navVisible":false,"toggleVisible":true}
+dark: dark

@@ -1,0 +1,121 @@
+http_errors_en_pass: ["400 GET /api/v1/cases/null"]
+structure: {
+ "quality": {
+  "title": "B2B AI Support · Admin",
+  "h1": 1,
+  "imgsNoAlt": 0,
+  "btnNoLabel": 0,
+  "thNoScope": 0,
+  "navAria": null,
+  "skipLink": false,
+  "pagination": false,
+  "totalNote": false,
+  "liveRegions": 0
+ },
+ "gaps": {
+  "title": "B2B AI Support · Admin",
+  "h1": 1,
+  "imgsNoAlt": 0,
+  "btnNoLabel": 0,
+  "thNoScope": 0,
+  "navAria": null,
+  "skipLink": false,
+  "pagination": false,
+  "totalNote": false,
+  "liveRegions": 0
+ },
+ "prompts": {
+  "title": "B2B AI Support · Admin",
+  "h1": 1,
+  "imgsNoAlt": 0,
+  "btnNoLabel": 0,
+  "thNoScope": 4,
+  "navAria": null,
+  "skipLink": false,
+  "pagination": false,
+  "totalNote": true,
+  "liveRegions": 0
+ },
+ "flags": {
+  "title": "B2B AI Support · Admin",
+  "h1": 0,
+  "imgsNoAlt": 0,
+  "btnNoLabel": 0,
+  "thNoScope": 0,
+  "navAria": null,
+  "skipLink": false,
+  "pagination": false,
+  "totalNote": false,
+  "liveRegions": 0
+ },
+ "cases": {
+  "title": "B2B AI Support · Admin",
+  "h1": 1,
+  "imgsNoAlt": 0,
+  "btnNoLabel": 0,
+  "thNoScope": 0,
+  "navAria": null,
+  "skipLink": false,
+  "pagination": false,
+  "totalNote": true,
+  "liveRegions": 0
+ },
+ "members": {
+  "title": "B2B AI Support · Admin",
+  "h1": 1,
+  "imgsNoAlt": 0,
+  "btnNoLabel": 0,
+  "thNoScope": 4,
+  "navAria": null,
+  "skipLink": false,
+  "pagination": false,
+  "totalNote": true,
+  "liveRegions": 0
+ },
+ "usage": {
+  "title": "B2B AI Support · Admin",
+  "h1": 1,
+  "imgsNoAlt": 0,
+  "btnNoLabel": 0,
+  "thNoScope": 0,
+  "navAria": null,
+  "skipLink": false,
+  "pagination": false,
+  "totalNote": false,
+  "liveRegions": 0
+ },
+ "branding": {
+  "title": "B2B AI Support · Admin",
+  "h1": 1,
+  "imgsNoAlt": 0,
+  "btnNoLabel": 0,
+  "thNoScope": 0,
+  "navAria": null,
+  "skipLink": false,
+  "pagination": false,
+  "totalNote": false,
+  "liveRegions": 0
+ }
+}
+untranslated[quality]: ["AI","Dark"]
+untranslated[gaps]: ["AI","Dark"]
+untranslated[prompts]: ["AI","Dark","You are the support agent.\nRule 1: cite authorized evidence.\nRound-6 fix verification draft."]
+untranslated[flags]: []
+untranslated[cases]: ["AI","Dark","x' OR '1'='1; DROP TABLE cases; --","x'; DROP TABLE cases; --","triaged","Clean probe","Mutation probe","Replay race probe","Concurrency probe","Acceptance test case"]
+untranslated[members]: ["AI","Dark","Admin Demo","admin-demo@example.com"]
+untranslated[usage]: ["AI","Dark"]
+untranslated[branding]: ["AI","Dark","<img src=x onerror=alert(2)>Acme & Co","· admin-demo"]
+cases_null_400_count: onLoad=2 afterSelectAndClose=3 rows=7
+prompt_a11y: opened=1 activeEl=BUTTON|btn role=group escapeCloses=false
+quota_invalid_input: ["Quota must be a whole number of runs, or empty for unlimited.\nRetry"]
+flag_key_special: []
+flag_key_special_url: []
+mobile[quality]: {"vp":390,"sidebarH":499,"navBottomVh":59}
+mobile[gaps]: {"vp":390,"sidebarH":499,"navBottomVh":59}
+mobile[prompts]: {"vp":421,"sidebarH":499,"navBottomVh":55}
+mobile[flags]: {"vp":594,"sidebarH":499,"navBottomVh":39}
+mobile[cases]: {"vp":390,"sidebarH":499,"navBottomVh":59}
+mobile[members]: {"vp":415,"sidebarH":499,"navBottomVh":55}
+mobile[usage]: {"vp":390,"sidebarH":499,"navBottomVh":59}
+mobile[branding]: {"vp":512,"sidebarH":499,"navBottomVh":45}
+dark_theme: dark
