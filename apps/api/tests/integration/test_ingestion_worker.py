@@ -328,9 +328,7 @@ class _ClosingSession(AsyncSession):
 
 def _session_factory(url: str) -> tuple[object, object]:
     engine = create_async_engine(url, pool_pre_ping=True)
-    return engine, async_sessionmaker(
-        engine, expire_on_commit=False, class_=_ClosingSession
-    )
+    return engine, async_sessionmaker(engine, expire_on_commit=False, class_=_ClosingSession)
 
 
 # --- 1. The happy path ----------------------------------------------------
@@ -615,7 +613,9 @@ def test_an_api_style_upload_with_a_content_type_ingests_to_ready(
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                stats = await drain_versions(session, [uuid.UUID(version_id)], embedder=StubEmbedder())
+                stats = await drain_versions(
+                    session, [uuid.UUID(version_id)], embedder=StubEmbedder()
+                )
                 await session.commit()
                 return stats
         finally:
@@ -645,9 +645,7 @@ def test_a_claimed_version_is_not_claimed_twice(monkeypatch: pytest.MonkeyPatch)
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                first = await claim_versions(
-                    session, batch=50, version_ids=[uuid.UUID(version_id)]
-                )
+                first = await claim_versions(session, batch=50, version_ids=[uuid.UUID(version_id)])
                 await session.commit()
             async with factory() as session:  # type: ignore[operator]
                 second = await claim_versions(
@@ -885,9 +883,7 @@ def test_a_fresh_claim_is_not_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                await claim_versions(
-                    session, batch=50, version_ids=[uuid.UUID(version_id)]
-                )
+                await claim_versions(session, batch=50, version_ids=[uuid.UUID(version_id)])
                 await session.commit()
             async with factory() as session:  # type: ignore[operator]
                 stolen = await reclaim(session, timeout_seconds=900)
@@ -921,7 +917,9 @@ def test_a_binary_document_fails_explicitly(monkeypatch: pytest.MonkeyPatch) -> 
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                stats = await drain_versions(session, [uuid.UUID(version_id)], embedder=StubEmbedder())
+                stats = await drain_versions(
+                    session, [uuid.UUID(version_id)], embedder=StubEmbedder()
+                )
                 await session.commit()
                 return stats
         finally:
@@ -1359,9 +1357,7 @@ def test_a_targeted_claim_reaches_a_row_the_fifo_would_starve(
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                targeted = await claim_versions(
-                    session, batch=2, version_ids=[uuid.UUID(marker)]
-                )
+                targeted = await claim_versions(session, batch=2, version_ids=[uuid.UUID(marker)])
                 await session.commit()
                 return [str(v.version_id) for v in targeted]
         finally:
@@ -1369,8 +1365,7 @@ def test_a_targeted_claim_reaches_a_row_the_fifo_would_starve(
 
     targeted = _run(_targeted())
     assert targeted == [marker], (
-        "a targeted claim must reach its row regardless of FIFO position, "
-        f"got {targeted}"
+        f"a targeted claim must reach its row regardless of FIFO position, got {targeted}"
     )
     assert _read_version(marker)["status"] == "parsing"
 
@@ -1485,9 +1480,7 @@ def test_drain_versions_narrows_the_claim_it_issues(
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                await ingestion_consumer.drain_versions(
-                    session, wanted, embedder=StubEmbedder()
-                )
+                await ingestion_consumer.drain_versions(session, wanted, embedder=StubEmbedder())
                 await session.commit()
         finally:
             await engine.dispose()  # type: ignore[attr-defined]
@@ -1567,5 +1560,3 @@ def test_drain_versions_raises_rather_than_returning_partial_success(
     assert _read_version(str(version_id))["status"] == "uploaded", (
         "a retryable fault must leave the row claimable for a later cycle"
     )
-
-

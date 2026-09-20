@@ -684,9 +684,7 @@ _CN_TICKET_REQUEST = re.compile(
 # `\S{1,12}` is the object span. Bounded because an unbounded gap would let a
 # `把` in one clause pair with a verb in the next, and 12 characters covers
 # the objects this vocabulary takes ("这个订单", "刚才那张问题工单").
-_CN_BA_CONSTRUCTION = re.compile(
-    r"把\S{1,12}?(?P<verb>" + "|".join(_CN_ACTION_VERBS) + r")"
-)
+_CN_BA_CONSTRUCTION = re.compile(r"把\S{1,12}?(?P<verb>" + "|".join(_CN_ACTION_VERBS) + r")")
 
 # First-person desire or explicit request for help. These are the frame; the
 # verb alone is a topic.

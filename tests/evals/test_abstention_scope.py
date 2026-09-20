@@ -39,9 +39,7 @@ def _run[T](awaitable: Awaitable[T]) -> T:
     return asyncio.run(_wrap())
 
 
-async def _empty_retriever(
-    question: str, scope: PrincipalScope
-) -> list[RetrievedChunk]:
+async def _empty_retriever(question: str, scope: PrincipalScope) -> list[RetrievedChunk]:
     """No evidence for anything - the English-corpus/Chinese-question shape."""
     return []
 
@@ -62,9 +60,7 @@ def _chunk(text: str) -> RetrievedChunk:
     )
 
 
-async def _refund_retriever(
-    question: str, scope: PrincipalScope
-) -> list[RetrievedChunk]:
+async def _refund_retriever(question: str, scope: PrincipalScope) -> list[RetrievedChunk]:
     return [_chunk("The refund window is fourteen days from delivery.")]
 
 
@@ -120,6 +116,7 @@ def test_a_cross_lingual_case_that_abstains_for_another_reason_is_not_exempt() -
     retriever could reach, so exempting it would hide the more actionable of
     the two failures.
     """
+
     async def _irrelevant(question: str, scope: PrincipalScope) -> list[RetrievedChunk]:
         return [_chunk("Completely unrelated text about bicycles.")]
 
@@ -278,18 +275,20 @@ def test_an_artifact_without_the_new_fields_fails_the_match_gate() -> None:
     constructing an `EvalReport` by hand - the hand-built form has the field
     defaults and would not reproduce the bug.
     """
-    loaded = _load_report({  # no cross-lingual keys at all
-        "run_id": "r",
-        "started_at": 0,
-        "finished_at": 1,
-        "total": 40,
-        "passed": 40,
-        "failed": 0,
-        "abstention_correct": 40,
-        "abstention_false": 0,
-        "citation_violations": 0,
-        "forbidden_claim_hits": 0,
-    })
+    loaded = _load_report(
+        {  # no cross-lingual keys at all
+            "run_id": "r",
+            "started_at": 0,
+            "finished_at": 1,
+            "total": 40,
+            "passed": 40,
+            "failed": 0,
+            "abstention_correct": 40,
+            "abstention_false": 0,
+            "citation_violations": 0,
+            "forbidden_claim_hits": 0,
+        }
+    )
     assert loaded.cross_lingual_unreachable < 0, "not reported, not zero"
     assert loaded.exemptible_cross_lingual < 0, "not reported, not zero"
     assert not _gate(loaded, "cross_lingual_exclusions_match").passed

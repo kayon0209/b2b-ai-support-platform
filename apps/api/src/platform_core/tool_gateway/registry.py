@@ -93,9 +93,7 @@ TOOL_CAPABILITY: dict[str, str] = {
 # cannot. The executors are session-bound, so they read and write under the
 # caller's RLS-bound transaction and another tenant's row is invisible rather
 # than filtered afterwards.
-PLATFORM_TOOLS: frozenset[str] = frozenset(
-    {"case.read", "case.eq_confirm", "case.create"}
-)
+PLATFORM_TOOLS: frozenset[str] = frozenset({"case.read", "case.eq_confirm", "case.create"})
 
 # Arguments a write tool requires that the customer never supplies, and the
 # connector-configuration key each one is read from.

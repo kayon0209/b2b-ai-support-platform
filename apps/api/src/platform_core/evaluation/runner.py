@@ -349,19 +349,13 @@ class EvaluationRunner:
                 1
                 for r, c in zip(results, cases, strict=False)
                 if r.abstention_attributable
-                and (
-                    (c.must_abstain and r.abstained)
-                    or (not c.must_abstain and not r.abstained)
-                )
+                and ((c.must_abstain and r.abstained) or (not c.must_abstain and not r.abstained))
             ),
             abstention_false=sum(
                 1
                 for r, c in zip(results, cases, strict=False)
                 if r.abstention_attributable
-                and (
-                    (c.must_abstain and not r.abstained)
-                    or (not c.must_abstain and r.abstained)
-                )
+                and ((c.must_abstain and not r.abstained) or (not c.must_abstain and r.abstained))
             ),
             cross_lingual_unreachable=sum(1 for r in results if not r.abstention_attributable),
             # Counted from the cases, not the results, so the gate comparing

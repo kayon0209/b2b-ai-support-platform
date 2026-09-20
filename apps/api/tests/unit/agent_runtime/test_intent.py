@@ -346,9 +346,7 @@ def test_chinese_action_requests_reach_the_write_path() -> None:
         "帮我改一下收货地址",
     ):
         detection = classify(utterance)
-        assert detection.route is Route.BUSINESS_WRITE, (
-            f"{utterance!r} -> {detection.route.value}"
-        )
+        assert detection.route is Route.BUSINESS_WRITE, f"{utterance!r} -> {detection.route.value}"
         assert detection.action is IntentAction.PROPOSE_WRITE
 
 

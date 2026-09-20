@@ -114,14 +114,18 @@ async def _execute(parameters: dict, *, tenant: str = TENANT):
 def _case_row(case_id: str) -> dict | None:
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
-        row = conn.execute(
-            text(
-                "SELECT tenant_id, subject, priority, category, status, sla_tier, "
-                "enterprise_account_id, first_response_due_at, resolution_due_at "
-                "FROM cases WHERE id = :i"
-            ),
-            {"i": case_id},
-        ).mappings().one_or_none()
+        row = (
+            conn.execute(
+                text(
+                    "SELECT tenant_id, subject, priority, category, status, sla_tier, "
+                    "enterprise_account_id, first_response_due_at, resolution_due_at "
+                    "FROM cases WHERE id = :i"
+                ),
+                {"i": case_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
     admin.dispose()
     return dict(row) if row is not None else None
 
@@ -169,12 +173,8 @@ def test_the_tier_decides_the_clock_so_the_account_is_not_a_label() -> None:
     strategic = _seed_account(tier="strategic", name="Big")
     basic = _seed_account(tier="basic", name="Small")
 
-    high, _ = _run(
-        _execute({"enterprise_account_id": strategic, "subject": "A", "priority": "p1"})
-    )
-    low, _ = _run(
-        _execute({"enterprise_account_id": basic, "subject": "B", "priority": "p1"})
-    )
+    high, _ = _run(_execute({"enterprise_account_id": strategic, "subject": "A", "priority": "p1"}))
+    low, _ = _run(_execute({"enterprise_account_id": basic, "subject": "B", "priority": "p1"}))
 
     assert high["sla_tier"] == "strategic"
     assert low["sla_tier"] == "basic"
@@ -185,9 +185,7 @@ def test_the_tier_decides_the_clock_so_the_account_is_not_a_label() -> None:
 
 def test_an_unknown_account_is_refused_and_creates_nothing() -> None:
     """`ACCOUNT_NOT_FOUND` covers "no such account" and "another tenant's"."""
-    out, _ = _run(
-        _execute({"enterprise_account_id": str(_uuid.uuid4()), "subject": "ghost"})
-    )
+    out, _ = _run(_execute({"enterprise_account_id": str(_uuid.uuid4()), "subject": "ghost"}))
     assert out == {"ok": False, "error_code": "ACCOUNT_NOT_FOUND"}
 
     admin = create_engine(ADMIN_URL)
@@ -246,9 +244,7 @@ def test_an_empty_subject_is_refused() -> None:
 
 def test_an_invalid_priority_is_refused() -> None:
     account_id = _seed_account()
-    out, _ = _run(
-        _execute({"enterprise_account_id": account_id, "subject": "x", "priority": "p9"})
-    )
+    out, _ = _run(_execute({"enterprise_account_id": account_id, "subject": "x", "priority": "p9"}))
     assert out is not None and out["ok"] is False
     assert out["error_code"] == "PRIORITY_INVALID"
 
@@ -336,9 +332,7 @@ def test_the_postcondition_is_observed_not_taken_from_the_output() -> None:
         from platform_core.tool_gateway.case_create import CaseCreateExecutor
 
         async with session_scope_with_url(app_role_url()) as session:
-            ctx = TenantContext(
-                tenant_id=_uuid.UUID(TENANT), actor_id=None, actor_kind="service"
-            )
+            ctx = TenantContext(tenant_id=_uuid.UUID(TENANT), actor_id=None, actor_kind="service")
             await apply_rls_tenant(session, ctx)
             executor = CaseCreateExecutor(session, tenant_id=_uuid.UUID(TENANT))
             claimed = {"ok": True, "case_id": case_id, "sla_tier": "strategic"}
@@ -379,9 +373,7 @@ def test_case_create_resolves_without_a_connector() -> None:
             ctx = TenantContext(tenant_id=_uuid.UUID(TENANT), actor_id=None, actor_kind="service")
             await apply_rls_tenant(session, ctx)
             resolver = ConnectorExecutorResolver(session, tenant_id=_uuid.UUID(TENANT))
-            resolved = await resolver.executors_for(
-                ["case.read", "case.eq_confirm", "case.create"]
-            )
+            resolved = await resolver.executors_for(["case.read", "case.eq_confirm", "case.create"])
         return {name: True for name in resolved}
 
     assert _run(scenario()) == {
