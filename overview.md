@@ -476,3 +476,122 @@ which one applies to you.」——说「我无法核实」是**假话**，政策
 → `82ce28b`（拒绝变体条件化答案，`KNOWN_GAPS` 清空）
 → `b624ecf`（ADR 0005 + claim-support 指标，分阶段而非直接拦截）
 → `f668a9f`（`--samples N` 测量逐用例波动）→ 本轮（claim-support 精确率 1/2 → 2/2）
+
+---
+
+# 本轮会话：ADR 0009 落地 + 门禁漏洞发现与修复（2026-09-19）
+
+**触发**：用户指令「这个架构级别的问题 得修复」——指此前记录为"未擅自改"的**门禁耦合**。
+
+## 一、修复了什么
+
+**问题**：`expected_route` 断言**路由契约**，`abstention_correct_rate` 断言**检索契约**，
+两条独立契约压在**同一条用例**上。中文问句打在英文语料上必然弃答
+（`NO_AUTHORIZED_EVIDENCE`），于是语言缺口被一个关于"弃答判断"的指标惩罚：
+实测 `0.8293 vs 0.9`，门禁红。
+
+**做法**（ADR 0009，先写 ADR 再写码）：给 `EvalCase` 加显式 `cross_lingual` 声明，
+豁免**四条子句全中**才生效：
+
+```python
+if (decision.abstain
+        and not case.must_abstain                        # 本该弃答的不参与
+        and case.cross_lingual                           # 必须显式声明
+        and decision.reason_code == ABSTAIN_NO_EVIDENCE): # 只有"没检索到"算语言缺口
+    result.abstention_attributable = False
+```
+
+**三个设计约束**（各有对应测试，任何一条写反都是静默失效）：
+- **fail-closed**：`abstention_attributable` 默认 `True`，未声明的弃答照旧计入。
+- **`EVIDENCE_BELOW_THRESHOLD` 不豁免**：证据在、分低，是检索器调参问题，必须可见。
+- **`must_abstain` 不豁免**：它的弃答本已计作 correct，豁免只会删掉一条**通过**的用例
+  （方向只能让分变好）。这是第一版的**真实漏洞**，被自己写的 counter-guard 抓到。
+
+**两扇防退化门禁**（因分母为空时该比率返回 `1.0`，无上限豁免=假满分）：
+`cross_lingual_exclusions_match` + `cross_lingual_exclusions_bounded`。
+
+**豁免有活消费端**：新增 `cn-answerable-warranty-period` / `cn-answerable-after-sales-process`
+两条中文问句，故意不标 `must_abstain`——它们是豁免真正生效的地方。
+没有活消费端的豁免比没有豁免更糟：**它看起来像覆盖**。
+
+## 二、验证（本次重点）
+
+| 验证 | 结果 |
+|---|---|
+| **变异验证** | **6/6 全被捕获**（M1 去声明要求 / M2 去 `not must_abstain` / M3 去 reason-code / M4a 门禁恒真 / M4b match 改比全部声明 / M4c 同 M1） |
+| **反向验证**（ADR 要求"比正向更重要"） | 三条**仅声明不同、其余全同**的案例逐案跑 `EvaluationRunner`，豁免**恰好**只落在声明了 `cross_lingual` 的那条；注入与语言无关的真实 false abstention → 门禁照旧红 |
+| `tests/evals` | **67 passed** |
+| `release_check --evidence-only` | **exit 0**，baseline 四项逐项一致（1533 / cross-tenant 15 / unauthorized-writes 4 / duplicate-replies 3） |
+| ruff + mypy（改动文件） | All checks passed / no issues found |
+
+**真实数字**：`total=40` / `counted=38` / `excluded=2` / `exemptible=2` /
+`abstention_correct_rate=1.0000`（在**非空**分母 38 上）/ `failed=2`（两条真实能力缺口
+仍红并登记 `KNOWN_GAPS`）/ bounded `0.05 vs 0.5`。
+会计恒等式 `counted + excluded == total` 已断言——没有用例凭空消失。
+
+**量化了容忍度**（诚实记录）：分母 38 时，改动后 **4 个**真实误弃答仍 PASS（0.8947），
+**第 5 个才 FAIL**；改动前 2 个即 FAIL。豁免**确实放松了容忍度**——但这是把"语言缺口"
+换成"真实缺口"，且由两扇新门禁兜底，属于**该放松的那一部分**。
+
+## 三、顺带发现并修复的第二个漏洞：门禁"空洞通过"
+
+`release_check` 原用 `raw.get(field, 0)` 读三个新字段。磁盘上那份**旧**产物
+（`total=23`，不含新字段）→ 三个字段全读成 0 → `exclusions_match` 比较 `0 == 0`
+→ **绿灯**，`release_check --evidence-only` 照常 **exit 0**。
+
+**这正是 ADR 0009 自己要防的"没有活消费端的豁免"，却复现在了本该防它的门禁里。**
+
+修法：`release_check` 改用 `-1` 作"未上报"哨兵，`gates.py` 遇哨兵判 FAIL 并给可操作指引。
+
+```
+[FAIL] cross_lingual_exclusions_match: -1 vs -1
+       (artifact predates ADR 0009 ... regenerate the eval report with `scripts/run_eval.py`)
+[FAIL] cross_lingual_exclusions_bounded: -1.0 vs 0.5
+```
+
+对应的旧测试**曾把这个 bug 断言成期望行为**，已重写为断言失败，并改走真实反序列化路径
+（手搓 `EvalReport` 会走 dataclass 默认值，复现不了该 bug）。
+
+## 四、新发现的独立预存缺陷（**未修**，需你定）
+
+`scripts/run_eval.py` 稳定报
+`RuntimeError: ingesting refund-policy-v3 left ingestion_status='uploaded'
+(stats=IngestStats(claimed=8, ready=8, ...))`。
+
+**已确证与本次改动无关**：该文件在 HEAD 上就是 `batch=10` + "每条目只 drain 一次"的循环，
+`CORPUS` 也一直是 13 条（我对该文件只有 8 行 report 字段持久化改动）。
+
+**根因**：测量脚本与**全局 FIFO** 认领队列的容量不匹配。`claim_ingestion_versions`
+跨租户、无过滤（`ORDER BY created_at LIMIT p_batch`）。确定性实测：
+播 5 陈旧 + 13 新 → `claim(10)` 返回 **5 陈旧 + 5 新**，新行 5~12 全被排除。
+
+**修法建议**：改成"drain 到本条目 ready 为止"（带上限防死循环），或把 `batch` 提到 ≥ 队列水位。
+属评测基础设施且另一会话可能正在动它，故未擅自改。
+
+## 五、改动文件
+
+**新增**
+- `docs/adr/0009-abstention-rate-scope.md` — 设计依据（先于代码）
+- `tests/evals/test_abstention_scope.py` — 豁免机制自己的 15 条测试
+
+**修改**
+- `runner.py` — `cross_lingual` / `abstention_attributable` / 三个计数
+- `gates.py` — 两扇新门禁 + `-1` 哨兵处理
+- `release_check.py` — `-1` 哨兵（修复空洞通过）
+- `intent.py` — `_is_cn_human_request`（counter-guard 抓到的真实路由缺陷：
+  `为什么要转人工` 曾误判 `human_required`）
+- `tests/evals/dataset.py` — 12 条中文用例 + 两条豁免活消费端
+- `tests/evals/test_release_gates.py` — `KNOWN_GAPS` 登记两条真实能力缺口
+- `scripts/run_eval.py` — 持久化三个新字段
+- `docs/research/chinese-intent-measurement.md` + `huaqiu-research.md`（附录 J）— 已更新
+
+**未提交**：按交接约定，不擅自 commit / reset。约 60 个改动文件仍待你决定切分。
+
+## 六、诚实边界
+
+- **跨语言检索能力本身仍未实现**。两条 `cn-answerable-*` 用例仍红、登记在 `KNOWN_GAPS`。
+  ADR 0009 只保证这个缺口**可见**，**不假装它消失**——那需要一项新能力，属另一个决策。
+- 三个 flaky（`test_billing_ledger` / `test_inbox_reclaim` / `test_ingestion_worker`）
+  + `test_knowledge_gaps` 1 个 ERROR 周期性复现，**隔离运行全过**，且**均不 import**
+  本次改动模块 → 预存问题，非本次引入。
+- 仍**不擅自决定**的三项：约 60 个文件的提交切分、host worker、`Route.CASE_STATUS` 的去留。

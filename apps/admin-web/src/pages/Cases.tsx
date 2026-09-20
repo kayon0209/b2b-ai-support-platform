@@ -48,10 +48,122 @@ function slaTone(due: number | null, done: number | null): "good" | "warn" | "ba
   return "good";
 }
 
+/**
+ * Open a case from the console.
+ *
+ * This page could transition, reassign and re-prioritise an existing case and
+ * not create one, so every new case - including the `eq_confirmation` cases
+ * the confirmation flow is built around - had to be raised with `curl`. A
+ * category nobody can set is a category nobody uses.
+ *
+ * The two reference fields are optional and take a UUID. They are typed rather
+ * than picked because the console has no conversation or account picker yet;
+ * naming that honestly beats a dropdown that shows nothing.
+ */
+function NewCasePanel({
+  onCreated,
+}: {
+  onCreated: (caseId: string, message: string) => void;
+}) {
+  const { t } = useLang();
+  const [subject, setSubject] = useState("");
+  const [description, setDescription] = useState("");
+  const [priority, setPriority] = useState("p2");
+  const [category, setCategory] = useState("general");
+  const [conversationRef, setConversationRef] = useState("");
+  const [accountRef, setAccountRef] = useState("");
+  const action = useAction();
+
+  async function submit() {
+    if (!subject.trim()) {
+      action.fail(t("cases.subjectRequired"));
+      return;
+    }
+    let created: string | null = null;
+    const ok = await action.run(async () => {
+      const res = await apiPost<{ case: Case }>(
+        "/v1/cases",
+        {
+          subject: subject.trim(),
+          description,
+          priority,
+          category,
+          // Omitted rather than sent as "" - an empty string is not a UUID and
+          // the API rejects it, which would read as a broken form.
+          ...(conversationRef.trim() ? { conversation_ref_id: conversationRef.trim() } : {}),
+          ...(accountRef.trim() ? { enterprise_account_id: accountRef.trim() } : {}),
+        },
+        newIdempotencyKey(),
+      );
+      created = res.case.case_id;
+    });
+    if (ok && created) onCreated(created, t("cases.created"));
+  }
+
+  return (
+    <Card title={t("cases.newTitle")}>
+      <p className="muted">{t("cases.newDetail")}</p>
+      <label className="field">
+        {t("cases.subjectLabel")}
+        <input value={subject} onChange={(e) => setSubject(e.target.value)} maxLength={512} />
+      </label>
+      <label className="field">
+        {t("cases.descriptionLabel")}
+        <textarea rows={3} value={description} onChange={(e) => setDescription(e.target.value)} />
+      </label>
+      <label className="field">
+        {t("cases.priorityLabel")}
+        <select value={priority} onChange={(e) => setPriority(e.target.value)}>
+          {["p0", "p1", "p2", "p3"].map((p) => (
+            <option key={p} value={p}>
+              {p}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="field">
+        {t("cases.category")}
+        <select value={category} onChange={(e) => setCategory(e.target.value)}>
+          <option value="general">{t("case.category.general")}</option>
+          <option value="eq_confirmation">{t("case.category.eq_confirmation")}</option>
+        </select>
+      </label>
+      <label className="field">
+        {t("cases.conversationRef")}
+        <input
+          value={conversationRef}
+          onChange={(e) => setConversationRef(e.target.value)}
+          placeholder={t("cases.uuidHint")}
+        />
+      </label>
+      <label className="field">
+        {t("cases.accountRef")}
+        <input
+          value={accountRef}
+          onChange={(e) => setAccountRef(e.target.value)}
+          placeholder={t("cases.uuidHint")}
+        />
+      </label>
+      <div className="row-actions">
+        <button className="btn btn-primary" onClick={() => void submit()} disabled={action.busy}>
+          {t("cases.newSubmit")}
+        </button>
+      </div>
+      {/* Errors stay here, next to the fields that caused them. The success
+          message goes to the page, because this panel closes on success and a
+          banner inside it would be unmounted in the same commit that set it -
+          the same defect the proposal panel had. */}
+      <ActionFeedback error={action.error} notice={null} />
+    </Card>
+  );
+}
+
+
 export function Cases() {
   const { t } = useLang();
   const [selected, setSelected] = useState<string | null>(null);
   const [offset, setOffset] = useState(0);
+  const [creating, setCreating] = useState(false);
   // SLA badges are "time until due", so they go stale on their own. A minute
   // is coarse enough not to churn renders and fine enough that a case does
   // not sit showing green after it has breached.
@@ -71,11 +183,18 @@ export function Cases() {
   // No case is selected on mount (and none after "Close"), and the loader
   // used to run anyway against `/v1/cases/null`, which the API answers with
   // a 400 on every visit and again on every close.
-  const detail = useAsync<{ case: Case }>(
+  //
+  // The not-selected branch resolves to `null` rather than to a `{case: null}`
+  // shape. That shape was a lie to the type system - it needed
+  // `null as unknown as Case` to compile - and the lie is what crashed the
+  // page: `detail.data` was a truthy object holding a null case, so the render
+  // guard below passed and `CaseDetail` dereferenced `null.subject` as soon as
+  // the first load resolved. **This page crashed on every visit**, and nothing
+  // caught it because no test had ever opened it in a browser. A cast that
+  // silences a type error is a place to look for a runtime error.
+  const detail = useAsync<{ case: Case } | null>(
     () =>
-      selected
-        ? apiGet<{ case: Case }>(`/v1/cases/${selected}`)
-        : Promise.resolve({ case: null as unknown as Case }),
+      selected ? apiGet<{ case: Case }>(`/v1/cases/${selected}`) : Promise.resolve(null),
     [selected],
   );
   const action = useAction();
@@ -107,6 +226,24 @@ export function Cases() {
 
       <ActionFeedback error={action.error} notice={action.notice} />
       <LoadError error={list.error} status={list.errorStatus} onRetry={list.reload} />
+
+      <div className="row-actions">
+        <button className="btn" onClick={() => setCreating((v) => !v)}>
+          {creating ? t("cases.newHide") : t("cases.new")}
+        </button>
+      </div>
+      {creating ? (
+        <NewCasePanel
+          onCreated={(caseId, message) => {
+            setCreating(false);
+            setOffset(0);
+            setSelected(caseId);
+            action.succeed(message);
+            list.reload();
+          }}
+        />
+      ) : null}
+
       {list.loading ? <Spinner label={t("cases.loadingCases")} /> : null}
       {list.data && list.data.items.length === 0 ? (
         <EmptyState message={t("cases.emptyList")} />
@@ -154,13 +291,18 @@ export function Cases() {
             <Spinner label={t("cases.loadingCase")} />
           ) : detail.error ? (
             <ErrorBanner message={detail.error} onRetry={detail.reload} />
-          ) : detail.data ? (
+          ) : detail.data?.case ? (
             <CaseDetail
               c={detail.data.case}
               onCommand={command}
               onClose={() => setSelected(null)}
             />
-          ) : null}
+          ) : (
+            // Reached both when nothing is selected and while a newly selected
+            // case is loading. `detail.data?.case`, not `detail.data`: the
+            // envelope is always truthy, the case inside it is not.
+            <EmptyState message={t("cases.selectCase")} />
+          )}
         </div>
       </div>
     </div>

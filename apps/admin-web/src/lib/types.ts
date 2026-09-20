@@ -198,6 +198,71 @@ export interface BillingAdjustmentResult {
 }
 
 /**
+ * A tool proposal as `GET /v1/tool-proposals` returns it — a write the agent
+ * prepared.
+ *
+ * Two status fields, and the difference is the whole point. `status` is the
+ * stored row. `effective_status` is what a human should act on: a proposal
+ * past its expiry is reported as `expired`, because `confirm` and `execute`
+ * both refuse it. Binding the UI to `status` would offer an approval the API
+ * will not accept, and the operator would only find that out by clicking.
+ */
+/**
+ * One tool the tenant can propose against.
+ *
+ * Read from `GET /v1/tools` rather than carried in the UI, so a tool added to
+ * the server catalog appears without a front-end change and one a tenant has
+ * disabled disappears. `input_schema` is what the propose form prefills from,
+ * so the operator starts from the shape the API validates against.
+ */
+export interface ToolCatalogEntry {
+  name: string;
+  version: number;
+  risk: string;
+  requires_confirmation: boolean;
+  input_schema: {
+    type?: string;
+    properties?: Record<string, unknown>;
+    required?: string[];
+  };
+  /** True when this tenant overrides the shared catalog entry. */
+  tenant_scoped: boolean;
+}
+
+export interface ToolProposal {
+  proposal_id: string;
+  tool_name: string | null;
+  tool_version: number | null;
+  risk: string | null;
+  status: string;
+  effective_status: string;
+  /** The frozen arguments. This is exactly what an approval binds to. */
+  arguments: Record<string, unknown>;
+  action_hash: string;
+  permission_decision: string;
+  permission_reason: string;
+  required_confirmation: boolean;
+  expires_at: number;
+}
+
+/**
+ * One attempt at running a proposal.
+ *
+ * `verification_status` is the honest field: `executed` means the call
+ * returned, not that the write happened. `unknown` means the postcondition
+ * could not be determined and must never be rendered as a completed action.
+ */
+export interface ToolProposalExecution {
+  execution_id: string;
+  status: string;
+  verification_status: string | null;
+  output: Record<string, unknown> | null;
+  error_code: string | null;
+  started_at: number;
+  completed_at: number | null;
+}
+
+/**
  * A failed API call, as a real `Error`.
  *
  * It must extend `Error`, not merely be shaped like one. Every call site

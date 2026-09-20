@@ -12,6 +12,7 @@ const NAV = [
   { to: "/prompts", key: "nav.prompts", icon: "✍️" },
   { to: "/flags", key: "nav.flags", icon: "🚩" },
   { to: "/cases", key: "nav.cases", icon: "🎫" },
+  { to: "/approvals", key: "nav.approvals", icon: "✅" },
   { to: "/members", key: "nav.members", icon: "👥" },
   { to: "/usage", key: "nav.usage", icon: "📈" },
   { to: "/branding", key: "nav.branding", icon: "🎨" },

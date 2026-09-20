@@ -27,6 +27,7 @@ Message received
   → resolve tenant, actor, contact, conversation and control lease
   → redact/minimize sensitive data
   → classify intent and risk
+  → resolve what the conversation is waiting on (may override the path)
   → select path: answer / deterministic flow / handoff
   → retrieve authorized evidence or authorize tool
   → generate draft
@@ -39,12 +40,42 @@ Message received
 ## Routing classes
 
 1. `KNOWLEDGE_QA`: policies, manuals, product documentation.
-2. `CASE_STATUS`: read an internal Case or linked issue.
+2. `CASE_STATUS`: read an internal Case or linked issue. **Not currently
+   produced by the classifier** — a case-status question is classified
+   `BUSINESS_READ` and answered by the `case.read` tool, which is why the
+   evaluation dataset declares `business_read` for it. Listed here because the
+   class is defined in the taxonomy; noted because a documented class the
+   classifier cannot emit reads as a capability that exists.
 3. `BUSINESS_READ`: query CRM, entitlement, contract, asset or order data.
 4. `BUSINESS_WRITE`: create/update an external record through a deterministic flow.
 5. `SENSITIVE`: security, legal, HR, account ownership, personal data.
 6. `OUT_OF_SCOPE`: unsupported or unrelated requests.
 7. `HUMAN_REQUIRED`: explicit request, conflict, low evidence, policy requirement, or repeated failure.
+
+### The one context-dependent decision
+
+A confirmation is the single message whose meaning depends on what the
+conversation is waiting for rather than on its own words. "确认" carries no verb
+and no object, so it never classifies as a write request — but in a conversation
+linked to an `eq_confirmation` case in `waiting_customer`, it is the answer
+production is held for.
+
+The decision is gated on four facts that must all hold: the write path is
+enabled for the tenant, exactly one case is linked to this conversation, that
+case is `eq_confirmation`, and it is `waiting_customer`; plus the message reading
+as assent (`agent_runtime.confirmation`, lexical and deliberately narrow —
+short, no negation, not a question).
+
+**What it does is hand off, not act.** `case.eq_confirm` is `human_approval`,
+the class this deployment reserves for `tenant_owner` and keeps unreachable by
+the agent at every stage including propose, because the case status is what the
+factory reads and a customer's word in a conversation is not a production
+release. The AI relays and collects; a person records the confirmation. So the
+run ends in a handoff with reason `EQ_CONFIRMATION_REQUIRES_HUMAN`.
+
+That is still worth doing: without it the QA path answers a bare "确认" from the
+corpus, or asks a customer who has just answered the platform's question to say
+more. Both are plainly wrong, and neither is a handoff.
 
 ## Evidence policy
 

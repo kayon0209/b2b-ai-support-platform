@@ -81,7 +81,13 @@ pythonpath = [
     "packages/observability/src",
     ".",
 ]
-testpaths = ["apps/api/tests", "packages/contracts/tests", "tests/evals"]
+# `tests` rather than `tests/evals`: the comment below describes the suite as
+# having two test roots, but only the evals subtree was listed, so every test
+# under `tests/unit` - the Huaqiu seed guard and the worker dispatch tests -
+# was collected by nothing and ran only when named explicitly. `tests/e2e/*`
+# is not collected by the file-name convention (they are scripts, not test
+# modules), so widening the root does not pull them in.
+testpaths = ["apps/api/tests", "packages/contracts/tests", "tests"]
 # Loaded explicitly rather than as a conftest: the suite has two test roots
 # (`apps/api/tests` and `tests/`), so a conftest at either one is not an
 # ancestor of the other, and the release-gate evidence collector must see

@@ -80,7 +80,11 @@ Case
 - requester_user_ref?
 - subject
 - description
-- category
+- category: general | eq_confirmation
+  (a free-form column and a *vocabulary*, not a constraint — an unrecognised
+  value stays readable rather than becoming an error. `eq_confirmation` marks
+  a case whose customer owes an answer to an engineering question and whose
+  production is held until they give it; it is what scopes `case.eq_confirm`.)
 - priority: p0|p1|p2|p3
 - status
 - assignee_ref?
@@ -112,6 +116,16 @@ RESOLVED/CLOSED → REOPENED → IN_PROGRESS
 ```
 
 All transitions are explicit commands and audited. SLA pause behavior is determined by policy, not inferred from labels.
+
+**Recording an EQ confirmation uses `WAITING_CUSTOMER → IN_PROGRESS`.** That is
+deliberate, and the reason is the SLA policy rather than taste: `DEFAULT_SLA`
+keeps the clocks running in `NEW`, `TRIAGED`, `IN_PROGRESS` and `REOPENED`, and
+pauses them in the three waiting states. Moving the case to `WAITING_INTERNAL`
+when the customer confirms would pause the resolution clock at exactly the
+moment the customer has done their part and the work is ours — the platform
+granting itself an extension for the interval it is most obliged to be quick
+about. `IN_PROGRESS` restarts the clock against us, which is the incentive the
+flow needs, and it is already a legal transition, so no edge was added for it.
 
 ## Conversation control
 

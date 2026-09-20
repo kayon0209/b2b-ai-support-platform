@@ -150,7 +150,39 @@ Response contains authorized candidates only:
 
 Scores are diagnostics and must not be represented to end users as probabilities.
 
-## Case command API
+## Case API
+
+```text
+POST /v1/cases
+POST /v1/cases/{case_id}/commands
+GET  /v1/cases
+GET  /v1/cases/{case_id}
+```
+
+```json
+{
+  "subject": "EQ 12345: confirm stackup before production",
+  "description": "",
+  "priority": "p2",
+  "category": "eq_confirmation",
+  "enterprise_account_id": "019...",
+  "conversation_ref_id": "019..."
+}
+```
+
+`enterprise_account_id` selects the SLA policy through the account's contract
+tier. An unknown id and another tenant's id both return `ACCOUNT_NOT_FOUND` —
+RLS cannot see the latter, and distinguishing them would make this endpoint a
+way to enumerate account ids.
+
+`conversation_ref_id` records where the case came from, on
+`CaseConversation`. It is optional because a case can be raised from a phone
+call or an email, and it matters beyond provenance: it is what
+`inbox_consumer.case_conversation_ref` joins on to find the conversation of an
+**escalated** case, which is what priority claiming filters on. A case created
+without it is not reachable that way.
+
+## Case commands
 
 ```text
 POST /v1/cases/{case_id}/commands
@@ -167,13 +199,69 @@ POST /v1/cases/{case_id}/commands
 
 Optimistic concurrency prevents lost updates. Invalid state transitions return `CASE_TRANSITION_NOT_ALLOWED`.
 
+## Tool catalog
+
+```text
+GET /v1/tools
+```
+
+```json
+{
+  "items": [
+    {
+      "name": "case.eq_confirm",
+      "version": 1,
+      "risk": "confirmed_write",
+      "requires_confirmation": true,
+      "input_schema": {"type": "object", "properties": {"case_ref": {"type": "string"}}, "required": ["case_ref"]},
+      "tenant_scoped": false
+    }
+  ],
+  "total": 1
+}
+```
+
+The tools this tenant may propose against, read from `tool_definitions` — the
+tenant's own rows plus the shared ones, highest version first, deduplicated by
+name so the entry returned is the one the propose path would resolve.
+
+A tenant whose catalog was never registered sees an empty list rather than the
+code catalog, which is intended: a tenant may edit or disable a definition, and
+repairing that silently is worse than an empty form. Seed with
+`tool_gateway.registry.ensure_tool_definitions`, which only adds missing rows.
+
+A tool the caller cannot propose is **omitted**, not listed-and-refused: a choice
+the API always rejects is not a choice. Two things disqualify one — the
+`prohibited` class, and a risk class whose action this principal does not hold.
+The second matters more than it looks, because the write grants are narrow:
+`support_agent` holds `CASE_READ`, `CASE_CREATE`, `CASE_UPDATE`, `KNOWLEDGE_READ`
+and `TOOL_READ`, and **no write action at all**, so a support agent's catalog is
+read tools only. Approving is separate from proposing, and a support agent does
+hold `CASE_UPDATE` — which is what lets them approve a `confirmed_write`
+proposal the agent raised without being able to raise one.
+
 ## Tool proposal and execution
 
 ```text
 POST /v1/tool-proposals
 POST /v1/tool-proposals/{id}/confirm
 POST /v1/tool-proposals/{id}/execute
+GET  /v1/tool-proposals
+GET  /v1/tool-proposals/{id}
 ```
+
+`GET /v1/tool-proposals` lists the tenant's proposals, newest first, with
+`limit`/`offset` and an optional `status` filter, and requires `case.read` —
+listing exposes the arguments of writes in flight, which is case content.
+Each item carries both `status` (the stored value) and `effective_status`: a
+proposal still `authorized` past its expiry is reported as `expired`, because
+`confirm` and `execute` both refuse it, and a console that showed it as pending
+would offer an approval that cannot be given.
+
+The list is what makes the agent's write path usable. The agent can propose a
+`confirmed_write` and then stop — it holds `tool.write.confirmed` so it can
+propose, and not `case.update`, so it cannot approve — and a human discovers the
+proposal here rather than being told its id out of band.
 
 A proposal freezes:
 
