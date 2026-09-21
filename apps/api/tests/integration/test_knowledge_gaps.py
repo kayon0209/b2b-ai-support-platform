@@ -22,12 +22,12 @@ import uuid
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 
 from platform_core.identity.middleware import TenantContextMiddleware
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.knowledge import gap_service
-from platform_core.knowledge.gap_models import DraftStatus, GapStatus
+from platform_core.knowledge.gap_models import DraftStatus, GapStatus, KnowledgeDraft
 
 pytestmark = pytest.mark.integration
 
@@ -412,6 +412,49 @@ class TestDraftWorkflow:
         draft, (rows, _total) = _run(_in_session(TENANT, _fn))
         assert draft.status == DraftStatus.PENDING.value
         assert rows[0].status == GapStatus.DRAFTED.value
+
+    def test_the_same_draft_submitted_twice_is_one_draft(self) -> None:
+        """A double-click is a duplicate, not a second opinion.
+
+        The console mints a fresh idempotency key per click, so the key cannot
+        catch this, and unlike customer messages there is no content hash on
+        this path - without the guard a reviewer gets two identical drafts and
+        has to work out that they are the same thing.
+        """
+        gap_id = self._gap()
+
+        async def _fn(session):
+            first = await gap_service.create_draft(
+                session, ctx=_ctx(), gap_id=gap_id, title="Enabling SSO", body="One."
+            )
+            second = await gap_service.create_draft(
+                session, ctx=_ctx(), gap_id=gap_id, title="Enabling SSO", body="One."
+            )
+            drafts = await session.execute(
+                select(KnowledgeDraft).where(KnowledgeDraft.gap_id == gap_id)
+            )
+            return first, second, list(drafts.scalars().all())
+
+        first, second, all_drafts = _run(_in_session(TENANT, _fn))
+
+        assert first.id == second.id, "the second submit created a second draft"
+        assert len(all_drafts) == 1
+
+    def test_a_different_title_is_still_a_new_draft(self) -> None:
+        """The guard is narrow on purpose: a different proposal is a new one."""
+        gap_id = self._gap()
+
+        async def _fn(session):
+            first = await gap_service.create_draft(
+                session, ctx=_ctx(), gap_id=gap_id, title="Enabling SSO", body="One."
+            )
+            second = await gap_service.create_draft(
+                session, ctx=_ctx(), gap_id=gap_id, title="Configuring SCIM", body="Two."
+            )
+            return first, second
+
+        first, second = _run(_in_session(TENANT, _fn))
+        assert first.id != second.id
 
     def test_empty_draft_is_refused(self) -> None:
         gap_id = self._gap()

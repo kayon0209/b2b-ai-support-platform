@@ -27,7 +27,7 @@ import uuid
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from platform_core.agent_runtime.models import Citation, ConversationTurn
 from platform_core.api import (
@@ -168,6 +168,26 @@ async def post_message(request: Request, conversation_ref: str, body: MessageIn)
     digest = payload_hash(body.text.encode())
 
     async with tenant_session(ctx) as session:
+        # Serialise the check-and-insert for this one logical message.
+        #
+        # The guard below is a SELECT followed by an INSERT, and that pair is a
+        # race: ten simultaneous submissions of the same text all read nothing
+        # and all insert. Measured, not theorised - ten parallel requests with
+        # the *same* idempotency key produced four rows, and ten with different
+        # keys produced two, and the table already held duplicate groups from
+        # earlier runs. Sequential tests cannot see any of that, which is why
+        # the suite was green.
+        #
+        # A transaction-scoped advisory lock on (tenant, conversation, hash)
+        # makes the pair atomic for writers of the same message, without a
+        # schema change: a unique index would also constrain the Chatwoot
+        # ingestion path, which records messages this endpoint never sees and
+        # has its own reasons to keep every one of them.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"{ctx.tenant_id}:{ref_id}:{digest}"},
+        )
+
         # Replay guard. Requiring the header is not enough — a retry that
         # simply inserts again turns "the customer pressed send twice" into
         # two separate questions for the agent to answer. Content hashing

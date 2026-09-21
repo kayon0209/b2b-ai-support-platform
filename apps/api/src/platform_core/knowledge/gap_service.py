@@ -240,6 +240,28 @@ async def create_draft(
     if gap.status == GapStatus.RESOLVED.value:
         raise GapError("ALREADY_RESOLVED", "this gap already has published knowledge")
 
+    # A second submit of the same draft is a duplicate, not a second opinion.
+    # The console generates a fresh idempotency key per click, so the key
+    # cannot catch a double-click; and unlike customer messages there is no
+    # content hash on this path, so without this check two identical drafts
+    # appear and a reviewer has to work out that they are the same thing.
+    # Matching on (gap, title) is deliberately narrow - a genuinely different
+    # title for the same gap is still a new draft.
+    existing = (
+        await session.execute(
+            select(KnowledgeDraft)
+            .where(
+                KnowledgeDraft.tenant_id == ctx.tenant_id,
+                KnowledgeDraft.gap_id == gap.id,
+                KnowledgeDraft.title == title.strip()[:512],
+                KnowledgeDraft.status == DraftStatus.PENDING.value,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
     draft = KnowledgeDraft(
         tenant_id=ctx.tenant_id,
         gap_id=gap.id,
