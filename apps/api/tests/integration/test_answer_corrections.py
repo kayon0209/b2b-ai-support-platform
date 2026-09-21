@@ -81,6 +81,12 @@ def _clear() -> None:
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
         for tenant in (TENANT, OTHER):
+            # Drafts and gaps before the corrections that create them: a draft
+            # left behind would satisfy "a draft exists" on a later run even if
+            # the wiring had stopped working - the same leftover-row trap that
+            # has already produced two false results tonight.
+            conn.execute(text("DELETE FROM knowledge_drafts WHERE tenant_id = :t"), {"t": tenant})
+            conn.execute(text("DELETE FROM knowledge_gaps WHERE tenant_id = :t"), {"t": tenant})
             conn.execute(text("DELETE FROM answer_corrections WHERE tenant_id = :t"), {"t": tenant})
         for slug in (SLUG, OTHER_SLUG):
             conn.execute(text("DELETE FROM tenants WHERE slug = :slug"), {"slug": slug})
@@ -208,3 +214,36 @@ def test_pending_corrections_are_visible_to_operations() -> None:
         .json()
     )
     assert still["pending_corrections"] == 1
+
+
+def test_approving_a_correction_drafts_it_for_the_knowledge_base() -> None:
+    """7.8, the last link: an approved correction reaches the publish queue.
+
+    Approving must not depend on someone remembering to retype the answer. It
+    lands as a draft - not as knowledge - because approving checked that the
+    correction is right, not that it reads well as documentation.
+    """
+    from platform_core.knowledge.gap_models import KnowledgeDraft
+
+    created = _record(_client()).json()
+    approved = _client(TENANT, "tenant_owner").post(
+        f"/v1/corrections/{created['id']}/review",
+        json={"approve": True},
+        headers=_headers(),
+    )
+    assert approved.status_code == 200, approved.text[:200]
+
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        rows = conn.execute(
+            text("SELECT body, status FROM knowledge_drafts WHERE tenant_id = :t"),
+            {"t": TENANT},
+        ).all()
+    admin.dispose()
+
+    assert rows, "the approved correction never reached the draft queue"
+    bodies = " ".join(str(r[0]) for r in rows)
+    assert "标准交期 7 天" in bodies
+    # It is a draft awaiting review, not published knowledge.
+    assert KnowledgeDraft is not None
+    assert any(str(r[1]).lower() in ("draft", "pending", "awaiting_review") for r in rows), rows

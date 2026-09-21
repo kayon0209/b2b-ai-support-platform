@@ -119,4 +119,41 @@ async def review_correction(
     row.reviewed_at = int(time.time())
     row.updated_at = row.reviewed_at
     await session.flush()
+
+    # Approving writes the correction into the knowledge pipeline, so it does
+    # not depend on anyone remembering to retype it. It becomes a *draft*, not
+    # knowledge: approving checked that the correction is right, not that it
+    # reads well as documentation, and publishing keeps its own review.
+    if approve:
+        await _propose_as_draft(session, ctx=ctx, correction=row)
     return row
+
+
+async def _propose_as_draft(
+    session: AsyncSession, *, ctx: TenantContext, correction: AnswerCorrection
+) -> None:
+    """Open a gap and draft the corrected answer against it.
+
+    A wrong answer is a knowledge defect, so it joins the same queue as any
+    other - reviewers see one list rather than two, and it is published by the
+    same reviewed path.
+    """
+    from platform_core.knowledge import gap_service
+
+    record = await gap_service.record_gap(
+        session,
+        tenant_id=ctx.tenant_id,
+        question=correction.question,
+        reason_code="AGENT_CORRECTION",
+    )
+    if record.gap_id is None:
+        # An unclassifiable question is not a reason to lose the correction;
+        # it stays approved and visible in the queue.
+        return
+    await gap_service.create_draft(
+        session,
+        ctx=ctx,
+        gap_id=record.gap_id,
+        title=correction.question[:80],
+        body=correction.correct_answer,
+    )
