@@ -177,9 +177,7 @@ def test_non_standard_thickness_and_expedite_still_go_to_a_person() -> None:
     from platform_core.pricing import service
 
     assert service.quote_from_text("4层板 100x100mm 板厚2.0mm 沉金 500片多少钱？") is None
-    assert service.quote_from_text(
-        "4层板 100x100mm 板厚1.6mm 沉金 500片 加急多少钱？"
-    ) is None
+    assert service.quote_from_text("4层板 100x100mm 板厚1.6mm 沉金 500片 加急多少钱？") is None
 
 
 def test_quoting_can_be_switched_off_entirely(monkeypatch: pytest.MonkeyPatch) -> None:

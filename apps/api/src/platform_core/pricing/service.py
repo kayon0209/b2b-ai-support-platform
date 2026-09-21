@@ -61,7 +61,4 @@ def quote_label(question: str) -> str | None:
     warning = ""
     if f"version={VERSION}" in band.basis:
         warning = " NON-CONTRACTUAL: public reference data, confirm before quoting"
-    return (
-        f"quote_band={band.low_minor}-{band.high_minor} {band.currency} "
-        f"[{band.basis}]{warning}"
-    )
+    return f"quote_band={band.low_minor}-{band.high_minor} {band.currency} [{band.basis}]{warning}"
