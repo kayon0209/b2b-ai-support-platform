@@ -182,6 +182,129 @@ call or an email, and it matters beyond provenance: it is what
 **escalated** case, which is what priority claiming filters on. A case created
 without it is not reachable that way.
 
+## Case workbench
+
+```text
+GET /v1/cases/{case_id}/workbench
+```
+
+Everything an agent needs to take over without asking the customer to repeat
+themselves: the case, the conversation, the AI's last proposal with its
+sources, related cases, the account's tier, and every contact bound to the
+account (one company reaches us through several channels, and each is a
+different Chatwoot contact).
+
+```json
+{
+  "case": {},
+  "account_tier": "enterprise",
+  "account_contacts": [
+    {"external_contact_id": "email-contact", "channel": "email"},
+    {"external_contact_id": "wechat-contact", "channel": "wechat"}
+  ],
+  "conversation": {"items": []},
+  "ai_suggestion": {"text": null, "citations": [], "abstain_reason": null},
+  "related_cases": {"items": [], "basis": "same_category"}
+}
+```
+
+Read-only and assembled from what already exists, so it cannot drift from the
+underlying rows. `related_cases.basis` is spelled out rather than left
+implied - the query filters on category and recency, and an agent who believes
+it is a relevance ranking will trust it more than it deserves.
+
+## Answer corrections
+
+```text
+POST /v1/corrections
+GET  /v1/corrections?status=pending
+POST /v1/corrections/{id}/review
+```
+
+An agent records that an answer was wrong, and what it should have been; a
+reviewer approves or dismisses it.
+
+```json
+{
+  "agent_run_id": "019...",
+  "question": "标准交期是几天？",
+  "correct_answer": "标准交期 7 天，加急 3 天，以报价单为准。",
+  "note": "AI 说了 5 天，实际是 7 天。"
+}
+```
+
+Recording needs `case.update` - the people who see bad answers are agents, and
+gating it behind an admin action would leave corrections in a chat message
+where they are lost. Reviewing needs `knowledge.publish`, because approving
+says "this may become what the platform tells customers".
+
+Nothing here learns automatically. Approving an `AGENT_CORRECTION` opens a gap
+and drafts the corrected answer - a draft, not knowledge: approving checked
+that the answer is right, not that it reads well as documentation. Publishing
+stays its own reviewed act.
+
+## Quality metrics
+
+```text
+GET /v1/quality/metrics?window_seconds=86400
+GET /v1/quality/routes?window_seconds=86400
+```
+
+Returns the dashboard numbers, plus the leak analysis:
+
+- `handoff_reason_counts` - how many runs reached a person, and why.
+- `automation_candidates` - those reasons ranked by volume, each with
+  `automatable`. `true` means the gap is in the corpus and a document closes it;
+  `false` means a control decided, and the honest response is capacity planning
+  rather than automation. Each carries `sample_questions` taken from the gap
+  queue, so the list is a work queue and not a histogram with opinions.
+- `pending_corrections` - agent corrections awaiting review (see above).
+
+## Case evidence attachments
+
+```text
+POST /v1/cases/{case_id}/attachments   multipart: file, uploaded_by?
+GET  /v1/cases/{case_id}/attachments   list, each with a pre-signed download URL
+```
+
+```json
+{
+  "attachment": {
+    "attachment_id": "019...",
+    "filename": "board-rev-c.jpg",
+    "content_type": "image/jpeg",
+    "size_bytes": 184320,
+    "uploaded_by": "eng-42",
+    "created_at": 1789812000,
+    "url": null
+  }
+}
+```
+
+The bytes live in the object store; the row holds the reference, the display
+name, the accepted content type and the size. **Upload is multipart and read is
+pre-signed**, which is not a stylistic split: routing the bytes through the API
+is what lets the content type and the 25 MiB cap be enforced *before* anything
+is stored, whereas a pre-signed PUT lets a client write arbitrary bytes and only
+then have the API discover they are not allowed, after the object exists.
+Reading is the opposite problem - a pre-signed GET gives a reviewer a
+short-lived URL without handing out a credential.
+
+`url` is **null on the upload response** and signed only on read. A link minted
+at upload time would outlive the request that asked for it, and one long enough
+to survive a review is one long enough to leak.
+
+Attaching requires `CASE_UPDATE` and an `Idempotency-Key` (a retried upload is a
+second copy of the evidence); listing requires `CASE_READ`. A case in another
+tenant answers `CASE_NOT_FOUND` - RLS makes it invisible, and the same answer
+covers "does not exist", so this cannot be used to enumerate case ids.
+
+The accepted types are this endpoint's own list, not the knowledge corpus's:
+knowledge documents are parsed and indexed, so images are useless there, while a
+complaint's evidence is frequently a board photograph or a fabrication archive.
+Refusals are `EMPTY_ATTACHMENT`, `ATTACHMENT_TOO_LARGE` and
+`UNSUPPORTED_ATTACHMENT_TYPE`.
+
 ## Case commands
 
 ```text
