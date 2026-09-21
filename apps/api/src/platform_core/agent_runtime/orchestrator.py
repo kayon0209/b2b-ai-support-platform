@@ -508,6 +508,7 @@ class AgentOrchestrator:
         self._policy_version = policy_version
         self._top_k = deps.top_k
         self._target_team: str | None = None
+        self._attachment_types: list[str] = []
 
     async def run(
         self,
@@ -525,6 +526,9 @@ class AgentOrchestrator:
         context_budget_chars: int | None = None,
         known_facts: list[tuple[str, str]] | None = None,
         contact_id: str | None = None,
+        # Content types the customer attached (1.3) - types only, never URLs or
+        # content. Used so a handoff can say evidence was already supplied.
+        attachment_types: list[str] | None = None,
     ) -> RunOutcome:
         """Execute the pipeline for one inbound customer message.
 
@@ -563,6 +567,7 @@ class AgentOrchestrator:
                 context_budget_chars=context_budget_chars,
                 known_facts=known_facts,
                 contact_id=contact_id,
+                attachment_types=attachment_types,
             )
         except Exception as exc:
             # An unexpected failure still has to be visible in metrics and in
@@ -623,6 +628,7 @@ class AgentOrchestrator:
         context_budget_chars: int | None,
         known_facts: list[tuple[str, str]] | None,
         contact_id: str | None,
+        attachment_types: list[str] | None,
     ) -> RunOutcome:
 
         # --- 1. Acquire/observe the control lease. ---
@@ -647,6 +653,9 @@ class AgentOrchestrator:
         # orchestrator rather than threaded through every call site: there is
         # one detection per run and six places that can hand off.
         self._target_team = team_for_scene(detection.scene)
+        # One place, set from the caller: the minimiser already decided what is
+        # safe to keep, so this only carries it.
+        self._attachment_types = list(attachment_types or [])
         run_span.set_attributes(
             route=route,
             intent_scene=detection.scene.value,
@@ -2276,6 +2285,13 @@ class AgentOrchestrator:
             f" | question_hash={getattr(run, 'input_hash', '')}"
             f" | run_id={run.id}"
         )
+        if self._attachment_types:
+            # 1.3: "请提供照片" when the customer already sent two is the
+            # exchange that makes handoffs feel like starting over. The types
+            # are metadata; the files themselves stay in Chatwoot.
+            supplied = ",".join(self._attachment_types)
+            marker = f"customer_attachments={supplied}"
+            handoff_context = f"{handoff_context} | {marker}" if handoff_context else marker
         if self._target_team:
             # Which team, so the note lands somewhere specific instead of in a
             # queue where whoever reads it first is probably the wrong person.

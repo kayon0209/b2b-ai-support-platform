@@ -559,6 +559,22 @@ async def _resolve_contact_id(event: ClaimedEvent, deps: OrchestratorDeps) -> st
         return None
 
 
+def _attachment_types(event: object) -> list[str]:
+    """Attachment content types the minimiser kept, or [].
+
+    Defensive about the shape because the payload comes from outside: a
+    hostile or merely unexpected value must not fail the run, and an
+    attachment we cannot classify is simply not reported.
+    """
+    payload = getattr(event, "minimized_payload", None)
+    if not isinstance(payload, dict):
+        return []
+    types = payload.get("attachment_types")
+    if not isinstance(types, list):
+        return []
+    return [str(item) for item in types if isinstance(item, str)]
+
+
 async def process_event(
     session: AsyncSession,
     event: ClaimedEvent,
@@ -658,6 +674,10 @@ async def process_event(
         history=history,
         known_facts=known_facts,
         contact_id=str(contact_id_early) if contact_id_early else None,
+        # 1.3: what the customer attached, as content types only. The
+        # minimiser already dropped everything else; this just carries the
+        # metadata through so a handoff can say evidence was supplied.
+        attachment_types=_attachment_types(event),
     )
     await _persist_memory(session, event=event, question=question, outcome=outcome)
 

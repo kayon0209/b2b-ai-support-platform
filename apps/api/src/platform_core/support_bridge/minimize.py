@@ -13,6 +13,12 @@ from typing import Any
 
 EVENT_VERSION = 1
 
+# Bounds on attachment metadata. Both are about keeping a hostile or merely
+# noisy payload from turning one event row into a large document: the row is
+# metadata for routing, not a store of what the customer sent.
+_MAX_ATTACHMENTS = 5
+_MAX_TYPE_CHARS = 63
+
 
 def payload_hash(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
@@ -35,6 +41,26 @@ def minimize_chatwoot_payload(event_type: str, payload: dict[str, Any]) -> dict[
         # content is deliberately excluded; store length for diagnostics only
         content = payload.get("content")
         extracted["content_length"] = len(content) if isinstance(content, str) else None
+        # Attachments (feature list 1.3): this trade runs on board photos,
+        # Gerber archives and BOM spreadsheets, and a platform that only knows
+        # about text cannot tell that evidence was already supplied.
+        #
+        # Only the content TYPES are kept - no URLs, no filenames, no bytes.
+        # Two reasons, both load-bearing: the minimisation policy stores no
+        # customer content at rest, and a Gerber or board drawing is customer
+        # IP (the report's own red line). "The customer attached two images"
+        # is what the run actually needs; anything more is risk.
+        attachments = payload.get("attachments")
+        if isinstance(attachments, list) and attachments:
+            types: list[str] = []
+            for item in attachments[:_MAX_ATTACHMENTS]:
+                if not isinstance(item, dict):
+                    continue
+                file_type = item.get("file_type") or item.get("content_type")
+                if isinstance(file_type, str) and file_type not in types:
+                    types.append(file_type[:_MAX_TYPE_CHARS])
+            if types:
+                extracted["attachment_types"] = types
 
     conversation = payload.get("conversation")
     if isinstance(conversation, dict):

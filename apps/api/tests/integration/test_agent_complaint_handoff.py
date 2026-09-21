@@ -125,13 +125,16 @@ class _RecordingSender:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(self, *, account_id, conversation_id, content, command_id):
+    async def send_message(
+        self, *, account_id, conversation_id, content, command_id, private: bool = False
+    ):
         self.calls.append(
             {
                 "account_id": account_id,
                 "conversation_id": conversation_id,
                 "content": content,
                 "command_id": command_id,
+                "private": private,
             }
         )
 
@@ -142,7 +145,10 @@ class _RecordingSender:
 
 
 async def _execute(
-    *, question: str, enable_write_flag: bool = False
+    *,
+    question: str,
+    enable_write_flag: bool = False,
+    attachment_types: list[str] | None = None,
 ) -> tuple[object, list[dict], dict[str, int]]:
     """One orchestrator run. Returns (outcome, sent messages, row counts)."""
     from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
@@ -178,6 +184,7 @@ async def _execute(
             expected_lease_version=expected_version,
             chatwoot_account_id="1",
             chatwoot_conversation_id="1",
+            attachment_types=attachment_types,
         )
         await session.commit()
 
@@ -326,3 +333,25 @@ def test_a_stalled_order_is_not_hijacked() -> None:
     outcome, _sent, _counts = _run(_execute(question="my order has still not arrived"))
 
     assert outcome.abstain_reason != COMPLAINT_REQUIRES_HUMAN
+
+
+def test_supplied_evidence_is_named_on_the_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The private note is off by default; this test is about its contents.
+    from platform_core.config import get_settings
+
+    monkeypatch.setenv("APP_HANDOFF_EVIDENCE_ENABLED", "true")
+    get_settings.cache_clear()
+    """1.3: don't ask again for what the customer already sent.
+
+    "Please send a photo" when two images are attached is the exchange that
+    makes a handoff feel like starting over. The note carries the content
+    types - metadata only, the files stay in Chatwoot - so the agent opens
+    the conversation already knowing evidence exists.
+    """
+    outcome, sent, _counts = _run(
+        _execute(question=COMPENSATION_CLAIM, attachment_types=["image/png", "image/jpeg"])
+    )
+
+    assert outcome.abstain_reason == "COMPLAINT_REQUIRES_HUMAN"
+    notes = [c["content"] for c in sent if c["private"]]
+    assert any("customer_attachments=image/png,image/jpeg" in note for note in notes), notes
