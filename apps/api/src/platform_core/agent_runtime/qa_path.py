@@ -1231,3 +1231,37 @@ def _is_identity_dependent(question: str) -> bool:
 action_verbs = ACTION_VERBS
 object_markers = _OBJECT_MARKERS
 is_action_request = _is_action_request
+
+
+# --- External system unavailable (feature list 10.2) ------------------------
+#
+# These reason codes all mean the same thing to the customer: we tried to read
+# their data from a system we do not own, and that system did not answer.
+# `TOOL_NO_CANDIDATE` is deliberately NOT one of them - no tool being
+# configured is a setup gap, and calling it an outage would be a small lie in
+# the other direction.
+#
+# `TOOL_EXECUTION_FAILED` belongs here because arguments are schema-validated
+# before the gateway ever calls out: by the time execution fails, the request
+# was well-formed and the failure is the other system's. A malformed request
+# never reaches this code path.
+SYSTEM_OUTAGE_REASONS = frozenset(
+    {"TOOL_UNAVAILABLE", "TOOL_EXECUTION_UNVERIFIED", "TOOL_EXECUTION_FAILED"}
+)
+
+
+def system_outage_notice() -> str:
+    """What to say when an external system is down (10.2).
+
+    Names the actual cause, says the request is kept, and says someone will
+    follow up. It does not promise a time - how long an outage lasts is not
+    something this platform knows - and it does not claim a ticket exists,
+    because this path does not file one. Both omissions are deliberate: an
+    outage is exactly when a customer needs the truth and not a reassurance.
+    """
+    return (
+        "Our order and logistics systems are not responding at the moment, so "
+        "I can't look this up right now. Your request has been recorded with "
+        "this conversation and someone will follow up once the systems are "
+        "back."
+    )

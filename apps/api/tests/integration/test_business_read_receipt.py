@@ -105,6 +105,22 @@ class _ReceiptCitingGenerator:
         )
 
 
+class _FailingExecutor:
+    """What an unreachable ERP looks like from here."""
+
+    async def execute(self, tool_name: str, parameters: dict, idempotency_key: str) -> dict | None:
+        raise RuntimeError("CONNECTOR_UNAVAILABLE")
+
+    async def verify_postcondition(self, tool_name: str, parameters: dict, output: object) -> bool:
+        return False
+
+
+class _FailingBusinessApiFactory:
+    @staticmethod
+    def build(context: object) -> _FailingExecutor:
+        return _FailingExecutor()
+
+
 class _RecordingSender:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -186,7 +202,7 @@ def clean() -> None:
     _clear()
 
 
-async def _execute() -> tuple[object, list[dict]]:
+async def _execute(*, failing: bool = False) -> tuple[object, list[dict]]:
     from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
     from platform_core.db import create_engine
     from platform_core.identity import lease_service
@@ -209,7 +225,11 @@ async def _execute() -> tuple[object, list[dict]]:
             session,
             OrchestratorDeps(
                 sender=sender,
-                tool_factories={"business_api": _FakeBusinessApiFactory},
+                tool_factories={
+                    "business_api": (
+                        _FailingBusinessApiFactory if failing else _FakeBusinessApiFactory
+                    )
+                },
                 generator=_ReceiptCitingGenerator(),
             ),
         )
@@ -262,3 +282,26 @@ def test_the_receipt_reaches_the_conversation_as_data() -> None:
     payload = json.loads(body)
     assert payload["order_id"] == "SO-9001"
     assert payload["status"] == "in_production"
+
+
+def test_an_unreachable_erp_tells_the_customer_what_is_wrong() -> None:
+    """10.2: graceful degradation, end to end.
+
+    The read path is the one that talks to systems we do not own, so it is
+    where an outage surfaces. The customer should be told it is an outage -
+    not the generic "couldn't verify", which is true but leaves them waiting
+    on us for something that is not ours.
+    """
+    outcome, sent = _run(_execute(failing=True))
+
+    assert outcome.status.value == "abstained"
+    # The gateway's name for "the external call failed". Arguments are
+    # schema-validated before execution, so this is the other system.
+    assert outcome.abstain_reason == "TOOL_EXECUTION_FAILED", outcome.abstain_reason
+
+    customer_visible = [c["content"] for c in sent if not c["private"]]
+    assert customer_visible, "an outage that says nothing leaves them waiting"
+    joined = " ".join(customer_visible).lower()
+    assert "not responding" in joined
+    # And it still does not claim a ticket was filed.
+    assert "ticket" not in joined

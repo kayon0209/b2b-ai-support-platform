@@ -100,3 +100,26 @@ def test_the_window_comes_from_settings_not_constants(
         # Restored for the next test: settings are cached process-wide, and a
         # window left configured here would leak into every later assertion.
         get_settings.cache_clear()
+
+
+def test_an_external_outage_is_named_as_one() -> None:
+    """10.2: degradation should say what is actually wrong.
+
+    "I couldn't verify an answer" is true during an ERP outage and useless -
+    the customer is waiting on a system we do not own. Saying so is the entire
+    point of a graceful degradation.
+    """
+    from platform_core.agent_runtime.qa_path import SYSTEM_OUTAGE_REASONS, system_outage_notice
+
+    assert "TOOL_UNAVAILABLE" in SYSTEM_OUTAGE_REASONS
+    # A tool that was never configured is a setup gap, not an outage; calling
+    # it one would mislead in the other direction.
+    assert "TOOL_NO_CANDIDATE" not in SYSTEM_OUTAGE_REASONS
+
+    notice = system_outage_notice().lower()
+    assert "not responding" in notice
+    # It promises no time and claims no ticket: this path records the run and
+    # hands off, and a ticket number nobody filed is the same class of lie as a
+    # tool reporting success it never verified.
+    for forbidden in ("ticket", "shortly", "in 5 minutes", "resolved"):
+        assert forbidden not in notice

@@ -64,6 +64,7 @@ from platform_core.agent_runtime.qa_path import (
     ABSTAIN_OUT_OF_SCOPE,
     ABSTAIN_SENSITIVE_REQUEST,
     ABSTAIN_STRATEGIC_ACCOUNT_REQUIRES_HUMAN,
+    SYSTEM_OUTAGE_REASONS,
     AbstentionDecision,
     DraftAnswer,
     claim_contradiction_candidates,
@@ -71,6 +72,7 @@ from platform_core.agent_runtime.qa_path import (
     excerpt_hash,
     redline_violations,
     safe_abstention_text,
+    system_outage_notice,
     validate_citations,
 )
 from platform_core.agent_runtime.routing import team_for_scene
@@ -2129,15 +2131,26 @@ class AgentOrchestrator:
             if band is not None:
                 handoff_context = f"{handoff_context} | {band}" if handoff_context else band
 
-        notice = safe_abstention_text(decision.reason_code)
-        # 7.5: never promise a person who is not there. The reason code still
-        # says why the run stopped - that is for the receiving agent and the
-        # audit log - but the customer is told the truth about when someone
-        # will look at it. Only for handoffs: a clarification that says "we
-        # are closed" would strand a customer who could have answered and been
-        # answered.
-        if decision.handoff and not is_open():
-            notice = offline_notice()
+        # 10.2: when the reason is an external system we could not reach, say
+        # so. The generic notice ("I couldn't verify an answer") is true but
+        # useless here - the customer is waiting on an outage, not on us, and
+        # telling them which is which is the whole point of a graceful
+        # degradation. It deliberately does NOT claim a ticket was created:
+        # this path records the run and hands off, and "已留工单" when nothing
+        # was filed would be the same lie as a tool reporting success it never
+        # verified.
+        if decision.reason_code in SYSTEM_OUTAGE_REASONS:
+            notice = system_outage_notice()
+        else:
+            notice = safe_abstention_text(decision.reason_code)
+            # 7.5: never promise a person who is not there. The reason code
+            # still says why the run stopped - that is for the receiving agent
+            # and the audit log - but the customer is told the truth about when
+            # someone will look at it. Only for handoffs: a clarification that
+            # says "we are closed" would strand a customer who could have
+            # answered and been answered.
+            if decision.handoff and not is_open():
+                notice = offline_notice()
 
         # Send the notice **before** releasing the lease, because the lease
         # gate below refuses once the owner is the queue. Releasing first was
