@@ -159,6 +159,85 @@ jobs:
           APP_ADMIN_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src
 
+  concurrency-guard:
+    # Enforces the F-9 invariant: N concurrent writers of one logical message
+    # must collapse to a single row, and the rate limiter must shed load with
+    # 429 rather than queue it. A fully green suite did not catch the original
+    # defect - SELECT-then-INSERT only loses the race under real parallelism,
+    # and TestClient shares one portal so it cannot reproduce it.
+    #
+    # Of the two runtime guards this is the one CI can honestly enforce. The
+    # other, scripts/ui_smoke.cjs, needs a browser and a served front end, so
+    # it stays a pre-release manual step; its verified invocation, including
+    # the NODE_PATH it needs, is in .workbuddy-ai/memory/REFERENCE.md.
+    #
+    # The API runs straight from the checkout rather than as a built image.
+    # The guard tests *running* code, so a cached image would test yesterday's
+    # build and stay green no matter what this commit broke: measured locally,
+    # a two-day-old image answered every probe request with 404 while the same
+    # source run in-process passed 5/5. It also lets this job set
+    # APP_ALLOW_BOOTSTRAP_TOKENS directly, which compose cannot do cleanly
+    # because the token comes from an env file that a fresh checkout lacks.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start database and Redis
+        run: docker compose -f infra/compose/docker-compose.yml up -d ai-postgres ai-redis
+      - name: Create app role
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            psql -U platform -d platform -c \
+            "DO \$\$ BEGIN
+               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'platform_app') THEN
+                 CREATE ROLE platform_app LOGIN PASSWORD 'platform_app' NOBYPASSRLS;
+               END IF;
+             END \$\$;
+             GRANT platform_app TO platform;
+             GRANT ALL ON SCHEMA public TO platform_app;"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run migrations
+        run: alembic -c apps/api/migrations/alembic.ini upgrade head
+        env:
+          APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
+          PYTHONPATH: apps/api/src
+      - name: Seed the demo tenant and capture its token
+        run: |
+          python scripts/seed_admin_demo.py 2>&1 | tee seed.log
+          TOKEN="$(grep -oE 'pt_[A-Za-z0-9_-]+' seed.log | head -1)"
+          if [ -z "$TOKEN" ]; then echo "seed printed no bootstrap token"; exit 1; fi
+          echo "APP_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        env:
+          APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
+          PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
+      - name: Start the API from this checkout
+        run: |
+          nohup python -m platform_core.main > api.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
+              echo "api healthy"; exit 0
+            fi
+            sleep 2
+          done
+          echo "api never became healthy"; cat api.log; exit 1
+        env:
+          APP_API_PORT: "8000"
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+          APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
+          APP_REDIS_URL: redis://localhost:6380/0
+          APP_SECRET_KEY: ci-secret
+          PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
+      - name: Run the concurrency guard
+        run: python scripts/concurrency_probe.py
+        env:
+          APP_BASE_URL: http://127.0.0.1:8000
+          APP_ADMIN_DATABASE_URL: postgresql://platform:platform@localhost:5435/platform
+          PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
+
   release-evidence:
     # Verifies the evidence behind the zero-tolerance release gates.
     #
