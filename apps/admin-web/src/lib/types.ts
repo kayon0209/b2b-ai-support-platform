@@ -42,6 +42,8 @@ export interface QualityMetrics {
      * policy reasons, which are not knowledge gaps. */
     sample_questions: string[];
   }>;
+  /** Agent corrections awaiting review (7.8). */
+  pending_corrections: number;
 }
 
 export interface RouteDistribution {

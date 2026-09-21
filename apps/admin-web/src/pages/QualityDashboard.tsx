@@ -116,6 +116,15 @@ export function QualityDashboard() {
             </Card>
             <Card>
               <Stat
+                label={t("quality.pendingCorrections")}
+                value={int(metrics.data.pending_corrections)}
+                tone={
+                  metrics.data.pending_corrections > 0 ? ("warn" as const) : ("good" as const)
+                }
+              />
+            </Card>
+            <Card>
+              <Stat
                 label={t("quality.wrongResolution")}
                 value={pct(metrics.data.wrong_resolution_rate)}
                 tone={toneFor(metrics.data.wrong_resolution_rate, 0.05, 0.15)}

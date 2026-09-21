@@ -22,6 +22,7 @@ from typing import Any
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.api import error_response, tenant_session
@@ -68,6 +69,9 @@ class QualityMetricsOut(BaseModel):
     # reason -> the questions customers actually asked, so a candidate can be
     # acted on. Empty for policy reasons, which are not knowledge gaps and are
     # deliberately never queued for documentation.
+    # Corrections awaiting review (7.8) - reviewed knowledge that has not been
+    # written yet.
+    pending_corrections: int = 0
 
 
 def _principal_from_ctx(ctx: TenantContext) -> Principal:
@@ -93,6 +97,23 @@ async def _aggregate(
         enriched = dict(item)
         enriched["sample_questions"] = samples.get(str(item["reason"]), [])
         candidates.append(enriched)
+
+    # 7.8: how much reviewed knowledge is waiting to be written. A correction
+    # that nobody knows about is a correction that never becomes an answer, so
+    # it belongs on the same screen as the leak analysis - they are the two
+    # halves of "what should we fix next".
+    from platform_core.knowledge.correction_models import AnswerCorrection, CorrectionStatus
+
+    pending = (
+        await session.execute(
+            select(func.count())
+            .select_from(AnswerCorrection)
+            .where(
+                AnswerCorrection.tenant_id == tenant_id,
+                AnswerCorrection.status == CorrectionStatus.PENDING.value,
+            )
+        )
+    ).scalar_one()
     return QualityMetricsOut(
         window_seconds=metrics.window_seconds,
         total_runs=metrics.total_runs,
@@ -115,6 +136,7 @@ async def _aggregate(
         wrong_resolution_rate=metrics.wrong_resolution_rate,
         handoff_reason_counts=metrics.handoff_reason_counts,
         automation_candidates=candidates,
+        pending_corrections=int(pending),
     )
 
 

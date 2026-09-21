@@ -176,3 +176,35 @@ def test_a_correction_cannot_be_reviewed_twice() -> None:
         headers=_headers(),
     )
     assert second.status_code == 409
+
+
+def test_pending_corrections_are_visible_to_operations() -> None:
+    """7.8, surfaced where the decision gets made.
+
+    A correction nobody can see never becomes an answer. The count rides on
+    the same payload as the leak analysis - they are the two halves of "what
+    should we fix next".
+    """
+    metrics = _client(TENANT, "tenant_owner").get(
+        "/v1/quality/metrics?window_seconds=3600", headers=_headers()
+    )
+    assert metrics.status_code == 200, metrics.text[:200]
+    assert metrics.json()["pending_corrections"] == 0
+
+    assert _record(_client()).status_code == 200
+
+    after = (
+        _client(TENANT, "tenant_owner")
+        .get("/v1/quality/metrics?window_seconds=3600", headers=_headers())
+        .json()
+    )
+    assert after["pending_corrections"] == 1
+
+    # Another tenant's correction must not move this tenant's number.
+    assert _record(_client(OTHER), question="别家修正？").status_code == 200
+    still = (
+        _client(TENANT, "tenant_owner")
+        .get("/v1/quality/metrics?window_seconds=3600", headers=_headers())
+        .json()
+    )
+    assert still["pending_corrections"] == 1
