@@ -17,6 +17,8 @@ import {
 import { LoadError } from "../components/LoadError";
 import { Pagination } from "../components/Pagination";
 import { usePrompt } from "../components/Prompt";
+import { useSearchParams } from "react-router-dom";
+
 import { useLang, type DictKey } from "../lib/i18n";
 import { dateFromEpochSeconds } from "../lib/format";
 
@@ -161,8 +163,24 @@ function NewCasePanel({
 
 export function Cases() {
   const { t } = useLang();
-  const [selected, setSelected] = useState<string | null>(null);
-  const [offset, setOffset] = useState(0);
+  // Page and open case live in the address, not in component state: an
+  // agent who refreshes keeps the page they were reading, the browser's back
+  // button steps between cases, and a case can be linked to a colleague.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const selected = searchParams.get("case");
+  const offset = Number(searchParams.get("offset") ?? 0) || 0;
+
+  function updateParam(key: string, value: string | null) {
+    const next = new URLSearchParams(searchParams);
+    if (value === null || value === "") next.delete(key);
+    else next.set(key, value);
+    setSearchParams(next);
+  }
+
+  const setSelected = (id: string | null) => updateParam("case", id);
+  // Offset 0 is the default, so it is dropped rather than written - a URL
+  // ending in `?offset=0` is noise in a link someone shares.
+  const setOffset = (next: number) => updateParam("offset", next > 0 ? String(next) : null);
   const [creating, setCreating] = useState(false);
   // SLA badges are "time until due", so they go stale on their own. A minute
   // is coarse enough not to churn renders and fine enough that a case does

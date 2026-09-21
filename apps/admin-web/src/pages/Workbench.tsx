@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 import { apiGet } from "../lib/api";
 import { useAsync } from "../lib/useAsync";
 import { Badge, Card, EmptyState, ErrorBanner, PageHeader, Spinner } from "../components/ui";
@@ -49,9 +50,25 @@ const ROLE_TONE: Record<string, "good" | "warn" | "neutral" | "bad"> = {
 
 export function Workbench() {
   const { t } = useLang();
-  const [selected, setSelected] = useState<string | null>(null);
+  const { caseId } = useParams();
+  const navigate = useNavigate();
+  // The URL is the source of truth for which case is open: that is what makes
+  // a refresh keep the agent's place and a link shareable. Component state
+  // alone lost both.
+  const [selected, setSelected] = useState<string | null>(caseId ?? null);
 
-  const cases = useAsync(() => apiGet<{ cases: CaseSummary[] }>("/v1/cases"), []);
+  useEffect(() => {
+    setSelected(caseId ?? null);
+  }, [caseId]);
+
+  function selectCase(id: string) {
+    setSelected(id);
+    // `replace` on the first pick would drop the entry an agent arrived from;
+    // each deliberate selection is a step they may want to undo.
+    navigate(`/workbench/${id}`);
+  }
+
+  const cases = useAsync(() => apiGet<{ items: CaseSummary[]; total: number }>("/v1/cases"), []);
   const bundle = useAsync(
     () =>
       selected === null
@@ -60,11 +77,16 @@ export function Workbench() {
     [selected],
   );
 
-  const list = cases.data?.cases ?? [];
+  // The endpoint answers {items, total}, like every other list route, so
+  // reading a field named "cases" yielded undefined and the queue rendered
+  // "no cases" no matter how many existed. The generic on apiGet is a cast,
+  // so TypeScript could not catch a name that was never on the wire - only
+  // opening the page could, which is how this survived a passing test suite.
+  const list = cases.data?.items ?? [];
   useEffect(() => {
     // Preselect the first case so the panel is never empty on arrival -
     // an agent opening this page wants to work, not to pick a filter first.
-    if (selected === null && list.length > 0) setSelected(list[0].case_id);
+    if (selected === null && list.length > 0) selectCase(list[0].case_id);
   }, [list, selected]);
 
   return (
@@ -85,7 +107,7 @@ export function Workbench() {
                 <button
                   type="button"
                   className={item.case_id === selected ? "workbench-item selected" : "workbench-item"}
-                  onClick={() => setSelected(item.case_id)}
+                  onClick={() => selectCase(item.case_id)}
                 >
                   <span className="workbench-subject">{item.subject}</span>
                   <Badge tone="neutral">{item.status}</Badge>

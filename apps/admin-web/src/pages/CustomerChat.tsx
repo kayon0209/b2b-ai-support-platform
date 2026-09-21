@@ -19,13 +19,26 @@
  * exists so every state can be inspected without waiting for a real failure.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { apiGet, apiPost } from "../lib/api";
+import { apiGet, apiPost, isUnauthorized } from "../lib/api";
 import { newIdempotencyKey } from "../lib/idempotency";
 import { DataCard } from "../components/DataCard";
 import { useLang } from "../lib/i18n";
+import type { TenantBranding } from "../lib/types";
 
 type Role = "customer" | "agent" | "system" | "tool";
 type SendState = "sending" | "sent" | "failed";
+
+/**
+ * How long the chat waits for a reply before telling the customer.
+ *
+ * Configurable so the wait can be shortened when testing it: the behaviour
+ * under test is what happens *when time passes*, so the one thing a test
+ * cannot do is pretend the time passed. The default stays at 45s, which is
+ * longer than the platform's own 30s model timeout - the point is to outlast
+ * a slow answer, not to race it.
+ */
+const WAIT_TIMEOUT_MS = Number(import.meta.env.VITE_CHAT_WAIT_TIMEOUT_MS) || 45_000;
+
 
 interface Citation {
   label: string;
@@ -68,6 +81,13 @@ const COPY = {
     send: "Send",
     sending: "Sending…",
     failedRetry: "Not delivered",
+    internal: "Internal",
+    internalTitle:
+      "An internal verification surface, not the customer experience. The customer channel is Chatwoot.",
+    waitTimeout:
+      "No one has picked this up yet. Your question is saved - ask for a human and an agent will see it.",
+    problemAuth:
+      "This chat needs an operator access token. Open the console, paste one, then reload.",
     retry: "Retry",
     handoff: "Talk to a human",
     handoffDone: "You are in the queue for a human agent.",
@@ -101,6 +121,11 @@ const COPY = {
     send: "发送",
     sending: "发送中…",
     failedRetry: "未送达",
+    internal: "内部验证面",
+    internalTitle: "内部验证用界面，不是客户侧体验。客户渠道是 Chatwoot。",
+    waitTimeout:
+      "暂时还没有人应答。你的问题已保存，点「转人工」坐席会看到它。",
+    problemAuth: "此界面需要运营访问令牌：请先在后台粘贴令牌，然后刷新。",
     retry: "重试",
     handoff: "转人工",
     handoffDone: "您已进入人工客服队列。",
@@ -141,18 +166,55 @@ export function CustomerChat() {
   const [typing, setTyping] = useState(false);
   const [scenario, setScenario] = useState<Scenario>("answer");
   const [handedOff, setHandedOff] = useState(false);
+  // A visible reason for a failure. Without it the only feedback was a bubble
+  // reading "Not delivered", which cannot tell "you are not signed in" apart
+  // from "the network is down" - and the timeline loader swallowed its errors
+  // entirely, so a 401 looked like an empty conversation forever.
+  const [problem, setProblem] = useState<string | null>(null);
+  const [waitTimedOut, setWaitTimedOut] = useState(false);
   const waitingRef = useRef(false);
+  const waitStartedRef = useRef(0);
   const endRef = useRef<HTMLDivElement | null>(null);
   const launcherRef = useRef<HTMLButtonElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
+  // `isUnauthorized` first: it is the one failure with a remedy. This
+  // surface authenticates with an operator token, so a 401 is not transient
+  // and retrying will never help - the customer needs to be told that.
+  const describeFailure = (err: unknown): string =>
+    isUnauthorized(err) ? c.problemAuth : err instanceof Error ? err.message : String(err);
+
   const offlineNow = scenario === "offline";
   const open = view !== "collapsed";
 
+  // The tenant's own branding, not a constant. The branding screen says it
+  // configures "how this tenant appears to customers", and this is the one
+  // customer-facing surface - so a hardcoded name meant that setting had no
+  // effect anywhere it mattered. The literal stays as the fallback for a
+  // tenant that has not configured anything.
+  const [branding, setBranding] = useState<TenantBranding | null>(null);
+  useEffect(() => {
+    let active = true;
+    void apiGet<{ branding: TenantBranding }>("/v1/tenant/branding")
+      .then((res) => {
+        if (active) setBranding(res.branding);
+      })
+      .catch(() => {
+        // A chat that cannot read branding still has to work; the fallback
+        // name is not worth an error banner in front of a customer.
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const brand = useMemo(
-    () => ({ name: "Acme Electronics", color: "#2f6feb" }),
-    [],
+    () => ({
+      name: branding?.display_name || "Acme Electronics",
+      color: branding?.primary_color || "#2f6feb",
+    }),
+    [branding],
   );
 
   useEffect(() => {
@@ -164,6 +226,7 @@ export function CustomerChat() {
     if (typing && messages.some((m) => m.role === "agent")) {
       setTyping(false);
       waitingRef.current = false;
+      setWaitTimedOut(false);
     }
   }, [messages, typing]);
 
@@ -230,9 +293,11 @@ export function CustomerChat() {
           state: "sent" as SendState,
         })),
       );
-    } catch {
-      // A conversation with no turns yet is not an error worth shouting
-      // about — the empty state covers it.
+    } catch (err) {
+      // A conversation with no turns yet is not an error - but a *failure* is,
+      // and swallowing it here meant a 401 rendered as a permanently empty
+      // chat, indistinguishable from a new conversation.
+      setProblem(describeFailure(err));
     }
   }, [conversationRef]);
 
@@ -244,8 +309,29 @@ export function CustomerChat() {
   // asynchronously, so "sent" and "answered" are genuinely separate moments.
   useEffect(() => {
     if (!waitingRef.current) return;
-    const timer = window.setInterval(() => void loadTimeline(), 2000);
-    return () => window.clearInterval(timer);
+    let attempt = 0;
+    let timer = 0;
+
+    const tick = () => {
+      // Give up rather than spin forever. The platform can legitimately never
+      // answer: shadow mode withholds the send on purpose, the worker may not
+      // be running, and a failed run produces no agent turn at all. Without
+      // this the customer watched "typing..." indefinitely while the page
+      // polled every two seconds for as long as the tab stayed open.
+      if (Date.now() - waitStartedRef.current > WAIT_TIMEOUT_MS) {
+        waitingRef.current = false;
+        setTyping(false);
+        setWaitTimedOut(true);
+        return;
+      }
+      void loadTimeline();
+      attempt += 1;
+      // Back off, so a long wait costs less than a fast one.
+      timer = window.setTimeout(tick, Math.min(2000 * 2 ** Math.min(attempt, 3), 10_000));
+    };
+
+    timer = window.setTimeout(tick, 2000);
+    return () => window.clearTimeout(timer);
   }, [typing, loadTimeline]);
 
   function send(text: string) {
@@ -254,8 +340,11 @@ export function CustomerChat() {
 
     push({ role: "customer", text: body, state: "sending" });
     setDraft("");
+    setProblem(null);
+    setWaitTimedOut(false);
     setTyping(true);
     waitingRef.current = true;
+    waitStartedRef.current = Date.now();
 
     void (async () => {
       try {
@@ -275,9 +364,10 @@ export function CustomerChat() {
           newIdempotencyKey(),
         );
         await loadTimeline();
-      } catch {
+      } catch (err) {
         setTyping(false);
         waitingRef.current = false;
+        setProblem(describeFailure(err));
         // Mark the optimistic bubble so the customer sees it did not go out
         // and can retry, rather than assuming it was received.
         setMessages((prev) =>
@@ -335,6 +425,15 @@ export function CustomerChat() {
                 {offlineNow ? c.offline : c.online}
               </div>
             </div>
+            {/*
+              ADR 0010: this panel is an internal verification surface, not the
+              customer experience - the customer surface is Chatwoot. Saying so
+              on the surface itself is what stops it being shipped as one, since
+              nothing else about it (a real brand, a working send) would.
+            */}
+            <span className="cw-internal" title={c.internalTitle}>
+              {c.internal}
+            </span>
             <div className="cw-actions">
               <button
                 className="cw-icon"
@@ -426,10 +525,18 @@ export function CustomerChat() {
               </div>
             ) : null}
 
-            {scenario === "error" && messages.some((m) => m.state === "failed") ? (
+            {problem || (scenario === "error" && messages.some((m) => m.state === "failed")) ? (
               <div className="cw-row">
                 <div className="cw-error" role="alert">
-                  {c.errorMessage}
+                  {problem ?? c.errorMessage}
+                </div>
+              </div>
+            ) : null}
+
+            {waitTimedOut ? (
+              <div className="cw-row">
+                <div className="cw-system" role="status">
+                  {c.waitTimeout}
                 </div>
               </div>
             ) : null}

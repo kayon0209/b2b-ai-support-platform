@@ -101,6 +101,7 @@ const en = {
   "token.connect": "Connect",
   "token.checking": "Checking…",
   "token.errorEmpty": "Paste the access token issued for your account.",
+  "token.signOut": "Sign out",
 
   // --- inline prompt --------------------------------------------------------
   "prompt.required": "{label} is required.",
@@ -208,6 +209,9 @@ const en = {
   "prompts.title": "Prompt Release",
   "prompts.subtitle": "Author, evaluate, and promote prompt template versions.",
   "prompts.templatePlaceholder": "template_name",
+  "prompts.templateLabel": "Template name",
+  "prompts.bodyLabel": "Draft body",
+
   "prompts.currentlyServing": "Currently serving",
   "prompts.newDraft": "New draft",
   "prompts.bodyPlaceholder": "Paste the new prompt body…",
@@ -254,6 +258,9 @@ const en = {
   "flags.enable": "Enable",
   "flags.disable": "Disable",
   "flags.setRollout": "Set rollout",
+  "flags.reenableTitle": "Turn {key} back on?",
+  "flags.reenableDetail":
+    "This flag is still set to {percent}% rollout, and switching it off did not clear that. Turning it on now exposes that share of traffic again.",
   "flags.rolloutTitle": "Rollout percent for {key}",
   "flags.rolloutDetail":
     "0 disables the flag for everyone; 100 enables it for the whole tenant.",
@@ -582,6 +589,7 @@ const zh: Record<keyof typeof en, string> = {
   "token.connect": "连接",
   "token.checking": "校验中…",
   "token.errorEmpty": "请粘贴为你签发的访问令牌。",
+  "token.signOut": "退出登录",
 
   // --- inline prompt --------------------------------------------------------
   "prompt.required": "{label} 为必填项。",
@@ -688,6 +696,9 @@ const zh: Record<keyof typeof en, string> = {
   "prompts.title": "提示词发布",
   "prompts.subtitle": "编写、评估并发布提示词模板版本。",
   "prompts.templatePlaceholder": "template_name",
+  "prompts.templateLabel": "模板名称",
+  "prompts.bodyLabel": "草稿正文",
+
   "prompts.currentlyServing": "当前生效",
   "prompts.newDraft": "新建草稿",
   "prompts.bodyPlaceholder": "粘贴新的提示词正文…",
@@ -733,6 +744,8 @@ const zh: Record<keyof typeof en, string> = {
   "flags.enable": "启用",
   "flags.disable": "停用",
   "flags.setRollout": "设置放量",
+  "flags.reenableTitle": "重新启用 {key}？",
+  "flags.reenableDetail": "该开关的放量仍为 {percent}%，停用并不会清零。现在启用会立即恢复这部分流量。",
   "flags.rolloutTitle": "{key} 的放量百分比",
   "flags.rolloutDetail": "0 表示对所有人停用；100 表示对整个租户启用。",
   "flags.percentLabel": "百分比（0-100）",

@@ -45,6 +45,10 @@ const router = createBrowserRouter([
       { path: "flags", element: <FeatureFlags /> },
       { path: "cases", element: <Cases /> },
       { path: "workbench", element: <Workbench /> },
+      // The case id is part of the address so a refresh keeps the agent where
+      // they were and a link can be shared. `/workbench` alone still works -
+      // the page then picks the first case as before.
+      { path: "workbench/:caseId", element: <Workbench /> },
       { path: "approvals", element: <Approvals /> },
       { path: "members", element: <Members /> },
       { path: "usage", element: <Usage /> },

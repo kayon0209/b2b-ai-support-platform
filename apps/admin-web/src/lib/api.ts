@@ -15,7 +15,18 @@ export function setUnauthorizedHandler(fn: (() => void) | null): void {
 }
 
 export function getToken(): string {
-  return localStorage.getItem(TOKEN_KEY) || import.meta.env.VITE_API_TOKEN || "";
+  const stored = localStorage.getItem(TOKEN_KEY);
+  if (stored) return stored;
+  // A build-time token is compiled into the bundle and served to every
+  // visitor - including the customer-facing chat, which is the same bundle.
+  // So it is honoured only in a dev build; a production bundle always starts
+  // signed out and asks for a token.
+  return import.meta.env.DEV ? import.meta.env.VITE_API_TOKEN || "" : "";
+}
+
+/** Whether a build-time token is being used (dev only) rather than a stored one. */
+export function usingBuildToken(): boolean {
+  return !localStorage.getItem(TOKEN_KEY) && Boolean(import.meta.env.DEV && import.meta.env.VITE_API_TOKEN);
 }
 
 export function setToken(token: string): void {
@@ -134,7 +145,23 @@ async function unwrap<T>(res: Response): Promise<T> {
       // A proxy or an ingress can answer with HTML (a 502 page, an auth
       // redirect). Letting JSON.parse throw would surface as a syntax error
       // and hide the status, which is the actionable part.
-      throw new ApiError(res.status, "NON_JSON_RESPONSE", `HTTP ${res.status}`, res.status >= 500);
+      //
+      // A bare status is still not enough, though. The helpful "could not
+      // reach the control plane" branch in `send` only fires when the browser
+      // itself cannot connect, which is not the deployed shape: with a proxy
+      // or an ingress in front, an outage arrives as an HTTP response. Vite's
+      // dev proxy answers 500 when its target is down, so an operator with the
+      // API stopped was shown "HTTP 500" - which reads like a bug in the
+      // server, not like the server being absent.
+      const down = res.status >= 500;
+      throw new ApiError(
+        res.status,
+        "NON_JSON_RESPONSE",
+        down
+          ? `The control plane answered HTTP ${res.status} without a JSON body, so it is most likely down or restarting. Retry in a moment.`
+          : `HTTP ${res.status}`,
+        down,
+      );
     }
   }
   if (!res.ok) {
@@ -160,7 +187,17 @@ function toApiError(status: number, data: unknown): ApiError {
       : typeof errorBlock.reason === "string"
         ? errorBlock.reason
         : "";
-  const message = stated || `HTTP ${status}`;
+  // A 5xx with nothing to say about itself is the shape of a server that is
+  // not there. This is the common case, not the exotic one: Vite's dev proxy
+  // answers a dead target with `500`, `text/plain`, and an *empty* body, so
+  // neither the JSON branch nor the JSON-parse failure branch above ever runs -
+  // the operator was simply shown "HTTP 500", which reads like a bug in the
+  // control plane rather than like its absence.
+  const message =
+    stated ||
+    (status >= 500
+      ? `The control plane answered HTTP ${status} with no explanation, so it is most likely down or restarting. Retry in a moment.`
+      : `HTTP ${status}`);
   // The trace id is the one thing support needs from a failing request;
   // appending it means every banner shows it without each page caring.
   const traceId = typeof envelope.trace_id === "string" ? envelope.trace_id : "";
