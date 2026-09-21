@@ -494,6 +494,17 @@ def default_factories() -> dict[str, AdapterFactory]:
         return TeamsNotificationAdapter(context)
 
     def _build_business_read(context: ConnectorContext) -> ToolExecutor:
+        from platform_core.config import get_settings
+
+        # A deployment with no ERP to call can still run the whole read path
+        # against sample data. Selected by configuration, and the sample
+        # records say `source: "demo"` so they cannot be mistaken for a real
+        # system's answer.
+        if str(get_settings().business_api_adapter or "").strip().lower() == "demo":
+            from platform_core.integrations.demo_erp import DemoBusinessToolExecutor
+
+            return DemoBusinessToolExecutor(context)
+
         from platform_core.integrations.business_read import BusinessReadToolExecutor
 
         return BusinessReadToolExecutor(context)

@@ -202,7 +202,9 @@ def clean() -> None:
     _clear()
 
 
-async def _execute(*, failing: bool = False) -> tuple[object, list[dict]]:
+async def _execute(
+    *, failing: bool = False, use_default_provider: bool = False
+) -> tuple[object, list[dict]]:
     from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
     from platform_core.db import create_engine
     from platform_core.identity import lease_service
@@ -225,11 +227,15 @@ async def _execute(*, failing: bool = False) -> tuple[object, list[dict]]:
             session,
             OrchestratorDeps(
                 sender=sender,
-                tool_factories={
-                    "business_api": (
-                        _FailingBusinessApiFactory if failing else _FakeBusinessApiFactory
-                    )
-                },
+                tool_factories=(
+                    None
+                    if use_default_provider
+                    else {
+                        "business_api": (
+                            _FailingBusinessApiFactory if failing else _FakeBusinessApiFactory
+                        )
+                    }
+                ),
                 generator=_ReceiptCitingGenerator(),
             ),
         )
@@ -305,3 +311,38 @@ def test_an_unreachable_erp_tells_the_customer_what_is_wrong() -> None:
     assert "not responding" in joined
     # And it still does not claim a ticket was filed.
     assert "ticket" not in joined
+
+
+def test_the_shipped_demo_provider_answers_a_real_question() -> None:
+    """10.1 with no external system: the read path runs on the shipped demo
+    provider, not on a test double.
+
+    The deployment has no ERP to call, which previously meant the path that
+    answers "where is my order" was exercised only by fakes. This resolves the
+    provider the way production does and asserts a real receipt comes back -
+    carrying `source: demo` and `fetched_at`, so the card can say what it is
+    and how old it is.
+    """
+    outcome, _sent = _run(_execute(use_default_provider=True))
+
+    assert outcome.status.value == "completed", outcome.abstain_reason
+    assert outcome.route == "business_read"
+
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        rows = conn.execute(
+            sa.text(
+                "SELECT text_redacted FROM conversation_turns "
+                "WHERE tenant_id = :t AND role = 'tool'"
+            ),
+            {"t": TENANT},
+        ).all()
+    admin.dispose()
+
+    assert rows, "no receipt was published"
+    payload = json.loads(rows[0][0])
+    assert payload["order_id"] == "SO-9001"
+    assert payload["status"] == "in_production"
+    assert payload["source"] == "demo"
+    assert payload["fetched_at"]
+    assert len(payload["nodes"]) == 4

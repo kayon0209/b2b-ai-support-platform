@@ -224,6 +224,11 @@ class Settings(BaseSettings):
     # "empty" declines every request so all quoting goes to a person, which is
     # the right setting until a contracted price list exists.
     pricing_ruleset: str = "public-reference"
+    # "http" is the real BusinessReadAdapter against the tenant's ERP. "demo"
+    # uses local sample data (see integrations/demo_erp) so the read path can
+    # run in a deployment that has no ERP to call; its records are marked
+    # `source: "demo"` so they are never mistaken for real ones.
+    business_api_adapter: str = "demo"
     # Priority claiming is a deployment-level decision (the claim query is
     # cross-tenant), so it is a plain switch rather than a tenant flag.
     priority_claim_enabled: bool = False
