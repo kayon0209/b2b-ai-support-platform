@@ -269,6 +269,24 @@ def _assert_auth_is_configured(settings: Settings) -> None:
             "APP_OIDC_ISSUER instead."
         )
 
+    # `environment` defaults to "local", so a deployment that simply forgets to
+    # declare it is treated as a local machine - and if it also inherited
+    # `APP_ALLOW_BOOTSTRAP_TOKENS=true` from a copied .env, the check above
+    # passes and the impersonation path is live in production.
+    #
+    # `model_fields_set` distinguishes "declared" from "defaulted" (the .env
+    # file counts as declared; a default does not), so the guard is about
+    # intent rather than about the value. Opting into an unsigned token scheme
+    # now requires saying which environment you are in.
+    if settings.allow_bootstrap_tokens and "environment" not in settings.model_fields_set:
+        raise RuntimeError(
+            "APP_ALLOW_BOOTSTRAP_TOKENS is set but APP_ENVIRONMENT was never "
+            "declared, so this process cannot tell a laptop from production. "
+            "Bootstrap tokens are unsigned and impersonate a known slug + user "
+            "id, so declare APP_ENVIRONMENT explicitly (local/test) before "
+            "enabling them."
+        )
+
     if settings.oidc_issuer is None and not settings.allow_bootstrap_tokens:
         raise RuntimeError(
             "no authentication configured: set APP_OIDC_ISSUER, or set "

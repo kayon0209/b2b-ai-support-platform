@@ -30,6 +30,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from platform_core import db
 from platform_core.agent_runtime.customer_router import router as customer_router
@@ -131,6 +132,40 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
         VALIDATION_FAILED,
         _validation_message(exc),
         status_code=422,
+        trace_id=new_trace_id(),
+    )
+
+
+_HTTP_ERROR_CODES = {
+    404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED",
+    401: "AUTH_UNRESOLVED",
+    403: "POLICY_DENIED",
+    409: "CONFLICT",
+    413: "PAYLOAD_TOO_LARGE",
+    429: "RATE_LIMITED",
+}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Route-level failures in the same envelope as everything else.
+
+    Starlette answers 404 and 405 with `{"detail": "Not Found"}`. The admin
+    UI reads `error.message` (falling back to `error.reason`), so neither
+    matched and the operator was shown "HTTP 404" - a status code where the
+    useful information is *which* address does not exist and *what* to do.
+    It also carried no `trace_id`, so a support conversation about a bad link
+    had nothing to quote.
+
+    The detail is echoed because it is Starlette's own text ("Not Found",
+    "Method Not Allowed") and never contains caller input - unlike the
+    validation handler, where the body had to be suppressed.
+    """
+    return error_response(
+        _HTTP_ERROR_CODES.get(exc.status_code, f"HTTP_{exc.status_code}"),
+        str(exc.detail),
+        status_code=exc.status_code,
         trace_id=new_trace_id(),
     )
 

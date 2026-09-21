@@ -151,11 +151,16 @@ async def bootstrap_token_resolver(request: Request) -> TenantContext:
 
     # MVP bootstrap token format: pt_<tenant-slug>_<user-id>
     # Phase 2 swaps this for OIDC introspection; call sites do not change.
-    parts = token.split("_", 2)
-    if len(parts) != 3 or parts[0] != "pt":
+    #
+    # Split from the RIGHT, not the left: a slug is free-form and may itself
+    # contain "_", and `split("_", 2)` on `pt_my_tenant_<uuid>` would hand the
+    # slug "my" and the id "tenant_<uuid>", failing as a malformed actor id for
+    # a tenant that exists. The id is the fixed-shape part, so it is the one
+    # that must be cut off the end.
+    prefix, separator, rest = token.partition("_")
+    tenant_slug, separator2, user_id_raw = rest.rpartition("_")
+    if prefix != "pt" or not separator or not separator2 or not tenant_slug:
         raise PermissionError("malformed token")
-
-    _, tenant_slug, user_id_raw = parts
     try:
         user_id = uuid.UUID(user_id_raw)
     except ValueError as exc:
