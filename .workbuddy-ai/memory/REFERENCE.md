@@ -221,3 +221,126 @@ decision, not a bug. 方案 A (`63407de`): `POST /v1/customer/conversations/{ref
 writes `conversation_turns` (redacted on write, dedup on `(conversation, text_hash)`).
 `scripts/seed_admin_demo.py` prints `pt_admin-demo_<uuid>`; `scripts/backup_restore_drill.py`
 exit **2** = "source was not quiescent".
+
+---
+
+## Folded from MEMORY.md on 2026-09-21 (v8 trim)
+
+MEMORY.md was exceeding the injection limit and being silently truncated, so these four
+situational sections moved here and MEMORY.md now carries one-line rules plus a pointer.
+**Nothing was deleted** — this is the full text as of v8.
+
+### Windows traps (full)
+
+- **API must be `python -m platform_core.main`, never bare uvicorn** (ProactorEventLoop → psycopg async
+  refuses → every DB request dies at connect → bare `401 AUTH_UNRESOLVED`).
+- **`curl --noproxy "*"`** (a host proxy `:55940` 502s `localhost`, reading as a broken route); write bodies
+  with `-o`, not a pipe (exit 23 / empty body).
+- **Port ghosts:** an old `127.0.0.1:PORT` beats your new `0.0.0.0:PORT`; loopback reaches old code →
+  404/405 that look like unregistered routes. Judge by `netstat -ano` bind address + PID; `taskkill` may not
+  work — change port instead.
+- **Long runs exhaust sockets** (~20 h: `WinError 10055` → `/healthz` 502 or silent exit — not a code bug).
+  **Kill services you started before ending a session** (a leaked API+Vite ran 29 h → `fork: Cannot allocate
+  memory`).
+- **`docker` CLI can hang entirely** while containers still run — use `psycopg` directly.
+- **Process inspection:** the PowerShell tool is silently sandboxed and `wmic` is blacklisted. Use `tasklist`
+  (PID/name) + `netstat -ano | grep ":5435"` (never `5435|5432` — matches 54323); command lines via `psutil`
+  from `~/.workbuddy-ai/binaries/python/envs/default`.
+- asyncio: `asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)`; `uvicorn.run(loop=...)` takes a
+  **string**. Long jobs need `run_in_background: true` (`nohup … &` is reaped when the call returns); a script
+  piped into `head`/`tail` dies of SIGPIPE — write to a file.
+
+### RLS (full)
+
+- **Bootstrap pattern (8 instances):** a tenant table read *before* a binding exists needs a narrow
+  `SECURITY DEFINER` function — pinned `SET search_path = pg_catalog, public`, `REVOKE ALL FROM PUBLIC` and
+  from `platform`, `GRANT EXECUTE` to `platform_app` only. Never `USING (app.tenant_id IS NULL OR ...)`.
+- **RLS fails silently on writes**: unbound `SELECT` → 0 rows; `UPDATE`/`DELETE` → rowcount 0. Assert
+  `rowcount` on every app-role write. Cross-tenant queue scans are global by design — **never leave probe
+  rows**.
+- **Policy is `tenant_id IS NULL OR tenant_id = app.tenant_id()`** → a NULL-tenant row is *global reference
+  data*. Isolation tests must assert `WHERE tenant_id IS NOT NULL`; counting all rows fails on fixture
+  leftovers and reports hygiene as a breach.
+- Teardown: children before parents, else you poison the next run. **Fails solo = dirty DB; passes solo =
+  attribute further.**
+
+### Async, sessions, agent runs (full)
+
+- `set_config('app.tenant_id', …, true)` is **transaction-scoped**; `tenant_session(ctx)` rebinds on
+  `after_begin`. **A failed flush poisons the session** → `await session.rollback()` before raising; prefer
+  `ON CONFLICT DO NOTHING`. **The outbox relay's caller owns the transaction** — `run_once(session)` does not
+  commit.
+- **Two `AgentRun` creation sites:** `router.py:159` writes a *placeholder* (`status=queued`, `input_hash=""`),
+  `orchestrator.py:674` the *real* run. Nothing advances a `queued` row → "stuck queued" = orphan placeholder;
+  tell them apart by `input_hash=''`.
+- **Query a run by its exact `run_id`** — never by `conversation_ref` (parallel sessions leave other people's
+  rows; this produced one completely wrong conclusion). Worker log `event_processed.status` beats table
+  inspection. `AgentRun` stores **no answer text** (only `output_hash`); body in `outbox_events.payload`.
+- **Do not replace `deps.reader`'s identity** (tried, reverted `e9d8a3e`) — it breaks
+  `deps.sender is deps.reader`. Put local-first inside `fetch_message` / the consumer.
+
+### Conventions (full)
+
+- Conventional-commit subject + body explaining **why**; state test-count delta + ruff/mypy.
+- `alembic.ini` at `apps/api/migrations/`; non-ASCII path ⇒ `cfg.set_main_option("script_location", …)` and
+  **do not chdir** (else `.env` not found). `APP_ALLOW_BOOTSTRAP_TOKENS=true` locally. Bootstrap tokens are
+  **unsigned**, so `APP_ENVIRONMENT` must be *explicitly* declared (S-1: `model_fields_set`, not a `"local"`
+  default) — the guard is only as good as the flag.
+- **A test file outside `testpaths` never runs.** **Never issue parallel edits to one file.**
+- SAML login issues **no session**; first SAML login **never provisions a role**; SCIM Group → Department,
+  never `MembershipRole`; `infra/kubernetes/` is never applied to a cluster.
+
+### Rationale behind the `Scene.*` rule
+
+`_SCENE_PATTERNS` is for retrieval breadth and tool affinity, not routing: its COMPLAINT entry counts
+"still not"/"third time", so `my order has still not arrived` classifies as complaint while the report's own
+complaint example classifies as `technical_support` (see `complaint.py`).
+
+### Environment details moved out of MEMORY.md
+
+- **GitHub** `git@github.com:kayon0209/b2b-ai-support-platform`, SSH key `~/.ssh/id_ed25519`.
+- **Chatwoot admin password is set interactively on first boot** and is deliberately **not** recorded in any
+  tracked file — a credential in a tracked file is readable by anyone with repo access.
+- **Lost refs/objects recovery** (happened 2026-09-20): last sha from `.git/logs/refs/heads/master` →
+  `git fetch origin` → `git update-ref refs/heads/master origin/master` → `rm .git/index && git reset --mixed
+  HEAD` → `git fsck`. **None of these touches the working tree.**
+- **Process inspection:** the PowerShell tool is silently sandboxed and `wmic` is blacklisted. Use `tasklist`
+  (PID/name only) + `netstat -ano | grep ":5435"` (never `5435|5432` — that matches 54323); command lines via
+  `psutil` from `~/.workbuddy-ai/binaries/python/envs/default`.
+- asyncio: `asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)`; `uvicorn.run(loop=...)` takes a
+  **string**. Long jobs need `run_in_background: true` (`nohup … &` is reaped when the call returns); a script
+  piped into `head`/`tail` dies of SIGPIPE — write to a file and read it.
+
+### The two runtime guards — verified invocation (2026-09-21)
+
+Both need live services; neither is a pytest test, and both are mutation-tested.
+
+```bash
+# 1. API on a port nobody holds (8010), then Vite pointed at it
+PYTHONPATH="<absolute ;-joined>" APP_API_PORT=8010 ./.venv/Scripts/python.exe -m platform_core.main
+cd apps/admin-web && VITE_API_TARGET=http://localhost:8010 VITE_API_TOKEN=pt_admin-demo_<user_id> \
+  node node_modules/vite/bin/vite.js --port 5174 --strictPort
+
+# 2. concurrency (needs API + admin DB)
+APP_BASE_URL=http://127.0.0.1:8010 APP_TOKEN=pt_admin-demo_<user_id> \
+APP_ADMIN_DATABASE_URL=postgresql://platform:platform@localhost:5435/platform \
+./.venv/Scripts/python.exe scripts/concurrency_probe.py
+
+# 3. UI wiring (needs Vite)
+NODE_PATH="C:/Users/Rose/.workbuddy-ai/binaries/node/workspace/node_modules" \
+APP_BASE_URL=http://localhost:5174 APP_TOKEN=pt_admin-demo_<user_id> node scripts/ui_smoke.cjs
+```
+
+- **`ui_smoke.cjs` fails with `Cannot find module 'playwright-core'` unless `NODE_PATH` points at the managed
+  node workspace** — `playwright-core` is not installed in the repo. `NODE_PATH` works here because the script
+  is CJS; ESM ignores it (see the browser-testing section above).
+- Use `localhost:5174`, not `127.0.0.1` — Vite binds IPv6 `[::1]` only.
+- Pass `postgresql://` (not `postgresql+psycopg://`) to `APP_ADMIN_DATABASE_URL`; the probe calls
+  `psycopg.connect` directly.
+- Token: `SELECT t.slug, m.user_id FROM memberships m JOIN tenants t ON t.id=m.tenant_id WHERE m.status='active'`.
+- Last measured: probe **5/5**, ui_smoke **10/10** (`/workbench served=23 rendered=23` — that is the F-5 fix).
+- **A full-suite run that makes no progress is usually a dead container, not a slow suite.** Check CPU time
+  first (a hung run showed 5.6 s of CPU after 20 min), then probe 5435/6380. After restarting only the data
+  services the same suite finished in 2 min 13 s. Start **only the data services** — never the workers.
+- MinIO cannot be started while Docker has no HTTPS proxy (registry-1.docker.io unreachable), but **no test
+  needs it** — its absence caused zero failures.
