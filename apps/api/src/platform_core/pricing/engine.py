@@ -174,9 +174,14 @@ def quote(request: QuoteRequest, rules: RuleSet) -> QuoteBand | QuoteUnavailable
             f"version={rules.version}",
             f"layers={request.layers}",
             f"tier={request.lead_time_tier}",
+            f"qty={request.quantity}",
             f"qty_break={quantity_multiplier}",
             f"finish={request.surface_finish}",
             f"thickness={request.thickness_mm}",
+            # The band is for the whole order, not one board. Without this the
+            # number reads as a unit price and a 500-piece total looks like a
+            # very expensive prototype.
+            "total_for_order",
         )
     )
     # A band must be a band: a zero-width interval would read as an exact

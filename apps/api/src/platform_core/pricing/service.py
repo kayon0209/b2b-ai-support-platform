@@ -11,8 +11,26 @@ from __future__ import annotations
 
 from platform_core.pricing.engine import QuoteBand, RuleSet, quote
 from platform_core.pricing.parse import parse_quote_request
+from platform_core.pricing.reference import VERSION, build_reference_ruleset
 
-RULES = RuleSet()
+
+def _load_rules() -> RuleSet:
+    """The table this deployment quotes from.
+
+    Defaults to the public reference data rather than to nothing, because an
+    engine with no table cannot be exercised at all - but every band it
+    produces names its source (see `quote_label`), and `pricing_ruleset=empty`
+    turns quoting off entirely for anyone who has not confirmed the figures.
+    """
+    from platform_core.config import get_settings
+
+    mode = str(get_settings().pricing_ruleset or "public-reference").strip().lower()
+    if mode in ("empty", "none", "unconfigured", "off"):
+        return RuleSet()
+    return build_reference_ruleset()
+
+
+RULES = _load_rules()
 
 
 def quote_from_text(question: str) -> QuoteBand | None:
@@ -38,4 +56,12 @@ def quote_label(question: str) -> str | None:
     band = quote_from_text(question)
     if band is None:
         return None
-    return f"quote_band={band.low_minor}-{band.high_minor} {band.currency} [{band.basis}]"
+    # Never let a reference figure read as a quoted one. The version is already
+    # in the basis; this spells out the consequence for the person quoting.
+    warning = ""
+    if f"version={VERSION}" in band.basis:
+        warning = " NON-CONTRACTUAL: public reference data, confirm before quoting"
+    return (
+        f"quote_band={band.low_minor}-{band.high_minor} {band.currency} "
+        f"[{band.basis}]{warning}"
+    )

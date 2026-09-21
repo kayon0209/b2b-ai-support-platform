@@ -219,6 +219,11 @@ class Settings(BaseSettings):
     # not told us its hours must not gain a new way to refuse its customers.
     support_open_hour: int = 0
     support_close_hour: int = 0
+    # Which price table to quote from. "public-reference" uses published
+    # industry data with its provenance attached (see pricing/reference);
+    # "empty" declines every request so all quoting goes to a person, which is
+    # the right setting until a contracted price list exists.
+    pricing_ruleset: str = "public-reference"
     # Priority claiming is a deployment-level decision (the claim query is
     # cross-tenant), so it is a plain switch rather than a tenant flag.
     priority_claim_enabled: bool = False

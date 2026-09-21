@@ -118,18 +118,81 @@ def test_the_helper_returns_a_band_or_why_not() -> None:
     assert pytest is not None
 
 
-def test_the_service_declines_until_a_real_table_is_supplied() -> None:
-    """The production path, in one assertion.
+def test_the_shipped_table_carries_its_provenance() -> None:
+    """A number without a source cannot be judged.
 
-    `service.RULES` ships empty, so a fully-specified customer request still
-    produces nothing and goes to a person. This is the guard against someone
-    "helpfully" adding a sample price table on the way to production.
+    The table is public industry data, not a contracted price list, so the
+    version and the warning travel with every figure - otherwise it reads as
+    this company's price.
+    """
+    from platform_core.pricing import reference, service
+
+    assert service.RULES.version == reference.VERSION
+    assert reference.PROVENANCE["source"]
+    assert reference.PROVENANCE["retrieved"]
+    assert reference.PROVENANCE["source_updated"]
+    assert "not a contracted" in reference.PROVENANCE["basis_note"]
+
+    label = service.quote_label("4层板 100x100mm 板厚1.6mm 沉金 500片多少钱？")
+    assert label is not None
+    assert "NON-CONTRACTUAL" in label
+
+
+@pytest.mark.parametrize(
+    ("question", "quantity", "published_low", "published_high"),
+    [
+        # Per-board figures published for a 100x100mm reference board, USD.
+        ("2层板 100x100mm 板厚1.6mm 喷锡 100片多少钱？", 100, 1.80, 3.00),
+        ("4层板 100x100mm 板厚1.6mm 沉金 500片多少钱？", 500, 3.00, 4.80),
+    ],
+)
+def test_the_band_agrees_with_the_published_figures_it_came_from(
+    question: str, quantity: int, published_low: float, published_high: float
+) -> None:
+    """The table is derived from public data, so check it against that data.
+
+    Without this, "fitted to published figures" is just a comment. The band is
+    for the whole order, so divide back down to a per-board figure first.
     """
     from platform_core.pricing import service
 
-    assert service.RULES.version == "unconfigured"
-    assert service.RULES.layers == {}
-    assert service.quote_from_text("4层板 100x80mm 板厚1.6mm 沉金 500片多少钱？") is None
+    band = service.quote_from_text(question)
+    assert band is not None
+
+    per_board_low = band.low_minor / 100.0 / quantity
+    per_board_high = band.high_minor / 100.0 / quantity
+
+    # Overlap, not containment: a band computed from range data is not
+    # expected to sit neatly inside another range.
+    assert per_board_low <= published_high, (per_board_low, published_high)
+    assert per_board_high >= published_low, (per_board_high, published_low)
+
+
+def test_non_standard_thickness_and_expedite_still_go_to_a_person() -> None:
+    """4B.4 against the real table, not only against a test one.
+
+    The public source publishes no thickness pricing at all and a +30-150%
+    expedite range, so neither can be quoted honestly - both decline.
+    """
+    from platform_core.pricing import service
+
+    assert service.quote_from_text("4层板 100x100mm 板厚2.0mm 沉金 500片多少钱？") is None
+    assert service.quote_from_text(
+        "4层板 100x100mm 板厚1.6mm 沉金 500片 加急多少钱？"
+    ) is None
+
+
+def test_quoting_can_be_switched_off_entirely(monkeypatch: pytest.MonkeyPatch) -> None:
+    """For anyone who has not confirmed the figures."""
+    from platform_core.config import get_settings
+    from platform_core.pricing import service
+
+    monkeypatch.setenv("APP_PRICING_RULESET", "empty")
+    get_settings.cache_clear()
+    try:
+        assert service._load_rules().version == "unconfigured"
+    finally:
+        get_settings.cache_clear()
 
 
 def test_with_a_table_supplied_the_service_returns_a_labelled_band(
