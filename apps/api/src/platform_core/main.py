@@ -67,6 +67,7 @@ from platform_core.integrations.router import (
     router as connectors_router,
 )
 from platform_core.integrations.webhook_router import router as connector_webhook_router
+from platform_core.knowledge.correction_router import router as correction_router
 from platform_core.knowledge.flag_router import router as feature_flag_router
 from platform_core.knowledge.gap_router import router as knowledge_gap_router
 from platform_core.knowledge.router import router as knowledge_router
@@ -172,6 +173,7 @@ app.include_router(tool_catalog_router)
 app.include_router(quality_router)
 app.include_router(prompt_router)
 app.include_router(knowledge_gap_router)
+app.include_router(correction_router)
 app.include_router(knowledge_router)
 app.include_router(feature_flag_router)
 # Observability last: /metrics is an unauthenticated infrastructure endpoint
