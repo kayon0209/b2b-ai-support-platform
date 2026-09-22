@@ -42,7 +42,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from observability import JsonLogger
 from observability_metrics import get_metrics
 from platform_core.billing.service import handle_usage_recorded
-from platform_core.db import session_scope
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
 from platform_core.outbox import OutboxEvent
 from platform_core.outbox_service import claim_pending, mark_failed, mark_sent
@@ -270,7 +269,33 @@ class OutboxWorker:
         return self._stopping
 
     async def run_once(self) -> RelayStats:
-        async with session_scope() as session:
+        """Claim and dispatch one batch on the queue's bookkeeping session.
+
+        **Known limitation, stated rather than hidden.** This class still runs
+        both the claim and the dispatch on the owner role, so the per-row
+        `apply_rls_tenant` in `_dispatch` is decoration: on a bypassing
+        connection RLS does not filter anything, and a handler's tenant scoping
+        rests entirely on the explicit `tenant_id` it passes. Contrast
+        `InboxWorker`, which was fixed to claim on this role and process each
+        event on a `tenant_session` after the same measurement showed the flag
+        lookup reading another tenant's row there.
+
+        The fix is the same split - claim here, dispatch each row on a
+        `tenant_session` - and it is *not* applied here yet because it changes
+        this class's documented unit of work: the batch is deliberately one
+        transaction ("a crash mid-batch leaves the whole batch to be retried"),
+        and per-row sessions mean per-row commits, which is a different
+        delivery-dedup story. That deserves its own change and its own
+        verification against a real downstream consumer, which this deployment
+        does not have (the default handler is `log_only_handler`).
+
+        Until then: handlers on this path MUST scope every read and write by an
+        explicit `tenant_id`. `tests/integration/test_outbox_relay.py` covers
+        delivery; nothing there can see the missing boundary.
+        """
+        from worker.wiring import queue_bookkeeping_session
+
+        async with queue_bookkeeping_session() as session:
             return await self._relay.run_once(session)
 
     async def run_forever(self) -> None:

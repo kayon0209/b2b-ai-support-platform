@@ -1510,11 +1510,19 @@ def test_drain_versions_raises_rather_than_returning_partial_success(
 
     Two things this test had to learn, both of which are real contracts:
 
-    1. **A missing object defers, it does not fail.** Storage raising is
-       classified retryable by design (`_Retryable`), so the row goes back to
-       `uploaded` for a later cycle. The outcome to assert is `deferred`, and
-       the row must still be `uploaded` rather than parked in FAILED for a
-       fault that clears itself.
+    1. **An unreachable dependency defers, it does not fail.** A storage
+       outage is classified retryable by design (`_Retryable`), so the row goes
+       back to `uploaded` for a later cycle. The outcome to assert is
+       `deferred`, and the row must still be `uploaded` rather than parked in
+       FAILED for a fault that clears itself.
+
+       The fault is injected rather than inherited from the environment. This
+       test used to reach the real storage layer and pass because that layer
+       was *misconfigured and always unreachable* - so it was asserting
+       "deferral" against an outage while the docstring called it a missing
+       object. Once the endpoint was fixed, the same call returned a real 404
+       and the two conditions separated: an outage is transient, a 404 is not
+       (`test_a_missing_object_fails_...` pins the other half).
     2. **`drain_versions` does not raise for a handled row.** Deferral means
        the row is *supposed* to stay claimable, so treating it as "never
        ingested" would make the loop raise on the one path that exists to
@@ -1528,9 +1536,15 @@ def test_drain_versions_raises_rather_than_returning_partial_success(
     enforces.
     """
     from platform_core.knowledge.ingest import IngestionError
+    from platform_core.knowledge.storage import StorageValidationError
     from worker.ingestion_consumer import drain_versions
 
     version_id = uuid.UUID(_make_version())
+
+    def _dependency_down(key: str) -> bytes:
+        raise StorageValidationError("get_object failed: 503")
+
+    monkeypatch.setattr("platform_core.knowledge.service.get_object", _dependency_down)
 
     async def _drain() -> object:
         engine, factory = _session_factory(APP_URL)
@@ -1559,4 +1573,51 @@ def test_drain_versions_raises_rather_than_returning_partial_success(
     )
     assert _read_version(str(version_id))["status"] == "uploaded", (
         "a retryable fault must leave the row claimable for a later cycle"
+    )
+
+
+def test_a_missing_object_fails_instead_of_retrying_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 404 is permanent; an outage is not, and they used to be one thing.
+
+    An upload whose bytes never landed leaves exactly this row behind: the API
+    registers the document, then the storage write fails, and the version row
+    stays claimable. Every cycle re-read the key, got a 404, called it
+    retryable and released the claim - measured at roughly six attempts per
+    second, per stuck document, with no end. Nothing about a 404 clears on its
+    own.
+
+    `failed` is the honest terminal state, and it is visible: the document list
+    shows it, where the loop only ever showed up in a log nobody reads.
+    """
+    from platform_core.knowledge.storage import ObjectNotFound
+    from worker.ingestion_consumer import drain_versions
+
+    version_id = _make_version()
+
+    def _gone(key: str) -> bytes:
+        raise ObjectNotFound(f"get_object failed: 404 for {key}")
+
+    monkeypatch.setattr("platform_core.knowledge.service.get_object", _gone)
+    embedder = StubEmbedder()
+
+    async def _drive() -> object:
+        engine, factory = _session_factory(APP_URL)
+        try:
+            async with factory() as session:  # type: ignore[operator]
+                stats = await drain_versions(session, [uuid.UUID(version_id)], embedder=embedder)
+                await session.commit()
+                return stats
+        finally:
+            await engine.dispose()  # type: ignore[attr-defined]
+
+    stats = _run(_drive())
+    assert stats.deferred == 0, f"a 404 must not be deferred, got {stats}"
+    assert stats.failed == 1, f"a 404 must be a terminal failure, got {stats}"
+    assert embedder.batches == [], "nothing should be embedded without content"
+
+    row = _read_version(version_id)
+    assert row["status"] == "failed", (
+        "a missing object cannot clear itself; the row must not stay claimable"
     )

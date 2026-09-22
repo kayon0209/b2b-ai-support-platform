@@ -37,6 +37,7 @@ from platform_core.agent_runtime.conversation import (
     normalize_colloquial,
     rewrite_query,
 )
+from platform_core.agent_runtime.emotion import detect_emotion
 from platform_core.agent_runtime.generator import LlmAnswerGenerator
 from platform_core.agent_runtime.hours import is_open, offline_notice
 from platform_core.agent_runtime.intent import (
@@ -60,6 +61,7 @@ from platform_core.agent_runtime.qa_path import (
     ABSTAIN_CLARIFICATION,
     ABSTAIN_COMPLAINT_REQUIRES_HUMAN,
     ABSTAIN_CONFLICT,
+    ABSTAIN_EMOTION_ESCALATION,
     ABSTAIN_HUMAN_REQUIRED,
     ABSTAIN_OUT_OF_SCOPE,
     ABSTAIN_SENSITIVE_REQUEST,
@@ -75,7 +77,8 @@ from platform_core.agent_runtime.qa_path import (
     system_outage_notice,
     validate_citations,
 )
-from platform_core.agent_runtime.routing import team_for_scene
+from platform_core.agent_runtime.queue_status import queue_notice, queue_status
+from platform_core.agent_runtime.routing import routing_note, team_for
 from platform_core.audit import service as audit_service
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
@@ -460,7 +463,9 @@ async def _load_aliases(
         return []
 
 
-def _non_answerable_reason(route: str, restricted_query: bool) -> str:
+def _non_answerable_reason(
+    route: str, restricted_query: bool, emotion_reason: str | None = None
+) -> str:
     """The abstention reason for a route that never reaches retrieval.
 
     Distinguishing the reasons is what makes the handoff explainable
@@ -468,7 +473,14 @@ def _non_answerable_reason(route: str, restricted_query: bool) -> str:
     a customer asking for a person is a routing request being honoured, while a
     sensitive request is a disclosure being refused, and an operator reading
     the audit log needs to tell them apart.
+
+    An emotion escalation wins over the route-derived reason (7.1 trigger 7):
+    "handed off because the customer threatened legal action" is a more
+    specific answer to "why is this in the queue?" than "handed off because a
+    human was required", and it is the one that decides who picks it up next.
     """
+    if emotion_reason:
+        return emotion_reason
     if restricted_query or route == Route.SENSITIVE.value:
         return ABSTAIN_SENSITIVE_REQUEST
     if route == Route.HUMAN_REQUIRED.value:
@@ -511,6 +523,9 @@ class AgentOrchestrator:
         self._top_k = deps.top_k
         self._target_team: str | None = None
         self._attachment_types: list[str] = []
+        # Set per run in `_run_pipeline`; defaulted so a handoff reached
+        # without a classification cannot raise on the way out.
+        self._business_line_note: str | None = None
 
     async def run(
         self,
@@ -531,6 +546,14 @@ class AgentOrchestrator:
         # Content types the customer attached (1.3) - types only, never URLs or
         # content. Used so a handoff can say evidence was already supplied.
         attachment_types: list[str] | None = None,
+        # Feature 2.5. Three states, and the difference matters:
+        #   None          - not a visitor run (operator surfaces): no gate,
+        #                   because the caller is authorised by policy.
+        #   ""            - an anonymous visitor: the read tools must not run at
+        #                   all, or the surface serves *somebody's* order data.
+        #   "acme"        - a visitor who proved ownership of that account: the
+        #                   tools run, and each receipt is checked against it.
+        verified_account: str | None = None,
     ) -> RunOutcome:
         """Execute the pipeline for one inbound customer message.
 
@@ -570,6 +593,7 @@ class AgentOrchestrator:
                 known_facts=known_facts,
                 contact_id=contact_id,
                 attachment_types=attachment_types,
+                verified_account=verified_account,
             )
         except Exception as exc:
             # An unexpected failure still has to be visible in metrics and in
@@ -631,6 +655,9 @@ class AgentOrchestrator:
         known_facts: list[tuple[str, str]] | None,
         contact_id: str | None,
         attachment_types: list[str] | None,
+        # Feature 2.5 ownership gate - threaded from run() (see that parameter's
+        # docstring for the three states).
+        verified_account: str | None = None,
     ) -> RunOutcome:
 
         # --- 1. Acquire/observe the control lease. ---
@@ -654,16 +681,50 @@ class AgentOrchestrator:
         # the scene is known and carried on the handoff. Stored on the run's
         # orchestrator rather than threaded through every call site: there is
         # one detection per run and six places that can hand off.
-        self._target_team = team_for_scene(detection.scene)
+        #
+        # The business line refines the scene when a deployment configures a
+        # (scene, line) team; unfilled, this is exactly `team_for_scene`.
+        self._target_team = team_for(detection.scene, detection.business_line)
+        # A PCB complaint and a complaint are different jobs for whoever reads
+        # the queue, so the line travels with the handoff even when it does not
+        # change the destination.
+        self._business_line_note = routing_note(detection.scene, detection.business_line)
         # One place, set from the caller: the minimiser already decided what is
         # safe to keep, so this only carries it.
         self._attachment_types = list(attachment_types or [])
+        # Feature 2.5 ownership gate - three states, see the parameter.
+        self._verified_account = verified_account
+
+        # --- 1b-2. Emotion (7.2), which closes 7.1's seventh handoff trigger. ---
+        #
+        # Checked here, alongside the other pre-retrieval routes, so an
+        # escalation costs no embedding and no model call: a customer who
+        # threatened legal action is not waiting for a knowledge answer, and
+        # spending one to produce it is how an angry conversation gets a
+        # confident, unhelpful reply. Only ANGRY and above escalate - see
+        # `EmotionSignal.should_handoff` for why impatience does not.
+        self._emotion = detect_emotion(question)
+        emotion_reason: str | None = None
+        emotion_context: str | None = None
+        if self._emotion.should_handoff:
+            route = Route.HUMAN_REQUIRED.value
+            emotion_reason = ABSTAIN_EMOTION_ESCALATION
+            # The matched terms travel with the handoff. A queue entry that
+            # says "escalation risk" without saying which words triggered it
+            # leaves the agent to re-read the whole conversation to find out.
+            emotion_context = (
+                f"emotion={self._emotion.level.value} terms={','.join(self._emotion.terms)}"
+            )
         run_span.set_attributes(
             route=route,
             intent_scene=detection.scene.value,
             intent_kind=detection.primary_kind.value,
             intent_confidence=round(detection.confidence, 3),
             intent_multi=detection.multi_intent,
+            # 3.2/7.3: the line is what a queue triages on; recording it on the
+            # span is what makes "which line generates the complaints" answerable
+            # without re-classifying history.
+            intent_business_line=detection.business_line.value,
             **{"lease.version": expected_lease_version},
         )
 
@@ -733,30 +794,17 @@ class AgentOrchestrator:
             }
         )
 
-        run = AgentRun(
+        run = await self._adopt_or_create_run(
             tenant_id=tenant_id,
             conversation_ref_id=conversation_ref_id,
             route=route,
-            status=RunStatus.RUNNING.value,
-            # The quality dashboard windows over `started_at`; a run without it
-            # is invisible to every metric and only shows up in `untimed_runs`.
-            started_at=int(time.time()),
-            model_config=self._model_config(context=context, detection=detection),
-            retrieval_config=self._retrieval_config(
-                rewritten=rewritten, retrieval_query=retrieval_query
-            ),
-            policy_version=self._policy_version,
-            code_version=self._code_version,
-            trace_id=ctx.trace_id,
-            input_hash=hashlib.sha256(question.encode()).hexdigest(),
-            token_usage={},
+            ctx=ctx,
+            context=context,
+            detection=detection,
+            rewritten=rewritten,
+            retrieval_query=retrieval_query,
+            question=question,
         )
-        if self._deps.generator is not None:
-            run.prompt_version_id = await _get_or_create_prompt(
-                self._session, tenant_id, self._deps.generator
-            )
-        self._session.add(run)
-        await self._session.flush()
 
         # --- 2. Restricted and non-knowledge routes never reach the model. ---
         if restricted_query or route in PRE_RETRIEVAL_ROUTES:
@@ -767,9 +815,10 @@ class AgentOrchestrator:
                 expected_lease_version=expected_lease_version,
                 decision=AbstentionDecision(
                     abstain=True,
-                    reason_code=_non_answerable_reason(route, restricted_query),
+                    reason_code=_non_answerable_reason(route, restricted_query, emotion_reason),
                     handoff=True,
                 ),
+                handoff_context=emotion_context,
                 ctx=ctx,
                 started=started,
                 question=question,
@@ -925,24 +974,42 @@ class AgentOrchestrator:
         # answer. The attempt returns either customer-safe evidence (tool
         # receipts) or a finished RunOutcome (handoff) - never a guess.
         tool_evidence: list[RetrievedChunk] = []
-        if route == Route.BUSINESS_READ.value and await self._flag_enabled(
-            settings.flag_business_read_tools, tenant_id
-        ):
-            read_result = await self._attempt_business_read(
-                run=run,
-                tenant_id=tenant_id,
-                question=question,
-                detection=detection,
-                ctx=ctx,
-                started=started,
-                conversation_ref_id=conversation_ref_id,
-                expected_lease_version=expected_lease_version,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
-            )
-            if isinstance(read_result, RunOutcome):
-                return read_result
-            tool_evidence = read_result
+        if route == Route.BUSINESS_READ.value:
+            if await self._flag_enabled(settings.flag_business_read_tools, tenant_id):
+                read_result = await self._attempt_business_read(
+                    run=run,
+                    tenant_id=tenant_id,
+                    question=question,
+                    detection=detection,
+                    ctx=ctx,
+                    started=started,
+                    conversation_ref_id=conversation_ref_id,
+                    expected_lease_version=expected_lease_version,
+                    chatwoot_account_id=chatwoot_account_id,
+                    chatwoot_conversation_id=chatwoot_conversation_id,
+                )
+                if isinstance(read_result, RunOutcome):
+                    return read_result
+                tool_evidence = read_result
+            else:
+                # A tenant that asks for live data and cannot serve it falls
+                # through to the corpus, which answers "where is my order" out
+                # of indexed prose or abstains. Both look identical to the
+                # customer and to the metrics, and the two call for opposite
+                # fixes - so the gate says which one happened. Silently
+                # degrading here is how a disabled flag gets diagnosed as a
+                # retrieval quality problem.
+                #
+                # The fields are the ones the log allowlist keeps: an earlier
+                # version of this line passed `flag=` and the value was dropped
+                # silently, which is the same class of problem one level down.
+                logger.info(
+                    "business_read_flag_off",
+                    ctx,
+                    route=route,
+                    reason_code="BUSINESS_READ_FLAG_OFF",
+                    tenant_id=str(tenant_id),
+                )
 
         # --- 2d. Business write tools (plan 3.5; flag off by default). ---
         #
@@ -1531,6 +1598,27 @@ class AgentOrchestrator:
         from platform_core.tool_gateway.selector import select_read_tools
         from platform_policy import Action, Decision, PolicyEngine, Principal
 
+        # Feature 2.5, gate 1 of 2: an *anonymous* visitor never reaches the
+        # data. This fires before selection, before any connector call, and
+        # before anything about the question is turned into parameters - there
+        # is no version of "look up the order first, check ownership after"
+        # that does not already have the data in hand. The customer is told
+        # exactly what unblocks it (2.2), which is the difference between a
+        # gate and a dead end.
+        if self._verified_account == "":
+            return await self._handoff_for_tool(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                reason_code="IDENTITY_REQUIRED",
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+
         candidates = select_read_tools(detection, question)
         if not candidates:
             return await self._handoff_for_tool(
@@ -1669,6 +1757,48 @@ class AgentOrchestrator:
             )
 
         output = execution.sanitized_output or {}
+
+        # Feature 2.5, gate 2 of 2: the receipt itself says whose record it is.
+        # Checked here, before the receipt is published or the answer is built,
+        # because once the card is on the timeline the leak has already
+        # happened. A record with no owner is not gated - stock levels and
+        # process capability are nobody's private data; orders, shipments and
+        # invoices are.
+        receipt_account = output.get("account")
+        if not receipt_account and isinstance(output.get("record"), dict):
+            receipt_account = output["record"].get("account")
+        if (
+            self._verified_account not in (None, "")
+            and receipt_account
+            and str(receipt_account) != self._verified_account
+        ):
+            logger.warning(
+                "read_ownership_refused",
+                ctx,
+                tool_name=chosen.tool_name,
+                reason_code="IDENTITY_MISMATCH",
+            )
+            # Label names must match the counter's declared labelnames
+            # exactly - prometheus_client raises ValueError on an unknown
+            # label, and here that would abort the run *on the refusal path*:
+            # the gate would fire, then crash before the customer was told
+            # anything, which is the one outcome worse than no gate.
+            get_metrics().policy_denials_total.labels(
+                action=Action.TOOL_READ.value, reason_code="IDENTITY_MISMATCH"
+            ).inc()
+            return await self._handoff_for_tool(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                reason_code="IDENTITY_MISMATCH",
+                ctx=ctx,
+                started=started,
+                question=question,
+                chatwoot_account_id=chatwoot_account_id,
+                chatwoot_conversation_id=chatwoot_conversation_id,
+            )
+
         receipt_json = _json.dumps(output, sort_keys=True, ensure_ascii=False, default=str)
         ref_value = next(iter(arguments.values()), "")
         receipt_id = uuid.uuid5(tenant_id, f"receipt:{chosen.tool_name}:{idempotency_key}")
@@ -2151,6 +2281,25 @@ class AgentOrchestrator:
             # answered and been answered.
             if decision.handoff and not is_open():
                 notice = offline_notice()
+            elif decision.handoff:
+                # 1.7: where they are in the queue, now that someone is
+                # actually there to work it. Mutually exclusive with the
+                # branch above by construction: naming a position on a queue
+                # nobody is serving would promise a wait that cannot start.
+                # Enrichment only - a failure to count the queue must never
+                # stop the handoff from being sent.
+                try:
+                    position_notice = queue_notice(
+                        await queue_status(
+                            self._session,
+                            tenant_id=tenant_id,
+                            conversation_ref_id=conversation_ref_id,
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - enrichment, not a dependency
+                    position_notice = None
+                if position_notice:
+                    notice = f"{notice} {position_notice}"
 
         # Send the notice **before** releasing the lease, because the lease
         # gate below refuses once the owner is the queue. Releasing first was
@@ -2309,6 +2458,13 @@ class AgentOrchestrator:
             # Which team, so the note lands somewhere specific instead of in a
             # queue where whoever reads it first is probably the wrong person.
             note = f"{note} | team={self._target_team}"
+        if self._business_line_note:
+            # 3.2/7.3: the product line, so a handoff that lands in the general
+            # queue still says what it is about. "A complaint" and "a PCB
+            # complaint" are different jobs for whoever opens the note, and the
+            # classification is already done - dropping it here would discard a
+            # fact the platform just established.
+            note = f"{note} | line={self._business_line_note}"
         if handoff_context:
             # Which account, so the note is actionable: "a strategic account
             # complained" without a name still leaves the agent guessing.
@@ -2476,6 +2632,92 @@ class AgentOrchestrator:
             return "OUTBOUND_AMBIGUOUS"
         del tenant_id, conversation_ref_id
         return ""
+
+    async def _adopt_or_create_run(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        conversation_ref_id: uuid.UUID,
+        route: str,
+        ctx: TraceContext,
+        context: CompactedContext | None,
+        detection: IntentDetection | None,
+        rewritten: bool,
+        retrieval_query: str,
+        question: str,
+    ) -> AgentRun:
+        """One row per logical run: adopt the queued placeholder, or create one.
+
+        The enqueue endpoint writes a `queued` row so the caller gets an id and
+        the request counts against quota the moment it is accepted. This used to
+        insert a **second** row for the same request, leaving the first `queued`
+        forever with `input_hash=''`. Nothing advanced it -- a capability with no
+        consumer -- and because the placeholder also set `started_at`, which is
+        the quota predicate, `usage_snapshot` counted both. Measured before the
+        fix: 434 rows counted against 171 real runs, and for one tenant in one
+        month 30 placeholders against 12 real runs, so quota read 42 instead of
+        12 and the tenant would have been cut off at roughly a third of its
+        actual allowance.
+
+        Adoption is claimed with `FOR UPDATE SKIP LOCKED` plus the status
+        transition, so the row leaves `queued` exactly once even with several
+        workers running. Oldest first, so the first request accepted is the first
+        run executed.
+
+        A placeholder that is never adopted -- the request was dropped, or it
+        came from a path that does not execute -- stays `queued`, which is now an
+        honest state meaning "accepted, never executed" rather than a duplicate
+        of a run that did happen.
+        """
+        placeholder = (
+            await self._session.execute(
+                select(AgentRun)
+                .where(
+                    AgentRun.tenant_id == tenant_id,
+                    AgentRun.conversation_ref_id == conversation_ref_id,
+                    AgentRun.status == RunStatus.QUEUED.value,
+                    AgentRun.input_hash == "",
+                )
+                .order_by(AgentRun.started_at.asc())
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalar_one_or_none()
+
+        # `started_at` is rewritten to the moment execution actually begins.
+        # The dashboard windows over it, and the placeholder's value was the
+        # enqueue time; keeping that would report latency that never happened.
+        values: dict[str, Any] = {
+            "route": route,
+            "status": RunStatus.RUNNING.value,
+            "started_at": int(time.time()),
+            "model_config": self._model_config(context=context, detection=detection),
+            "retrieval_config": self._retrieval_config(
+                rewritten=rewritten, retrieval_query=retrieval_query
+            ),
+            "policy_version": self._policy_version,
+            "code_version": self._code_version,
+            "trace_id": ctx.trace_id,
+            "input_hash": hashlib.sha256(question.encode()).hexdigest(),
+            "token_usage": {},
+        }
+        if placeholder is not None:
+            for field, value in values.items():
+                setattr(placeholder, field, value)
+            run = placeholder
+        else:
+            run = AgentRun(
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                **values,
+            )
+            self._session.add(run)
+        if self._deps.generator is not None:
+            run.prompt_version_id = await _get_or_create_prompt(
+                self._session, tenant_id, self._deps.generator
+            )
+        await self._session.flush()
+        return run
 
     def _model_config(
         self,

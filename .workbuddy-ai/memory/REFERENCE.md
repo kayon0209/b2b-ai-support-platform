@@ -342,5 +342,216 @@ APP_BASE_URL=http://localhost:5174 APP_TOKEN=pt_admin-demo_<user_id> node script
 - **A full-suite run that makes no progress is usually a dead container, not a slow suite.** Check CPU time
   first (a hung run showed 5.6 s of CPU after 20 min), then probe 5435/6380. After restarting only the data
   services the same suite finished in 2 min 13 s. Start **only the data services** — never the workers.
-- MinIO cannot be started while Docker has no HTTPS proxy (registry-1.docker.io unreachable), but **no test
-  needs it** — its absence caused zero failures.
+- MinIO cannot be *pulled* while Docker has no HTTPS proxy (registry-1.docker.io unreachable), and the
+  compose file asks for `minio/minio:latest` — but a mirror tag is already local. **Retag it and compose
+  needs no registry at all:**
+  ```bash
+  docker tag docker.1ms.run/minio/minio:RELEASE.2023-03-20T20-16-18Z minio/minio:latest
+  ```
+  Then the full stack is one command (start **only** the services you need; the workers are consumers and
+  make pytest flaky while they run):
+  ```bash
+  docker compose -f infra/compose/docker-compose.yml up -d \
+    ai-postgres ai-redis minio ai-api ai-worker-interactive ai-worker-outbox
+  ```
+  `ai-api` is built from the checkout (`build:` in compose), so it is only as fresh as its last build —
+  after a code change either `up -d --build ai-api` or run the API in-process instead.
+  Front end, with the token injected so the Token dialog is skipped:
+  ```bash
+  cd apps/admin-web && VITE_API_TARGET=http://localhost:8000 \
+    VITE_API_TOKEN=pt_admin-demo_<user_id> node node_modules/vite/bin/vite.js --port 5173 --strictPort
+  ```
+  Open **`http://localhost:5173`** (Vite binds IPv6 `[::1]`). Admin-demo currently shows **23 cases**, and
+  its `brand_display_name` is still the XSS payload from §6.3 — the user chose to leave that data alone, so
+  it *is* expected to appear on the Branding page. MinIO's absence caused zero test failures.
+
+### `docker compose` MUST be run with `--env-file .env` (cost me the whole customer loop)
+
+```bash
+docker compose --env-file .env -f infra/compose/docker-compose.yml up -d
+```
+
+`docs/deployment-and-operations.md:38` documents this; it is easy to drop the flag because everything *looks*
+fine without it. Mechanism: the services set `environment: APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}` etc. Compose
+substitutes `${...}` from the **project-directory `.env` / the calling shell**, *not* from the service's
+`env_file`. There is no `infra/compose/.env`, so without `--env-file .env` every one of those resolves to the
+empty default — and an explicit empty `environment` value **overrides** the good value `env_file` supplied.
+
+Verified by measurement (2026-09-21): `ai-api` had `APP_CHATWOOT_API_TOKEN` set but `APP_LLM_API_KEY` empty,
+`ai-worker-interactive` had **both** empty, and `ai-worker-outbox` had both set — the difference is exactly
+which keys each service lists in `environment:`. So it is per-service and looks random.
+
+**The only symptom is one WARNING line** — `{"event": "worker_cannot_send", "reason_code":
+"NO_CHATWOOT_TOKEN"}` — while the API starts normally, `/healthz` is 200, and the whole test suite passes.
+The customer loop then consumes messages and **replies to nobody**. Check for it with:
+
+```bash
+docker compose -f infra/compose/docker-compose.yml exec -T ai-worker-interactive \
+  sh -c 'for v in APP_CHATWOOT_API_TOKEN APP_LLM_API_KEY; do eval "val=\$$v"; \
+         [ -z "$val" ] && echo "$v EMPTY" || echo "$v set"; done'
+```
+
+After recreating with `--env-file .env`, all three services report both secrets set and the warning is gone.
+
+**Related:** the compose comment claims "worker.wiring fails closed on this". Measured behaviour is a
+**warning plus a normal start** — it does not refuse to start. So the stated control does not exist, and the
+comment is the only place that says otherwise. (Same family as "a comment is not a control".)
+
+### Webhook topology — which port the API must listen on (verified 2026-09-21)
+
+Read the configured hooks straight from Chatwoot (read-only; creds are `chatwoot:chatwoot`):
+
+```bash
+./.venv/Scripts/python.exe -c "
+import psycopg
+with psycopg.connect('postgresql://chatwoot:chatwoot@localhost:5434/chatwoot') as c:
+    for r in c.execute('SELECT id, account_id, url, subscriptions FROM webhooks ORDER BY id'):
+        print(r)"
+```
+
+| account | url | subscriptions |
+|---|---|---|
+| 1 | `http://192.168.65.254:8000/v1/webhooks/chatwoot` | message_created, message_updated, conversation_status_changed |
+| **3** | `http://host.docker.internal:8010/v1/webhooks/chatwoot` | message_created |
+
+**Account 3 is the AI inbox, and its hook targets 8010.** So the API must listen on **8010** for the customer
+loop to fire — which is exactly why the manual walkthrough uses `APP_API_PORT=8010`. The compose `ai-api`
+publishes **8000 only**, so a stack started purely from compose has a live UI but a **dead inbound leg**, and
+nothing says so: the failure is silence on Chatwoot's side, not an error on ours.
+
+Verified in this environment: `curl` unsigned POST to `/v1/webhooks/chatwoot` returns **401** (route is
+registered and the signature is enforced — `middleware.EXEMPT_PATHS` covers it), and the Chatwoot container
+reaches `host.docker.internal:8010` over TCP. Note `host.docker.internal` resolves to an **IPv6** address
+(`fdc4:f303:9324::254`) here; it resolves and connects fine.
+
+**Do not test container→host reachability with `(echo > /dev/tcp/host/port)`** — `/dev/tcp` is a **bash**
+feature and these images' `sh` has no such thing, so every port reports "unreachable" and it looks like a
+network fault. Use `ruby -rsocket` (the Rails image always has it) or `getent hosts` for DNS only.
+
+### Two MinIO traps that cost time every time (verified 2026-09-21)
+
+1. **`minio` reports `unhealthy` forever, and it is a false alarm.** The compose healthcheck is
+   `["CMD", "mc", "ready", "local"]`, but **the server image ships no `mc` binary** — so the probe can never
+   succeed regardless of the service's health. The service itself answers `200` on
+   `/minio/health/live`. Judge MinIO by that endpoint, not by the container status. Nothing in compose
+   gates on `minio`'s health, so it is cosmetic.
+2. **No code anywhere creates the `documents` bucket.** `grep -rniE "make_bucket|create_bucket|
+   ensure_bucket"` over `apps packages scripts` returns **nothing**, and `MinioStorage` only has
+   `put_object` / `get_object` / `presign_get` — so a fresh volume makes every upload fail with
+   `NoSuchBucket`, and the failure looks like an application bug. Create it once, out of band
+   (the `minio` python client is in `.venv`; the console at `:9001` also works):
+   ```bash
+   ./.venv/Scripts/python.exe -c "
+   from minio import Minio
+   c = Minio('localhost:9000', access_key='minioadmin', secret_key='minioadmin', secure=False)
+   c.bucket_exists('documents') or c.make_bucket('documents')"
+   ```
+   Verified after creating it: the app's own client round-trips (`put_object` → `get_object` equal,
+   `presign_get` returns a signed URL). **This belongs in the launch checklist** — a deploy that forgets it
+   ships an upload path that is broken by construction.
+
+### The log allowlist silently drops your debugging fields (verified 2026-09-21 evening)
+
+`observability.JsonLogger.log` keeps only `ALLOWED_LOG_FIELDS` (`event`, `tenant_id`, `trace_id`,
+`delivery_id`, `event_type`, `run_id`, `route`, `status`, `model_name`, `token_count`, `latency_ms`,
+`tool_name`, `decision`, `reason_code`, `document_version_id`, `chunk_count`, `error_code`, `queue`,
+`attempt`) and **drops everything else without a word** (`observability.py:189` / `log_fields`).
+Cost: I added `logger.info("...", ctx, flag=..., rls_tenant=...)` and the line printed with neither —
+which reads as "the code did not run". Put the value in the **event name** while debugging, or use
+`reason_code` / `tenant_id`, which survive the filter.
+
+### Diagnosing a config/flag that is "silently off": role first, then GUC, then logic
+
+Order matters, because the first two are invisible in application logs:
+
+```bash
+# 1. which role is the session on? (a superuser bypasses RLS entirely)
+docker exec <worker> python -c "
+import asyncio
+async def m():
+    from sqlalchemy import text
+    from platform_core.db import create_engine, app_role_url
+    e = create_engine(app_role_url())
+    async with e.connect() as c:
+        print(await c.scalar(text('select current_user, rolbypassrls from pg_roles where rolname=current_user')))
+asyncio.run(m())"
+# 2. what does RLS actually see? bind, then count
+#    SELECT count(*) FROM feature_flags;   -- with and without set_config('app.tenant_id', ...)
+```
+
+Measured sizes on the local DB: `feature_flags` has 13 rows total, `platform_app` sees 11 of them
+for `admin-demo`, `platform` sees 13.
+
+### `set_config('app.tenant_id', …, true)` does NOT survive COMMIT — and `_load_flag` depends on it
+
+Verified in-container by binding the tenant and then committing:
+
+```
+A no-GUC       -> False UNKNOWN_FLAG   (0 flags visible)
+B GUC bound    -> True  ROLLOUT        (11 flags visible)
+C after commit -> False UNKNOWN_FLAG
+```
+
+`flag_service` deliberately relies on RLS instead of a tenant predicate. So **anything that commits
+before a flag read makes every flag resolve to its default**. `lease_service` commits, which is why
+the run path must re-bind after acquiring the lease — see
+`scripts/_probe_card_under_app_role.py` for the working shape.
+
+### Container introspection without a rebuild (saves ~100s per iteration)
+
+`docker compose up -d --build` takes ~100s here. While iterating on a diagnosis, write the edit and
+copy it in instead:
+
+```bash
+docker cp apps/api/src/platform_core/<path>.py <worker>:/app/apps/api/src/platform_core/<path>.py
+docker restart <worker>
+```
+
+**Then rebuild once at the end** so the container matches the worktree (verify with `md5sum` on both
+sides — I checked `orchestrator.py`, `tool_card.py`, `chat_service.py`, `business_read.py`).
+Also: `docker exec` is Linux, so `asyncio.WindowsSelectorEventLoopPolicy` raises `AttributeError`
+there — use a plain `asyncio.run`.
+
+### The `connectors` table is empty on this deployment
+
+`ConnectorExecutorResolver` builds an executor only for a provider with an **active connector row
+claiming the tool's capability**, so with no connector every read tool resolves to nothing and the run
+hands off with `TOOL_EXECUTOR_MISSING`. Verified: `select count(*) from connectors` was **0** — which
+is why the deployment had published **zero** `tool` turns despite the read tools being registered.
+`scripts/seed_admin_demo.py` now seeds a `business_api` connector plus the
+`agent.business_read_enabled` flag (mirroring `test_business_read_receipt._seed_connector`).
+
+### A live worker steals the inbox event you just seeded (verified 2026-09-21 night)
+
+`docker compose stop ai-worker-interactive ai-worker-outbox` is not optional before running the suite
+or a probe. A polling consumer claims `received` inbox rows within a second of the insert, so a probe
+that seeds an event and then drains sees `processed: 0`, the row still `received`, and a run row stuck
+at `queued` — which reads as "the drain is broken" and is not. Cost: ~15 minutes of chasing the wrong
+thing, twice (the first time I had stopped the workers, then restarted them for a browser check).
+
+### Window for a bare probe script: `asyncio.run` picks ProactorEventLoop
+
+Any script that runs worker/API code directly needs the policy set first, or psycopg async refuses:
+
+```python
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+```
+
+The test suite is immune because `apps/api/tests/conftest.py` sets it autouse.
+
+### A guard must always report — a hang is worse than a failure
+
+`scripts/support_card_smoke.cjs` once sat for 18 minutes after the page had already got everything it
+needed, and printed **nothing** (no chromium was even alive; the teardown was the thing hanging).
+A guard that hangs tells you nothing and blocks whatever runs it. The shape that fixes it, now in that
+file: findings at module scope, `Promise.race` around `browser.close()`, and a watchdog
+(`APP_HARD_DEADLINE_MS`) that reports what is known and exits non-zero.
+
+### Schema details that cost a query each
+
+- `agent_runs` has **no `created_at`** — order by the uuidv7 pk or `started_at`.
+- `conversation_turns` is FK'd from `contact_facts`; test teardown must delete `contact_facts` first.
+- `inbox_events` needs `payload_hash` (NOT NULL) and `received_at` (the FIFO key).
+- `feature_flags` has a UNIQUE `(tenant_id, key)`, so the same key in two tenants is legal — and that
+  is exactly the fixture a `_load_flag` guard needs (one tenant cannot observe the defect).

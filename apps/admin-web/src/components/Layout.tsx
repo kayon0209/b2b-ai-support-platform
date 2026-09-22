@@ -9,6 +9,8 @@ import { TokenDialog } from "./TokenDialog";
 const NAV = [
   { to: "/quality", key: "nav.quality", icon: "📊" },
   { to: "/gaps", key: "nav.gaps", icon: "🧩" },
+  { to: "/knowledge", key: "nav.knowledge", icon: "📚" },
+  { to: "/conversations", key: "nav.conversations", icon: "🔁" },
   { to: "/prompts", key: "nav.prompts", icon: "✍️" },
   { to: "/flags", key: "nav.flags", icon: "🚩" },
   { to: "/cases", key: "nav.cases", icon: "🎫" },

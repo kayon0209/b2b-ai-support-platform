@@ -88,7 +88,7 @@ def _seed() -> None:
                 text(
                     "INSERT INTO agent_runs (id, tenant_id, conversation_ref_id, route, "
                     "status, abstain_reason, started_at, input_hash, code_version) VALUES "
-                    "(gen_random_uuid(), :t, :conv, 'knowledge_qa', :s, :r, :ts, '', 'test')"
+                    "(gen_random_uuid(), :t, :conv, 'knowledge_qa', :s, :r, :ts, :hash, 'test')"
                 ),
                 {
                     "t": TENANT,
@@ -96,6 +96,11 @@ def _seed() -> None:
                     "s": status,
                     "r": reason,
                     "ts": now,
+                    # These model runs that ran and abstained or handed off, so
+                    # they carry the question hash the orchestrator writes at
+                    # execution start. An empty one is the queue-placeholder
+                    # shape, and those are no longer aggregated as runs.
+                    "hash": uuid.uuid4().hex * 2,
                 },
             )
     admin.dispose()

@@ -1,0 +1,291 @@
+/* Styles for the customer chat window (`/support`).
+ *
+ * Kept out of `styles.css` on purpose: that file is the operator console's
+ * shell, and a customer page that inherits it would drift back toward looking
+ * like the console. The accent comes from the tenant's branding via
+ * `--support-accent`, which the component sets from `brand_primary_color`.
+ */
+
+.support-shell {
+  --support-accent: #1a393d;
+  display: flex;
+  flex-direction: column;
+  max-width: 720px;
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 0 16px 16px;
+  background: #f7f8f8;
+  color: #1c1c1e;
+  font: 15px/1.6 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+.support-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 20px 4px 14px;
+  border-bottom: 1px solid #e3e6e6;
+}
+
+.support-head h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--support-accent);
+}
+
+.support-logo {
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+}
+
+.support-sub {
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.support-thread {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px 0;
+  overflow-y: auto;
+}
+
+.support-empty {
+  margin: auto;
+  color: #9ca3af;
+  font-size: 14px;
+}
+
+.support-bubble {
+  max-width: 78%;
+  padding: 10px 14px;
+  border-radius: 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* The customer's own words sit right, the answer sits left — the convention
+ * every chat app uses, so the customer does not have to read a label to tell
+ * who said what. */
+.support-bubble.is-customer {
+  align-self: flex-end;
+  background: var(--support-accent);
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+
+.support-bubble.is-agent {
+  align-self: flex-start;
+  background: #fff;
+  border: 1px solid #e3e6e6;
+  border-bottom-left-radius: 4px;
+}
+
+.support-typing {
+  align-self: flex-start;
+  color: #6b7280;
+  font-size: 13px;
+}
+
+/* Platform notices (a clarification, a handoff). Neither the customer's words
+ * nor the assistant's answer, so it gets no bubble - a bubble would attribute
+ * it to someone. */
+.support-system {
+  align-self: center;
+  max-width: 88%;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: #eceeee;
+  color: #55605f;
+  font-size: 12.5px;
+  text-align: center;
+}
+
+/* --- Tool receipt card (feature list 4A.3/4A.4) -------------------------
+ *
+ * Left-aligned like an answer, because it *is* part of the answer: the data
+ * the platform looked up. It is a block, not a bubble - the shape is what
+ * tells the customer this is a record and not someone talking. */
+.tool-card {
+  align-self: flex-start;
+  width: 100%;
+  max-width: 88%;
+  padding: 12px 14px;
+  border: 1px solid #dfe4e4;
+  border-left: 3px solid var(--support-accent);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.tool-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.tool-card-kind {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.tool-card-title {
+  font-size: 15px;
+  letter-spacing: 0.02em;
+}
+
+.tool-card-status {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--support-accent);
+  color: #fff;
+  font-size: 12px;
+}
+
+/* Provenance is not decoration: a figure from sample data must never be read
+ * as one from a real system. */
+.tool-card-demo {
+  padding: 1px 6px;
+  border: 1px dashed #c9a227;
+  border-radius: 4px;
+  color: #8a6d1a;
+  font-size: 11.5px;
+}
+
+.tool-card-age {
+  margin-left: auto;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.tool-card-nodes {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tool-card-node {
+  position: relative;
+  display: grid;
+  grid-template-columns: 16px 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 13.5px;
+}
+
+.tool-card-dot {
+  width: 9px;
+  height: 9px;
+  margin-left: 3px;
+  border: 2px solid #cfd6d6;
+  border-radius: 50%;
+  background: #fff;
+}
+
+/* The connector between stages, drawn per row so it stops at the last one
+ * instead of trailing off the card. */
+.tool-card-node:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: 7px;
+  top: 50%;
+  height: 100%;
+  border-left: 1px solid #dfe4e4;
+}
+
+.tool-card-node.is-done .tool-card-dot {
+  border-color: #9aa5a5;
+  background: #9aa5a5;
+}
+
+.tool-card-node.is-active .tool-card-dot {
+  border-color: var(--support-accent);
+  background: var(--support-accent);
+  box-shadow: 0 0 0 3px rgba(26, 57, 61, 0.14);
+}
+
+.tool-card-node.is-active .tool-card-node-label {
+  font-weight: 600;
+}
+
+.tool-card-node-label {
+  position: relative;
+  z-index: 1;
+  background: #fff;
+}
+
+.tool-card-node-state,
+.tool-card-node-at {
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.tool-card-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid #eceeee;
+  color: #55605f;
+  font-size: 13px;
+}
+
+.tool-card-facts strong {
+  color: #1c1c1e;
+}
+
+.support-problem {
+  margin: 0 0 10px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: #fdecec;
+  border: 1px solid #f3c2c2;
+  color: #8a1c1c;
+  font-size: 13px;
+}
+
+.support-composer {
+  display: flex;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid #e3e6e6;
+}
+
+.support-composer input {
+  flex: 1;
+  padding: 11px 14px;
+  border: 1px solid #d5d9d9;
+  border-radius: 22px;
+  font-size: 15px;
+  background: #fff;
+  color: inherit;
+}
+
+.support-composer input:focus {
+  outline: 2px solid var(--support-accent);
+  outline-offset: 1px;
+}
+
+.support-composer button {
+  padding: 0 22px;
+  border: none;
+  border-radius: 22px;
+  background: var(--support-accent);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.support-composer button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

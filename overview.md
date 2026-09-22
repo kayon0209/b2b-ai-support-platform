@@ -595,3 +595,99 @@ if (decision.abstain
   + `test_knowledge_gaps` 1 个 ERROR 周期性复现，**隔离运行全过**，且**均不 import**
   本次改动模块 → 预存问题，非本次引入。
 - 仍**不擅自决定**的三项：约 60 个文件的提交切分、host worker、`Route.CASE_STATUS` 的去留。
+
+---
+
+# 本轮会话：客户侧数据卡片（§5-A），以及它撞出来的两个真问题（2026-09-21 晚）
+
+**任务**：按 `HANDOVER-2026-09-21-THREE-SURFACES.md` §5-A 做客户侧"数据卡片"——
+用户原话是"订单状态、物流节点可视化，**不是一段文字**"。
+
+**交付**：`outputs/CARD-DELIVERY-2026-09-21.md`（交付清单 + 复现命令）
+**证据**：`FINDINGS-2026-09-21-CARD-AND-RLS.md`（每条结论带实测原始输出）
+
+## 一、做完了的
+
+回执本来就在 `role=tool` 的 turn 里（`orchestrator._publish_receipt`），所以**不新造存储**：
+新增 `agent_runtime/tool_card.py` 在**读取侧**把它归一化成结构化卡片（白名单字段、两种适配器
+封装、不臆造新鲜度），`read_timeline` 增加 `card` 字段（加法），前端新增唯一的
+`components/ToolCard.tsx`、`SupportChat` 的 `tool` 分支渲染卡片（**不再打印原始 JSON**）、
+样式、`scripts/seed_admin_demo.py` 补种 demo ERP 连接器与读工具开关，以及浏览器守卫
+`scripts/support_card_smoke.cjs`（对账"接口给了 N 个节点 / 页面渲染了几个"）。
+
+顺手修掉一个**真 bug**：真实适配器的 `fetched_at` 是 10 位 epoch，被 PII 脱敏成 `[PHONE]`
+→ JSON 破裂 → `_survives_redaction` 拒绝发布 → **生产适配器下卡片永远不会出现**（只有 demo 的
+ISO 字符串能过）；而测试夹具里的"假真实执行器"返回的恰恰是 ISO，所以**测试全绿**。
+
+**变异验证**（4 条，全部先红后还原）：不渲染阶段列表 / 回执照文本气泡渲染 / 回退成 epoch /
+`card` 恒为 None。
+
+## 二、必须你决定的两件事
+
+1. **P0（已修，不再需要决定）**：交互式 worker 的工作单元用 `session_scope()` →
+   **bootstrap owner（`rolbypassrls`）**，于是 **run 全程绕过 RLS**。实测：开关
+   `agent.business_read_enabled` 取到了**另一租户**那一行（`DISABLED`）→ 读工具分支被跳过
+   → 卡片在真实部署里进不去；同时跨租户隔离在该路径失效。
+   现改为**认领用 owner（具名例外）、每事件用 `tenant_session`（app 角色 + 每事务重绑）**，
+   并把 `tenant_session` 从 HTTP 层（`platform_core.api`）搬回 RLS 层（`identity.tenant_context`），
+   worker 不再需要 import 请求层。6 条守卫 + 变异验证 + 真实 worker 端到端复验（ask 模式 35s 全绿）。
+2. **P1（未修，属另一会话）**：**中文问法永远选不中读工具**（5 个中文问法全部 `knowledge_qa`、
+   候选为空）→ 产品唯一真实语言下"订单交期查询"不触发。根因在 `intent.py`，而该文件与
+   `test_intent.py`、`docs/research/chinese-intent-measurement.md` 正是另一会话在做的一半，未碰；
+   最小复现表在 `FINDINGS-2026-09-21-CARD-AND-RLS.md` §2，可直接转给他们。
+
+## 三、同轮内一并处置的
+
+- **§5-C（已修）**：`router.py` 的入队实现改为委托 `chat_service.queue_agent_run`
+  （新增 `audit_extra` 保住审计血缘）。顺带修掉"路径 uuid 的两种写法会指向不同会话"的潜在不一致。
+- **§5-D（查清后建议不动）**：`test_usage_counts_queued_runs` 明确断言**入队即计入配额**——
+  这是产品语义（否则租户可无限排队）。admin-demo 那 32 行未认领占位是旧双写 bug 的历史重复计数，
+  删它属于动租户数据。实测表在 findings §8。
+- **outbox relay（同根因，例外已写明）**：它的认领与派发仍共用一个 owner 会话，所以逐行
+  `apply_rls_tenant` 是装饰。修法同 §1，但会改变该类文档化且被测试钉住的"整批一个事务"契约，
+  且此部署无真实下游可验证投递 —— 已把例外写成具名 + 边界 + 代价（`OutboxWorker.run_once`）。
+
+## 四、验证（实测）
+
+| 检查 | 结果 |
+|---|---|
+| ruff check / format | All checks passed / 375 files unchanged |
+| mypy | 158 files, no issues |
+| 全量回归 | **1787 passed / 1 failed**（新增 46 条测试） |
+| 那 1 个失败 | `expected 42 migrations, got 43` —— **§5-E 记录的既有耦合**，非本次回归 |
+| `release_check --evidence-only` | 证据不可用 —— 因上面那个失败让会话 `exitstatus=1`（既有条件） |
+| `tsc --noEmit` + `vite build` | 通过 |
+| 浏览器守卫 | **ask 模式**（真实 worker、页面驱动）：`served=4 rendered=4` + 答复随后到达，35s，exit 0；adopt 模式 6s |
+| 真实链路 | `/v1/support/messages` → worker：`tool_read_executed` → `tool` 回执行 → `agent` 行；run 就地认领 |
+
+变异测试 5 条全部先红后还原（含"处理阶段改回 owner 会话 → 隔离测试红"）。
+
+## 五、边界
+
+未动另一会话的 14 个文件、§5-E 的迁移三件套、§5-F 的 HEAD 断裂、§5-G 的租户数据；
+未改 `redact_text`（`tracking_no` 被脱敏成 `SF[PHONE]` 是已知残留）。卡片目前只覆盖
+`order.get_status` / `shipment.track` 两类。
+
+---
+
+# 续：§5-B 坐席工作台"相似工单"（三界面最后一块）
+
+交接文档 §5-B 写"Workbench.tsx 没有相似工单"。**核对后发现前后端都已经有**——
+真正的问题是这块**没有相关性**：查询 = 同 `category` + 最近 5 条，而 `category` 默认
+`general`（admin-demo 23 条里 9 条），`basis` 这个 API 枚举还被原样拼进用户可见标题。
+
+**关键实测**：第一版方案（`pg_trgm.similarity()` 当门槛）被量出来**不可用**——
+`similarity('能不能加急','加急打样多久') = 0.000`（共享词"加急"是 2 字，在两个串里的
+3 字窗口分别是"能加急/加急打"，永远对不上）；英文同串 0.613。**trigram 对产品真实语言是盲的。**
+
+**改为**：`cases/service.find_related_cases` —— 词项重叠（拉丁词 + **CJK 二元组**，Dice 排序）+
+**词频自适应裁剪**（>50% 标题都有的词不算共享证据，按租户自己的数据量出来，不手写停用词表）；
+两级信号如实标注（`match: subject | category` + 每行 `shared_terms`），**桶匹配封顶 2 条**并排在后；
+前端标题去掉原始枚举、每行 Badge 标注理由；i18n 中英补齐。无迁移。
+
+**部署栈实测**：对 "EQ 0813448-B: confirm stackup (from console)" 返回 5 条同类 EQ 确认，
+其中**同单号的原始工单以 0.667 关联**——正是"这条咨询我们之前怎么处理的"。
+
+验证：`test_case_workbench.py` 8 条（含跨租户负向：另一租户**标题完全相同**的诱饵绝不出现）；
+全量 **1788 条用例 / 1 failed**（§5-E 既有）。
+

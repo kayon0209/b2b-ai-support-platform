@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from sqlalchemy import select
 
 from observability import JsonLogger
+from platform_core.agent_runtime.abandoned import abandon_stale_placeholders
+from platform_core.config import get_settings
 from platform_core.db import session_scope_with_url
 from platform_core.evaluation.pii import DEFAULT_RETENTION, RetentionPolicy, sweep_expired_data
 from platform_core.identity.models import Tenant, TenantStatus
@@ -34,10 +36,16 @@ class RetentionStats:
     expired_versions: int = 0
     pruned_dead_letters: int = 0
     pruned_inbox_events: int = 0
+    abandoned_runs: int = 0
 
     @property
     def changed_rows(self) -> int:
-        return self.expired_versions + self.pruned_dead_letters + self.pruned_inbox_events
+        return (
+            self.expired_versions
+            + self.pruned_dead_letters
+            + self.pruned_inbox_events
+            + self.abandoned_runs
+        )
 
 
 async def _active_tenant_ids() -> list[uuid.UUID]:
@@ -73,10 +81,22 @@ async def drain_retention_once(
             ctx = TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="system")
             await apply_rls_tenant(session, ctx)
             counts = await sweep_expired_data(session, tenant_id=tenant_id, now=ts, policy=policy)
+            # Queue hygiene, in the same per-tenant transaction: an accepted
+            # run that no worker ever picked up should not stay `queued`
+            # forever, or the word stops distinguishing "waiting" from
+            # "abandoned" and the quota counter has to guess. See
+            # `agent_runtime/abandoned.py`.
+            abandoned = await abandon_stale_placeholders(
+                session,
+                tenant_id=tenant_id,
+                older_than_seconds=get_settings().run_abandon_after_seconds,
+                now=ts,
+            )
         stats.tenants_swept += 1
         stats.expired_versions += counts.get("document_versions_expired", 0)
         stats.pruned_dead_letters += counts.get("dead_letters_pruned", 0)
         stats.pruned_inbox_events += counts.get("inbox_events_pruned", 0)
+        stats.abandoned_runs += abandoned
 
     if stats.changed_rows:
         logger.info(
@@ -85,5 +105,6 @@ async def drain_retention_once(
             expired_versions=stats.expired_versions,
             pruned_dead_letters=stats.pruned_dead_letters,
             pruned_inbox_events=stats.pruned_inbox_events,
+            abandoned_runs=stats.abandoned_runs,
         )
     return stats

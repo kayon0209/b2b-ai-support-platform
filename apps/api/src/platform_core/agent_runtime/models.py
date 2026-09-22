@@ -24,6 +24,13 @@ class RunStatus(enum.StrEnum):
     ABSTAINED = "abstained"
     HANDED_OFF = "handed_off"
     FAILED = "failed"
+    # Accepted, never executed, and no longer waiting: the retention sweep
+    # closes placeholders that outlived any plausible queue latency. Without
+    # it `queued` means two different things - "a worker will get to this in a
+    # second" and "this was abandoned three days ago" - and both the quota
+    # counter and the replay list have to guess which. See
+    # `agent_runtime/abandoned.py`.
+    ABANDONED = "abandoned"
 
 
 class Route(enum.StrEnum):
@@ -78,6 +85,32 @@ class AgentRun(Base, PkMixin, TenantMixin):
     token_usage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     latency_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     abstain_reason: Mapped[str | None] = mapped_column(String(127), nullable=True)
+
+
+def run_executed() -> Any:
+    """Criterion selecting runs that actually executed.
+
+    The queue endpoint writes a `queued` row so the caller gets an id, and
+    `orchestrator._answer_run` adopts it and fills in the question's hash the
+    moment execution begins. A row that is still empty therefore means the
+    placeholder was never adopted: accepted, never run. The orchestrator's own
+    docstring calls that an honest state, and it is - it just is not *usage*.
+
+    Aggregating those rows does more damage than a wrong denominator. The
+    placeholder carries the queue's default `route` ("knowledge_qa", set in
+    `chat_service.queue_agent_run`) and no intent snapshot at all, so counting
+    it reports route traffic that never happened and pours rows that never ran
+    into the intent distribution's `unrecorded` bucket - the one bucket that is
+    supposed to mean "this run predates the field".
+
+    Measured on 2026-09-22 against the dev database, one tenant, one month:
+    usage read 76 runs against 42 that executed.
+
+    Defined once, here, because the same predicate is needed by usage
+    accounting and by both quality aggregations; three hand-written copies is
+    how they drift apart again.
+    """
+    return AgentRun.input_hash != ""
 
 
 class Citation(Base, PkMixin, TenantMixin):

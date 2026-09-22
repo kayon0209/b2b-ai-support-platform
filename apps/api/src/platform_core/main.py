@@ -36,6 +36,7 @@ from platform_core import db
 from platform_core.agent_runtime.customer_router import router as customer_router
 from platform_core.agent_runtime.prompt_router import router as prompt_router
 from platform_core.agent_runtime.router import router as agent_runtime_router
+from platform_core.agent_runtime.support_router import router as support_router
 from platform_core.api import (
     INTERNAL_ERROR,
     VALIDATION_FAILED,
@@ -203,6 +204,7 @@ app.include_router(cases_router)
 app.include_router(retrieval_router)
 app.include_router(agent_runtime_router)
 app.include_router(customer_router)
+app.include_router(support_router)
 app.include_router(tool_gateway_router)
 app.include_router(tool_catalog_router)
 app.include_router(quality_router)

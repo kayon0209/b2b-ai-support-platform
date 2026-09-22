@@ -61,6 +61,7 @@ from platform_core.identity.tenant_context import TenantContext, apply_rls_tenan
 from platform_core.knowledge import ingest
 from platform_core.knowledge.ingest import IngestionError
 from platform_core.knowledge.models import Chunk, DocumentVersion, IngestionStatus
+from platform_core.knowledge.storage import ObjectNotFound
 
 logger = JsonLogger("platform.worker")
 
@@ -107,7 +108,16 @@ class _Retryable(Exception):
     FAILED means a human has to notice and requeue, for a failure that is
     about the dependency rather than the document. The claim is released
     (status back to UPLOADED) so the next cycle picks it up.
+
+    Carries a stable `code`, because the class name is not a reason. Every
+    dependency outage raised the same `_Retryable`, so the log read
+    `reason_code: "_Retryable"` and said nothing about which dependency to
+    look at - observed while debugging a document that would never ingest.
     """
+
+    def __init__(self, message: str, *, code: str = "DEPENDENCY_UNAVAILABLE") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass
@@ -307,13 +317,22 @@ async def _embed_chunks(texts: list[str], embedder: Any) -> list[list[float]]:
         except ModelRejected as exc:
             raise IngestionError(f"embedding request rejected: {exc}") from exc
         except Exception as exc:  # noqa: BLE001 - provider boundary
-            raise _Retryable(f"embedding provider unavailable: {type(exc).__name__}") from exc
+            raise _Retryable(
+                f"embedding provider unavailable: {type(exc).__name__}",
+                code="EMBEDDING_UNAVAILABLE",
+            ) from exc
         got = list(result.vectors)
         if len(got) != len(batch):
-            raise _Retryable(f"embedder returned {len(got)} vectors for {len(batch)} inputs")
+            raise _Retryable(
+                f"embedder returned {len(got)} vectors for {len(batch)} inputs",
+                code="EMBEDDING_SHAPE_MISMATCH",
+            )
         vectors.extend(got)
     if len(vectors) != len(texts):
-        raise _Retryable(f"embedding count mismatch: {len(vectors)} for {len(texts)} chunks")
+        raise _Retryable(
+            f"embedding count mismatch: {len(vectors)} for {len(texts)} chunks",
+            code="EMBEDDING_SHAPE_MISMATCH",
+        )
     return vectors
 
 
@@ -342,8 +361,20 @@ async def ingest_version(
 
     try:
         raw = service.get_object(version.object_uri)
+    except ObjectNotFound as exc:
+        # Permanent, and it used to be retried forever. An upload whose bytes
+        # never landed leaves exactly this row behind (the API registers the
+        # document, then fails to store it), so the worker spent a hot loop
+        # re-reading an object that cannot appear. Marking it failed makes the
+        # problem visible in the document list instead of in a log nobody
+        # reads - the same reasoning the `_Retryable` docstring gives, applied
+        # in the other direction.
+        raise IngestionError(f"stored object is missing: {version.object_uri}") from exc
     except Exception as exc:  # noqa: BLE001 - storage boundary
-        raise _Retryable(f"object storage unavailable: {type(exc).__name__}") from exc
+        raise _Retryable(
+            f"object storage unavailable: {type(exc).__name__}",
+            code="OBJECT_STORAGE_UNAVAILABLE",
+        ) from exc
 
     text = ingest.parse_document(version.content_type, raw)
 
@@ -636,11 +667,17 @@ async def drain_ingestion_once(
             count = await ingest_version(session, version, embedder=embedder)
         except _Retryable as exc:
             await release_claim(session, version)
+            # Field names come from ALLOWED_LOG_FIELDS. `version_id` and
+            # `detail` were not on it, and JsonLogger drops non-allowlisted
+            # keys **silently** - so this line logged neither the document nor
+            # the reason, and the document that never ingested left no trace
+            # of why. `reason_code` is the stable code; the exception class
+            # goes in `error_code`, which is where a class name belongs.
             logger.warning(
                 "ingestion_deferred",
-                version_id=str(version.version_id),
-                reason_code=type(exc).__name__,
-                detail=str(exc)[:200],
+                document_version_id=str(version.version_id),
+                reason_code=exc.code,
+                error_code=type(exc).__name__,
             )
             stats.deferred += 1
             continue
@@ -651,7 +688,7 @@ async def drain_ingestion_once(
             await mark_failed(session, version.version_id, f"{type(exc).__name__}: {exc}")
             logger.error(
                 "ingestion_failed",
-                version_id=str(version.version_id),
+                document_version_id=str(version.version_id),
                 error_code=type(exc).__name__,
             )
             stats.failed += 1
@@ -659,9 +696,11 @@ async def drain_ingestion_once(
 
         logger.info(
             "ingestion_completed",
-            version_id=str(version.version_id),
+            document_version_id=str(version.version_id),
             tenant_id=str(version.tenant_id),
-            chunks=count,
+            # `chunk_count`, not `chunks`: the allowlist has the former, so
+            # the success path was silently reporting no chunk count either.
+            chunk_count=count,
         )
         stats.ready += 1
 

@@ -27,6 +27,17 @@ class StorageValidationError(Exception):
     pass
 
 
+class ObjectNotFound(StorageValidationError):
+    """The key does not exist in the bucket.
+
+    Separate from its parent because the caller's correct response differs:
+    an unreachable endpoint is worth retrying, a missing object is not - no
+    amount of retrying creates it. Collapsing the two made the ingestion
+    worker re-read a version whose upload had failed at the storage step, in a
+    tight loop, forever.
+    """
+
+
 @dataclass(frozen=True)
 class ObjectKey:
     tenant_id: str
@@ -132,9 +143,19 @@ class MinioStorage:
         data: bytes,
         content_type: str,
     ) -> str:
+        """Store bytes under `key`. **The caller owns the content-type policy.**
+
+        This used to call `validate_content_type` itself, which hard-coded the
+        knowledge allowlist (pdf, text, office documents) into shared
+        infrastructure. That was redundant - `knowledge.service` already
+        validates on its own seam, and `upload_object` now does it too - and it
+        made the client unable to store any object the knowledge corpus has no
+        use for: a case attachment's board photograph, for instance. The
+        storage client stores bytes; which bytes are acceptable is the calling
+        module's rule.
+        """
         import httpx
 
-        validate_content_type(content_type)
         now = datetime.now(UTC)
         payload_hash = hashlib.sha256(data).hexdigest()
         path = f"/{self.bucket}/{quote(key, safe='/-._~')}"
@@ -166,6 +187,8 @@ class MinioStorage:
 
         scheme = "https" if self._secure else "http"
         resp = httpx.get(f"{scheme}://{self.endpoint}{path}", headers=headers, timeout=30.0)
+        if resp.status_code == 404:
+            raise ObjectNotFound(f"get_object failed: 404 for {key}")
         if resp.status_code >= 300:
             raise StorageValidationError(f"get_object failed: {resp.status_code}")
         return resp.content

@@ -6,8 +6,10 @@ transaction. The outbox enqueue rides along, so integrations observe
 case.events without any extra writes from the caller.
 """
 
+import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
@@ -215,6 +217,252 @@ class CaseService:
         status = CaseStatus(case.status)
         if status in DEFAULT_SLA.running_states and case.last_state_changed_at:
             case.elapsed_running_seconds += max(now - case.last_state_changed_at, 0)
+
+
+# How many recent cases in the tenant are scored for relatedness. The score is
+# computed in Python (see `_term_set`), so this bounds the work per call;
+# the alternative - scoring in SQL - cannot express the CJK case at all.
+#
+# The consequence, stated because it is real: a related case older than the
+# window is not found. Raising this is the knob until the term extraction is
+# expressible in the database (a `pg_bigm`-style index, or a materialised term
+# column), which is a schema change and therefore its own decision.
+RELATED_WINDOW = 500
+
+# Bound on how many rows the workbench will assemble. The panel is a reference
+# strip, not a search result page.
+RELATED_CASE_LIMIT = 20
+
+# How many rows whose only signal is the category may take slots on the panel.
+# A bucket match is the weaker signal - the two subjects share no wording - so
+# it gets a couple of slots, never the whole strip. Without the cap a case in
+# the dominant bucket (`general` by default) showed a full strip of rows that
+# shared nothing but a label, which is the defect this function exists to
+# remove, merely renamed.
+RELATED_CATEGORY_ONLY_MAX = 2
+
+# Function words only: they carry no subject matter in any business, so they
+# are listed. **Content words are deliberately NOT listed here** - which words
+# are generic depends on the tenant ("order" is in nearly every subject for a
+# component distributor, and rare for a payroll team), and a hand-maintained
+# list of them would be wrong for the second customer and stale for the first.
+# That job is done by `_ubiquitous_terms`, measured from the tenant's own
+# subjects.
+RELATED_STOP_TERMS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "this",
+        "that",
+        "how",
+        "what",
+        "when",
+        "的",
+        "了",
+        "吗",
+        "呢",
+        "是",
+        "在",
+        "我",
+        "你",
+        "请",
+        "问",
+    }
+)
+
+# Document-frequency cut. A term that appears in more than half of the tenant's
+# case subjects describes the *business*, not the case, and cannot distinguish
+# two of them - so it stops counting as shared evidence for a related pair.
+# Measured rather than listed (see above), and only applied once the sample is
+# large enough for the frequency to mean anything: below `RELATED_DF_MIN_SAMPLE`
+# subjects, one repeated word is not evidence of anything.
+RELATED_UBIQUITY = 0.5
+RELATED_DF_MIN_SAMPLE = 30
+
+
+@dataclass(frozen=True)
+class RelatedCase:
+    """A case in the same tenant that looks like another one.
+
+    `match` says which signal put it here, and `shared_terms` says what the two
+    subjects actually have in common. A panel whose rows cannot answer "why is
+    this in front of me" gets ignored, so the evidence travels with the row
+    instead of being asserted once in a heading.
+    """
+
+    case_id: uuid.UUID
+    subject: str
+    status: str
+    category: str
+    opened_at: int
+    # "subject" when the two subjects share wording, "category" when only the
+    # bucket is shared.
+    match: str
+    # Dice coefficient over the two term sets, 0..1. Ordering only - it is not
+    # a gate, because a gate would have to be language-tuned (see below).
+    score: float
+    # The terms the two subjects share, most useful first, capped for display.
+    shared_terms: tuple[str, ...]
+
+
+def _term_set(text: str) -> set[str]:
+    """The meaningful terms in a case subject. Language-agnostic by design.
+
+    **Why not `pg_trgm`.** Measured on this database: `similarity()` returns
+    **0.000** for every Chinese pair tried, including "能不能加急" vs
+    "加急打样多久" - two subjects a person would call the same question. The
+    reason is structural rather than a tuning problem: pg_trgm works on
+    three-character windows, so the shared term 加急 appears as "能加急" in one
+    subject and "加急打" in the other and never matches. Trigram similarity is
+    a working signal for Latin text (0.613 for "Short circuit claim" vs "Short
+    circuit claim on batch 42", 0.222 for "... vs Earlier claim") and a blind
+    one for Chinese, which is the language this product actually runs in. A
+    trigram gate would have produced a permanently empty panel for the pilot
+    and read as "no related cases exist".
+
+    So the unit is a term:
+
+    - Latin runs of three or more characters, lowercased;
+    - CJK **bigrams** - the shortest unit that carries meaning in Chinese, and
+      the one that still matches when a two-character term sits inside longer
+      words.
+    """
+    found: set[str] = set()
+    lowered = text.lower()
+    for word in re.findall(r"[a-z0-9]{3,}", lowered):
+        if word not in RELATED_STOP_TERMS:
+            found.add(word)
+    for run in re.findall(r"[㐀-䶿一-鿿豈-﫿]+", lowered):
+        for index in range(len(run) - 1):
+            bigram = run[index : index + 2]
+            if bigram not in RELATED_STOP_TERMS:
+                found.add(bigram)
+    return found
+
+
+def _ubiquitous_terms(term_sets: list[set[str]]) -> frozenset[str]:
+    """Terms too common in this tenant's subjects to identify any of them.
+
+    Document frequency over the candidate window, not a hand-written list: the
+    words that carry no information differ per tenant and per language, and a
+    list maintained by hand is wrong for the next customer.
+
+    Returns an empty set below `RELATED_DF_MIN_SAMPLE` subjects. With five
+    cases, "appears in three of them" is noise, and a rule that fires on noise
+    is worse than one that stays quiet.
+    """
+    if len(term_sets) < RELATED_DF_MIN_SAMPLE:
+        return frozenset()
+    counts: dict[str, int] = {}
+    for terms in term_sets:
+        for term in terms:
+            counts[term] = counts.get(term, 0) + 1
+    ceiling = RELATED_UBIQUITY * len(term_sets)
+    return frozenset(term for term, seen in counts.items() if seen > ceiling)
+
+
+def _compare(
+    case_terms: set[str], other_terms: set[str], ubiquitous: frozenset[str]
+) -> tuple[tuple[str, ...], float]:
+    """Terms the two subjects share, plus their Dice coefficient.
+
+    The terms are returned, not just the count, because the caller shows them:
+    "these two share 加急" answers "why is this row in front of me", and a bare
+    score does not. Capped at three - a row listing every shared bigram is
+    unreadable. Longer terms sort first, since a shared phrase says more about
+    a subject than a shared particle does.
+    """
+    mine = case_terms - ubiquitous
+    theirs = other_terms - ubiquitous
+    shared = mine & theirs
+    ordered = tuple(sorted(shared, key=lambda term: (-len(term), term))[:3])
+    total = len(mine) + len(theirs)
+    return ordered, (round(2 * len(shared) / total, 3) if total else 0.0)
+
+
+async def find_related_cases(
+    session: AsyncSession, *, tenant_id: uuid.UUID, case: Case, limit: int = 5
+) -> list[RelatedCase]:
+    """Cases that look like `case`, ranked, within one tenant.
+
+    Deterministic - no model, no embedding, nothing to build or backfill.
+
+    **Eligibility** is one of two signals, and every row says which:
+
+    1. the subjects share a term (`match: "subject"`, `shared_terms` lists them);
+    2. the category matches (`match: "category"`).
+
+    Category alone was the whole query before, and it was the defect: `category`
+    defaults to `general`, so for a `general` case it returned the N most recent
+    cases in the tenant - unrelated tickets whose presence implied a relevance
+    nothing had computed. Category still selects rows, because a same-bucket
+    case with different wording ("Short circuit claim" / "过孔烧毁") is worth
+    showing, but it is ranked below every wording match and **labelled**, so
+    the panel never presents a bucket peer as a topical one.
+
+    **Order** is wording matches first, then score, then recency, then category
+    match. Deliberately not "category first": a bucket is not evidence of
+    relevance, and this tenant's dominant bucket is the default one.
+
+    `tenant_id` is filtered **explicitly** as well as by RLS. RLS alone is
+    sufficient (and is what the negative test exercises); the explicit
+    predicate mirrors `export_cases`, because leaning on the implicit scope is
+    what produced the cross-tenant read in
+    `FINDINGS-2026-09-21-CARD-AND-RLS.md` §1 - there the scope silently became
+    another tenant instead of an error.
+    """
+    limit = max(1, min(int(limit), RELATED_CASE_LIMIT))
+    window = (
+        await session.execute(
+            select(Case)
+            .where(Case.tenant_id == tenant_id, Case.id != case.id)
+            .order_by(Case.opened_at.desc(), Case.id)
+            .limit(RELATED_WINDOW)
+        )
+    ).scalars()
+    candidates = list(window)
+
+    case_terms = _term_set(case.subject)
+    other_terms = {other.id: _term_set(other.subject) for other in candidates}
+    ubiquitous = _ubiquitous_terms(list(other_terms.values()) + [case_terms])
+
+    scored: list[tuple[int, float, int, RelatedCase]] = []
+    for other in candidates:
+        shared, dice = _compare(case_terms, other_terms[other.id], ubiquitous)
+        same_category = other.category == case.category
+        if not shared and not same_category:
+            continue
+        scored.append(
+            (
+                # Wording matches first, then the coefficient, then freshness.
+                0 if shared else 1,
+                -dice,
+                -int(other.opened_at or 0),
+                RelatedCase(
+                    case_id=other.id,
+                    subject=other.subject,
+                    status=other.status,
+                    category=other.category,
+                    opened_at=int(other.opened_at or 0),
+                    match="subject" if shared else "category",
+                    score=dice,
+                    shared_terms=shared,
+                ),
+            )
+        )
+
+    scored.sort(key=lambda row: row[:3])
+    ordered = [row[3] for row in scored]
+    # A bucket match is the weaker signal, so it gets a couple of slots rather
+    # than the panel. Without this, a case in the dominant bucket (`general` by
+    # default) would show a full strip of rows that share nothing but a label -
+    # which is the defect this whole function exists to remove, merely renamed.
+    strong = [item for item in ordered if item.match == "subject"]
+    weak = [item for item in ordered if item.match != "subject"]
+    return (strong + weak[:RELATED_CATEGORY_ONLY_MAX])[:limit]
 
 
 async def export_cases(

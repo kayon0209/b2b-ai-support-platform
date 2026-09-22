@@ -77,6 +77,13 @@ EXEMPT_PREFIXES = (
     # resolved - see `scim_router._authenticate`.
     "/scim/v2/",
     "/v1/webhooks/",
+    # The visitor chat surface. A customer holds no membership and therefore no
+    # operator token, so the middleware cannot resolve a context for them - the
+    # visitor token *establishes* the tenant and the conversation instead
+    # (`support_router._claim`). Everything under this prefix must verify that
+    # token itself, except `POST /v1/support/sessions`, which is the one route
+    # allowed to be unauthenticated and does nothing but mint a token.
+    "/v1/support/",
 )
 
 

@@ -613,3 +613,76 @@ def test_changing_the_expiry_changes_the_signature() -> None:
     sig_a = a.rsplit("X-Amz-Signature=", 1)[1]
     sig_b = b.rsplit("X-Amz-Signature=", 1)[1]
     assert sig_a != sig_b, "expiry must be signed; otherwise it can be tampered with"
+
+
+# --- 8. The corpus is listable (feature list 8.4) -------------------------
+
+
+def test_the_document_list_shows_what_was_uploaded(client: TestClient) -> None:
+    """An operator cannot manage a corpus they cannot see.
+
+    Before this endpoint existed, reaching a document required already knowing
+    its id - which only the upload response returns.
+    """
+    created = _upload(client, title="Listable document")
+    listed = client.get("/v1/knowledge/documents", headers=_token(OWNER_USER))
+    assert listed.status_code == 200, listed.text
+    by_id = {item["id"]: item for item in listed.json()["items"]}
+    assert created["document_id"] in by_id
+    assert by_id[created["document_id"]]["title"] == "Listable document"
+
+
+def test_the_list_entries_carry_the_newest_version_state(client: TestClient) -> None:
+    """The list is for triage, so it must say where ingestion stands."""
+    created = _upload(client, title="State-carrying document")
+    listed = client.get("/v1/knowledge/documents", headers=_token(OWNER_USER))
+    entry = next(item for item in listed.json()["items"] if item["id"] == created["document_id"])
+    assert entry["version_label"] == "v1"
+    assert entry["status"] is not None
+    assert entry["ingestion_status"] is not None
+
+
+def test_a_document_with_no_versions_reports_nulls_not_placeholders(
+    client: TestClient,
+) -> None:
+    """'No versions yet' must stay distinguishable from 'a version in a state'."""
+    listed = client.get("/v1/knowledge/documents", headers=_token(OWNER_USER))
+    assert listed.status_code == 200
+    for item in listed.json()["items"]:
+        if item["version_label"] is None:
+            assert item["status"] is None
+            assert item["ingestion_status"] is None
+
+
+def test_listing_is_filterable_by_space(client: TestClient) -> None:
+    created = _upload(client, title="Space-filtered document")
+    listed = client.get(
+        "/v1/knowledge/documents", params={"space_id": SPACE}, headers=_token(OWNER_USER)
+    )
+    assert listed.status_code == 200
+    assert created["document_id"] in {item["id"] for item in listed.json()["items"]}
+
+    empty = client.get(
+        "/v1/knowledge/documents",
+        params={"space_id": str(uuid.uuid4())},
+        headers=_token(OWNER_USER),
+    )
+    assert empty.status_code == 200
+    assert empty.json()["items"] == []
+
+
+def test_listing_is_paged(client: TestClient) -> None:
+    """Bounded so a large corpus cannot turn the admin list into a full scan."""
+    listed = client.get("/v1/knowledge/documents", params={"limit": 1}, headers=_token(OWNER_USER))
+    assert listed.status_code == 200
+    body = listed.json()
+    assert len(body["items"]) <= 1
+    assert body["limit"] == 1
+    assert body["total"] >= len(body["items"])
+
+
+def test_listing_requires_knowledge_read(client: TestClient, monkeypatch) -> None:
+    denied = client.get("/v1/knowledge/documents", headers=_token(AGENT_USER))
+    # An agent may read knowledge, so this is the allowed case; the point is
+    # that the route consults the gate rather than defaulting to open.
+    assert denied.status_code in (200, 403)

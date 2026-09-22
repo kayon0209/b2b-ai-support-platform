@@ -177,6 +177,12 @@ export interface UsageSnapshot {
   period_start: number;
   period_end: number;
   runs_used: number;
+  /**
+   * Runs that were accepted, never executed, and closed by the retention
+   * sweep. Excluded from `runs_used`; surfaced so a falling usage figure has
+   * a visible explanation rather than looking like a miscount.
+   */
+  abandoned: number;
   prompt_tokens: number;
   completion_tokens: number;
   /** null means unlimited. */
@@ -290,6 +296,118 @@ export interface ToolProposalExecution {
  * every `alert()` in this app used to show, so the server's message (the one
  * thing the operator needs) was thrown away at the last step.
  */
+/**
+ * One corpus document as the console lists it (feature list 8.4).
+ *
+ * The version fields are nullable and mean "no version yet", not "unknown":
+ * a document row can exist before its first version lands, and the console
+ * shows that state rather than hiding the document until it is ingested.
+ */
+export interface KnowledgeDocument {
+  id: string;
+  title: string;
+  canonical_uri: string;
+  classification: string;
+  space_id: string;
+  version_label: string | null;
+  status: string | null;
+  ingestion_status: string | null;
+}
+
+/** A surface form mapped to a canonical corpus term (feature list 3.6). */
+export interface Alias {
+  alias: string;
+  term: string;
+  weight: number;
+}
+
+/**
+ * One run's routing decision, as the replay shows it (feature list 8.3).
+ *
+ * `matched_by` says how this decision was tied to the utterance above it. It
+ * is rendered, not hidden: an operator reading "why did it say that" deserves
+ * to know the link is a hash equality rather than a guess.
+ */
+export interface ReplayDecision {
+  run_id: string;
+  route: string;
+  status: string;
+  abstain_reason: string | null;
+  latency_ms: number | null;
+  trace_id: string;
+  case_id: string | null;
+  model: string | null;
+  intent: Record<string, unknown>;
+  matched_by: string;
+}
+
+/** One turn of the exchange. `text` is stored redacted, never raw. */
+export interface ReplayTurn {
+  role: string;
+  text: string;
+  at: number | null;
+  source: string;
+  decision: ReplayDecision | null;
+}
+
+/** One cited source behind a run. A pointer, not the excerpt itself. */
+export interface ReplaySource {
+  source_uri: string;
+  claim_index: number;
+  retrieval_score: number;
+  document_version_id: string | null;
+}
+
+/** One run, attributed or not. Unattributed runs are still shown. */
+export interface ReplayRun extends ReplayDecision {
+  started_at: number | null;
+  sources: ReplaySource[];
+}
+
+/** A case the conversation produced. */
+export interface ReplayCase {
+  case_id: string;
+  subject: string;
+  status: string;
+  category: string | null;
+  team_ref: string | null;
+  version: number;
+  opened_at: number;
+}
+
+/** One conversation as the list shows it. */
+export interface ConversationSummary {
+  conversation_ref_id: string;
+  turn_count: number;
+  last_at: number | null;
+  latest_run: {
+    run_id: string;
+    route: string;
+    status: string;
+    abstain_reason: string | null;
+    started_at: number | null;
+  } | null;
+}
+
+export interface ConversationList {
+  items: ConversationSummary[];
+  limit: number;
+  offset: number;
+  /** Conversations whose only trace is a run that never ran. */
+  nothing_to_replay: number;
+}
+
+export interface ConversationReplay {
+  conversation_ref_id: string;
+  turn_count: number;
+  run_count: number;
+  first_at: number | null;
+  last_at: number | null;
+  turns: ReplayTurn[];
+  runs: ReplayRun[];
+  cases: ReplayCase[];
+}
+
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;

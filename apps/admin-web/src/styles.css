@@ -1698,3 +1698,81 @@ select:focus-visible {
   opacity: 0.7;
   white-space: nowrap;
 }
+
+/* --- Conversation replay (feature list 8.3) ------------------------------- */
+
+/* Layout only, and only because the nearest existing class cannot do the
+   job: `.timeline` is scoped to `.workbench-detail` and lays every entry out
+   as one baseline row, which has no room for the decision panel a replay
+   hangs underneath its question. Colours, tones and typography all come from
+   the tokens above and the Badge component, so both themes are inherited
+   rather than restated. */
+.replay-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.replay-timeline > li {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.replay-timeline > li:last-child {
+  border-bottom: none;
+}
+
+.replay-turn {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  /* Wraps rather than truncating: a replay is read for the words, and an
+     ellipsis in the middle of a customer's sentence is the one thing that
+     makes it unreadable. */
+  flex-wrap: wrap;
+}
+
+.replay-turn > span:nth-child(2) {
+  flex: 1 1 240px;
+}
+
+.replay-decision {
+  margin: 8px 0 0 12px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+  background: var(--surface-2);
+  border-radius: 0 6px 6px 0;
+  font-size: 13px;
+}
+
+.replay-decision-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.replay-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.replay-chips li {
+  display: flex;
+  gap: 4px;
+}
+
+.replay-small {
+  font-size: 12px;
+}
+
+.replay-pager {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}

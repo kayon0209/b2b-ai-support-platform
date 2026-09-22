@@ -193,6 +193,23 @@ def _cleanup(admin: Any) -> None:
             text("DELETE FROM inbox_events WHERE tenant_id IN (:t1, :t2)"),
             {"t1": TENANT_A, "t2": TENANT_B},
         )
+        # Runs, and their citations. Every `POST /agent-runs` in this file
+        # leaves a `queued` placeholder behind, and once the tenant row is
+        # deleted those runs belong to nobody: no tenant-scoped sweep can ever
+        # reach them, because the sweep enumerates active tenants. They
+        # accumulated 254 rows in the shared dev database before this line
+        # existed. Citations first - they reference the run.
+        conn.execute(
+            text(
+                "DELETE FROM citations WHERE agent_run_id IN "
+                "(SELECT id FROM agent_runs WHERE tenant_id IN (:t1, :t2))"
+            ),
+            {"t1": TENANT_A, "t2": TENANT_B},
+        )
+        conn.execute(
+            text("DELETE FROM agent_runs WHERE tenant_id IN (:t1, :t2)"),
+            {"t1": TENANT_A, "t2": TENANT_B},
+        )
         for slug in (SLUG_A, SLUG_B):
             conn.execute(text("DELETE FROM tenants WHERE slug = :slug"), {"slug": slug})
 
@@ -1087,6 +1104,13 @@ def test_created_agent_run_has_a_started_at() -> None:
     No writer populated it, so every run was invisible to
     /v1/quality/metrics (total_runs 0, every run reported as untimed). This
     pins the write at the API boundary.
+
+    The metric this run lands in is `never_executed_runs`, not `total_runs`:
+    this endpoint writes a placeholder, and a placeholder has not produced an
+    outcome for the dashboard to summarise. Asserting `total_runs` here was
+    the original probe, and it only passed because placeholders were being
+    counted as real runs - the defect that made usage read 76 against 42 that
+    executed. The run must still be *visible*, and that is what is asserted.
     """
     client = _client(TENANT_A, "support_admin")
     created = client.post(
@@ -1109,7 +1133,9 @@ def test_created_agent_run_has_a_started_at() -> None:
         "/v1/quality/metrics?window_seconds=3600", headers=_auth()
     )
     assert metrics.status_code == 200, metrics.text
-    assert metrics.json()["total_runs"] >= 1
+    body = metrics.json()
+    assert body["never_executed_runs"] >= 1, "the run must be visible, not silently dropped"
+    assert body["total_runs"] == 0, "and it has no outcome yet, so it is not a run that happened"
 
 
 # --- Tool catalog (docs/api-contracts.md tool catalog API) -----------------

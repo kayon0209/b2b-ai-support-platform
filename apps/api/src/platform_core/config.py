@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://ai.gitee.com/v1"
     llm_api_key: SecretStr | None = None
     llm_model: str = "qwen3.8-flash"
+    # Feature list 11.2: per-task model routing. Classification and answer
+    # generation have different requirements - the first wants latency and
+    # cost, the second wants reasoning - so they may be different models.
+    # Unset means "use `llm_model`", not "disable": a deployment that never
+    # tunes this keeps working exactly as before, and turning routing on is a
+    # single variable rather than a code change.
+    llm_model_classify: str | None = None
     llm_embedding_model: str = "Qwen3-Embedding-8B"
     llm_rerank_model: str = "bge-reranker-v2-m3"
     # Matches the chunks.embedding vector(1536) column; the provider honors
@@ -184,6 +191,12 @@ class Settings(BaseSettings):
     # Inbox depth above which new runs are refused with 429 instead of
     # queueing - bounded backlog beats unbounded latency.
     queue_max_depth: int = 500
+    # How long an accepted-but-never-executed run may stay `queued` before the
+    # retention sweep closes it as `abandoned`. Generous on purpose: the sweep
+    # must not race a worker that is merely slow, and a wrong answer here makes
+    # the admission-counter (`usage_snapshot`) under-count what is pending.
+    # One hour is far beyond any observed queue latency.
+    run_abandon_after_seconds: int = 3600
     # Exponential-backoff jitter: without it every caller retries in the same
     # beat and the retry storm is synchronised. 0 disables.
     retry_jitter_ratio: float = 0.3

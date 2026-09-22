@@ -38,7 +38,19 @@ interface Workbench {
   account_contacts: Array<{ external_contact_id: string; channel: string | null }>;
   conversation: Turn[];
   ai_suggestion: Suggestion | null;
-  related_cases: { basis: string; items: CaseSummary[] };
+  /**
+   * `basis` names the query, and each item carries the signal that selected it
+   * (`match`) plus the terms the two subjects share. Both are shown, because a
+   * row an operator is asked to trust has to say why it is there - and because
+   * a bucket match (`match: "category"`) is not the same kind of evidence as a
+   * wording match, so the two must not look alike.
+   */
+  related_cases: {
+    basis: string;
+    items: Array<
+      CaseSummary & { match: string; score: number; shared_terms: string[] }
+    >;
+  };
 }
 
 const ROLE_TONE: Record<string, "good" | "warn" | "neutral" | "bad"> = {
@@ -183,16 +195,28 @@ export function Workbench() {
                 )}
               </Card>
 
-              <Card
-                title={`${t("workbench.related")} (${bundle.data.related_cases.basis})`}
-              >
+              <Card title={t("workbench.related")}>
                 {bundle.data.related_cases.items.length === 0 ? (
                   <EmptyState message={t("workbench.noRelated")} />
                 ) : (
                   <ul>
                     {bundle.data.related_cases.items.map((item) => (
                       <li key={item.case_id}>
-                        {item.subject} <Badge tone="neutral">{item.status}</Badge>
+                        {item.subject} <Badge tone="neutral">{item.status}</Badge>{" "}
+                        {/* Why this row is here. A wording match and a bucket
+                            match are different kinds of evidence, and showing
+                            the shared terms is the only honest way to say it. */}
+                        <Badge tone={item.match === "subject" ? "good" : "neutral"}>
+                          {item.match === "subject"
+                            ? t("workbench.matchSubject")
+                            : t("workbench.matchCategory")}
+                        </Badge>
+                        {item.shared_terms.length > 0 ? (
+                          <span className="muted">
+                            {" "}
+                            · {item.shared_terms.join(", ")}
+                          </span>
+                        ) : null}
                       </li>
                     ))}
                   </ul>

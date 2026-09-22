@@ -200,6 +200,53 @@ def main() -> None:
             ),
             {"tid": str(tenant_id), "uid": str(user_id), "role": ROLE},
         )
+        # The read path ("where is my order") needs two more rows before it can
+        # run at all, and no migration creates either:
+        #
+        # 1. An active `business_api` connector. `ConnectorExecutorResolver`
+        #    builds an executor only for a provider that has an active
+        #    connector row *claiming the tool's capability*, so with no
+        #    connector a read tool resolves to nothing and the run hands off
+        #    with TOOL_EXECUTOR_MISSING. Measured: this table was empty, which
+        #    is why the deployment had published zero `tool` turns even though
+        #    the read tools are registered.
+        # 2. The `agent.business_read_enabled` flag, which gates the route.
+        #
+        # The id is derived, like the tenant's, so re-seeding updates the same
+        # row instead of accumulating connectors. `base_url` is ignored by the
+        # demo adapter (it reads local sample data - see `integrations/demo_erp`)
+        # and is set anyway: an empty value reads as a broken connector to
+        # whoever looks next, and during a pilot that is a real cost.
+        connector_id = uuid.uuid5(uuid.NAMESPACE_URL, f"connector:{SLUG}:business_api")
+        conn.execute(
+            text(
+                "INSERT INTO connectors (id, tenant_id, provider, name, status, "
+                "capabilities, configuration, credential_ref) VALUES "
+                "(:id, :tid, 'business_api', 'Demo ERP', 'active', "
+                "CAST(:caps AS jsonb), CAST(:cfg AS jsonb), NULL) "
+                "ON CONFLICT (id) DO UPDATE SET status = 'active', "
+                "capabilities = EXCLUDED.capabilities"
+            ),
+            {
+                "id": str(connector_id),
+                "tid": str(tenant_id),
+                "caps": json.dumps(
+                    ["orders_read", "shipments_read", "invoices_read", "inventory_read"]
+                ),
+                "cfg": json.dumps({"base_url": "http://demo-erp.local"}),
+            },
+        )
+        conn.execute(
+            text(
+                "INSERT INTO feature_flags (id, tenant_id, key, description, enabled, "
+                "rollout_percent, created_at) VALUES "
+                "(gen_random_uuid(), :tid, 'agent.business_read_enabled', "
+                "'read tools answer from the ERP', true, 100, 0) "
+                "ON CONFLICT (tenant_id, key) DO UPDATE SET enabled = true, "
+                "rollout_percent = 100"
+            ),
+            {"tid": str(tenant_id)},
+        )
 
     engine.dispose()
     token = f"pt_{SLUG}_{user_id}"

@@ -74,6 +74,17 @@ def minimize_chatwoot_payload(event_type: str, payload: dict[str, Any]) -> dict[
     if isinstance(account, dict) and account.get("id") is not None:
         extracted["chatwoot_account_id"] = str(account["id"])
 
+    # Feature 2.5: the account a visitor *proved* ownership of (set by
+    # `POST /v1/support/verify`, re-issued onto the visitor token). It is an
+    # opaque authorisation label the worker's ownership gate compares against
+    # the receipt's own account - not customer content, so it survives
+    # minimisation where the message body does not. Empty string is meaningful
+    # here ("anonymous visitor"): do not drop it, or the gate would see absence
+    # and treat an anonymous run as an un-gated operator run.
+    verified = payload.get("verified_account")
+    if isinstance(verified, str):
+        extracted["verified_account"] = verified
+
     sender = payload.get("sender")
     if isinstance(sender, dict):
         extracted["sender_type"] = sender.get("type")

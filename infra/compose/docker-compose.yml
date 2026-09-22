@@ -42,7 +42,15 @@ services:
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      # `mc` is not in the server image - the probe failed with ExitCode -1
+      # ("executable file not found in $PATH") on every attempt, so MinIO
+      # reported `unhealthy` for 14016 consecutive checks while serving
+      # normally. A healthcheck that can never pass is worse than none: it
+      # trains everyone to read the red line as normal, and any future
+      # `depends_on: condition: service_healthy` would hang forever.
+      # `curl` is present in this image and this endpoint is MinIO's own
+      # liveness probe.
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -63,6 +71,7 @@ services:
     build:
       context: ../..
       dockerfile: infra/compose/api.Dockerfile
+    image: b2b-ai-support-ai-api  # named so the workers can reuse this exact image
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
     # so it exited at startup with 'no authentication configured' even
@@ -82,17 +91,27 @@ services:
       # environment so the .env value and this one cannot disagree - they
       # did, and an API run outside Docker would have rejected every
       # delivery with a 401 that looks like silence, not misconfiguration.
-      APP_CHATWOOT_WEBHOOK_SECRET: ${APP_CHATWOOT_WEBHOOK_SECRET:-local-dev-webhook-secret}
       APP_CHATWOOT_BASE_URL: http://chatwoot-web:3000
-      APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
-      APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
-      APP_LLM_MODEL: ${APP_LLM_MODEL:-qwen3.8-flash}
+      # Same class of remap as the two above, and it was missing: the setting
+      # defaults to `localhost:9000`, which inside this container is the
+      # container itself. Document upload failed with
+      # `STORAGE_UNAVAILABLE ... ConnectError` while MinIO was healthy and
+      # serving - the bug was the address, not the service. `.env` cannot fix
+      # this: it holds host-facing addresses (localhost:5435, localhost:6380)
+      # that are equally wrong in here, which is why this block exists.
+      APP_OBJECT_STORAGE_ENDPOINT: minio:9000
     ports:
       - "8000:8000"
     depends_on:
       ai-postgres:
         condition: service_healthy
       ai-redis:
+        condition: service_healthy
+      # Not a correctness requirement - a storage failure returns 503 rather
+      # than corrupting anything - but without it a cold start has a window
+      # where uploads fail on an endpoint that is merely not up yet. The
+      # healthcheck above is what makes this condition mean something.
+      minio:
         condition: service_healthy
 
   # Customer-visible AI work: InboxEvent -> agent run. Same image as the
@@ -104,9 +123,10 @@ services:
   # token would consume real customer messages and reply to nobody while
   # reporting success. worker.wiring fails closed on this.
   ai-worker-interactive:
-    build:
-      context: ../..
-      dockerfile: infra/compose/api.Dockerfile
+    # Reuses the image `ai-api` builds. Building it a second time
+    # produced a second image that silently drifted from the API's:
+    # a fix present in ai-api was absent from every worker.
+    image: b2b-ai-support-ai-api
     command: ["python", "-m", "worker.runner"]
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
@@ -124,10 +144,6 @@ services:
       APP_REDIS_URL: redis://ai-redis:6379/0
       APP_SECRET_KEY: local-dev-secret
       APP_CHATWOOT_BASE_URL: http://chatwoot-web:3000
-      APP_CHATWOOT_API_TOKEN: ${APP_CHATWOOT_API_TOKEN:-}
-      APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
-      APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
-      APP_LLM_MODEL: ${APP_LLM_MODEL:-qwen3.8-flash}
     depends_on:
       ai-postgres:
         condition: service_healthy
@@ -137,9 +153,10 @@ services:
   # Bulk work: parsing, chunking, embedding. Lowest priority, so it can
   # never starve interactive work (evaluation.queues reservation model).
   ai-worker-ingestion:
-    build:
-      context: ../..
-      dockerfile: infra/compose/api.Dockerfile
+    # Reuses the image `ai-api` builds. Building it a second time
+    # produced a second image that silently drifted from the API's:
+    # a fix present in ai-api was absent from every worker.
+    image: b2b-ai-support-ai-api
     command: ["python", "-m", "worker.runner"]
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
@@ -156,23 +173,31 @@ services:
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
       APP_REDIS_URL: redis://ai-redis:6379/0
       APP_SECRET_KEY: local-dev-secret
-      APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
-      APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
-      APP_LLM_MODEL: ${APP_LLM_MODEL:-qwen3.8-flash}
       APP_WORKER_QUEUE: ingestion
+      # The ingest pipeline reads the stored original to parse it
+      # (`ingestion_consumer.service.get_object`), so this worker needs the
+      # same in-network address the API does. It was missing here too, and
+      # the failure was worse than the API's: the read raised, the consumer
+      # classified it `_Retryable` and released the claim, so the document sat
+      # at `uploaded` and every document was retried forever - the knowledge
+      # base was silently unusable for retrieval while upload looked fine.
+      APP_OBJECT_STORAGE_ENDPOINT: minio:9000
     depends_on:
       ai-postgres:
         condition: service_healthy
       ai-redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
 
   # Applies the tenant retention policy on a long interval (superseded
   # versions -> expired, resolved dead letters and completed inbox events
   # pruned). No LLM key: it touches no external system.
   ai-worker-retention:
-    build:
-      context: ../..
-      dockerfile: infra/compose/api.Dockerfile
+    # Reuses the image `ai-api` builds. Building it a second time
+    # produced a second image that silently drifted from the API's:
+    # a fix present in ai-api was absent from every worker.
+    image: b2b-ai-support-ai-api
     command: ["python", "-m", "worker.runner"]
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
@@ -198,9 +223,10 @@ services:
   # notified while it is still actionable) and a sweep on that cadence must
   # not share a poll loop with customer-facing work.
   ai-worker-sla:
-    build:
-      context: ../..
-      dockerfile: infra/compose/api.Dockerfile
+    # Reuses the image `ai-api` builds. Building it a second time
+    # produced a second image that silently drifted from the API's:
+    # a fix present in ai-api was absent from every worker.
+    image: b2b-ai-support-ai-api
     command: ["python", "-m", "worker.runner"]
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
@@ -225,9 +251,10 @@ services:
   # key because delivering business events is independent of the AI path --
   # that is why it is its own service rather than bundled with the worker.
   ai-worker-outbox:
-    build:
-      context: ../..
-      dockerfile: infra/compose/api.Dockerfile
+    # Reuses the image `ai-api` builds. Building it a second time
+    # produced a second image that silently drifted from the API's:
+    # a fix present in ai-api was absent from every worker.
+    image: b2b-ai-support-ai-api
     command: ["python", "-m", "worker.runner", "--outbox-only"]
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
@@ -252,6 +279,7 @@ services:
 
   # --- Chatwoot support kernel (upstream, separate storage) ---
   chatwoot-postgres:
+    profiles: ["chatwoot"]
     image: docker.1ms.run/pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: chatwoot
@@ -268,6 +296,7 @@ services:
       retries: 10
 
   chatwoot-redis:
+    profiles: ["chatwoot"]
     image: redis:7-alpine
     ports:
       - "6381:6379"
@@ -280,6 +309,7 @@ services:
       retries: 10
 
   chatwoot-web:
+    profiles: ["chatwoot"]
     image: docker.1ms.run/chatwoot/chatwoot:latest
     command: bundle exec rails s -p 3000 -b 0.0.0.0
     environment:
@@ -301,6 +331,7 @@ services:
         condition: service_healthy
 
   chatwoot-sidekiq:
+    profiles: ["chatwoot"]
     image: docker.1ms.run/chatwoot/chatwoot:latest
     command: bundle exec sidekiq
     environment:

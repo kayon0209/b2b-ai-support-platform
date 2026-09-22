@@ -1,6 +1,7 @@
 # ADR 0010: The Customer Surface Is Chatwoot; `/chat` Is Internal
 
-- Status: Accepted
+- Status: Accepted (amended by
+  [ADR 0011](0011-customer-chat-is-a-visitor-session.md))
 - Date: 2026-09-21
 
 ## Context
@@ -53,5 +54,12 @@ not grow a customer identity scheme, a session token, or a public send path.
   signed per-conversation link issued by Chatwoot. Neither is needed for the
   pilot; if one is ever built, it starts with an ADR of its own, because it
   changes who can spend the tenant's model budget.
+
+  > Amended 2026-09-21: a customer window was subsequently built in this
+  > repository as a **visitor session**, because the pilot's value to the
+  > customer is the data card, which Chatwoot cannot render. The two
+  > commitments that still hold are the operator token on `/v1/customer/*` and
+  > the labelling of `/chat`. See
+  > [ADR 0011](0011-customer-chat-is-a-visitor-session.md).
 - A deployment must not expose `/chat` publicly. The operator-token requirement
   enforces this technically; the label enforces it socially.

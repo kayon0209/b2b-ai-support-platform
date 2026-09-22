@@ -14,11 +14,12 @@ that was reopened is a resolution that did not. Deriving it from
 
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_core.agent_runtime.models import AgentRun, RunStatus
+from platform_core.agent_runtime.models import AgentRun, RunStatus, run_executed
 from platform_core.cases.models import Case, CaseStatus
 from platform_core.evaluation.gates import ReadToolOutcome
 
@@ -36,6 +37,12 @@ class QualityMetrics:
     # Rows this tenant owns that carry no `started_at` (written before
     # migration 0012). Reported so a shrinking window is explainable.
     untimed_runs: int = 0
+    # Rows in the window that were queued and never executed. Excluded from
+    # every count above - they carry the queue's default route and no intent,
+    # so including them reported route traffic that never happened. Reported
+    # here for the same reason as `untimed_runs`: the exclusion should be
+    # visible, not inferred from a total that does not add up.
+    never_executed_runs: int = 0
     latency_p50_ms: int | None = None
     latency_p95_ms: int | None = None
     # Resolution outcomes over Cases touched in the window.
@@ -207,6 +214,7 @@ async def aggregate_quality_metrics(
         AgentRun.tenant_id == tenant_id,
         AgentRun.started_at.is_not(None),
         AgentRun.started_at >= cutoff,
+        run_executed(),
     )
     rows = (await session.execute(stmt)).scalars().all()
 
@@ -242,6 +250,25 @@ async def aggregate_quality_metrics(
                 select(func.count())
                 .select_from(AgentRun)
                 .where(AgentRun.tenant_id == tenant_id, AgentRun.started_at.is_(None))
+            )
+        ).scalar_one()
+    )
+
+    # Observability: rows in the window that never executed, excluded above.
+    # Windowed, unlike `untimed_runs` - that one counts the tenant's lifetime
+    # untimed rows, which is a different question, and this one is about the
+    # window the operator is looking at.
+    metrics.never_executed_runs = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(AgentRun)
+                .where(
+                    AgentRun.tenant_id == tenant_id,
+                    AgentRun.started_at.is_not(None),
+                    AgentRun.started_at >= cutoff,
+                    ~run_executed(),
+                )
             )
         ).scalar_one()
     )
@@ -387,3 +414,134 @@ def _now() -> int:
     import time
 
     return int(time.time())
+
+
+# --- Feature list 8.7: intent distribution and trend -----------------------
+#
+# The distribution is the operational question "what are customers actually
+# asking about", which a handoff rate cannot answer: two tenants with the same
+# 30% handoff rate need opposite responses if one is all PCB quoting and the
+# other is all missing documents.
+#
+# It reads the intent snapshot each run already stores in `model_config`
+# (written by `_model_config`), so it needs no new write path and no migration:
+# every historical run is included from the moment the field existed. Runs
+# written before a dimension existed - or under a route that never classified
+# - are counted under `UNRECORDED` rather than dropped, because a dashboard
+# that silently omits what it could not measure looks complete while hiding
+# exactly the gap an operator needs to see.
+UNRECORDED = "unrecorded"
+
+
+@dataclass
+class TrendBucket:
+    """One time bucket of the trend.
+
+    Mutable on purpose: unlike `ReadToolOutcome`, which is frozen because it is
+    a value handed to a gate, this is an accumulator that is filled as runs are
+    walked. Freezing it turned the increment into a FrozenInstanceError the
+    first time a second run landed in the same bucket.
+    """
+
+    bucket_start: int
+    total: int
+    by_business_line: dict[str, int]
+
+
+@dataclass
+class IntentDistribution:
+    """Counts per intent axis, plus a time trend (feature list 8.7)."""
+
+    window_seconds: int = 0
+    bucket_seconds: int = 0
+    total_runs: int = 0
+    by_scene: dict[str, int] = field(default_factory=dict)
+    by_kind: dict[str, int] = field(default_factory=dict)
+    by_business_line: dict[str, int] = field(default_factory=dict)
+    trend: list[TrendBucket] = field(default_factory=list)
+    # Queued but never executed, excluded from every count above. Reported so
+    # the size of the exclusion is visible instead of having to be inferred.
+    never_executed_runs: int = 0
+
+
+def _intent_snapshot(run: Any) -> dict[str, Any]:
+    """The run's recorded intent classification, or {} if it has none."""
+    config = getattr(run, "model_config", None)
+    if not isinstance(config, dict):
+        return {}
+    intent = config.get("intent")
+    return intent if isinstance(intent, dict) else {}
+
+
+def _bump(counter: dict[str, int], key: str | None) -> None:
+    name = _clean(key) if key else UNRECORDED
+    counter[name] = counter.get(name, 0) + 1
+
+
+def _clean(key: str) -> str:
+    return key.strip() or UNRECORDED
+
+
+async def aggregate_intent_distribution(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    window_seconds: int = 86400,
+    bucket_seconds: int = 3600,
+) -> IntentDistribution:
+    """Intent counts per axis, bucketed over time.
+
+    RLS context must be set by the caller, as elsewhere in this module. The
+    window filters on `started_at` and excludes null-timestamped rows for the
+    same reason `aggregate_quality_metrics` does.
+    """
+    cutoff = _now() - window_seconds
+    stmt = select(AgentRun).where(
+        AgentRun.tenant_id == tenant_id,
+        AgentRun.started_at.is_not(None),
+        AgentRun.started_at >= cutoff,
+        run_executed(),
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    result = IntentDistribution(window_seconds=window_seconds, bucket_seconds=bucket_seconds)
+    buckets: dict[int, TrendBucket] = {}
+    for run in rows:
+        result.total_runs += 1
+        intent = _intent_snapshot(run)
+        _bump(result.by_scene, intent.get("scene"))
+        _bump(result.by_kind, intent.get("primary_kind"))
+        line = _clean(intent.get("business_line") or UNRECORDED)
+        _bump(result.by_business_line, intent.get("business_line"))
+
+        started = int(run.started_at or 0)
+        bucket_start = (started // bucket_seconds) * bucket_seconds
+        bucket = buckets.get(bucket_start)
+        if bucket is None:
+            bucket = TrendBucket(bucket_start=bucket_start, total=0, by_business_line={})
+            buckets[bucket_start] = bucket
+        bucket.total += 1
+        bucket.by_business_line[line] = bucket.by_business_line.get(line, 0) + 1
+
+    # Rows in the window that never executed. Without this the `unrecorded`
+    # bucket becomes part fiction: a placeholder has no intent snapshot at
+    # all, so every one of them landed there and the bucket that is supposed
+    # to mean "this run predates the field" instead meant "plus everything
+    # that never ran".
+    result.never_executed_runs = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(AgentRun)
+                .where(
+                    AgentRun.tenant_id == tenant_id,
+                    AgentRun.started_at.is_not(None),
+                    AgentRun.started_at >= cutoff,
+                    ~run_executed(),
+                )
+            )
+        ).scalar_one()
+    )
+
+    result.trend = [buckets[key] for key in sorted(buckets)]
+    return result

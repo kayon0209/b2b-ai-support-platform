@@ -24,10 +24,13 @@ assembled, and it is deliberately explicit:
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import SecretStr
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime.orchestrator import OrchestratorDeps
 from platform_core.config import get_settings
@@ -206,6 +209,41 @@ def app_role_url() -> str:
     return _app_role_url()
 
 
+@asynccontextmanager
+async def queue_bookkeeping_session() -> AsyncIterator[AsyncSession]:
+    """The **owner** role, for claiming work off a queue. Nothing else.
+
+    This is the one place in the worker that is allowed to connect as the
+    bootstrap owner, and the reason is structural rather than convenient: a
+    claim runs *before any tenant is known* - the worker discovers tenants from
+    the rows it claims - and every queue table (`inbox_events`, `outbox_events`)
+    is FORCE-RLS on `tenant_id = current_setting('app.tenant_id')`. Under the app
+    role with no tenant bound, the claim SELECT returns zero rows, so the worker
+    would sit idle forever with an empty-looking queue.
+
+    What must NOT happen inside this scope is any read or write of tenant data.
+    That includes reading a feature flag, loading conversation history, or
+    writing a turn: on a bypassing connection the RLS binding is decoration, so
+    those statements see every tenant's rows. Measured: a run on this role read
+    **another tenant's** `agent.business_read_enabled` row, and every flag it
+    evaluated resolved to a different tenant's answer.
+
+    Tenant work belongs in `platform_core.identity.tenant_context.tenant_session`,
+    which connects as `platform_app` and re-binds the tenant on every
+    transaction (so a mid-scope COMMIT cannot silently unbind it).
+
+    The alternative - a `SECURITY DEFINER` claim function, the way
+    `claim_ingestion_versions` (migration 0018) solves the same problem - needs a
+    migration, and the migration counter is currently coupled to an untracked
+    revision in the shared worktree (`HANDOVER-2026-09-21-THREE-SURFACES.md` §5-E).
+    Splitting the session achieves the same boundary with no schema change.
+    """
+    from platform_core.db import session_scope
+
+    async with session_scope() as session:
+        yield session
+
+
 def build_ingestion_deps(*, require_embedding: bool = True) -> IngestionDeps:
     """Assemble the collaborators for the ingestion worker.
 
@@ -257,6 +295,7 @@ __all__ = [
     "WorkerConfigurationError",
     "WorkerWiring",
     "app_role_url",
+    "queue_bookkeeping_session",
     "audit_wiring",
     "build_ingestion_deps",
     "build_interactive_deps",

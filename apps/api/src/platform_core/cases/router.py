@@ -50,7 +50,12 @@ from platform_core.cases.models import (
     TransitionNotAllowed,
     VersionConflict,
 )
-from platform_core.cases.service import CaseError, CaseService
+from platform_core.cases.service import (
+    RELATED_WINDOW,
+    CaseError,
+    CaseService,
+    find_related_cases,
+)
 from platform_core.config import get_settings
 from platform_core.outbox_service import enqueue
 from platform_policy import Action
@@ -255,9 +260,11 @@ async def case_workbench(request: Request, case_id: str) -> Any:
     Read-only and derived: it assembles what already exists and writes
     nothing, so it cannot drift from the underlying rows.
 
-    Related cases are same-category and recent, and the payload says so
-    (`basis`). Calling that "similar" would promise a relevance the query does
-    not compute.
+    Related cases carry the signal that selected them (`match`: subject wording
+    or category) plus the computed similarity, because a panel an operator is
+    asked to trust has to be able to say why a row is in front of them. The
+    list is allowed to be short or empty: padding it with same-bucket cases is
+    how it becomes something people learn to ignore.
     """
     ctx = get_context(request)
     if ctx is None:
@@ -299,18 +306,7 @@ async def case_workbench(request: Request, case_id: str) -> Any:
             if latest is not None:
                 suggestion = {"text": latest[0], "sources": latest[1]}
 
-        related = (
-            await session.execute(
-                select(Case.id, Case.subject, Case.status)
-                .where(
-                    Case.tenant_id == ctx.tenant_id,
-                    Case.category == case.category,
-                    Case.id != cid,
-                )
-                .order_by(Case.opened_at.desc())
-                .limit(5)
-            )
-        ).all()
+        related = await find_related_cases(session, tenant_id=ctx.tenant_id, case=case, limit=5)
 
         tier: str | None = None
         contacts: list[dict[str, str | None]] = []
@@ -344,14 +340,25 @@ async def case_workbench(request: Request, case_id: str) -> Any:
             "conversation": conversation,
             "ai_suggestion": suggestion,
             "related_cases": {
-                "basis": "same_category",
+                # What the query actually computed, so a consumer cannot read
+                # more into the list than it is. Every item also carries the
+                # signal that selected it (`match`) and the terms the two
+                # subjects share (`shared_terms`), because a heading cannot
+                # explain five rows.
+                "basis": "subject_terms_or_category",
+                "window": RELATED_WINDOW,
                 "items": [
                     {
-                        "case_id": str(row[0]),
-                        "subject": row[1],
-                        "status": row[2],
+                        "case_id": str(item.case_id),
+                        "subject": item.subject,
+                        "status": item.status,
+                        "category": item.category,
+                        "opened_at": item.opened_at,
+                        "match": item.match,
+                        "score": item.score,
+                        "shared_terms": list(item.shared_terms),
                     }
-                    for row in related
+                    for item in related
                 ],
             },
         }

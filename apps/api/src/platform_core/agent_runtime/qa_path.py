@@ -181,11 +181,27 @@ def claim_contradiction_candidates(draft: DraftAnswer, evidence: list[RetrievedC
 
 _REDLINE_COMMITMENT = re.compile(
     r"保证|承诺|担保|确保|肯定能|一定能|绝对能|可以保证|"
-    r"we guarantee|we promise|i (?:can )?assure|guaranteed|is guaranteed",
+    # Granting verbs. A commitment does not need the word "承诺": "我们可以给您
+    # 打九折" gives away margin just as much as "我们保证打九折", and the
+    # guarantee-only list let it through - caught by a test with that exact
+    # sentence.
+    #
+    # Narrow on purpose: "给您" alone flagged "我可以给您发一份报价单", which
+    # offers a document rather than a price. Each alternative below names the
+    # act of conceding something, so offering to *send* paperwork no longer
+    # trips it.
+    r"给您打|给您折|给您优惠|给您让|给您算(?:便宜|低)|答应给您|同意给您|"
+    r"we guarantee|we promise|i (?:can )?assure|guaranteed|is guaranteed"
+    r"|we can give you|we can offer",
     re.IGNORECASE,
 )
 _REDLINE_OBJECT = re.compile(
     r"价格|报价|交期|交付日期|发货时间|赔偿|赔付|退款金额|折扣|库存数量|"
+    # 交货 is what customers actually write for delivery (交期 is what the
+    # industry writes); 打折/九折 and 优惠 are how a discount is named in
+    # Chinese, and `折扣` alone never matched "给您打九折".
+    r"交货|打[0-9一二三四五六七八九十]折|[0-9一二三四五六七八九十]折|优惠|让利"
+    r"|最低价|成本价|出厂价|包邮|"
     # `delivery` on its own, not only `delivery date`: "we guarantee delivery
     # by Friday" commits the company just as much as naming a date, and a test
     # caught the literal-only pattern letting it through.
@@ -282,6 +298,12 @@ ABSTAIN_SENSITIVE_REQUEST = "SENSITIVE_REQUEST"
 # or nothing recognizable). There is no corpus that could answer it, so
 # retrieving would only produce noise that looks like evidence.
 ABSTAIN_OUT_OF_SCOPE = "OUT_OF_SCOPE"
+# Feature 7.1 trigger 7 of 7 / 7.2: the customer's tone, not their question,
+# is why this goes to a person (anger, or language of legal/regulator action).
+# Separate from HUMAN_REQUIRED so the queue can be triaged by *why*, and so
+# the reply can acknowledge the situation - a customer who threatened to
+# escalate and got a generic "couldn't verify that" has been told nothing.
+ABSTAIN_EMOTION_ESCALATION = "EMOTION_ESCALATION"
 # The question cannot be answered as written but the customer is present and
 # one detail would unblock it. **A clarification, not a handoff**: the
 # distinction is that a handoff ends the AI's involvement and a clarification
@@ -310,6 +332,43 @@ class AbstentionDecision:
 
 
 MIN_EXCERPT_OVERLAP = 0.12
+
+# Feature list 3.7 (cross-language retrieval). `_chunk_overlap` counts *terms*,
+# and terms do not survive a language change: an English question against a
+# Chinese passage shares no term at all, so `MIN_EXCERPT_OVERLAP` refuses
+# evidence that retrieval ranked first and rerank scored confidently. Measured
+# on this stack (Qwen3-Embedding-8B + bge-reranker-v2-m3):
+#
+#   question -> its own passage, same language ... 0.942
+#   the same question in English -> that passage ... 0.509
+#   an unrelated passage .......................... 0.00003
+#
+# So the word-overlap floor is the wrong instrument across languages, and the
+# fix is not a translation service - it is letting a confident semantic signal
+# answer the question the term count cannot. 0.4 sits far above the noise floor
+# (0.00003) and far enough below the cross-language true positive (0.509) to
+# survive a stricter reranker without reopening the gate.
+#
+# Why this does not loosen abstention: a rerank score is only *added* by the
+# reranker. When rerank is off, degraded, or timed out, no `rerank_score` is
+# written and the term floor still applies unchanged - a tenant without rerank
+# sees exactly the behaviour it had.
+RERANK_EVIDENCE_FLOOR = 0.4
+
+
+def _rerank_evidence_is_confident(evidence: list[RetrievedChunk]) -> bool:
+    """Whether rerank placed any candidate decisively on-topic.
+
+    Reads only the score the reranker itself wrote, so an unreranked result set
+    (no `rerank_score` key) can never satisfy this and fall through to the
+    term-overlap floor as before.
+    """
+    for chunk in evidence:
+        score = (getattr(chunk, "ranking", None) or {}).get("rerank_score")
+        if isinstance(score, (int, float)) and float(score) >= RERANK_EVIDENCE_FLOOR:
+            return True
+    return False
+
 
 # How close two sources must be to count as competing, as a *fraction* of the
 # leader's score rather than an absolute difference.
@@ -1077,7 +1136,11 @@ def decide_abstention(
             abstain=True, reason_code=ABSTAIN_AMBIGUOUS_IDENTITY, handoff=True
         )
     best_overlap = max(_chunk_overlap(query, c) for c in evidence)
-    if best_overlap < min_overlap:
+    # A confident rerank verdict stands in for the term count (3.7): across
+    # languages there are no shared terms to count, and reranking the same
+    # passages is what tells us they are on topic. Both signals agree in the
+    # same-language case, so this only changes the cross-language one.
+    if best_overlap < min_overlap and not _rerank_evidence_is_confident(evidence):
         return AbstentionDecision(abstain=True, reason_code=ABSTAIN_LOW_RELEVANCE, handoff=True)
     return AbstentionDecision(abstain=False)
 
@@ -1116,6 +1179,33 @@ def safe_abstention_text(reason_code: str) -> str:
         return (
             "Could you give me a little more detail? I want to make sure I "
             "answer the right question."
+        )
+    if reason_code == "IDENTITY_REQUIRED":
+        # Feature 2.2/2.5: names the one thing that unblocks it, in the
+        # customer's terms, instead of "I couldn't verify" - the platform has
+        # the data, it just cannot prove the caller is its owner. This is the
+        # difference between a gate and a dead end.
+        return (
+            "为了保护您的数据，查询订单信息前需要先验证身份：请提供订单号和"
+            "下单时预留的手机尾号（后四位），或由人工同事为您处理。"
+        )
+    if reason_code == "IDENTITY_MISMATCH":
+        # Deliberately does not say whose data was requested: naming it would
+        # make this reply an order-number oracle.
+        return (
+            "这条信息与当前会话已验证的账户不一致，我无法提供。如需查询其他"
+            "订单，请完成对应验证，或由人工同事为您处理。"
+        )
+    if reason_code == ABSTAIN_EMOTION_ESCALATION:
+        # 7.2: acknowledges the situation, promises nothing. No "尽快", no
+        # "优先处理", no outcome - a customer who threatened legal action is
+        # exactly the one a soothing promise would turn into a commitment the
+        # platform has no authority to make (6.1). What it does say is that
+        # the context travelled with the handoff, which is the one true thing
+        # that reduces the frustration: they will not have to repeat it.
+        return (
+            "很抱歉给您带来了不好的体验。我已把这条对话连同上下文转给人工同事，"
+            "由他们来为您跟进处理。"
         )
     if reason_code in (ABSTAIN_HUMAN_REQUIRED, ABSTAIN_SENSITIVE_REQUEST):
         # Does not explain itself beyond "a person will help". Naming *why*

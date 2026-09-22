@@ -36,6 +36,25 @@ CASE_A = "01900000-0000-7000-8000-0000000000e1"
 CASE_B = "01900000-0000-7000-8000-0000000000e2"
 CONVERSATION = "01900000-0000-7000-8000-0000000000e3"
 
+# The related-case fixtures. Each one exists to make exactly one distinction
+# observable, and the subjects were chosen by measuring `similarity()` rather
+# than by feel (see `RELATED_SUBJECT_FLOOR`):
+#
+#   CASE_A       "Short circuit claim"              the case being opened
+#   CASE_C       "Short circuit claim on batch 42"  shares 3 terms + category => `match: subject`
+#   CASE_B       "Earlier claim"                    shares the term `claim`   => `match: subject`
+#   CASE_E       "Wrong part delivered"             same category, no shared term
+#                                                   => `match: category`, capped
+#   CASE_GENERAL "Where is my order?"               category `general`
+#   CASE_D       "Invoice address change"           same category as the above, no
+#                                                   shared term => bucket-only slot
+#   OTHER_CASE   "Short circuit claim"              ANOTHER TENANT, identical subject
+CASE_C = "01900000-0000-7000-8000-0000000000e4"
+CASE_D = "01900000-0000-7000-8000-0000000000e5"
+CASE_GENERAL = "01900000-0000-7000-8000-0000000000e6"
+OTHER_CASE = "01900000-0000-7000-8000-0000000000e7"
+CASE_E = "01900000-0000-7000-8000-0000000000e8"
+
 AGENT_TEXT = "标准交期以报价单为准，我帮您核实具体单号。"
 
 
@@ -79,15 +98,26 @@ def _seed() -> None:
                 ),
                 {"id": tid, "slug": slug},
             )
-        for case_id, subject in ((CASE_A, "Short circuit claim"), (CASE_B, "Earlier claim")):
+        for case_id, subject, tenant, category in (
+            (CASE_A, "Short circuit claim", TENANT, "quality"),
+            (CASE_B, "Earlier claim", TENANT, "quality"),
+            (CASE_C, "Short circuit claim on batch 42", TENANT, "quality"),
+            (CASE_E, "Wrong part delivered", TENANT, "quality"),
+            (CASE_GENERAL, "Where is my order?", TENANT, "general"),
+            # Same bucket as CASE_GENERAL and nothing else in common: this is
+            # the row that must be labelled as a bucket match, and capped.
+            (CASE_D, "Invoice address change", TENANT, "general"),
+            # The decoy: identical subject and category, different tenant.
+            (OTHER_CASE, "Short circuit claim", OTHER_TENANT, "quality"),
+        ):
             conn.execute(
                 text(
                     "INSERT INTO cases (id, tenant_id, subject, description, status, "
                     "priority, category, version, opened_at, elapsed_running_seconds, "
                     "last_state_changed_at) VALUES (:i, :t, :s, '', 'open', 'p2', "
-                    "'quality', 1, 0, 0, 0) ON CONFLICT DO NOTHING"
+                    ":cat, 1, 0, 0, 0) ON CONFLICT DO NOTHING"
                 ),
-                {"i": case_id, "t": TENANT, "s": subject},
+                {"i": case_id, "t": tenant, "s": subject, "cat": category},
             )
         conn.execute(
             text(
@@ -164,16 +194,91 @@ def test_the_bundle_carries_case_conversation_and_the_ai_proposal() -> None:
     assert isinstance(body["ai_suggestion"]["sources"], list)
 
 
-def test_related_cases_are_same_category_and_say_so() -> None:
-    """`basis` is stated because "similar" would promise a relevance the
-    query does not compute."""
+def test_related_cases_state_their_basis_and_their_reason() -> None:
+    """The panel must state what it computed, and every row why it is there.
+
+    The basis used to be `same_category`, which was honest about a query that
+    only bucketed by category - and useless, because `category` defaults to
+    `general`: for a `general` case the panel listed the most recent cases in
+    the tenant, unrelated tickets under a relevance heading.
+    """
     agent = _client(TENANT, "support_agent")
 
     body = agent.get(f"/v1/cases/{CASE_A}/workbench", headers=_headers()).json()
 
-    assert body["related_cases"]["basis"] == "same_category"
+    related = body["related_cases"]
+    assert related["basis"] == "subject_terms_or_category"
+    assert related["items"], "CASE_B shares the term `claim` with CASE_A"
+    for item in related["items"]:
+        assert item["match"] in ("subject", "category"), item
+        assert isinstance(item["score"], (int, float)), item
+    ids = [item["case_id"] for item in related["items"]]
+    assert CASE_A not in ids, "a case is not related to itself"
+
+
+def test_a_wording_match_ranks_above_a_bucket_match() -> None:
+    """Ranking is what makes the strip usable, so it is asserted, not assumed.
+
+    CASE_C shares three terms with CASE_A; CASE_E shares none and only matches
+    the bucket. The wording match must come first and say so - otherwise the
+    operator gets the old list with a longer heading.
+    """
+    agent = _client(TENANT, "support_agent")
+
+    body = agent.get(f"/v1/cases/{CASE_A}/workbench", headers=_headers()).json()
+    items = body["related_cases"]["items"]
+    by_id = {item["case_id"]: item for item in items}
+
+    assert items[0]["case_id"] == CASE_C, items
+    assert by_id[CASE_C]["match"] == "subject"
+    assert set(by_id[CASE_C]["shared_terms"]) >= {"short", "circuit", "claim"}, by_id[CASE_C]
+    assert by_id[CASE_E]["match"] == "category", by_id[CASE_E]
+    assert by_id[CASE_E]["shared_terms"] == []
+    # Bucket matches sit behind every wording match, wherever they appear.
+    first_weak = next(i for i, item in enumerate(items) if item["match"] == "category")
+    assert all(item["match"] == "subject" for item in items[:first_weak]), items
+
+
+def test_a_bucket_match_is_capped_and_labelled() -> None:
+    """`general` is the default category, so "same category" alone is noise.
+
+    For CASE_GENERAL the only peer is CASE_D, in the same bucket and sharing
+    nothing. It is allowed on the panel - a same-bucket case with different
+    wording is still worth a glance - but as what it is (`match: category`) and
+    in bounded supply, so a panel in the dominant bucket cannot become a list
+    of arbitrary recent tickets.
+    """
+    agent = _client(TENANT, "support_agent")
+
+    body = agent.get(f"/v1/cases/{CASE_GENERAL}/workbench", headers=_headers()).json()
+    items = body["related_cases"]["items"]
+
+    weak = [item for item in items if item["match"] == "category"]
+    assert [item["case_id"] for item in weak] == [CASE_D], items
+    assert all(item["shared_terms"] == [] for item in weak), items
+
+
+def test_a_related_case_from_another_tenant_is_never_returned() -> None:
+    """The mandatory negative: this is a list of *other people's* tickets.
+
+    Tenant B holds a case with the *identical* subject to CASE_A and the same
+    category, which is the strongest possible decoy. Two independent barriers
+    stand in front of it - the explicit `tenant_id` predicate and RLS - and
+    this asserts the outcome rather than either mechanism, because a test that
+    names one mechanism stops protecting the moment the other becomes the only
+    one left.
+    """
+    agent = _client(TENANT, "support_agent")
+
+    body = agent.get(f"/v1/cases/{CASE_A}/workbench", headers=_headers()).json()
     ids = [item["case_id"] for item in body["related_cases"]["items"]]
-    assert CASE_B in ids and CASE_A not in ids
+
+    assert OTHER_CASE not in ids, body["related_cases"]
+    # A negative that passes on an empty panel proves nothing, so the panel is
+    # asserted non-empty first - and its strongest match must be this tenant's
+    # own wording match rather than the decoy.
+    assert body["related_cases"]["items"], "an empty panel would make this vacuous"
+    assert ids[0] == CASE_C, body["related_cases"]
 
 
 def test_another_tenants_case_is_not_found() -> None:

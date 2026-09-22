@@ -11,10 +11,13 @@ import { Cases } from "./pages/Cases";
 import { CustomerChat } from "./pages/CustomerChat";
 import { FeatureFlags } from "./pages/FeatureFlags";
 import { GapQueue } from "./pages/GapQueue";
+import { Conversations } from "./pages/Conversations";
+import { Knowledge } from "./pages/Knowledge";
 import { Members } from "./pages/Members";
 import { NotFound } from "./pages/NotFound";
 import { PromptRelease } from "./pages/PromptRelease";
 import { QualityDashboard } from "./pages/QualityDashboard";
+import { SupportChat } from "./pages/SupportChat";
 import { Usage } from "./pages/Usage";
 import { Workbench } from "./pages/Workbench";
 import "./styles.css";
@@ -41,6 +44,8 @@ const router = createBrowserRouter([
       { index: true, element: <Navigate to="/quality" replace /> },
       { path: "quality", element: <QualityDashboard /> },
       { path: "gaps", element: <GapQueue /> },
+      { path: "knowledge", element: <Knowledge /> },
+      { path: "conversations", element: <Conversations /> },
       { path: "prompts", element: <PromptRelease /> },
       { path: "flags", element: <FeatureFlags /> },
       { path: "cases", element: <Cases /> },
@@ -66,6 +71,14 @@ const router = createBrowserRouter([
         <CustomerChat />
       </LangProvider>
     ),
+    errorElement: <RouteError />,
+  },
+  {
+    // The real customer surface (ADR 0011): no operator token, no operator
+    // layout. `/chat` above is the internal verification panel and keeps its
+    // operator auth; this one opens a visitor session instead.
+    path: "/support",
+    element: <SupportChat />,
     errorElement: <RouteError />,
   },
 ]);

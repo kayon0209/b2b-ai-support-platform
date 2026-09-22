@@ -125,6 +125,26 @@ export async function apiPut<T>(
   return unwrap<T>(res);
 }
 
+/**
+ * POST a multipart body, for endpoints that take a file.
+ *
+ * Separate from `apiPost` rather than a flag on it: `apiPost` sets
+ * `Content-Type: application/json` explicitly, and a multipart request must
+ * *not* set one - the browser generates it from the FormData so it carries the
+ * boundary string. Sending the JSON header with a FormData body makes the
+ * server parse nothing and reject the upload as malformed, which is a
+ * confusing failure for a mistake that looks like a detail.
+ */
+export async function apiUpload<T>(path: string, form: FormData): Promise<T> {
+  const res = await send(`${path}`, {
+    method: "POST",
+    // No Content-Type - the browser sets it, boundary included.
+    headers: { Accept: "application/json", ...authHeader() },
+    body: form,
+  });
+  return unwrap<T>(res);
+}
+
 export async function apiDelete<T>(path: string, idempotencyKey?: string): Promise<T> {
   const headers: Record<string, string> = {
     Accept: "application/json",

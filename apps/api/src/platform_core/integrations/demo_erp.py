@@ -25,10 +25,22 @@ from platform_core.integrations.business_read import READ_TOOL_RESOURCES
 # Deliberately small and obviously fictional: a handful of orders is enough to
 # exercise the timeline card, and a realistic-looking dataset would invite
 # someone to mistake it for production data.
+#
+# `account` exists for feature list 2.5: the read tools must be able to say
+# whose data a record is, or an anonymous visitor on the support surface is
+# served *somebody's* order by asking for its number. The account rides on the
+# receipt, and the orchestrator refuses to publish a receipt whose account is
+# not the one the visitor proved ownership of (see support_router.verify).
+
+# The proof of ownership, deliberately OUTSIDE the records: a phone tail on a
+# published receipt would leak the very credential the verification checks.
+# `verify_ownership` is the provider's own answer to "does this proof match
+# this record" - a real ERP would ask its system the same question.
 _ORDERS: dict[str, dict[str, Any]] = {
     "SO-9001": {
         "order_id": "SO-9001",
         "status": "in_production",
+        "account": "acme",
         "nodes": [
             {"label": "下单", "status": "done", "at": "2026-09-14T10:00:00Z"},
             {"label": "工程确认", "status": "done", "at": "2026-09-15T09:20:00Z"},
@@ -41,6 +53,7 @@ _ORDERS: dict[str, dict[str, Any]] = {
     "SO-9002": {
         "order_id": "SO-9002",
         "status": "shipped",
+        "account": "other-co",
         "nodes": [
             {"label": "下单", "status": "done", "at": "2026-09-08T11:00:00Z"},
             {"label": "工程确认", "status": "done", "at": "2026-09-09T10:00:00Z"},
@@ -58,8 +71,15 @@ _SHIPMENTS: dict[str, dict[str, Any]] = {
         "carrier": "SF Express",
         "tracking_no": "SF1234567890",
         "status": "in_transit",
+        # The shipment belongs to the account that ordered SO-9001, so the
+        # ownership gate can cover tracking without a second verification.
+        "account": "acme",
     },
 }
+
+# Last four digits of the contact phone on file - the weakest
+# demonstration-grade proof, and labelled as such by the verify endpoint.
+_CONTACT_TAILS: dict[str, str] = {"SO-9001": "8888", "SO-9002": "7777"}
 
 _RESOURCES: dict[str, dict[str, dict[str, Any]]] = {
     "orders": _ORDERS,
@@ -137,3 +157,21 @@ class DemoBusinessToolExecutor:
             # An honest no: the record is not in the sample data.
             return False
         return bool(output.get("fetched_at"))
+
+    async def verify_ownership(self, tool_name: str, record_id: str, proof: str) -> str | None:
+        """Feature list 2.2/2.5: whose record is this, if the proof matches.
+
+        Returns the owning account, or None when the record is unknown, the
+        proof is wrong, or the tool's records have no owner. None is also what
+        a provider that cannot prove ownership returns, and the caller must
+        treat it as a refusal - a silent yes here would put somebody's order on
+        a stranger's screen.
+        """
+        if tool_name != "order.get_status":
+            # Only orders carry an owner in the sample data; tracking and
+            # invoices inherit the owner of the order they belong to.
+            return None
+        record = _ORDERS.get(record_id)
+        if record is None or _CONTACT_TAILS.get(record_id) != proof.strip():
+            return None
+        return str(record.get("account") or "") or None

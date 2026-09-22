@@ -58,3 +58,25 @@ def test_detection_is_per_sentence_not_per_answer() -> None:
     violations = redline_violations(text)
 
     assert violations == ["我们保证交期 7 天"]
+
+
+def test_a_granting_verb_alone_commits_the_company() -> None:
+    """A commitment does not need the word 承诺.
+
+    "我们可以给您打九折" hands over margin exactly like "我们保证打九折" does.
+    Both halves of the old pattern missed it: the verb list had only
+    guarantee-family words, and the object list had 折扣 but not the 九折 a
+    customer actually writes. Caught by this sentence failing while writing
+    the tone checker (5.4), which shares the same path.
+    """
+    assert redline_violations("我们可以给您打九折，3 天交货。")
+
+
+def test_a_document_offer_is_not_a_price_commitment() -> None:
+    """Narrowness guard: offering to send a quote is not offering a price."""
+    assert redline_violations("我可以给您发一份报价单，请查收。") == []
+
+
+def test_stating_a_policy_is_not_committing_to_an_outcome() -> None:
+    """The line is a promise, not a topic. Policy text must pass."""
+    assert redline_violations("我们的退货政策是 7 天内可以退。") == []

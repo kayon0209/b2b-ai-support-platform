@@ -492,8 +492,11 @@
 | 阶段 2 · 智能体触发 | ✅ | 识别"确认" → **转人工** `EQ_CONFIRMATION_REQUIRES_HUMAN`；**不提议**（AI 只转述 + 收集，见附录 G） |
 | 阶段 2 · 管理台工作台 | ✅ | `GET /v1/tools`（**按调用者权限过滤**）+ 发起提议 + 新建工单；36 项浏览器断言 |
 | 阶段 2 · 分类器可达性 | ✅ | `ACTION_VERBS` 补 `create/report/raise/submit/file/open`；`expected_route` 从**死字段**变成路由守卫（附录 E） |
-| 阶段 3 · 深化 | ⬜ | 未开始：BOM 配单进度、质量投诉半自动化（`case.create` + 证据附件）、大客户分层、NextPCB 英文语料 |
-| 阶段 4 · 运营飞轮 | ⬜ | 未开始：缺口队列周度运营、质量看板基线对比、prompt 版本流程常态化 |
+| 阶段 3 · 质量投诉半自动化 | 🟡 | `case.create`（`confirmed_write`，ADR 0008）✅ + **证据附件**（迁移 0040、`POST/GET /v1/cases/{id}/attachments`、预签名读取）✅。**人工裁定**本就由人做，无需再建 |
+| 阶段 3 · BOM 配单进度查询 | ⬜ | **未开始，且被外部依赖阻塞**：`business_api` 适配器需要新增 `bom_read` 能力与 ERP 端点。只建平台侧工具会得到一个永远 `TOOL_UNAVAILABLE` 的工具——正是本仓库反复出现的"宣告存在、实际打不到" |
+| 阶段 3 · 大客户分层（直转专属人工） | ⬜ | **未开始，且被缺失的关联阻塞**：SLA 档位那半已可用（`sla_policy_for_tier`，走 `Case.enterprise_account_id`），但**平台无从得知一个会话属于哪个 `EnterpriseAccount`**——`ExternalResourceRef` 只映射了 chatwoot account/conversation → tenant，没有 contact → account。风险登记册第 9 条要的正是这个，所以先要建那条关联 |
+| 阶段 3 · NextPCB 英文语料按知识空间隔离 | ⬜ | 未开始：`KnowledgeSpace` **没有 language 字段**，检索也没有按语言过滤。需要一次 schema 变更 + 检索侧过滤 + 一条"中英不串"的泄漏测试（跨租户测试是模板） |
+| 阶段 4 · 运营飞轮 | 🟡 | 工具已就位（缺口队列、质量看板、prompt 发布/回滚三页 + 各自服务），**缺的是每周真的去跑**——那是运营节奏，不是代码 |
 
 ### 阶段 2 与原计划的两处差异（都已按证据改回/改对）
 
@@ -1189,11 +1192,11 @@ _QUOTE_REQUEST = re.compile(r"(?:多少钱|怎么收费|报个?价|价格是多�
 
 - **中文结果补语/趋向补语**（`退掉`/`退回来`/`关掉`）未覆盖：补语形态繁多，
   `_CN_REQUEST_FRAME` 的"紧跟宾语"条件会被补语吃掉。需要时再单开一条链。
-- **`我要投诉` 未断言为 `human_required`**：英文 `I want to complain` 同样落
-  `knowledge_qa`（`complain` 在 `_SCENE_PATTERNS` 是名词、不在 `ACTION_VERBS`）。
-  这是**跨语言**缺口，在此断言更强路由等于**夹带一次更大的改动**。
-- **中文投诉的 `scene` 是 `unspecified`**（`COMPLAINT` 场景词表全英文）：
-  只影响场景亲和排序，不影响路由。
+- ~~**`我要投诉` 未断言为 `human_required`**~~ → **已关闭，见附录 K**。改法**不**是
+  在分类器里断言更强路由（那确实是夹带），而是编排器加了一道"索赔闸门"：分类器的
+  `route` 契约一行未动，但这类消息**根本不进入回答路径**。
+- ~~**中文投诉的 `scene` 是 `unspecified`**~~ → 已由中文场景词表修复（本轮 §2 第 3 项），
+  现为 `complaint`。**但附录 K 实测：这个 scene 不能用来做转人工的判据。**
 - **跨语言检索**：独立且更大的问题，dataset 已用 `must_abstain` 诚实标注。
 
 ## 附录 J · 关闭门禁耦合：ADR 0009 让中文路由契约进入评估门禁（2026-09-19）
@@ -1269,3 +1272,181 @@ M3 去掉 reason-code 条件 / M4a 门禁恒真 / M4b match 改比全部声明 /
   新能力，属于另一个决策。
 - 中文路由契约现在**进了**门禁（这是本附录的成果），但中文的**结果补语**、
   `我要投诉` 的 `human_required` 断言、中文 `scene` 词表三项边界维持附录 I 的划法不变。
+  （**后两项已被附录 K 与中文场景词表关闭**，此处保留原文以存档当时的判断。）
+
+---
+
+## 附录 K · 投诉转人工：L6 的闸门（2026-09-20）
+
+报告 §2.1 把质量投诉/赔付定在 **L6 争议归责（必须转人工）**，§2.3 对
+"板子短路了，我要索赔"标注 **"✅ 机制就绪"**，红线表写 **AI 绝不可做归责表态或赔付承诺**。
+
+**实测：这一条不成立，而且比"没接上"更糟。**
+
+### 1. 动手前的实测（不是记忆）
+
+```
+板子短路了，我要索赔                 scene=technical_support  route=knowledge_qa   → 被知识库回答
+开短路不良我要索赔                    scene=technical_support  route=knowledge_qa   → 被知识库回答
+这批货有虚焊                        scene=technical_support  route=knowledge_qa   → 被知识库回答
+这个不良品怎么理赔                    scene=technical_support  route=knowledge_qa   → 被知识库回答
+货期延误了，我要你们赔偿                scene=billing            route=knowledge_qa   → 被知识库回答
+I demand a refund for these...     scene=billing            route=knowledge_qa   → 被知识库回答
+我要投诉                           scene=complaint          route=business_write → 生成写提议
+I want to file a complaint         scene=complaint          route=business_write → 生成写提议
+```
+
+即：**索赔被知识库回答，投诉被当成写操作**。规划要的是"根本不去回答"。
+红线守卫挡不住它（它是 flag 门控、默认关闭、且扫的是**生成后的草稿**）——
+"已经决定回答之后才拦"不等于"这类消息不该回答"。
+
+### 2. 为什么**不**用 `Scene.COMPLAINT` 做判据（实测反例）
+
+最直观的写法是"scene 是 complaint 就转人工"。**实测否掉**：
+`_SCENE_PATTERNS` 的 COMPLAINT 词表含 `still not` / `third time`，于是
+
+```
+my order has still not arrived          scene=complaint  route=knowledge_qa
+The shipment still not updated, where is it?  scene=complaint  route=business_read
+```
+
+一道 scene 闸门会把**订单状态问题**送进人工队列，第二个还会抢在 `order.get_status`
+之前。反之，真正要拦的 `板子短路了，我要索赔` 的 scene 是 **technical_support**——
+**scene 闸门恰好漏掉报告自己举的那一条**。两边都错，故弃用。
+
+判据改为 **"这是不是一次索赔"**（`agent_runtime/complaint.py`），三条全中才算：
+
+1. 出现**救济词**（索赔/赔偿/赔付/退款/退货/投诉/起诉/找经理/refund/compensation/escalate…）；
+2. 且**客户在要它**（`我要`/`我要求`/`请给`/`给我`/`i want`/`i demand`/`refund me`/`let me speak to`…）；
+3. 且**不是在问流程**（`怎么`/`如何`/`什么`/`谁`/`吗`/`呢`/`政策`/`流程`/`规定`，或英文 wh- 词）。
+
+第 3 条是**与 L1 的分界**，不是保守：报告把 **赔付政策/退换货规则列在 L1（检索+引用，可直接回答）**，
+`全测板开短路不良怎么赔付？` 正是该回答的问题（`test_intent.py` 也把它钉为 TECHNICAL_SUPPORT）。
+**"怎么赔付"问的是规则，"我要索赔"是在规则下主张权利**——两者同一个词表，靠第 3 条分开。
+
+第 2 条是**被我自己写出来的回归逼出来的**（见第 4 节）：只有救济词、没有"要"的
+声明句（`Please escalate this defect to your engineering team`）根本不是索赔。
+
+### 3. 闸门位置与 flag
+
+放在 `orchestrator._run_pipeline` 的 **2b-complaint**：在 EQ 确认分支之后、
+澄清闸门之前、检索之前、写路径之前。
+
+- 在**澄清之前**，是因为让一个刚提出索赔的人"再说详细点"不是收集信息，是让他复述一遍不满；
+- **不挂 feature flag**（与 EQ 分支相反）：EQ 分支是"租户可选择的新行为"，
+  这一条是"撤掉一个被列为红线的回答"。红线挂在默认关闭的 flag 后面，正是这次漏掉的原因。
+
+### 4. 我自己制造的回归（写路径）
+
+第一版判定器把"声明句里出现救济词"也算索赔，于是
+`Please escalate this defect to your engineering team`（写路径的**标准请求**）
+被判成索赔 → 转人工 → `test_agent_write_path.py` 4 条失败。
+**"把缺陷升级给工程团队"不是索赔**，它是 `jira.create_issue` 的正当入口。
+
+修法是收紧到第 2 条（必须"要"），并把这句写进单测反向用例——
+它是我这次唯一一处回归，也是唯一靠全量测试才发现的（定向跑我的新测试全绿）。
+
+### 5. 变异验证 3/3（每条都真的红）
+
+| 变异 | 被谁捕获 |
+|---|---|
+| M1 去掉流程否决（`_is_procedure_question` 恒 False） | 集成 `test_the_policy_question_still_reaches_the_knowledge_path` + 单测 7 条 |
+| M2 闸门改用 `detection.scene is Scene.COMPLAINT` | `test_a_stalled_order_is_not_hijacked` **且** `test_a_compensation_claim_is_handed_off...`（报告那条又漏了） |
+| M3 判定器恒 False | 3 条转人工断言全红，日志回到 `QUESTION_TOO_SHORT`（即改动前的缺陷） |
+
+M1 第一次**没有**被捕获：当时唯一的那条反向用例以 `？` 结尾，被"结尾问号"兜住了，
+否决本身没被验证到。**已补一条不带问号的同义句**（`你们的赔付政策是什么`），才有今天的表。
+
+### 6. 边界（有意不做，不是疏漏）
+
+- **纯缺陷陈述**（`板子短路了` / `这批货有虚焊`）**不判为索赔**：报告把它们列在场景 D，
+  但它们什么都没要。要拦就得匹配裸缺陷词，而那正是工程师求助时用的词
+  （`为什么板子会短路`）。它们并非无人处理：不触发闸门 → 走知识路径 →
+  按证据不足弃权 → 同样转人工。**过宽的守卫比没有守卫更糟。**
+- **结构化证据收集**（报告要求 AI 做的第②件事：订单号、批次、不良数量、照片）
+  **未做**。转人工话术里请客户提供订单号与照片（人无论如何都收得到），
+  但没有结构化受理表单去解析入库——**只建平台侧不建消费端，是本项目最典型的缺陷形态**。
+- **话术仍为英文**：`safe_abstention_text` 全部分支都是英文，本地化是另一个决策，
+  不在本次改动里夹带。话术本身已确保**不认责、不承诺金额**（有断言）。
+
+### 7. 验证
+
+- 单测 38 条（正 16 / 反 20 / 边界 2），集成 7 条（含 2 条变异守卫）；
+- 全量 **1627 收集 / 0 失败 / 0 错误 / 0 跳过**（改动前 1582，+45）；
+- `ruff check` + `ruff format --check` + `mypy` 全绿（143 源文件）；
+- `release_check --evidence-only` **exit 0**，零容忍计数 15 / 4 / 3。
+
+---
+
+## 附录 L · 大客户分层：让 tier 到达转人工决策（2026-09-20）
+
+难点 5 要的是"**tier 驱动 SLA 与转人工优先级**"、"大客户命中 COMPLAINT 一律直转专属人工"。
+**SLA 那半早就有了**（`sla_policy_for_tier` 读 `Case.enterprise_account_id`）；
+**路由那半一直缺一个前提**：平台无从得知一次会话属于哪个 `EnterpriseAccount`，
+所以 tier 永远走不到转人工决策。本附录补的是这个前提 + 它的消费端。
+
+### 1. 关联建在 contact 上，不是 inbox 上（附实测）
+
+上一版交接建议"按 inbox 建关联"，理由是 `inbox_id` 在 webhook 最小化载荷里。
+**实测否掉了这个前提**，两轮：
+
+- **语义**：`docs/architecture.md:51` 把 inbox 与 channels/contacts 并列——
+  **inbox 是渠道，不是客户**。一个网站在线聊天 inbox 里是所有客户，
+  把它绑到某家大客户，等于把走进这个渠道的每个人都当成大客户。
+- **数据**：真实事件里 `inbox_id` **29/29 有键，但 27 条是字符串 `"None"`**
+  （`minimize.py` 的 `str(conversation.get("inbox_id"))` 在字段缺失时会写出 `"None"`）；
+  真正可用的只有 2 条。
+
+因此改按 **contact** 关联——**但 contact 同样不在载荷里**：
+
+```
+contact_id               0/29
+sender_id / sender_type  1/29
+inbox_id                29/29（其中 27 条是 "None"）
+conversation_id         29/29
+```
+
+所以 contact 只能**从 Chatwoot API 读**（`fetch_message_contact_id`，取消息对象里的
+`sender.id` 且 `sender.type == "contact"`）。这也顺带说明：
+`minimize.py` 的 contact 提取、以及 `_persist_memory` 里"按 contact 存长期事实"的逻辑，
+**在当前部署下从来没被喂过数据**——同一条外部事实卡住了两处。
+
+### 2. 一次做完关联 + 消费端
+
+- **写侧**：迁移 `0041` 建 `enterprise_account_contacts`（`UNIQUE (tenant_id, external_contact_id)`、
+  复合 FK `(enterprise_account_id, tenant_id)`、RLS `FORCE`），
+  管理台 `POST/GET/DELETE /v1/identity/accounts/{id}/contacts`（`TENANT_ADMIN` + 幂等键）。
+- **读侧（消费端）**：编排器在索赔闸门里用 contact 查出账户，
+  tier ∈ {strategic, enterprise} 且 `contract_status == active` 时，
+  理由码改 `STRATEGIC_ACCOUNT_REQUIRES_HUMAN`，私有便签带上 `account_id` 与 tier。
+
+**只建关联不建消费端是本项目反复出现的缺陷**——所以这两半是一次提交的。
+同理，若 contact 查不到，**降级为"未绑定"而不是失败**：tier 只是让一次**本来就会发生**的
+转人工更准确，不能让它变成"转人工丢了"。
+
+### 3. 变异验证 2/2
+
+| 变异 | 被谁捕获 |
+|---|---|
+| M1 忽略 tier（恒用通用理由码） | `test_a_bound_strategic_contact_hands_off_to_the_account_team` |
+| M2 忽略 `contract_status` | `test_a_churned_contract_does_not_get_the_dedicated_route` |
+
+另有两条反向断言防止"写死 strategic"：未绑定的 contact、无 contact 时都必须仍走通用转人工。
+
+### 4. 边界（有意不做）
+
+- **专属对接人本人**：报告说大客户有"专属对接人"，但 `EnterpriseAccount` **没有 owner 字段**。
+  现在能说出"是哪家客户"，不能路由到"哪个人"。**加这个字段是要先决定"对接人的权威来源在哪"的
+   schema 决策**，不在本次夹带。
+- **交期风险意图**的直转未做：需要先定义"交期风险"的判定面，属另一个决策。
+- **管理台三个端点的 HTTP 层测试未写**：本次测的是 service 层（真实库 + RLS）。
+  端点的权限/幂等/422 路径**尚未被测试覆盖**，这是明确的欠账，不是"已验证"。
+- **`inbox_id` 写出 `"None"` 的缺陷未修**（`minimize.py:42`）——它已无人读取，
+  但会误导任何按它做统计的人。留作单独一条。
+
+### 5. 验证
+
+- 迁移 `0041` 已应用至本地库，`EXPECTED_MIGRATIONS` 40 → 41；
+- 新增单测 3 条（contact 解析）+ 集成 6 条（含跨租户 RLS、churned、未绑定、两条变异守卫）；
+- 全量 **1636 收集 / 0 失败 / 0 错误 / 0 跳过**；`release_check` exit 0（15/4/3）；
+  ruff + mypy 全绿。

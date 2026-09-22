@@ -223,6 +223,17 @@ class ConnectorOutcomeExecutor:
     ) -> bool | None:
         return await self._inner.verify_postcondition(tool_name, parameters, output)
 
+    async def verify_ownership(self, tool_name: str, record_id: str, proof: str) -> str | None:
+        # Delegate feature 2.2/2.5 ownership checks to the inner adapter. The
+        # demo adapter answers from the contact phone on file; a real HTTP
+        # provider returns None (cannot prove), which the caller treats as a
+        # refusal. Without this delegation the wrapper hid the method and
+        # /verify always 503'd.
+        inner = self._inner
+        if not hasattr(inner, "verify_ownership"):
+            return None
+        return await inner.verify_ownership(tool_name, record_id, proof)
+
 
 class ConnectorExecutorResolver:
     """Resolves the executors available to one tenant.

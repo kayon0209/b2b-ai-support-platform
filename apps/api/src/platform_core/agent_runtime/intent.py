@@ -67,6 +67,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from platform_core.agent_runtime.homophones import corrections_in, normalize_for_matching
 from platform_core.agent_runtime.qa_path import _content_terms, _stem
 
 # --- Reused vocabulary -----------------------------------------------------
@@ -104,6 +105,30 @@ class Scene(StrEnum):
     COMPLAINT = "complaint"
     ACCOUNT_SECURITY = "account_security"
     BILLING = "billing"
+    UNSPECIFIED = "unspecified"
+
+
+class BusinessLine(StrEnum):
+    """Which product line the question belongs to (feature list 3.2).
+
+    Distinct from `Scene`, which is *what the customer wants* (a complaint,
+    a pre-sales question). This is *what they are talking about* - a PCB, a
+    reel of components, an SMT run. The two are independent: "my PCB order
+    is late" is COMPLAINT on the scene axis and PCB here.
+
+    It exists so two downstream consumers stop guessing independently:
+    7.3 routes a handoff to the team that owns this line, and 8.7 counts
+    demand per line. Both previously had nothing to key on.
+
+    `UNSPECIFIED` is a real answer, not a failure: plenty of questions
+    (an invoice query, a password reset) belong to no line, and inventing
+    one to avoid the empty case would put a routing decision on noise.
+    """
+
+    COMPONENT = "component"
+    PCB = "pcb"
+    SMT = "smt"
+    DFM = "dfm"
     UNSPECIFIED = "unspecified"
 
 
@@ -166,13 +191,26 @@ class IntentAction(StrEnum):
 # and the scene the wording was asking for lost to whatever scene happened to
 # be listed first.
 
+# Chinese alternatives are appended to each pattern as a second top-level
+# alternative (`\b(?:en)\b|(?:cn)`), because `\b` never matches between two CJK
+# characters - wrapping CJK in the English `\b` group matches nothing, which is
+# how this file's other CJK patterns are written too.
+#
+# They were missing entirely: `docs/research/chinese-intent-measurement.md`
+# measured every scene pattern as English-only, so **no Chinese message got a
+# scene at all** and every one fell to UNSPECIFIED. The scenes do not decide the
+# route, but they decide which tools are candidates and how wide retrieval
+# reaches (`_top_k_for_scene`), and the pilot's customers write Chinese - so the
+# gap degraded tool ranking and evidence breadth for every conversation the
+# pilot would actually have.
 _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
     (
         Scene.ACCOUNT_SECURITY,
         2.0,
         re.compile(
             r"\b(?:breach\w*|compromi[sz]\w*|locked out|hijack\w*|stolen|"
-            r"unauthori[sz]ed access)\b",
+            r"unauthori[sz]ed access)\b"
+            r"|(?:被盗|泄露|泄漏|未授权|被人登录|账号异常|安全漏洞)",
             re.IGNORECASE,
         ),
     ),
@@ -181,7 +219,8 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
         1.0,
         re.compile(
             r"\b(?:password|passphrase|mfa|2fa|sso|log ?in|sign ?in|"
-            r"api ?key|token|credential|secret|permission\w*|access rights)\b",
+            r"api ?key|token|credential|secret|permission\w*|access rights)\b"
+            r"|(?:密码|验证码|登录|登入|密钥|凭证|令牌|权限)",
             re.IGNORECASE,
         ),
     ),
@@ -192,7 +231,10 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
             r"\b(?:complain\w*|unacceptable|ridiculous|furious|angry|"
             r"fed up|again and again|third time|still not|escalat\w*|"
             r"manager|supervisor|legal action|lawyer|ombudsman|"
-            r"disappoint\w*|disgrace|worst)\b",
+            r"disappoint\w*|disgrace|worst)\b"
+            r"|(?:投诉|抱怨|太差|很差|不满意|无法接受|不能接受|生气|愤怒|"
+            r"还是不行|又出问题|第三次|找经理|找主管|找领导|起诉|律师|"
+            r"走法律|失望|太糟糕|最差|什么态度)",
             re.IGNORECASE,
         ),
     ),
@@ -201,7 +243,8 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
         2.0,
         re.compile(
             r"\b(?:do you support|does your product|is it possible to|"
-            r"before (?:i|we) buy|can your (?:platform|product))\b",
+            r"before (?:i|we) buy|can your (?:platform|product))\b"
+            r"|(?:你们支持|能否支持|是否支持|能支持|买之前|采购前|下单前)",
             re.IGNORECASE,
         ),
     ),
@@ -210,7 +253,8 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
         1.0,
         re.compile(
             r"\b(?:pricing|price list|quote|quotation|trial|demo|evaluate|"
-            r"considering|compar(?:e|ing)|which plan)\b",
+            r"considering|compar(?:e|ing)|which plan)\b"
+            r"|(?:报价|价格|多少钱|单价|试用|演示|对比|哪个套餐|怎么收费)",
             re.IGNORECASE,
         ),
     ),
@@ -220,7 +264,9 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
         re.compile(
             r"\b(?:order|shipment|delivery|deliver\w*|track(?:ing)?|parcel|"
             r"dispatch|shipping|eta|where is my|has (?:it|my order) (?:arrived|shipped)|"
-            r"invoice|package|courier)\b",
+            r"invoice|package|courier)\b"
+            r"|(?:订单|发货|交期|物流|快递|到货|运单|出货|什么时候发|包裹|"
+            r"寄出|签收)",
             re.IGNORECASE,
         ),
     ),
@@ -231,7 +277,10 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
             r"\b(?:error|fault|fail(?:ing|ed|ure)?|crash\w*|hang|timeout|time ?out|"
             r"error code|fault code|not working|broken|defect|"
             r"firmware|hardware version|model number|serial|"
-            r"log file|stack trace|exception|restart|reboot)\b",
+            r"log file|stack trace|exception|restart|reboot)\b"
+            r"|(?:报错|故障|失败|崩溃|卡住|超时|不工作|无法使用|打不开|坏了|"
+            r"不良|缺陷|短路|开路|虚焊|焊点|固件|硬件版本|型号|序列号|"
+            r"日志|异常|重启|死机)",
             re.IGNORECASE,
         ),
     ),
@@ -241,7 +290,9 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
         re.compile(
             r"\b(?:refund|charge[ds]?|billing|invoice|payment|credit(?:ed)?|"
             r"subscription|renewal|overcharged|double charged|cancel(?:lation)?|"
-            r"downgrade|upgrade|proration)\b",
+            r"downgrade|upgrade|proration)\b"
+            r"|(?:退款|退费|退货|扣费|收费|账单|发票|付款|支付|订阅|续费|"
+            r"多扣|重复扣|取消|降级|升级|赔付|赔偿)",
             re.IGNORECASE,
         ),
     ),
@@ -251,6 +302,58 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
 # about service, but it must not fire on a pre-sales question. BILLING and
 # ORDER_FULFILMENT are more specific than AFTER_SALES, so they win when both
 # match; AFTER_SALES is only assigned when nothing more specific did.
+# Feature list 3.2: which product line the question is about. Weighted like
+# the scene patterns - a specific term outranks a generic one - with DFM
+# weighted highest because its vocabulary ("拼板", "工艺边") overlaps PCB's
+# and the DFM reading is the more specific one: a customer asking about
+# panelisation wants the manufacturability review, not a board quote.
+#
+# `\bpcb\b` deliberately does not match "pcba": the word boundary fails
+# between b and a, which is what keeps an assembly question out of the bare
+# board line. That distinction is the whole point of having SMT as its own
+# line - PCBA is assembly work, PCB is fabrication, and they are routed to
+# different teams.
+_BUSINESS_LINE_PATTERNS: tuple[tuple[BusinessLine, float, re.Pattern[str]], ...] = (
+    (
+        BusinessLine.DFM,
+        1.2,
+        re.compile(
+            r"dfm|可制造性|制造性设计|工艺评审|工程确认|工程问题确认|\beq\b|拼板|工艺边"
+            r"|邮票孔|钢网开口|可焊性|器件间距|过孔设计",
+            re.I,
+        ),
+    ),
+    (
+        BusinessLine.SMT,
+        1.0,
+        re.compile(
+            r"smt|pcba|贴片|贴装|回流焊|波峰焊|锡膏|钢网|上锡|焊接|炉温|过炉|元件偏移"
+            r"|立碑|虚焊|连锡",
+            re.I,
+        ),
+    ),
+    (
+        BusinessLine.COMPONENT,
+        1.0,
+        re.compile(
+            r"元器件|电子料|元件|芯片|电阻|电容|电感|晶振|连接器|\bic\b|bom|料号|物料"
+            r"|替代料|国产替代|原厂|授权代理|批次|丝印|封装",
+            re.I,
+        ),
+    ),
+    (
+        BusinessLine.PCB,
+        0.8,
+        re.compile(
+            r"\bpcb\b|电路板|线路板|印制板|印制电路|覆铜板|打样|fr-?4|阻抗|沉金|喷锡"
+            r"|层压|板材|孔铜|绿油|阻焊|字符层|板厚|铜厚",
+            re.I,
+        ),
+    ),
+)
+
+_BUSINESS_LINE_CONFIDENCE = 0.6
+
 _AFTER_SALES_HINT = re.compile(
     r"\b(?:my (?:account|plan|subscription|workspace)|existing customer|"
     r"since (?:i|we) (?:signed|upgraded|started)|support ticket|my case)\b",
@@ -377,6 +480,13 @@ class IntentDetection:
     confidence: float
     multi_intent: bool
     signals: tuple[IntentSignal, ...]
+    # Feature list 3.2. Defaulted so callers and tests that construct a
+    # detection without a line keep working; `classify` always sets it.
+    business_line: BusinessLine = BusinessLine.UNSPECIFIED
+    # Feature list 3.8: homophone substitutions applied before matching. Kept
+    # so "why was this routed by 订单 when the customer wrote 定单" has an
+    # answer; the customer's own words stay in the audit log untouched.
+    corrections: tuple[tuple[str, str], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         """Audit-safe snapshot for `AgentRun.model_config`.
@@ -393,6 +503,11 @@ class IntentDetection:
             "action": self.action.value,
             "confidence": round(self.confidence, 3),
             "multi_intent": self.multi_intent,
+            "business_line": self.business_line.value,
+            # Count, not the substitutions: a correction is a decision about
+            # the customer's words, and this snapshot is read back without
+            # re-exposing what they typed.
+            "spelling_corrections": len(self.corrections),
         }
 
 
@@ -420,6 +535,33 @@ def _detect_scene(question: str) -> tuple[Scene, float, list[IntentSignal]]:
         best = Scene.AFTER_SALES
         signals.append(IntentSignal("scene", best.value, "existing-customer hint"))
     confidence = _SCENE_MATCH_CONFIDENCE if best is not Scene.UNSPECIFIED else 0.0
+    return best, confidence, signals
+
+
+def _detect_business_line(question: str) -> tuple[BusinessLine, float, list[IntentSignal]]:
+    """Which product line the question is about, with its evidence.
+
+    Same scoring shape as `_detect_scene`, and deliberately no fallback
+    heuristic: unlike a scene, where an existing-customer hint is enough to
+    say "after sales", there is no textual hint that makes a question about
+    a line it never mentions. Guessing a line would misroute the handoff to
+    a team that cannot help, which is worse than saying UNSPECIFIED and
+    letting the general queue take it.
+    """
+    signals: list[IntentSignal] = []
+    scores: dict[BusinessLine, float] = {}
+    for line, weight, pattern in _BUSINESS_LINE_PATTERNS:
+        hits = len(pattern.findall(question))
+        if hits:
+            signals.append(IntentSignal("business_line", line.value, f"{hits} match(es)"))
+            scores[line] = scores.get(line, 0.0) + hits * weight
+    best: BusinessLine = BusinessLine.UNSPECIFIED
+    best_score = 0.0
+    for line, _weight, _pattern in _BUSINESS_LINE_PATTERNS:
+        score = scores.get(line, 0.0)
+        if score > best_score:
+            best, best_score = line, score
+    confidence = _BUSINESS_LINE_CONFIDENCE if best is not BusinessLine.UNSPECIFIED else 0.0
     return best, confidence, signals
 
 
@@ -899,8 +1041,18 @@ def classify(question: str) -> IntentDetection:
     a guess: an uncertain routing decision is cheaper to resolve with one
     question than to discover from a wrong answer.
     """
-    scene, scene_confidence, scene_signals = _detect_scene(question)
-    kinds, kind_confidence, kind_signals = _detect_kinds(question)
+    # 3.8: classify against a homophone-corrected copy of the utterance. A
+    # pinyin slip ("定单" for "订单") otherwise misses the vocabulary entirely
+    # and the question is routed by whatever else it happens to contain - or by
+    # nothing. The customer's own text is not rewritten anywhere: this copy
+    # exists only for matching, and the substitutions are recorded so the
+    # routing decision stays explainable.
+    corrections = corrections_in(question)
+    matching_text = normalize_for_matching(question)
+
+    scene, scene_confidence, scene_signals = _detect_scene(matching_text)
+    kinds, kind_confidence, kind_signals = _detect_kinds(matching_text)
+    line, _line_confidence, line_signals = _detect_business_line(matching_text)
     primary = kinds[0]
     secondary = tuple(kinds[1:])
 
@@ -922,7 +1074,9 @@ def classify(question: str) -> IntentDetection:
         action=action,
         confidence=confidence,
         multi_intent=len(kinds) > 1,
-        signals=tuple(scene_signals + kind_signals),
+        signals=tuple(scene_signals + kind_signals + line_signals),
+        business_line=line,
+        corrections=corrections,
     )
 
 

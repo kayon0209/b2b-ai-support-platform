@@ -34,7 +34,7 @@ from platform_core.agent_runtime.conversation import Turn
 from platform_core.agent_runtime.models import RunStatus
 from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
 from platform_core.db import app_role_url, session_scope_with_url
-from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
+from platform_core.identity.tenant_context import TenantContext, tenant_session
 from platform_core.retrieval.hybrid import PrincipalScope
 from platform_core.support_bridge.conversation_ref import conversation_ref_for
 from platform_core.support_bridge.models import InboxEvent, InboxEventStatus
@@ -276,11 +276,16 @@ async def _local_turn_text(message_id: object) -> str | None:
         # platform-originated question indistinguishable from "no body
         # found": the event was acked, the run sat queued, and nothing in
         # the log said why.
+        # `error_code`, not `error`: a free-text field is dropped by the
+        # allowlist, and forwarding an exception message would also put
+        # arbitrary text - possibly a customer's own words, quoted by the
+        # exception - into the log stream. The class name is what gets
+        # grepped for anyway.
         logger.warning(
             "local_turn_read_failed",
             new_trace_context(service_name="worker"),
             turn_id=str(turn_id),
-            error=f"{type(exc).__name__}: {exc}",
+            error_code=type(exc).__name__,
         )
         return None
     return row if isinstance(row, str) and row.strip() else None
@@ -411,7 +416,6 @@ async def load_history(
         logger.warning(
             "history_fetch_failed",
             error_code=type(exc).__name__,
-            error=str(exc),
             delivery_id=event.delivery_id,
             local_turns=len(memory.turns),
         )
@@ -468,13 +472,26 @@ async def _persist_memory(
     # it one credits a system of record that never held it - which then reads
     # as a second, duplicate question on the timeline.
     turn_source = "chatwoot" if event.minimized_payload.get("chatwoot_account_id") else "platform"
-    turn_id = await conversation_store.append_turn(
-        session,
-        tenant_id=event.tenant_id,
-        conversation_ref_id=conversation_ref_id,
-        turn=customer_turn,
-        source=turn_source,
-    )
+
+    # A question from the platform's own chat surface was already persisted when
+    # the message was accepted - `POST /v1/support/messages` and
+    # `/v1/customer/.../messages` both write the turn before queueing the run,
+    # so that the customer's own copy exists even if the run never executes.
+    # Appending it here as well put every such question on the timeline twice:
+    # measured in the browser, the customer saw their own message duplicated.
+    # The turn is addressed by id, so the existing row is reused rather than
+    # rewritten, which also keeps fact extraction pointing at the real turn.
+    already_stored = await _local_turn_text(event.minimized_payload.get("message_id"))
+    if already_stored is not None:
+        turn_id = uuid.UUID(str(event.minimized_payload["message_id"]))
+    else:
+        turn_id = await conversation_store.append_turn(
+            session,
+            tenant_id=event.tenant_id,
+            conversation_ref_id=conversation_ref_id,
+            turn=customer_turn,
+            source=turn_source,
+        )
     if outcome.status.value == "completed" and outcome.answer_text:
         await conversation_store.append_turn(
             session,
@@ -643,8 +660,12 @@ async def process_event(
 
     from platform_core.agent_runtime import conversation_store
 
-    ctx = TenantContext(tenant_id=event.tenant_id, actor_id=None, actor_kind="system")
-    await apply_rls_tenant(session, ctx)
+    # The RLS binding is the caller's: `drain_once` hands this function a
+    # `tenant_session`, which connects as the non-bypass app role and re-binds
+    # the tenant at the start of every transaction (`_event_context` is the
+    # context it was opened with). Re-applying it here would not be enough on
+    # its own - the run commits (the control lease), and a transaction-scoped
+    # `set_config` does not survive a commit.
 
     trace = new_trace_context(service_name="worker")
     metrics = get_metrics()
@@ -663,6 +684,14 @@ async def process_event(
                 event.tenant_id, str(contact_id_early)
             ),
         )
+    # Feature 2.5: resolve the visitor's ownership proof before the run. "" =
+    # anonymous visitor (the gate fires); None = operator run (no gate); a
+    # non-empty string = the verified account the run may read. Preserve "":
+    # collapsing it to None would let an anonymous visitor read order data, and
+    # collapsing a missing key to "" would gate operators out of their own reads.
+    _va = event.minimized_payload.get("verified_account")
+    verified_account = _va if isinstance(_va, str) else None
+
     outcome = await orchestrator.run(
         tenant_id=event.tenant_id,
         conversation_ref_id=conversation_ref_id,
@@ -678,6 +707,9 @@ async def process_event(
         # minimiser already dropped everything else; this just carries the
         # metadata through so a handoff can say evidence was supplied.
         attachment_types=_attachment_types(event),
+        # Feature 2.5: "" = anonymous visitor (gate fires); None = operator run
+        # (no gate); a non-empty string = the verified account the run may read.
+        verified_account=verified_account,
     )
     await _persist_memory(session, event=event, question=question, outcome=outcome)
 
@@ -703,9 +735,33 @@ async def drain_once(
 ) -> int:
     """Claim and process one batch. Returns the number of rows finalised.
 
+    **Two roles, on purpose.** The session passed in is the *queue's bookkeeping*
+    session - the owner role, because claiming must see every tenant's rows
+    before any tenant is known (`worker.wiring.queue_bookkeeping_session`). Every
+    event is then processed on its own `tenant_session`, which connects as
+    `platform_app` and binds that event's tenant.
+
+    Why this matters, measured rather than argued: with the whole batch on the
+    owner session, RLS is bypassed for the run, so `flag_service` - which reads
+    its row by key and relies on RLS to scope it - returned **another tenant's**
+    `agent.business_read_enabled=False`. The run then skipped the read-tool
+    branch, abstained, and published no receipt: the customer saw "I couldn't
+    verify an answer" and the cause was a different tenant's configuration. The
+    same bypass also meant every tenant-data read in the run was scoped by
+    application code alone, with no third defence layer.
+
+    The claim is committed before processing starts. It has to be: the claim
+    holds `FOR UPDATE` locks on the rows it takes, and a per-event session on a
+    different connection would contend for them. Committing first also makes the
+    claim durable, which is what lets `reclaim_stale_processing` recover a row
+    from a worker that dies mid-run - while the claim lived inside the batch
+    transaction, a crash rolled it back and the row was simply back in the queue
+    with the lock gone.
+
     A failure on one event is isolated: it is marked FAILED with the error
     recorded and the batch continues, so one poison payload cannot stall
-    the queue.
+    the queue. Each mark commits on its own, so a later crash cannot lose the
+    accounting for events that already finished.
     """
     reclaimed = await reclaim_stale_processing(session, timeout_seconds=reclaim_timeout_seconds)
     if reclaimed:
@@ -713,16 +769,20 @@ async def drain_once(
         # mid-run and real questions went unanswered until now.
         logger.warning("stale_claims_reclaimed", count=reclaimed)
         get_metrics().stale_claims_reclaimed_total.inc(reclaimed)
+    await session.commit()
 
     from platform_core.config import get_settings
 
     events = await claim_events(
         session, batch=batch, priority=get_settings().priority_claim_enabled
     )
+    await session.commit()
+
     processed = 0
     for event in events:
         try:
-            await process_event(session, event, deps=deps)
+            async with tenant_session(_event_context(event)) as event_session:
+                await process_event(event_session, event, deps=deps)
         except Exception as exc:  # noqa: BLE001 - per-event isolation
             await mark_failed(session, event.event_id, f"{type(exc).__name__}: {exc}")
             logger.error(
@@ -733,5 +793,16 @@ async def drain_once(
             get_metrics().inbox_events_total.labels(result="failed").inc()
         else:
             await mark_completed(session, event.event_id)
+        await session.commit()
         processed += 1
     return processed
+
+
+def _event_context(event: ClaimedEvent) -> TenantContext:
+    """The context an event runs under. No actor: this is the platform acting.
+
+    `actor_kind="system"` is honest labelling for the audit trail - the run was
+    started by a message, not by a person - and `actor_id=None` is what the
+    orchestrator already received as its principal.
+    """
+    return TenantContext(tenant_id=event.tenant_id, actor_id=None, actor_kind="system")

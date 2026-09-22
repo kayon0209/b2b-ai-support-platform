@@ -416,3 +416,51 @@ def test_chinese_questions_that_carry_a_full_action_frame_are_still_questions() 
         "帮我取消订单是什么流程",
     ):
         assert classify(utterance).route is Route.KNOWLEDGE_QA, utterance
+
+
+# --- Chinese scenes (docs/research/chinese-intent-measurement.md) ---------
+
+
+@pytest.mark.parametrize(
+    ("question", "scene"),
+    [
+        ("我要投诉质量问题", Scene.COMPLAINT),
+        ("你们这个态度太差了，我要找经理", Scene.COMPLAINT),
+        ("全测板开短路不良怎么赔付？", Scene.TECHNICAL_SUPPORT),
+        ("板子报错，一直死机", Scene.TECHNICAL_SUPPORT),
+        ("元器件的增值税普通发票什么时候开？", Scene.BILLING),
+        ("这个月怎么多扣了一次费用？", Scene.BILLING),
+        ("订单什么时候发货？", Scene.ORDER_FULFILMENT),
+        ("我的密码忘了，怎么登录？", Scene.ACCOUNT_SECURITY),
+        ("你们支持 32 层板吗？", Scene.PRE_SALES),
+    ],
+)
+def test_a_chinese_message_gets_a_scene(question: str, scene: Scene) -> None:
+    """Every scene pattern used to be English-only.
+
+    `docs/research/chinese-intent-measurement.md` measured it: **no Chinese
+    message got a scene at all**, so all of them fell to UNSPECIFIED. The scene
+    does not decide the route, but it decides which tools are candidates
+    (`selector.py`'s scene affinity) and how wide retrieval reaches
+    (`_top_k_for_scene`) - and the pilot's customers write Chinese, so the gap
+    degraded tool ranking and evidence breadth for every conversation the pilot
+    would actually have.
+
+    The English alternatives are unchanged, so this asserts an addition rather
+    than a replacement; the eval suite is the guard on the English side.
+    """
+    assert classify(question).scene is scene
+
+
+def test_a_chinese_policy_question_is_not_read_as_a_complaint() -> None:
+    """The complaint vocabulary must not swallow ordinary questions.
+
+    `赔付` sits in the billing pattern because the English list has `refund`,
+    and this question is a *policy* question about compensation - an angry
+    customer and a customer asking what the compensation rule is are different
+    conversations, and only the second should be answered from the corpus.
+    """
+    detection = classify("全测板开短路不良怎么赔付？")
+
+    assert detection.scene is Scene.TECHNICAL_SUPPORT
+    assert detection.scene is not Scene.COMPLAINT

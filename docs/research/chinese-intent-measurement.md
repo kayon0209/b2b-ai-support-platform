@@ -331,8 +331,17 @@ ADR 0009 落地**之后**的复测：
   `knowledge_qa`（`complain` 在 `_SCENE_PATTERNS` 里是名词、不在 `ACTION_VERBS` 里）。
   这是**跨语言**缺口，不是中文缺口；在这里断言更强的路由等于把一次更大的改动
   夹带进一次词表修复。记录为未决。
-- 中文投诉话术的 `scene` 是 `unspecified`（`COMPLAINT` 场景词表同样全英文）。
-  影响的是场景亲和度排序，不影响路由，故本轮未动。
+- ~~中文投诉话术的 `scene` 是 `unspecified`（`COMPLAINT` 场景词表同样全英文）。
+  影响的是场景亲和度排序，不影响路由，故本轮未动。~~
+  **已修（2026-09-20）**：`_SCENE_PATTERNS` 的**每一组**都补了中文备选
+  （`\b(?:en)\b|(?:cn)`——CJK 不能用 `\b` 包，这一点本文件第 623 行的注释已经写过）。
+  九条中文用例现在都拿到场景（投诉→`complaint`、报错→`technical_support`、
+  发票→`billing`、发货→`order_fulfilment`、登录→`account_security`、报价→`pre_sales`），
+  英文侧未动、`tests/evals` 仍全绿。
+  **同时更正原判断的幅度**：这条不只影响"场景亲和度排序"——
+  `orchestrator._top_k_for_scene(detection.scene)` 也吃它，即**检索广度**。
+  而试点的客户说中文，所以这个缺口压在每一次真实会话上。
+  `human_required` 那半（`我要投诉` 的路由）**仍未动**，见上一条。
 - **`scripts/run_eval.py` 的入库停滞是一个独立的预存 bug（新发现，未修）**：
   `RuntimeError: ingesting refund-policy-v3 left ingestion_status='uploaded'
   (stats=IngestStats(claimed=8, ready=8, ...))`，稳定复现，与 ADR 0009 无关

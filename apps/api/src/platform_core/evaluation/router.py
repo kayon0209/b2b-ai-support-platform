@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.api import error_response, tenant_session
 from platform_core.evaluation.metrics import (
+    aggregate_intent_distribution,
     aggregate_quality_metrics,
     automation_candidates,
     gap_samples_by_reason,
@@ -49,6 +50,10 @@ class QualityMetricsOut(BaseModel):
     handed_off: int
     failed: int
     untimed_runs: int
+    # Queued but never executed, excluded from every count above. Exposed for
+    # the same reason as `untimed_runs`: the operator should be able to see
+    # what the totals leave out rather than reconciling them by hand.
+    never_executed_runs: int
     abstention_rate: float
     handoff_rate: float
     citation_coverage: float
@@ -122,6 +127,7 @@ async def _aggregate(
         handed_off=metrics.handed_off,
         failed=metrics.failed,
         untimed_runs=metrics.untimed_runs,
+        never_executed_runs=metrics.never_executed_runs,
         abstention_rate=metrics.abstention_rate,
         handoff_rate=metrics.handoff_rate,
         citation_coverage=metrics.citation_coverage,
@@ -193,6 +199,65 @@ async def get_route_distribution(
         "window_seconds": window_seconds,
         "route_counts": payload.route_counts,
         "total_runs": payload.total_runs,
+    }
+
+
+@router.get("/intent-distribution")
+async def get_intent_distribution(
+    request: Request,
+    window_seconds: int = Query(default=86400, ge=60, le=MAX_WINDOW_SECONDS),
+    bucket_seconds: int = Query(default=3600, ge=60, le=86400),
+) -> Any:
+    """Feature list 8.7: what customers are asking about, and how it moves.
+
+    Separate from `/routes` because route is *which machinery answered*, while
+    these axes are *what the question was*. A tenant whose handoffs are rising
+    needs to know whether the rise is in complaints or in a product line, and
+    no route count can tell them that.
+
+    The trend is bucketed rather than returned as one total because the point
+    of a trend is the direction: "PCB questions doubled after the price-list
+    change" is a decision, while "there are 40 PCB questions" is not.
+
+    Counts are per-run and include runs whose classification predates a given
+    axis - those land under `unrecorded` rather than being dropped, so a
+    partly-measured window is visibly partial. Runs that were queued and never
+    executed are excluded, and their count is returned as
+    `never_executed_runs`: they have no classification at all, so including
+    them made `unrecorded` mean "predates the field, plus everything that
+    never ran" - which is not a state any operator can act on.
+    """
+    ctx = getattr(request.state, "tenant_context", None)
+    if ctx is None:
+        ctx = tenant_context.get_tenant_context()
+
+    gate = PolicyEngine().check(_principal_from_ctx(ctx), Action.AUDIT_READ)
+    if gate.decision != Decision.ALLOW.value:
+        return _denied(gate.reason_code)
+
+    async with tenant_session(ctx) as session:
+        dist = await aggregate_intent_distribution(
+            session,
+            tenant_id=ctx.tenant_id,
+            window_seconds=window_seconds,
+            bucket_seconds=bucket_seconds,
+        )
+    return {
+        "window_seconds": dist.window_seconds,
+        "bucket_seconds": dist.bucket_seconds,
+        "total_runs": dist.total_runs,
+        "never_executed_runs": dist.never_executed_runs,
+        "by_scene": dist.by_scene,
+        "by_kind": dist.by_kind,
+        "by_business_line": dist.by_business_line,
+        "trend": [
+            {
+                "bucket_start": bucket.bucket_start,
+                "total": bucket.total,
+                "by_business_line": bucket.by_business_line,
+            }
+            for bucket in dist.trend
+        ],
     }
 
 

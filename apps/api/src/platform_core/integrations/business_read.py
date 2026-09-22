@@ -11,7 +11,7 @@ all three tools work.
 and needs a session-bound executor, which the registry wires separately.
 """
 
-import time
+from datetime import UTC, datetime
 from typing import Any
 
 from platform_core.integrations.resilience import CircuitBreaker
@@ -141,12 +141,34 @@ class BusinessReadToolExecutor:
         # fetched_at rides on every receipt (huqiu research risk 1): a cached
         # progress or stock figure is an expired promise, so the answer the
         # model builds MUST be able to say when the provider stated it.
+        #
+        # ISO 8601 rather than the epoch integer this used to be, and the
+        # reason is not readability. Turns are stored through
+        # `evaluation.pii.redact_text`, which masks phone-shaped runs, so a
+        # 10-digit epoch becomes `[PHONE]` - which makes the receipt invalid
+        # JSON. `orchestrator._survives_redaction` then refuses to publish it,
+        # so the card never reaches the customer. Measured, not inferred: with
+        # this adapter the serialised payload failed to re-parse while the demo
+        # adapter's ISO string was the only reason a card was ever published.
+        # `case_create._iso` renders receipt times the same way, same reason.
         return {
             "found": True,
             "resource": resource,
             "record": record,
-            "fetched_at": int(time.time()),
+            "fetched_at": datetime.now(UTC).isoformat(),
         }
+
+    async def verify_ownership(self, tool_name: str, record_id: str, proof: str) -> str | None:
+        """Feature list 2.2/2.5: whose record is this, if the proof matches.
+
+        The HTTP provider has no ownership endpoint in this deployment, so this
+        returns None - which the caller must treat as "cannot prove", i.e. a
+        refusal. A provider that can answer (the demo adapter does, from the
+        contact phone on file) returns the owning account, and the visitor
+        session is then bound to it. Returning a permissive default here would
+        put somebody's order on a stranger's screen.
+        """
+        return None
 
     async def verify_postcondition(
         self, tool_name: str, parameters: dict[str, Any], output: dict[str, Any] | None

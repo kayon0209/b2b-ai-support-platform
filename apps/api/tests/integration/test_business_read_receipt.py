@@ -346,3 +346,53 @@ def test_the_shipped_demo_provider_answers_a_real_question() -> None:
     assert payload["source"] == "demo"
     assert payload["fetched_at"]
     assert len(payload["nodes"]) == 4
+
+
+def test_the_real_adapter_receipt_survives_the_turn_store_redactor() -> None:
+    """The receipt this adapter produces must be publishable at all.
+
+    `orchestrator` refuses to publish a receipt that does not re-parse after
+    `evaluation.pii.redact_text`, and that check is right - a card built from a
+    mangled document shows the customer numbers nobody can vouch for. What it
+    means for the producer is that a single field shaped like a phone number
+    makes the *whole* receipt unpublishable, and a 10-digit epoch `fetched_at`
+    is exactly that shape. Measured before the fix: this adapter's payload came
+    back as `{"fetched_at": [PHONE], ...}` and failed to parse, so the card
+    existed on the demo provider (ISO string) and never on this one - while
+    `test_the_shipped_demo_provider_answers_a_real_question` stayed green,
+    because the demo is the provider that test resolves.
+    """
+
+    class _StubAdapter:
+        """The ERP's response, without the transport."""
+
+        async def read_one(self, resource: str, record_id: str) -> dict:
+            return {
+                "order_id": record_id,
+                "status": "in_production",
+                "nodes": [{"label": "下单", "status": "done"}],
+                "eta": "2026-09-26T00:00:00Z",
+                "quantity": 500,
+            }
+
+    from platform_core.agent_runtime.orchestrator import AgentOrchestrator
+    from platform_core.agent_runtime.tool_card import build_card
+    from platform_core.integrations.business_read import BusinessReadToolExecutor
+
+    executor = BusinessReadToolExecutor(context=object())  # type: ignore[arg-type]
+    executor._adapter = _StubAdapter()  # type: ignore[assignment]
+
+    output = _run(executor.execute("order.get_status", {"order_id": "SO-9001"}, "idem-1"))
+    assert isinstance(output, dict)
+    assert output["fetched_at"], "a receipt with no fetch time cannot show freshness"
+
+    # Serialised the way `_attempt_business_read` publishes it.
+    published = json.dumps(
+        {**output, "tool": "order.get_status"}, sort_keys=True, ensure_ascii=False, default=str
+    )
+    assert AgentOrchestrator._survives_redaction(published) is True, published
+
+    # And the card the customer ends up with is built from what was stored.
+    card = build_card(published)
+    assert card is not None
+    assert card["fetched_at"] is not None, "the freshness label is the point of the field"

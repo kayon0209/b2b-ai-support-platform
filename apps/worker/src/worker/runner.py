@@ -37,7 +37,6 @@ from typing import Any
 
 from observability import JsonLogger
 from platform_core.agent_runtime.orchestrator import OrchestratorDeps
-from platform_core.db import session_scope
 from worker.inbox_consumer import drain_once
 from worker.ingestion_consumer import drain_ingestion_once
 from worker.outbox_relay import OutboxRelay, OutboxWorker, build_default_relay
@@ -49,6 +48,7 @@ from worker.wiring import (
     audit_wiring,
     build_ingestion_deps,
     build_interactive_deps,
+    queue_bookkeeping_session,
 )
 
 logger = JsonLogger("platform.worker")
@@ -184,9 +184,17 @@ class InboxWorker:
         return self._stopping
 
     async def run_once(self) -> int:
-        """One claim-and-process cycle against a fresh unit of work."""
-        async with session_scope() as session:
-            return await drain_once(session, deps=self._deps, batch=self._config.batch)
+        """One claim-and-process cycle against a fresh unit of work.
+
+        The session opened here is the queue's **bookkeeping** session - the
+        owner role, because a claim runs before any tenant is known. It is not
+        where the run happens: `drain_once` opens a `tenant_session` per event,
+        so the agent reaches tenant data as `platform_app` with RLS enforced.
+        See `worker.wiring.queue_bookkeeping_session` for why one role cannot do
+        both jobs.
+        """
+        async with queue_bookkeeping_session() as bookkeeping:
+            return await drain_once(bookkeeping, deps=self._deps, batch=self._config.batch)
 
     async def run_forever(self) -> None:
         """Poll until stopped, with the shared drain/backoff policy."""
@@ -396,7 +404,12 @@ def main() -> None:
     try:
         queue = resolve_queue(sys.argv[1:])
     except WorkerConfigurationError as exc:
-        logger.error("worker_misconfigured", detail=str(exc))
+        # `error_code`, not the message: the allowlist drops free text, and the
+        # readable text is not lost by doing so - this exception subclasses
+        # SystemExit (see `wiring.WorkerConfigurationError`), so re-raising it
+        # prints the message to stderr immediately below this line. What the
+        # structured field has to carry is the part that gets grepped.
+        logger.error("worker_misconfigured", error_code=type(exc).__name__)
         raise
 
     if queue == ROLE_OUTBOX:

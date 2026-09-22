@@ -110,7 +110,64 @@ from the working tree, which held another session's *untracked* `0040_case_attac
   **unsigned** → `APP_ENVIRONMENT` must be *explicitly* declared (S-1). **A test file outside `testpaths` never
   runs.** **Never issue parallel edits to one file.**
 
+## Worker / RLS conventions (2026-09-21, after fixing a P0)
+
+- **Two roles, two names.** Claiming runs *before any tenant is known* and every queue table is
+  FORCE-RLS, so the claim must be on the owner role — that is now the ONE allowed exception and it
+  has a name: `worker.wiring.queue_bookkeeping_session()`. **Everything that touches tenant data
+  goes through `identity.tenant_context.tenant_session(ctx)`** (app role + re-bind at `after_begin`).
+  `InboxWorker` claims on the first and processes each event on the second; `drain_once` commits the
+  claim before processing so the `FOR UPDATE` locks are released and a crash is reclaimable.
+- **The P0 that motivated it:** the worker ran its whole unit of work on `session_scope()` (bootstrap
+  owner, `rolbypassrls`), so RLS was off for the agent run. `flag_service` looks a flag up by key and
+  relies on RLS to scope it, so a run for tenant A read **tenant B's** `agent.business_read_enabled=false`
+  → the read-tool branch was skipped → no receipt → no card. Invisible in 1773 green tests: every
+  fixture seeded one tenant.
+- **`tenant_session` lives in `identity/tenant_context`, not `platform_core.api`** (that module is
+  "shared HTTP helpers"; the worker needed a DB helper and hand-rolled a broken binding instead of
+  importing the request layer). `api.py` re-exports it with `from x import y as y` — the PEP 484
+  explicit form, which is what satisfies both ruff and mypy.
+- **Quote the guard's failure mode when adding one:** the isolation guard only fails when *two*
+  tenants define the same flag key. A one-tenant fixture cannot see it (measured).
+- **Stop the worker containers before running pytest** — a live consumer claims seeded inbox events
+  within a second and the symptom is "0 processed / the run stays `queued`".
+- **§5-D is not a bug.** `test_usage_counts_queued_runs` asserts that queuing a run consumes quota;
+  placeholders are counted on purpose. Those 32 leftover rows are historical duplicate accounting.
+- **outbox relay still claims and dispatches on one owner session** (per-row `apply_rls_tenant` is
+  therefore decorative). Documented in `OutboxWorker.run_once`; the fix changes its documented
+  batch-atomicity contract and needs its own verification.
+
+## Still open / easy to re-break
+
+- **Related-cases ranking must stay language-agnostic.** `pg_trgm`'s `similarity()` returns **0.000**
+  for every short-Chinese pair tried ("能不能加急" vs "加急打样多久" → 0, because the shared 加急 is
+  a 2-char term that lands in different 3-char windows). So `cases.find_related_cases` scores
+  **term overlap** (Latin words ≥3 chars + CJK bigrams, Dice), with a document-frequency cut for
+  tenant-ubiquitous terms (`RELATED_UBIQUITY` 0.5, only above `RELATED_DF_MIN_SAMPLE` 30 subjects)
+  instead of a hand-written stopword list. Do not "simplify" it back to `similarity()` — that ships a
+  permanently empty panel in the product's real language.
+- **A bucket match is capped** (`RELATED_CATEGORY_ONLY_MAX` 2) and sorted last, labelled
+  `match: "category"`. `category` defaults to `general`, so same-category alone is a list of arbitrary
+  recent tickets — the original defect of the related-cases panel.
+- **Chinese never selects a read tool (P1, other session's file).** 5/5 Chinese phrasings →
+  `knowledge_qa`/`answer_from_knowledge` with zero candidates; 2/2 English → `business_read` +
+  `order.get_status`. So the cards, and the whole "where is my order" path, are English-only today.
+  Root cause is the kind decision in `intent.py`; the reproduction table is in
+  `FINDINGS-2026-09-21-CARD-AND-RLS.md` §2.
+- **Receipt timestamps must be ISO 8601, not epoch.** `redact_text` masks a 10-digit run to `[PHONE]`,
+  which breaks the receipt's JSON and makes `_survives_redaction` refuse to publish it — so the card
+  silently disappears on the real adapter while the demo (ISO) keeps working. `test_business_read_receipt`
+  had a fixture returning ISO while the adapter returned an int, which is why the suite stayed green.
+- **Cards are read-side only.** Receipts already live on `role=tool` turns; `agent_runtime/tool_card.py`
+  normalises them into `timeline[].card`. Nothing new is stored, so no migration — and no card for a
+  receipt whose shape it does not recognise (`card: null`, never raw JSON on the customer surface).
+- **Diagnostic ladder for a config/flag that is "silently off":** connection role (`current_user`,
+  `rolbypassrls`) → GUC (`current_setting('app.tenant_id', true)`, before *and* after any COMMIT) →
+  business logic. `_load_flag` is `WHERE key = ?` + `.first()` with no ORDER BY **by design**, so it is
+  only correct while RLS is enforced.
+
 ## See also
 
 `REFERENCE.md` — walkthrough, browser acceptance, migration/auth/UI/heuristic detail, folded originals.
 `HANDOVER-2026-09-19.md` — the other session's line (customer chat UI), still valid.
+`FINDINGS-2026-09-21-CARD-AND-RLS.md` — the read-path/RLS findings, with raw outputs.
