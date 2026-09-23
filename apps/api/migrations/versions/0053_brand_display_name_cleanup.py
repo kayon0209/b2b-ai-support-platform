@@ -51,9 +51,13 @@ def upgrade() -> None:
     # then any angle bracket left over from something that was not a complete
     # tag, then control characters, then trim. This is the same sequence as
     # `identity.branding.sanitize_display_name`, and the two must keep agreeing.
-    op.execute(
-        sa.text(
-            f"""
+    #
+    # The interpolation below is not string-built SQL from caller input:
+    # `TABLE` and `COLUMN` are the two module-level literals above, and
+    # Postgres cannot bind an identifier as a parameter - so there is no
+    # parameterised form of this statement to use instead. `S608` is ignored
+    # for this file in `pyproject.toml`, with the same reasoning.
+    statement = f"""
             UPDATE {TABLE}
                SET {COLUMN} = NULLIF(
                        BTRIM(
@@ -70,8 +74,7 @@ def upgrade() -> None:
              WHERE {COLUMN} IS NOT NULL
                AND ({COLUMN} ~ '[<>]' OR {COLUMN} ~ '[[:cntrl:]]')
             """
-        )
-    )
+    op.execute(sa.text(statement))
 
 
 def downgrade() -> None:

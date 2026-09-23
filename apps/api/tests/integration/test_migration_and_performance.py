@@ -124,7 +124,13 @@ TENANT_TABLES = (
 # Counted from `git ls-tree`, not from a local `ls`: the number this guards is
 # "how many revisions are registered", and a stray untracked file on one
 # machine must not be able to satisfy it.
-EXPECTED_MIGRATIONS = 51
+#
+# 52 as of 2026-09-23. `0053_brand_display_name_cleanup` was added and committed
+# without this moving, so the gate was red on a clean checkout - which is the
+# same drift the paragraph above describes, happening again. Re-measured with
+# `git ls-tree --name-only HEAD apps/api/migrations/versions/ | grep -c '\.py$'`
+# (53 entries, one of which is `.gitkeep`).
+EXPECTED_MIGRATIONS = 52
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

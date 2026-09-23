@@ -321,9 +321,7 @@ def test_a_conversation_parked_in_the_queue_skips_generation() -> None:
         # 1. The run is queued while AI owns the lease.
         async with factory() as session:
             await _with_ctx(session, TENANT)
-            await lease_service.acquire_or_get(
-                session, tenant_id=tid, conversation_ref_id=conv
-            )
+            await lease_service.acquire_or_get(session, tenant_id=tid, conversation_ref_id=conv)
             await session.commit()
 
         # 2. Handoff into the queue: no specific agent owns it yet. This is the

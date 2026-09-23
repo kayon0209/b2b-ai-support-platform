@@ -30,6 +30,12 @@ ignore = ["S101"]  # assert allowed in tests
 "apps/api/src/platform_core/retrieval/hybrid.py" = ["S608"]
 # negative suite builds DELETE/SELECT from a code-owned table list
 "apps/api/tests/integration/test_cross_tenant_negative.py" = ["S608"]
+# 0053 interpolates TABLE/COLUMN into an UPDATE. Both are module-level string
+# literals (`"tenants"`, `"brand_display_name"`), not caller input, and the
+# interpolation is unavoidable: Postgres cannot bind an identifier as a
+# parameter, so there is no parameterised form of this statement to prefer.
+# A migration is also not request-handling code - it runs once, from a deploy.
+"apps/api/migrations/versions/0053_brand_display_name_cleanup.py" = ["S608"]
 # channels/wechat.py needs both of these, and neither is avoidable:
 #   S324 sha1 is *mandated* by the WeChat Official Account protocol for its
 #        server-URL signature. It signs a shared token plus a public

@@ -370,7 +370,7 @@ def test_every_notice_follows_the_question_language() -> None:
 
 
 def test_the_codes_customers_actually_hit_have_their_own_wording() -> None:
-    """"Something went wrong" is the fallback, not the answer.
+    """ "Something went wrong" is the fallback, not the answer.
 
     `_ABSTENTION_ZH_FALLBACK` guarantees the *language*, so the property test
     above passes whether or not a code was translated. This one guards the
@@ -378,10 +378,10 @@ def test_the_codes_customers_actually_hit_have_their_own_wording() -> None:
     not quietly collapse into the generic sentence.
     """
     from platform_core.agent_runtime.qa_path import (
+        _ABSTENTION_ZH_FALLBACK,
         ABSTAIN_CONFLICT,
         ABSTAIN_LOW_RELEVANCE,
         ABSTAIN_NO_EVIDENCE,
-        _ABSTENTION_ZH_FALLBACK,
     )
 
     for code in (ABSTAIN_NO_EVIDENCE, ABSTAIN_LOW_RELEVANCE, ABSTAIN_CONFLICT, "NO_CLAIMS"):

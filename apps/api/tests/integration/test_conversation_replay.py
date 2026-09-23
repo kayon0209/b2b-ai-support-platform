@@ -568,9 +568,7 @@ def test_replay_over_http_returns_the_exchange() -> None:
     _add_turn(ref, role="customer", raw=asked)
     _add_run(ref, raw=asked)
 
-    resp = _client(TENANT, "support_admin").get(
-        f"/v1/conversations/{ref}/replay", headers=_auth()
-    )
+    resp = _client(TENANT, "support_admin").get(f"/v1/conversations/{ref}/replay", headers=_auth())
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["turn_count"] == 1
@@ -600,9 +598,7 @@ def test_the_ref_a_listing_returns_is_the_ref_replay_accepts() -> None:
     listed = [item["conversation_ref_id"] for item in listing.json()["items"]]
     assert str(ref) in listed, f"the conversation is not listed at all: {listed}"
 
-    resp = _client(TENANT, "support_admin").get(
-        f"/v1/conversations/{ref}/replay", headers=_auth()
-    )
+    resp = _client(TENANT, "support_admin").get(f"/v1/conversations/{ref}/replay", headers=_auth())
     assert resp.status_code == 200, resp.text
     body = resp.json()
     # The identity, not just "some conversation": a 200 carrying a different

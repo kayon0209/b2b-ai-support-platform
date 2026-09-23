@@ -16,9 +16,7 @@ from platform_core.identity.branding import sanitize_display_name
 
 
 def test_the_stored_value_that_caused_this_keeps_the_tenants_own_words() -> None:
-    assert (
-        sanitize_display_name("<img src=x onerror=alert(2)>Acme & Co") == "Acme & Co"
-    )
+    assert sanitize_display_name("<img src=x onerror=alert(2)>Acme & Co") == "Acme & Co"
 
 
 def test_a_clean_name_is_untouched() -> None:
