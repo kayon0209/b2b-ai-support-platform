@@ -555,3 +555,316 @@ file: findings at module scope, `Promise.race` around `browser.close()`, and a w
 - `inbox_events` needs `payload_hash` (NOT NULL) and `received_at` (the FIFO key).
 - `feature_flags` has a UNIQUE `(tenant_id, key)`, so the same key in two tenants is legal — and that
   is exactly the fixture a `_load_flag` guard needs (one tenant cannot observe the defect).
+
+## Folded from MEMORY.md on 2026-09-22 (v9 trim)
+
+MEMORY.md hit the injection limit again (13.4 KB, silently truncated on injection). Moved here: the
+2026-09-21 worker/RLS write-up, the full "still open" entries, and one Windows addendum.
+**Nothing was deleted** — this is the full text as of v9.
+
+### Worker vs RLS — the P0 that named `queue_bookkeeping_session` (2026-09-21)
+
+- **Two roles, two names.** Claiming runs *before any tenant is known* and every queue table is
+  FORCE-RLS, so the claim must be on the owner role — that is now the ONE allowed exception and it
+  has a name: `worker.wiring.queue_bookkeeping_session()`. **Everything that touches tenant data
+  goes through `identity.tenant_context.tenant_session(ctx)`** (app role + re-bind at `after_begin`).
+  `InboxWorker` claims on the first and processes each event on the second; `drain_once` commits the
+  claim before processing so the `FOR UPDATE` locks are released and a crash is reclaimable.
+- **The P0 that motivated it:** the worker ran its whole unit of work on `session_scope()` (bootstrap
+  owner, `rolbypassrls`), so RLS was off for the agent run. `flag_service` looks a flag up by key and
+  relies on RLS to scope it, so a run for tenant A read **tenant B's** `agent.business_read_enabled=false`
+  → the read-tool branch was skipped → no receipt → no card. Invisible in 1773 green tests: every
+  fixture seeded one tenant.
+- **`tenant_session` lives in `identity/tenant_context`, not `platform_core.api`** (that module is
+  "shared HTTP helpers"; the worker needed a DB helper and hand-rolled a broken binding instead of
+  importing the request layer). `api.py` re-exports it with `from x import y as y` — the PEP 484
+  explicit form, which is what satisfies both ruff and mypy.
+- **Quote the guard's failure mode when adding one:** the isolation guard only fails when *two*
+  tenants define the same flag key. A one-tenant fixture cannot see it (measured).
+- **Stop the worker containers before running pytest** — a live consumer claims seeded inbox events
+  within a second and the symptom is "0 processed / the run stays `queued`".
+- **§5-D is not a bug.** `test_usage_counts_queued_runs` asserts that queuing a run consumes quota;
+  placeholders are counted on purpose. Those 32 leftover rows are historical duplicate accounting.
+- **outbox relay still claims and dispatches on one owner session** (per-row `apply_rls_tenant` is
+  therefore decorative). Documented in `OutboxWorker.run_once`; the fix changes its documented
+  batch-atomicity contract and needs its own verification.
+
+### Still open / easy to re-break (full)
+
+- **Related-cases ranking must stay language-agnostic.** `pg_trgm`'s `similarity()` returns **0.000**
+  for every short-Chinese pair tried ("能不能加急" vs "加急打样多久" → 0, because the shared 加急 is
+  a 2-char term that lands in different 3-char windows). So `cases.find_related_cases` scores
+  **term overlap** (Latin words ≥3 chars + CJK bigrams, Dice), with a document-frequency cut for
+  tenant-ubiquitous terms (`RELATED_UBIQUITY` 0.5, only above `RELATED_DF_MIN_SAMPLE` 30 subjects)
+  instead of a hand-written stopword list. Do not "simplify" it back to `similarity()` — that ships a
+  permanently empty panel in the product's real language.
+- **A bucket match is capped** (`RELATED_CATEGORY_ONLY_MAX` 2) and sorted last, labelled
+  `match: "category"`. `category` defaults to `general`, so same-category alone is a list of arbitrary
+  recent tickets — the original defect of the related-cases panel.
+- **Chinese reaches the read path as of 2026-09-22 — do not re-report it as open.** Before the fix,
+  5/5 Chinese phrasings of "where is my order" went to `knowledge_qa` with zero candidates while 2/2 English
+  selected `order.get_status`. The real cost was not the missing card: `business_read` is the **only route
+  into the identity gate** (feature 2.2/2.5), so the whole verify-then-read flow was unreachable in the
+  language the pilot's customers write. Fix = `_CN_LIVE_DATA` (five state-in-progress frames) + a deliberately
+  **narrow** `_CN_HOW` guard (`_CN_PROCEDURE` cannot be reused — it lists `什么`/`哪`/`什么时候`, which *are*
+  the frames). Measured: 5/5 positives now `business_read` + `order.get_status`; 10 policy guards unchanged;
+  eval `expected_route` baseline 27/0 held; 3/3 mutations caught, each by a pair of cases differing by one
+  word. `_CASE_RECORD` remains English-only (deliberate boundary). Full write-up with the tables →
+  `docs/research/chinese-intent-measurement.md` §三.
+- **The read-path ownership gate (feature 2.2/2.5) is built and verified — do not "re-fix" it.** A stale
+  audit entry claimed `business_read.py` had no ownership binding; that was true only *before*
+  `fb92487`/the 2026-09-21 night round. `verified_account` is **three-state**: `None` = operator run (no
+  gate), `""` = anonymous visitor → gate 1 `IDENTITY_REQUIRED` before any connector call, `"acme"` =
+  verified → gate 2 refuses a receipt whose `account` differs (`IDENTITY_MISMATCH`). **The lesson is how it
+  failed before:** the gate existed, had tests, and never fired, because `""` collapsed to `None` in three
+  places (`chat_service` → `inbox_consumer` → `minimize.py`). Only the end-to-end smoke
+  (`scripts/visitor_ownership_smoke.cjs`, driving the real API) caught it — unit tests could not. Full
+  write-up: `FINDINGS-2026-09-21-VISITOR-OWNERSHIP.md`.
+- **Receipt timestamps must be ISO 8601, not epoch.** `redact_text` masks a 10-digit run to `[PHONE]`,
+  which breaks the receipt's JSON and makes `_survives_redaction` refuse to publish it — so the card
+  silently disappears on the real adapter while the demo (ISO) keeps working. `test_business_read_receipt`
+  had a fixture returning ISO while the adapter returned an int, which is why the suite stayed green.
+- **Cards are read-side only.** Receipts already live on `role=tool` turns; `agent_runtime/tool_card.py`
+  normalises them into `timeline[].card`. Nothing new is stored, so no migration — and no card for a
+  receipt whose shape it does not recognise (`card: null`, never raw JSON on the customer surface).
+- **Diagnostic ladder for a config/flag that is "silently off":** connection role (`current_user`,
+  `rolbypassrls`) → GUC (`current_setting('app.tenant_id', true)`, before *and* after any COMMIT) →
+  business logic. `_load_flag` is `WHERE key = ?` + `.first()` with no ORDER BY **by design**, so it is
+  only correct while RLS is enforced.
+
+### Windows traps — addendum
+
+- **`wmic` is blacklisted and the PowerShell tool silently drops stdout** in this sandbox (it returns
+  exit 0 with no output, which reads as "the command found nothing"). Use `tasklist` for PID/name and
+  `netstat -ano | grep ":PORT"` for bind address, both from bash. Note `netstat` matches substrings:
+  grep `":5435"`, never `5435|5432` (it matches 54323).
+- **Playwright's `browser.close()` can hang on this box, after the work is done.** Verified 2026-09-22:
+  `admin_render_check.cjs` printed all six pages `errors=0` and then sat for 8m54s without its final
+  verdict, because the unbounded `await browser.close()` never resolved. The same run finished in ~31s
+  when the process did exit. **Bound every teardown** (`Promise.race([browser.close(), timeout(10_000)])`)
+  — a check that hangs reports nothing, which is worse than one that fails. `support_card_smoke.cjs`
+  already did this; `admin_render_check.cjs` did not until that day.
+- **Do not edit a page while a browser guard is driving it.** Verified the same day: editing
+  `SupportChat.tsx` / `Layout.tsx` / `i18n.tsx` while `support_card_smoke.cjs` ran made Vite hot-reload
+  the page under the test, and the run hung for 8m16s with no output. Stopping, making no further edits,
+  and re-running took 31s and passed. Change the file, then run the guard.
+
+### Serving the stack — the profile trap (verified 2026-09-22)
+
+- **Chatwoot is behind the `chatwoot` compose profile.** `docker compose up -d` without
+  `--profile chatwoot` starts the AI platform and leaves Chatwoot **stopped**, with no warning — the
+  AI side is healthy and `/healthz` is 200, so it reads as "everything is up" until you notice there is
+  no agent workspace at :3000 and no inbound leg at all. The stopped containers show as `Exited (0)` /
+  "Gracefully stopping", i.e. an intentional `stop`, not a crash.
+
+### Why the verification rules exist (full prose, v9)
+
+- `ruff check` alone ≠ CI green — CI also runs `ruff format --check`.
+- pytest's summary goes to **stderr**; trust `--junitxml` for counts.
+- **The full suite must be the LAST pytest invocation.** The gate plugin writes evidence
+  unconditionally, so any targeted run afterwards overwrites it → `release_check` exit 2. It
+  `unlink()`s the old evidence file at `pytest_configure`, which trips the sandbox's batch-delete
+  guard. **Do not "fix" that plugin; it is correct.**
+- **A red full-suite run is not evidence.** Six identical runs produced 3/0/2/0/10/2 failures in
+  *different* files, each green when run alone. Re-run the failing test by itself before believing it.
+- **Green tests ≠ working UI.** 1741 tests were green while 6 wiring/failure-path bugs lived in the
+  product. UI → `scripts/ui_smoke.cjs` (and `scripts/admin_render_check.cjs`, which opens every admin
+  page in real Chromium and fails on any console/page error); concurrency →
+  `scripts/concurrency_probe.py` against a **real service** — `TestClient` shares one portal and can
+  pass on unfixed code. Both are mutation-tested; keep them that way.
+- **Stop every consumer before testing, host processes included.** Orphan `worker.runner` processes
+  silently claimed the outbox *and* the ingestion queues for a whole day of flaky tests. **Stopping
+  your shell does not stop your python child — kill the tree.** Probe, don't guess: insert a `queued`
+  outbox row and re-read it; climbing `attempts` means a consumer is live. `docker ps -a` showing all
+  `Exited` proves nothing — wait at least one full run (~40 s) before concluding "no consumer".
+- Gates: `zero_tolerance` marks → `release_gate_evidence.json`, whose only reader is
+  `evaluation/evidence.py`. Partial runs (<500 tests) are refused. `release_check` exits 0/1/2.
+  `run_eval.py` is the only `eval_report.json` producer. A concurrent run wipes the evidence.
+
+### Windows traps — process inspection, verbatim
+
+**The PowerShell tool is silently sandboxed and `wmic` is blacklisted.** The PowerShell tool returns
+exit 0 with **no stdout at all** (it looks like the command found nothing). Use `tasklist` for
+PID/name and `netstat -ano | grep ":PORT"` for the bound address, both from bash. `netstat` matches
+substrings, so grep `":5435"`, never `5435|5432` (that matches 54323). For a full command line, use
+`psutil` from `~/.workbuddy-ai/binaries/python/envs/default`.
+
+## Inbound channel adapters (added 2026-09-22, ADR 0013)
+
+**Where things live.** `apps/api/src/platform_core/channels/` — `base.py` (the adapter Protocol +
+`ChannelRequest`/`InboundMessage`), `email.py`, `wechat.py`, `router.py`. Route:
+`/v1/webhooks/channels/{connector_id}` (GET for WeChat's URL handshake, POST for deliveries). It is
+**already** exempt from the identity middleware because `EXEMPT_PREFIXES` contains `/v1/webhooks/`.
+
+**A channel IS a `connectors` row** (`provider = "email" | "wechat"`). That is the whole reason no
+migration was needed: `resolve_connector_for_webhook` (migration 0026) is already a SECURITY DEFINER
+resolver, and `connectors.webhook_secret_ref` is already a secret store. The first design tried
+`external_resource_refs` and was **measured wrong**: that table is FORCE RLS
+(`tenant_id = current_setting('app.tenant_id')`), so an unbound app-role read returns zero rows and
+every delivery resolves to no tenant. It has no secret column either.
+→ `integrations/inbound.py` holds the shared `resolve_connector` / `secret_bytes` / generic header
+names, used by both the connector webhook and the channel route. The Chatwoot header constants in
+`support_bridge/webhook_security.py` are `X-Chatwoot-*` — **do not read those from a channel
+adapter**, or every email looks unsigned.
+
+**An adapter produces exactly what the consumer reads** (`inbox_consumer.py`): `event_type =
+"message_created"`, `message_type = "incoming"`, `conversation_id` (a stable channel key feeding
+`conversation_ref_for`), and `message_id` = **the platform turn id**. The body goes to
+`conversation_turns` via `append_customer_turn` (redacted, retention-governed) and the consumer finds
+it through `_local_turn_text` — the same path a question typed into `/support` uses. So a channel
+message is indistinguishable from a platform one downstream, and **no consumer code changed**.
+
+**`"verified_account": ""` is load-bearing, not a default.** The gate is three-state: `None` =
+operator run (no gate), `""` = anonymous (refuse before any connector call). Omitting the key means
+`None`, which would make every email/WeChat sender an un-gated run able to read any order the tenant
+can. Mutation-tested by `test_a_channel_sender_is_stored_as_anonymous`.
+
+**HTTP header names are case-insensitive and frameworks disagree.** httpx lowercases them; Starlette
+preserves. `dict(request.headers).get("X-Webhook-Signature")` therefore passes in a hand-built probe
+and 401s against every real client — this shipped past a first implementation and was caught only by
+the integration test. Use `channels.base.header()`; mutation-testing it fails five tests.
+
+**WeChat differs from email in three ways, each of which changes code:** sha1 over the *sorted*
+`token`/`timestamp`/`nonce` (not HMAC over the body — `verify_webhook` cannot be reused), XML not
+JSON, and a **~5s synchronous reply window**. Because a run answers in 8–68s, the route returns the
+passive "已收到" XML and the real answer must go out via the outbound leg (ADR 0014, not built).
+`support_card_smoke.cjs`-style browser guards do not cover this; `test_channel_webhooks.py` does.
+
+**WeChat's `MsgId` is the delivery id.** It is stable across the protocol's three retries; a random
+delivery id would turn one question into three.
+
+### Outbound delivery (added 2026-09-22, ADR 0014)
+
+**The bug this fixed was a silent success.** `orchestrator._dispatch` returns `""` to mean
+*delivered*, and its `if not chatwoot_account_id: return ""` branch read "no Chatwoot account" as
+"the platform surface is the channel" — true for `/support`, false for email and WeChat. So every
+channel answer returned success and was never sent: run COMPLETED, answer stored, Workbench showed
+it, customer heard nothing. No error, no log, no metric.
+
+**`channels/outbound.py`** — `ChannelSender` registry keyed by `connectors.provider`, plus
+`EmailSmtpTransport` (smtplib, `asyncio.to_thread`) and `WeChatTransport` (customer-service message
+API, not the passive reply). `build_channel_sender(settings)` registers only channels with
+credentials, so `configured()` tells the truth.
+
+**The channel branch must precede `if self._deps.sender is None`.** `sender` is the *Chatwoot*
+client; a channel-only deployment has no Chatwoot token, so that guard running first would swallow
+every channel answer. Mutation-tested: gating the branch behind `sender` fails 7 tests.
+
+**Failure taxonomy** — `OUTBOUND_NOT_CONFIGURED` is *withheld, not failed*, and that is deliberate:
+the agent turn is only written for a COMPLETED run, so failing would discard the answer **and** the
+platform's only record of it. It joins `SHADOW_MODE` in `withheld_delivery`. The others
+(`OUTBOUND_TARGET_MISSING`, `OUTBOUND_FAILED`, `OUTBOUND_AMBIGUOUS`) do fail the run.
+
+**Email threading closes the loop**: outbound sets `In-Reply-To`/`References` to the **thread root**,
+the same value `channels.email` derives `conversation_key` from on the way in. Using the *parent*
+splits the thread on every exchange — the same trap, both directions.
+
+**`require_sender` was changed** to refuse only when *no* transport exists at all. It previously
+demanded a Chatwoot token, which would have made ADR 0012's removal impossible — a channel-only
+deployment has no token and is not misconfigured.
+
+**Not verified: any live send.** No SMTP server and no WeChat credentials exist here, so only the
+decision logic is tested (fake transport + mutation tests). The transports are thin and unexercised
+against a real provider — say so rather than implying otherwise.
+
+## Test isolation — three defects that compound (found 2026-09-22)
+
+**`children-first` teardown order is a systemic defect here, and it is not local.** Seen in three
+files. The mechanism, measured end to end:
+
+1. A `_cleanup` deletes a parent (`cases`, `document_versions`) before its children
+   (`case_attachments`/`case_conversations`/`case_escalations`; `chunks`).
+2. The FK violation makes the whole `with admin.begin()` **roll back**, so *nothing* is cleaned —
+   including the tenants.
+3. The leftover rows then collide with the **next** run's fixture.
+
+So one file's bad teardown turns a *different* file red on the next run. That is why the failures
+moved between runs and looked random. `test_cross_tenant_leak_surfaces.py` was the source: it never
+deleted the three tables that reference `cases` (enumerate them with `pg_constraint`, not memory).
+
+**Hardcoded tenant UUIDs shared across files.** `ON CONFLICT (slug)` does **not** suppress a
+primary-key conflict, so two files seeding the same id with different slugs means whichever runs
+second dies on `tenants_pkey`. `test_membership_resolution.py` had already fixed this once by
+hand-picking `…d5` and **missed `ACTIVE_TENANT`**. Hand-picking a free id fixes today's collision and
+invites tomorrow's — the whole `d` range is taken. Derive them: `str(uuid.uuid5(NS, name))`.
+**User ids are different**: files share `…e1`/`…e2` *with the same email*, so
+`ON CONFLICT (primary_email)` collapses them to one row on purpose. Deriving the id while keeping the
+shared email would make the insert a no-op and turn a PK error into an FK one.
+
+**`test_ingestion_worker.py` is the flaky file.** Across seven full runs it produced five *different*
+failing tests (`drain_versions_settles`, `search_vector`, `a_missing_object`, `drain_versions_narrows`,
+`another_tenant_cannot_retrieve`), each passing alone. Treat a failure from that file as interference
+until proven otherwise.
+
+**`pytest_randomly` is NOT installed**, so ordering is not randomized and `-p no:randomly` is a no-op.
+When failures move between runs, look for leftover state, not for ordering.
+
+**Effect of fixing the first two: errors 27 → 0, `cross_tenant_violations` 6 → 15.** The zero-tolerance
+cross-tenant suite is the security gate, so a "flaky" failure there is worth chasing, not retrying.
+
+### The migration gate (fixed 2026-09-22) — and a measurement trap
+
+`EXPECTED_MIGRATIONS` read **42** while **45** revisions were registered, so every clean checkout failed
+`test_migrations_apply_and_are_reversible_on_fresh_database`. Count the *tracked revisions*, not the
+files: `git ls-tree` lists 46 entries under `migrations/versions`, but the 46th is `.gitkeep`, and
+`ScriptDirectory.walk_revisions()` returns 45.
+
+`TENANT_TABLES` was also a **31-entry subset of 46 FORCE-RLS tables** — 15 tenant tables had no RLS
+assertion at all. Both assertions were verified satisfiable before adding them (each of the 15 has
+`relrowsecurity`, `relforcerowsecurity` and one policy). Now 46 = 46, 0 stale.
+
+**The trap: do not diff against a list you copied.** The first attempt compared the live schema to a
+grep-derived array and reported `tool_proposals` as missing when the file already had it — an
+invented gap. Parse the tuple out of the source (`ast`) and diff against the catalog.
+
+**`test_cross_tenant_negative.TENANT_TABLES` was left alone on purpose.** It drives a *live* isolation
+sweep that inserts a row per table, so adding a table needs a valid seed row too; adding strings alone
+makes it fail. Static RLS coverage is now complete; the dynamic sweep still covers 15 tables.
+
+**Final state after all of it: `2102 passed`, exit 0 — the whole suite green** (ruff, format and mypy
+clean; release gate usable). The remaining known flake is `test_ingestion_worker.py`.
+
+## Folded from MEMORY.md on 2026-09-22 (v11 trim)
+
+MEMORY.md was 8530 B and still truncated on injection. The v11 trim removed no rule — it compressed
+wording and added four facts that were only in the daily log. The full "still open" text was already
+folded at v9 (above), so nothing else moved here.
+
+### `/support` can now render its own card (fixed + verified 2026-09-22)
+
+The headline feature was unreachable: the run routed `business_read`, the identity gate answered
+`IDENTITY_REQUIRED` before any connector call (correct — the visitor was anonymous), and the page
+**never called** `POST /v1/support/verify`, so a visitor could never become verified. The endpoint
+existed and worked; it had no caller — the "capability with no consumer" defect again.
+
+Fixed in `SupportChat.tsx` (three-state `verified_account`, an order-id + phone-tail form shown only
+while anonymous, the returned account-bound token replacing the local session), `styles-support.css`,
+and `Layout.tsx`/`i18n.tsx` (a「客户对话窗 ↗」nav entry — `/support` had been reachable only by typing
+the URL). The 403 is one message on purpose: the backend deliberately does not distinguish "no such
+order" / "wrong tail" / "provider down", or it becomes an order-id probe. Guard: `support_card_smoke.cjs`
+6/6 (`the card, the data behind it and the answer agree`), `admin_render_check.cjs` 6/6 `errors=0`.
+
+### Chatwoot removal — where it stands (ADR 0012 Accepted, Stage 2 NOT run)
+
+- Stage 0 (the surviving channel works) ✅ and Stage 1 (the demo path stops depending on Chatwoot) ✅ —
+  the latter verified with all four Chatwoot containers **stopped**: the loop still passes 6/6 and
+  `worker_cannot_send` appears **zero** times in the worker log.
+- **Stage 2 (the actual deletion) has not started.** Its prerequisite is measured, not assumed:
+  `duplicate_replies` was *entirely* on the Chatwoot path (3 tests, in `test_e2e_acceptance.py` and
+  `test_orchestrator_lease_race.py`), so deleting the adapter as-is would take the category to zero and
+  **remove it from the release gate**. The guarantee is re-pointed at the channel path first
+  (`test_channel_webhooks.py::test_a_retry_does_not_become_a_second_question` now carries the mark).
+- **`support_bridge` is not "the Chatwoot module".** `conversation_ref.py` is load-bearing for `/support`,
+  and `webhook_security.py` is reused by the *connector* webhooks (CRM/ERP callbacks — a different
+  feature). Rule: delete a file only after `grep -rn` shows every importer is also going.
+- `AGENTS.md` rules 1/2 change **in the same commit that makes them true** — never earlier.
+
+### Measured status snapshot (2026-09-22 evening)
+
+`tests/artifacts/junit-final.xml` @ 18:57: **2102 collected, 2 failed, 0 errors, 0 skipped**; both
+failures in `test_ingestion_worker.py` (`test_a_claimed_version_is_not_claimed_twice` `assert 0 >= 1`,
+`test_drain_versions_narrows_the_claim_it_issues`), the known interfering file. Release gate: all three
+invariants `measured`, `violation_count` 0 (`cross_tenant_violations` 15 backing tests,
+`duplicate_replies` 4, `unauthorized_writes` 4). Feature checklist: **79 ✅ / 3 🟡 / 3 ❌** of 85, with
+P0 36/36 closed; the three ❌ (2.1 identity mapping, 1.1 extra channels, 4C.6 drawing/table parsing) are
+all blocked on external data or credentials, not on code.

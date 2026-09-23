@@ -47,13 +47,25 @@ const CHROME_FALLBACK =
  * configured `business_api` provider actually has. Both defaults come from the
  * shipped demo provider, so this runs on a fresh seed with no arguments.
  *
- * It is in English for a reason worth stating: every Chinese phrasing of the
- * same question routes to `knowledge_qa`, so the tool is never selected and no
- * card can be produced. That is a finding about `intent.py`, not about this
- * page - `docs/research/chinese-intent-measurement.md` is where it belongs.
+ * It is in English because it was written while every Chinese phrasing of the
+ * same question still routed to `knowledge_qa`, so the tool was never selected
+ * and no card could be produced. That gap in `intent.py` was fixed on
+ * 2026-09-22, so a Chinese phrasing reaches the tool too now - the measurement
+ * and the tables live in `docs/research/chinese-intent-measurement.md` §三.
+ *
+ * What stops a card here is no longer the question. A visitor session is
+ * anonymous, so the read path's ownership gate answers `IDENTITY_REQUIRED`
+ * before any connector call, and the card is unreachable until something binds
+ * an account to the session (`POST /v1/support/verify`). Check whether the page
+ * actually calls it before blaming this script or the render branch.
  */
 const QUESTION = process.env.APP_QUESTION || "What is the status of order SO-9001?";
 const EXPECTED_ORDER = process.env.APP_ORDER_ID || "SO-9001";
+/** The proof the demo provider accepts for `EXPECTED_ORDER`. It comes from
+ * `integrations/demo_erp.py`'s `_CONTACT_TAILS` map, not from invention: the
+ * provider compares this string and answers `None` (a refusal) on any
+ * mismatch, so a wrong value here looks exactly like a broken page. */
+const PHONE_TAIL = process.env.APP_PHONE_TAIL || "8888";
 
 const VISITOR_TOKEN = process.env.APP_VISITOR_TOKEN || "";
 const CONVERSATION_REF = process.env.APP_CONVERSATION_REF || "";
@@ -134,6 +146,10 @@ async function main() {
             conversation_ref: CONVERSATION_REF,
             expires_at: Math.floor(Date.now() / 1000) + 3600,
             visitor_id: VISITOR_ID,
+            // Adopt mode supplies a token the caller asserts is already bound,
+            // so the page must not offer the identity step here: it would sit
+            // there unsubmitted and change what this mode actually tests.
+            verified_account: process.env.APP_VERIFIED_ACCOUNT || "adopted",
           },
         },
       );
@@ -158,6 +174,33 @@ async function main() {
       { timeout: 20000 },
     );
     notes.push("ok   session accepted, composer enabled");
+
+    if (!ADOPT) {
+      // The identity step is part of the flow now, not an optional extra: an
+      // anonymous session cannot read an order at all (the read path answers
+      // `IDENTITY_REQUIRED` before calling any connector), so skipping this
+      // makes the card unreachable and the guard fail for the wrong reason.
+      if (!(await page.locator(".support-verify").count())) {
+        failures.push(
+          "the page offers no identity step, so an order card can never be reached",
+        );
+      } else {
+        await page.locator(".support-verify-row input").first().fill(EXPECTED_ORDER);
+        await page.locator(".support-verify-row input").nth(1).fill(PHONE_TAIL);
+        await page.locator(".support-verify-row button").click();
+        try {
+          await page
+            .locator(".support-verified")
+            .waitFor({ state: "visible", timeout: 20000 });
+          notes.push("ok   identity verified, session bound to an account");
+        } catch {
+          const shown = (await page.locator(".support-problem").textContent()) || "";
+          failures.push(
+            `identity verification did not succeed${shown ? `: ${shown.trim()}` : ""}`,
+          );
+        }
+      }
+    }
 
     if (!ADOPT) {
       await composer.fill(QUESTION);

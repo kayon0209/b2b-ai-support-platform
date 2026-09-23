@@ -15,8 +15,9 @@ raw-scan.json
 # Generated test reports (regenerated on every migration/perf run).
 tests/artifacts/
 
-# 验收脚本产物（截图等二进制）
-.workbuddy-ai/acceptance/shots/
+# 验收脚本产物（截图、驱动脚本、报告）：由会话驱动产生，不属于代码库。
+.workbuddy-ai/acceptance/
+.workbuddy-ai/artifacts/
 
 # 交付报告与运行产物：不属于代码库内容。
 # `outputs/` 里混有个人求职材料（面试题库、项目案例），此前未被忽略，

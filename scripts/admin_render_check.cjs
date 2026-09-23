@@ -89,7 +89,15 @@ async function main() {
     await context.close();
   }
 
-  await browser.close();
+  // Bounded on purpose. `browser.close()` has been observed to hang on this
+  // box *after* the last page is rendered and logged, leaving the process
+  // alive with no verdict printed — and a check that hangs reports nothing,
+  // which is worse than one that fails. The work is finished by here, so a
+  // timeout costs nothing and guarantees the result is emitted.
+  await Promise.race([
+    browser.close(),
+    new Promise((resolve) => setTimeout(resolve, 10_000)),
+  ]);
   console.log(failures === 0 ? "all pages rendered cleanly" : `${failures} page(s) failed`);
   process.exit(failures === 0 ? 0 : 1);
 }
