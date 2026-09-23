@@ -26,6 +26,7 @@ import os
 import statistics
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -41,6 +42,33 @@ TENANT_SLUG = os.environ.get("APP_TENANT_SLUG", "admin-demo")
 # broken API. httpx rather than urllib so the request is explicit about its
 # scheme rather than flagged by the S310 audit rule.
 CLIENT = httpx.Client(base_url=BASE, timeout=30.0, trust_env=False)
+
+
+def open_conversation() -> str:
+    """The platform ref of a probe conversation, from the session endpoint.
+
+    `/v1/customer/conversations/{ref}/messages` takes the platform's own
+    conversation id and uses it verbatim - since the double-derivation fix, a
+    path segment that is not a UUID is a 400, which is what this probe's
+    invented `probe-*` key collided with (all ten posts rejected, zero rows,
+    and the concurrency invariant untested). The one place that mints a ref
+    for a client is the session endpoint, so this asks it the way every real
+    client does. A fresh visitor per run; the probe cleans up its own turns
+    either way.
+    """
+    resp = CLIENT.post(
+        "/v1/support/sessions",
+        json={
+            "tenant_slug": TENANT_SLUG,
+            "visitor_id": "concurrency-probe-" + uuid.uuid4().hex,
+        },
+        headers={"Authorization": "Bearer " + TOKEN},
+    )
+    if resp.status_code != 200:
+        raise SystemExit(
+            f"could not open a probe conversation: {resp.status_code} {resp.text[:200]}"
+        )
+    return str(resp.json()["conversation_ref"])
 
 
 def _db():
@@ -99,11 +127,14 @@ def race(label: str, fragment: str, same_key: bool, parallel: int = 10) -> bool:
     cleanup(fragment)
     key = "probe-" + fragment
     payload = {"text": "concurrency probe " + fragment}
+    # `key` is the idempotency key here; the path ref comes from the session
+    # endpoint (see `open_conversation`).
+    ref = open_conversation()
     with ThreadPoolExecutor(max_workers=parallel) as pool:
         statuses = list(
             pool.map(
                 lambda i: post(
-                    f"/v1/customer/conversations/{key}/messages",
+                    f"/v1/customer/conversations/{ref}/messages",
                     payload,
                     key if same_key else f"{key}-{i}",
                 ),

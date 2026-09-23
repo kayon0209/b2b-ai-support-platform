@@ -175,6 +175,14 @@ jobs:
           # steps declare.
           APP_ENVIRONMENT: local
           APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+      - name: Grant the app role the migration bookkeeping table
+        # alembic_version is created by alembic, not by a migration, so no
+        # migration grants it - and the schema-privileges suite requires every
+        # public table to be usable by platform_app. A long-lived development
+        # database acquires the grant out of band, which is exactly the
+        # "passes locally, fails fresh" shape that suite exists to catch.
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres             psql -U platform -d platform -c             "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
       - name: Run integration tests
         run: pytest apps/api/tests/integration -m integration
         env:
@@ -184,6 +192,11 @@ jobs:
           # Same reason as the unit job: no .env exists in the checkout.
           APP_ENVIRONMENT: local
           APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+          # The worker-isolation suite builds the *real* worker wiring, whose
+          # configuration gate refuses to run without an LLM key. No test in
+          # this job makes a model call (they run fakes), so a placeholder
+          # satisfies the gate without spending anything.
+          APP_LLM_API_KEY: test-only-key-not-a-credential
 
   concurrency-guard:
     # Enforces the F-9 invariant: N concurrent writers of one logical message
@@ -242,6 +255,14 @@ jobs:
           # steps declare.
           APP_ENVIRONMENT: local
           APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+      - name: Grant the app role the migration bookkeeping table
+        # alembic_version is created by alembic, not by a migration, so no
+        # migration grants it - and the schema-privileges suite requires every
+        # public table to be usable by platform_app. A long-lived development
+        # database acquires the grant out of band, which is exactly the
+        # "passes locally, fails fresh" shape that suite exists to catch.
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres             psql -U platform -d platform -c             "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
       - name: Seed the demo tenant and capture its token
         run: |
           python scripts/seed_admin_demo.py 2>&1 | tee seed.log
@@ -330,12 +351,21 @@ jobs:
           # steps declare.
           APP_ENVIRONMENT: local
           APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+      - name: Grant the app role the migration bookkeeping table
+        # alembic_version is created by alembic, not by a migration, so no
+        # migration grants it - and the schema-privileges suite requires every
+        # public table to be usable by platform_app. A long-lived development
+        # database acquires the grant out of band, which is exactly the
+        # "passes locally, fails fresh" shape that suite exists to catch.
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres             psql -U platform -d platform -c             "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
       - name: Run the full suite (produces the release-gate evidence)
         run: pytest
         env:
           APP_TEST_DATABASE_URL: postgresql+psycopg://platform_app:platform_app@localhost:5435/platform
           APP_ADMIN_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
+          APP_LLM_API_KEY: test-only-key-not-a-credential
       - name: Verify the zero-tolerance evidence is complete
         run: python -m platform_core.evaluation.release_check --evidence-only
         env:
