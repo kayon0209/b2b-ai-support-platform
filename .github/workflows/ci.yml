@@ -144,7 +144,12 @@ jobs:
         with:
           python-version: "3.12"
       - name: Start services
-        run: docker compose -f infra/compose/docker-compose.yml up -d ai-postgres ai-redis
+        # --wait blocks until the healthchecks pass (pg_isready / redis-cli ping).
+        # A plain `up -d` returned before postgres listened, and the very next
+        # step's `exec psql` died on a socket that did not exist yet - the job
+        # never reached a test, and only after the image pull was fixed did
+        # this race become the visible failure.
+        run: docker compose -f infra/compose/docker-compose.yml up -d --wait ai-postgres ai-redis
       - name: Create app role
         run: |
           docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
@@ -199,7 +204,12 @@ jobs:
         with:
           python-version: "3.12"
       - name: Start database and Redis
-        run: docker compose -f infra/compose/docker-compose.yml up -d ai-postgres ai-redis
+        # --wait blocks until the healthchecks pass (pg_isready / redis-cli ping).
+        # A plain `up -d` returned before postgres listened, and the very next
+        # step's `exec psql` died on a socket that did not exist yet - the job
+        # never reached a test, and only after the image pull was fixed did
+        # this race become the visible failure.
+        run: docker compose -f infra/compose/docker-compose.yml up -d --wait ai-postgres ai-redis
       - name: Create app role
         run: |
           docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
@@ -275,7 +285,12 @@ jobs:
         with:
           python-version: "3.12"
       - name: Start services
-        run: docker compose -f infra/compose/docker-compose.yml up -d ai-postgres ai-redis
+        # --wait blocks until the healthchecks pass (pg_isready / redis-cli ping).
+        # A plain `up -d` returned before postgres listened, and the very next
+        # step's `exec psql` died on a socket that did not exist yet - the job
+        # never reached a test, and only after the image pull was fixed did
+        # this race become the visible failure.
+        run: docker compose -f infra/compose/docker-compose.yml up -d --wait ai-postgres ai-redis
       - name: Create app role
         run: |
           docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
