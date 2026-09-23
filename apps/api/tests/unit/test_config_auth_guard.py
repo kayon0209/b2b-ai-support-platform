@@ -3,7 +3,9 @@
 import pytest
 
 
-def test_bootstrap_tokens_require_a_declared_environment() -> None:
+def test_bootstrap_tokens_require_a_declared_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A deployment with no APP_ENVIRONMENT must not silently enable it.
 
     `environment` defaults to "local", so a process that never declares it is
@@ -14,8 +16,15 @@ def test_bootstrap_tokens_require_a_declared_environment() -> None:
     there is no local `.env` supplying the value. (pydantic-settings counts a
     `.env` as a *source*, so with the file present the field reads as declared
     - which is why this test cannot use the ambient configuration.)
+
+    The test creates its own premise rather than assuming it: CI exports
+    APP_ENVIRONMENT for the whole job (a fresh checkout has no .env), so the
+    variable is deleted here explicitly instead of the test relying on a
+    process that happens not to have it.
     """
     from platform_core.config import Settings
+
+    monkeypatch.delenv("APP_ENVIRONMENT", raising=False)
 
     settings = Settings(allow_bootstrap_tokens=True, _env_file=None)
 

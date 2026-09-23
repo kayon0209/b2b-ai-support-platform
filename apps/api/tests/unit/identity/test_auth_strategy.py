@@ -41,17 +41,26 @@ def _settings(**overrides: object) -> Settings:
 
 def test_oidc_is_selected_when_an_issuer_is_configured() -> None:
     """A configured realm is the authentication path."""
+    import os
+
     from platform_core.config import get_settings
     from platform_core.identity.middleware import build_resolver, oidc_token_resolver
 
+    # Save-and-restore, not an unconditional pop: this process may legitimately
+    # carry these variables (CI exports them because a fresh checkout has no
+    # .env). Popping unconditionally deleted CI's setting for every later test
+    # in the batch - 41 failures there, none in isolation, and invisible
+    # locally behind a developer's .env.
+    saved_issuer = os.environ.get("APP_OIDC_ISSUER")
     get_settings.cache_clear()
     try:
-        import os
-
         os.environ["APP_OIDC_ISSUER"] = "http://localhost:8081/realms/platform"
         assert build_resolver() is oidc_token_resolver
     finally:
-        os.environ.pop("APP_OIDC_ISSUER", None)
+        if saved_issuer is None:
+            os.environ.pop("APP_OIDC_ISSUER", None)
+        else:
+            os.environ["APP_OIDC_ISSUER"] = saved_issuer
         get_settings.cache_clear()
 
 
@@ -62,34 +71,48 @@ def test_oidc_wins_over_bootstrap_tokens_even_when_both_are_enabled() -> None:
     checked first, a developer who left the flag on in staging would silently
     downgrade to unsigned auth.
     """
+    import os
+
     from platform_core.config import get_settings
     from platform_core.identity.middleware import build_resolver, oidc_token_resolver
 
+    # Save-and-restore, not an unconditional pop - see the first test.
+    saved_issuer = os.environ.get("APP_OIDC_ISSUER")
+    saved_bootstrap = os.environ.get("APP_ALLOW_BOOTSTRAP_TOKENS")
     get_settings.cache_clear()
     try:
-        import os
-
         os.environ["APP_OIDC_ISSUER"] = "http://localhost:8081/realms/platform"
         os.environ["APP_ALLOW_BOOTSTRAP_TOKENS"] = "true"
         assert build_resolver() is oidc_token_resolver
     finally:
-        os.environ.pop("APP_OIDC_ISSUER", None)
-        os.environ.pop("APP_ALLOW_BOOTSTRAP_TOKENS", None)
+        if saved_issuer is None:
+            os.environ.pop("APP_OIDC_ISSUER", None)
+        else:
+            os.environ["APP_OIDC_ISSUER"] = saved_issuer
+        if saved_bootstrap is None:
+            os.environ.pop("APP_ALLOW_BOOTSTRAP_TOKENS", None)
+        else:
+            os.environ["APP_ALLOW_BOOTSTRAP_TOKENS"] = saved_bootstrap
         get_settings.cache_clear()
 
 
 def test_bootstrap_is_selected_only_when_explicitly_enabled() -> None:
+    import os
+
     from platform_core.config import get_settings
     from platform_core.identity.middleware import bootstrap_token_resolver, build_resolver
 
+    # Save-and-restore, not an unconditional pop - see the first test.
+    saved_bootstrap = os.environ.get("APP_ALLOW_BOOTSTRAP_TOKENS")
     get_settings.cache_clear()
     try:
-        import os
-
         os.environ["APP_ALLOW_BOOTSTRAP_TOKENS"] = "true"
         assert build_resolver() is bootstrap_token_resolver
     finally:
-        os.environ.pop("APP_ALLOW_BOOTSTRAP_TOKENS", None)
+        if saved_bootstrap is None:
+            os.environ.pop("APP_ALLOW_BOOTSTRAP_TOKENS", None)
+        else:
+            os.environ["APP_ALLOW_BOOTSTRAP_TOKENS"] = saved_bootstrap
         get_settings.cache_clear()
 
 
