@@ -6,8 +6,15 @@ Build a trustworthy B2B enterprise AI customer support platform. Optimize for te
 
 ## Non-negotiable architecture rules
 
-1. Chatwoot is the customer-service kernel. Do not fork or rewrite its core unless an ADR explicitly approves the change.
-2. Never access the Chatwoot database from custom services. Use documented REST APIs, signed webhooks, and versioned events.
+1. The platform hosts its own customer channels. `/support` is the customer
+   surface and `Workbench` is the operator's. A customer channel is a
+   `connectors` row plus an adapter in `platform_core/channels/`; adding one
+   must not mean adding a branch to the run path. Do not reintroduce a
+   third-party chat kernel without an ADR (see ADR 0012).
+2. Never read or write another system's database. Integrate through
+   documented REST APIs, signed webhooks, and versioned events. The connector
+   webhook and the channel adapters are the only inbound write paths, and both
+   verify a signature before persisting anything.
 3. The custom platform owns Tenant, EnterpriseAccount, Case, SLA, KnowledgeSpace, DocumentVersion, AgentRun, ToolExecution, Citation, Evaluation, and AuditEvent.
 4. Every persisted business row must carry `tenant_id` unless it is explicitly global reference data.
 5. PostgreSQL RLS must protect tenant-owned tables. Application filtering is additional defense, not a replacement.
@@ -21,7 +28,7 @@ Build a trustworthy B2B enterprise AI customer support platform. Optimize for te
 
 - Python 3.12+, FastAPI, Pydantic, SQLAlchemy 2, Alembic
 - PostgreSQL 16 with pgvector and RLS
-- Redis and Celery for custom asynchronous work; separate Redis from Chatwoot
+- Redis and Celery for custom asynchronous work, on their own instance
 - MinIO/S3 for immutable document originals and attachments
 - React, Vite, TypeScript for the enterprise admin UI
 - Keycloak for OIDC; SAML and SCIM after pilot
@@ -54,7 +61,9 @@ tests/
 ## Module boundaries
 
 - `identity`: tenants, memberships, roles, policies, external identities
-- `support_bridge`: Chatwoot webhooks, API client, resource mappings
+- `support_bridge`: channel-agnostic inbound primitives - `InboxEvent`,
+  conversation refs, visitor tokens, webhook signature verification, payload
+  minimization, continuity, per-channel formatting, satisfaction
 - `cases`: ticket lifecycle, assignment, escalation, SLA clocks
 - `knowledge`: source, document, version, parsing, chunking, indexing, ACL
 - `retrieval`: tenant filters, hybrid retrieval, reranking, citations
@@ -94,7 +103,7 @@ Modules may call one another through declared application interfaces. Do not imp
 
 - Unit tests for deterministic domain logic
 - Integration tests with PostgreSQL RLS enabled
-- Contract tests for Chatwoot and connector payloads
+- Contract tests for connector and channel payloads
 - Cross-tenant negative tests
 - Idempotency and duplicate-webhook tests
 - Human/AI race-condition tests
@@ -117,11 +126,11 @@ A feature is not complete until it has:
 
 ## Prohibited shortcuts
 
-- Direct database joins across Chatwoot and custom databases
+- Direct database joins across the platform's database and any external system
 - Passing client-supplied `tenant_id` through without server-side resolution
 - Treating vector similarity as calibrated confidence
 - Marking an issue resolved because the model produced an answer
 - Automatically learning from unreviewed conversations
 - Executing refunds, deletions, permission changes, or irreversible actions without confirmation
-- Sharing one Redis instance between Chatwoot and the custom platform
+- Sharing one Redis instance between the platform and an external system
 - Introducing Kafka, Milvus, OpenSearch, Temporal, or Kubernetes only for architectural appearance
