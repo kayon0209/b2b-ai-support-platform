@@ -15,25 +15,32 @@ This walks the seam - open a customer session, let a person reply through the
 operator endpoint, then read the *customer's* timeline back.
 
 Run from the project root (API must be up):
+    APP_TOKEN=pt_<tenant-slug>_<user-id> \
     .venv/Scripts/python.exe scripts/_audit_probe_agent_reply_integration.py
+
+The token is read from the environment and never written to this file: a probe
+that ships its own credential becomes a credential in the repository, and this
+one is committed. Every other probe here already follows that rule.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 import uuid
 
-BASE = "http://127.0.0.1:8000"
-# The seeded `admin-demo` owner. A real deployment resolves this from OIDC; the
-# probe borrows the bootstrap token for the same reason every other probe here
-# does.
-TOKEN = "pt_admin-demo_8c89893c-09ce-4252-b839-971ac15e9a07"  # noqa: S105 - the seeded demo token, not a secret
+BASE = os.environ.get("APP_BASE_URL", "http://127.0.0.1:8000")
+TOKEN = os.environ.get("APP_TOKEN", "")
 TIMEOUT = 30
 
 FAILED = 0
+
+if not TOKEN:
+    print("APP_TOKEN is required (pt_<tenant-slug>_<user-id>)", file=sys.stderr)
+    sys.exit(2)
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:

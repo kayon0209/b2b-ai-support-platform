@@ -9,12 +9,18 @@ const { chromium } = require("C:/Users/Rose/.workbuddy/binaries/node/workspace/n
 
 const CHROME =
   "D:/migrated/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe";
-const BASE = "http://127.0.0.1:5173";
-const TOKEN = "pt_admin-demo_8c89893c-09ce-4252-b839-971ac15e9a07";
+const BASE = process.env.APP_BASE_URL || "http://127.0.0.1:5173";
+// From the environment, like every other probe here - a committed script that
+// carries its own token is a credential in the repository.
+const TOKEN = process.env.APP_TOKEN || "";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 (async () => {
+  if (!TOKEN) {
+    console.error("APP_TOKEN is required (pt_<tenant-slug>_<user-id>)");
+    process.exit(2);
+  }
   const browser = await chromium.launch({ executablePath: CHROME, headless: true });
 
   /* --- 1. /conversations 底部提示的精确文案 --- */
