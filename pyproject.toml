@@ -30,6 +30,20 @@ ignore = ["S101"]  # assert allowed in tests
 "apps/api/src/platform_core/retrieval/hybrid.py" = ["S608"]
 # negative suite builds DELETE/SELECT from a code-owned table list
 "apps/api/tests/integration/test_cross_tenant_negative.py" = ["S608"]
+# channels/wechat.py needs both of these, and neither is avoidable:
+#   S324 sha1 is *mandated* by the WeChat Official Account protocol for its
+#        server-URL signature. It signs a shared token plus a public
+#        timestamp/nonce, not content, and no other digest is accepted.
+#   S314 the XML body is parsed only after the signature has been verified, and
+#        DOCTYPE/ENTITY declarations are refused before parsing - which closes
+#        the known classes (billion laughs, XXE, quadratic blowup) that this
+#        rule warns about. `defusedxml` is not a declared dependency here.
+"apps/api/src/platform_core/channels/wechat.py" = ["S314", "S324"]
+# The channel test computes WeChat's sha1 signature *independently* of the
+# adapter, on purpose: calling the adapter's own helper would make the test agree
+# with the code by construction, and a wrong sort order would pass. The
+# algorithm is fixed by the protocol, so there is nothing to strengthen.
+"apps/api/tests/integration/test_channel_webhooks.py" = ["S324"]
 
 [tool.mypy]
 python_version = "3.12"

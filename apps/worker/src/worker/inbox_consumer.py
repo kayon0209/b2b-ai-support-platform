@@ -236,16 +236,37 @@ def case_conversation_ref() -> Any:
 def _conversation_ref(event: ClaimedEvent) -> uuid.UUID | None:
     """Resolve the platform conversation ref from the minimized payload.
 
-    The webhook stores the Chatwoot conversation id, not our internal ref.
-    We derive a stable UUIDv5 from (tenant, chatwoot conversation id) so the
-    same conversation always maps to the same control-lease row without a
-    schema change to the inbox table.
+    Two encodings, and the payload says which one it used:
+
+    - `conversation_ref` - the platform id, already resolved by the writer.
+      Used verbatim. This is how a run queued by an operator, who reached the
+      conversation by its platform ref and holds no channel id, names the
+      conversation.
+    - `conversation_id` - a channel's own id (a Chatwoot conversation id, a
+      visitor id). Only this side can turn it into a ref.
+
+    Deriving the first would hash an id that is already a hash, filing the run
+    under a conversation no writer ever wrote to: the answer is produced and
+    then never found, and nothing raises. Preferring the explicit key is what
+    makes the two encodings distinguishable - both are UUIDs, so there is no
+    way to tell them apart from the value itself.
 
     The derivation is shared, not reimplemented here: the API's customer and
     run endpoints answer questions about the same conversation, and a second
     copy of the rule is how they end up disagreeing about which conversation
     they are talking about.
     """
+    resolved = event.minimized_payload.get("conversation_ref")
+    if isinstance(resolved, str) and resolved.strip():
+        try:
+            return uuid.UUID(resolved)
+        except ValueError:
+            # A writer that put a non-UUID here is broken, and the alternative
+            # to returning None is crashing the consumer loop. Logged by the
+            # caller as `no_conversation_ref`, which is the same outcome as an
+            # unusable channel id.
+            return None
+
     external = event.minimized_payload.get("conversation_id")
     if not isinstance(external, str) or not external.strip():
         return None
@@ -294,44 +315,26 @@ async def _local_turn_text(message_id: object) -> str | None:
 async def resolve_question(event: ClaimedEvent, deps: OrchestratorDeps) -> str | None:
     """Obtain the customer question text for this event.
 
-    The inbox stores minimized metadata only, so the body is fetched from
-    Chatwoot on demand (docs/security.md: no raw customer content at rest).
-    A payload that already carries content (tests, future connectors) is
-    used directly.
+    The inbox row stores minimized metadata only (docs/security.md: no raw
+    customer content at rest), so the body is read from the platform's own
+    `conversation_turns` by turn id — the path both `/support` and every
+    channel adapter write through. A payload that already carries `content`
+    (tests, connectors) is used directly.
+
+    This used to fall back to fetching the body from Chatwoot's API when the
+    local copy was missing. Chatwoot is gone (ADR 0012), and with it the only
+    producer of turns that were not persisted locally, so the fallback had no
+    case left to serve.
     """
+    del deps
     content = event.minimized_payload.get("content")
     if isinstance(content, str) and content.strip():
         return content
 
     message_id = event.minimized_payload.get("message_id")
-
-    # Questions typed into the platform's own chat surface are persisted
-    # locally (see POST /v1/customer/conversations/{ref}/messages) and have
-    # no Chatwoot message to fetch. Try that copy first — it is addressed by
-    # turn id, so no Chatwoot coordinates are needed.
-    local = await _local_turn_text(message_id)
-    if local is not None:
-        return local
-
-    account_id = event.minimized_payload.get("chatwoot_account_id")
-    conversation_id = event.minimized_payload.get("conversation_id")
-    reader = deps.reader
-    # Only the message id is universally required. `account_id` and
-    # `conversation_id` are Chatwoot coordinates, and a question typed into
-    # the platform's own chat surface has no Chatwoot account behind it —
-    # requiring them here made every platform-originated run silently skip
-    # (event claimed and marked completed, run left queued, no answer).
-    # The reader decides which coordinates it actually needs.
-    if reader is None or not message_id:
+    if not message_id:
         return None
-    body = await reader.fetch_message(  # type: ignore[attr-defined]
-        account_id=str(account_id or ""),
-        conversation_id=str(conversation_id or ""),
-        message_id=str(message_id),
-    )
-    if not isinstance(body, str) or not body.strip():
-        return None
-    return body
+    return await _local_turn_text(message_id)
 
 
 def is_customer_message(event: ClaimedEvent) -> bool:
@@ -352,23 +355,17 @@ async def load_history(
 ) -> list[Turn]:
     """Prior turns of this conversation, oldest first (plan 2.2/2.3).
 
-    Merge policy, in priority order:
-
-    1. Local redacted turns are authoritative for their window - they were
-       written by this platform and already redacted.
-    2. Live Chatwoot messages fill the OLDER window (before the oldest local
-       turn) and the whole history when nothing is stored yet. Chatwoot is
-       the system of record for raw content; the local store is a bounded
-       redacted cache, not a competitor.
+    Local redacted turns are the whole history now: they are written by this
+    platform, already redacted, and — since ADR 0012 — the only store there
+    is. There is no second source to merge with.
 
     Failure anywhere degrades to whatever was loaded: multi-turn is an
-    enhancement, and a run that cannot fetch history still answers the
+    enhancement, and a run that cannot read history still answers the
     question in front of it.
     """
     from platform_core.agent_runtime import conversation_store
-    from platform_core.agent_runtime.conversation import ConversationMemory, TurnRole
+    from platform_core.agent_runtime.conversation import ConversationMemory
     from platform_core.config import get_settings
-    from platform_core.evaluation.pii import redact_text
 
     conversation_ref_id = _conversation_ref(event)
     if conversation_ref_id is None:
@@ -394,49 +391,7 @@ async def load_history(
     for turn in local:
         await _admit(turn)
 
-    reader = deps.reader
-    fetch = getattr(reader, "list_messages", None)
-    if fetch is None:
-        return memory.turns
-    account_id = str(event.minimized_payload.get("chatwoot_account_id") or "")
-    conversation_id = str(event.minimized_payload.get("conversation_id") or "")
-    if not (account_id and conversation_id):
-        return memory.turns
-    try:
-        messages = await fetch(
-            account_id=account_id,
-            conversation_id=conversation_id,
-            limit=settings.history_fetch_limit,
-        )
-    except Exception as exc:  # noqa: BLE001 - degradation is the documented contract
-        # Degrade, but never silently. Losing the Chatwoot history is meant to
-        # be survivable - the run still answers the question in front of it -
-        # yet an unlogged failure here looks identical to a conversation with
-        # no history, so a broken reader would never be noticed.
-        logger.warning(
-            "history_fetch_failed",
-            error_code=type(exc).__name__,
-            delivery_id=event.delivery_id,
-            local_turns=len(memory.turns),
-        )
-        return memory.turns
-
-    oldest_local_ts = min((t.ts for t in local if t.ts), default=0)
-    for message in reversed(messages):
-        if not isinstance(message, dict):
-            continue
-        message_type = str(message.get("message_type") or message.get("sender_type") or "")
-        role = TurnRole.CUSTOMER if message_type == "incoming" else TurnRole.AGENT
-        text = message.get("content")
-        if not isinstance(text, str) or not text.strip():
-            continue
-        created_at = int(message.get("created_at") or 0)
-        # Skip everything the local window already covers (and the current
-        # message itself, which the orchestrator treats as the question).
-        if local and created_at >= oldest_local_ts:
-            continue
-        redacted, _count = redact_text(text)
-        await _admit(Turn(role=role, text=redacted, ts=created_at))
+    del deps
     return memory.turns
 
 
@@ -467,11 +422,12 @@ async def _persist_memory(
         return
     now = int(time.time())
     customer_turn = Turn(role=TurnRole.CUSTOMER, text=question, ts=now)
-    # `source` names where the turn actually came from. A question typed into
-    # the platform's own chat surface is not a Chatwoot message, and labelling
-    # it one credits a system of record that never held it - which then reads
-    # as a second, duplicate question on the timeline.
-    turn_source = "chatwoot" if event.minimized_payload.get("chatwoot_account_id") else "platform"
+    # `source` names where the turn actually came from. Every turn is the
+    # platform's now: `/support` and the channel adapters all persist through
+    # `append_customer_turn`. Labelling one "chatwoot" credited a system of
+    # record that no longer holds anything, and read as a second, duplicate
+    # question on the timeline.
+    turn_source = "platform"
 
     # A question from the platform's own chat surface was already persisted when
     # the message was accepted - `POST /v1/support/messages` and
@@ -548,32 +504,12 @@ async def _resolve_contact_id(event: ClaimedEvent, deps: OrchestratorDeps) -> st
     if payload_contact:
         return str(payload_contact)
 
-    sender = deps.sender
-    message_id = event.minimized_payload.get("message_id")
-    account_id = event.minimized_payload.get("chatwoot_account_id")
-    conversation_id = event.minimized_payload.get("conversation_id")
-    if not (message_id and account_id and conversation_id):
-        return None
-
-    from platform_core.support_bridge.chatwoot_client import ChatwootClient
-
-    if not isinstance(sender, ChatwootClient):
-        # A test double has no API to ask. Degrading to "no contact" keeps the
-        # run going instead of failing the event on a missing capability.
-        return None
-    try:
-        return await sender.fetch_message_contact_id(
-            account_id=str(account_id),
-            conversation_id=str(conversation_id),
-            message_id=str(message_id),
-        )
-    except Exception as exc:  # noqa: BLE001 - enrichment, not a dependency
-        logger.warning(
-            "contact_resolve_failed",
-            delivery_id=event.delivery_id,
-            error_code=type(exc).__name__,
-        )
-        return None
+    # No payload contact and nothing stored: this event carries no contact, and
+    # inventing one would attribute the run to the wrong customer. There used to
+    # be a fallback that asked Chatwoot which contact sent the message; every
+    # producer stores the id on the payload now, so it had no case left.
+    del deps
+    return None
 
 
 def _attachment_types(event: object) -> list[str]:
@@ -629,10 +565,21 @@ async def process_event(
         # to return here with no trace at all, which is indistinguishable
         # from "the worker never ran" - and it cost hours of chasing a
         # reader that was never broken.
+        #
+        # Both keys, because there are two encodings now and seeing which one
+        # a bad row carried is the whole diagnosis: `conversation_ref` present
+        # but unparseable means the writer is broken, both absent means the
+        # row never named a conversation at all.
         logger.warning(
             "event_skipped_no_conversation_ref",
             delivery_id=event.delivery_id,
             event_type=event.event_type,
+            # Named `conversation_ref_id`, not `conversation_ref`: the log schema
+            # (`observability.ALLOWED_LOG_FIELDS`) allowlists the former and
+            # drops the latter silently - which is the one outcome a diagnostic
+            # line exists to avoid. The value is the payload's raw `conversation_ref`
+            # as received; a non-UUID here is the whole reason this branch ran.
+            conversation_ref_id=str(event.minimized_payload.get("conversation_ref") or ""),
             conversation_id=str(event.minimized_payload.get("conversation_id") or ""),
         )
         get_metrics().inbox_events_total.labels(result="no_conversation_ref").inc()
@@ -653,7 +600,6 @@ async def process_event(
             conversation_ref_id=str(conversation_ref_id),
             # Metadata only - never the customer's text.
             message_id=str(event.minimized_payload.get("message_id") or ""),
-            has_chatwoot_account=bool(event.minimized_payload.get("chatwoot_account_id")),
         )
         get_metrics().inbox_events_total.labels(result="unreadable_question").inc()
         return None
@@ -698,8 +644,7 @@ async def process_event(
         question=question,
         principal=AI_PRINCIPAL,
         trace=trace,
-        chatwoot_account_id=str(event.minimized_payload.get("chatwoot_account_id") or ""),
-        chatwoot_conversation_id=str(event.minimized_payload.get("conversation_id") or ""),
+        channel_conversation_key=str(event.minimized_payload.get("conversation_id") or ""),
         history=history,
         known_facts=known_facts,
         contact_id=str(contact_id_early) if contact_id_early else None,
@@ -710,6 +655,13 @@ async def process_event(
         # Feature 2.5: "" = anonymous visitor (gate fires); None = operator run
         # (no gate); a non-empty string = the verified account the run may read.
         verified_account=verified_account,
+        # ADR 0014: which channel to answer on. Absent for the platform's own
+        # surface, where `_dispatch` already knows what to do - so this is
+        # None, not "".
+        channel_system=str(event.minimized_payload.get("channel_system") or "") or None,
+        # Where to answer: the customer's email address, or the WeChat openid.
+        # The channel route stores it as `contact_id`.
+        channel_address=str(contact_id_early) if contact_id_early else None,
     )
     await _persist_memory(session, event=event, question=question, outcome=outcome)
 

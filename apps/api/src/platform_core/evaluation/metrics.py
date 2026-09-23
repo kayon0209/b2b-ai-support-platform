@@ -188,7 +188,7 @@ def automation_candidates(metrics: "QualityMetrics") -> list[dict[str, object]]:
     return items
 
 
-def _percentile(sorted_values: list[int], pct: float) -> int | None:
+def percentile(sorted_values: list[int], pct: float) -> int | None:
     if not sorted_values:
         return None
     idx = min(int(len(sorted_values) * pct), len(sorted_values) - 1)
@@ -296,8 +296,8 @@ async def aggregate_quality_metrics(
             metrics.runs_with_citations = len(set(counted))
 
     latencies.sort()
-    metrics.latency_p50_ms = _percentile(latencies, 0.50)
-    metrics.latency_p95_ms = _percentile(latencies, 0.95)
+    metrics.latency_p50_ms = percentile(latencies, 0.50)
+    metrics.latency_p95_ms = percentile(latencies, 0.95)
     await _aggregate_resolution(session, tenant_id=tenant_id, cutoff=cutoff, metrics=metrics)
     return metrics.finalize()
 

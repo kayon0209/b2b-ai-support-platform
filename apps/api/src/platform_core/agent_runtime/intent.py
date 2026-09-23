@@ -657,6 +657,15 @@ def _detect_kinds(question: str) -> tuple[list[IntentKind], float, list[IntentSi
     elif _LIVE_DATA.search(question):
         kinds.append(IntentKind.BUSINESS_QUERY)
         signals.append(IntentSignal("kind", IntentKind.BUSINESS_QUERY.value, "live data requested"))
+    elif _CN_LIVE_DATA.search(question) and not _CN_HOW.search(question):
+        # The Chinese frame, evaluated last for the same reason
+        # `_is_cn_action_request` is: the two vocabularies do not overlap in
+        # practice, and ordering it here leaves every English signal
+        # byte-identical, which is what the evaluation baseline rests on.
+        kinds.append(IntentKind.BUSINESS_QUERY)
+        signals.append(
+            IntentSignal("kind", IntentKind.BUSINESS_QUERY.value, "chinese live data requested")
+        )
 
     if is_question or _content_terms(question):
         kinds.append(IntentKind.KNOWLEDGE_QUESTION)
@@ -861,6 +870,62 @@ _CN_OBJECT = re.compile(r"[\u4e00-\u9fff]")
 # that a request never carries.
 _CN_PROCEDURE = re.compile(r"(?:怎么|如何|怎样|什么|哪些|哪|是否|能否|多久|多少|什么时候)")
 _CN_QUESTION_PARTICLE = re.compile(r"[吗呢吧]\s*[?？]?\s*$")
+
+# --- Chinese live-data questions: the read path's counterpart of _LIVE_DATA -
+
+# `_LIVE_DATA` is the signal that sends "where is my order" to `business_read`,
+# and it was English-only. Measured 2026-09-22, five Chinese phrasings of
+# exactly that question - "我的订单 SO-9001 到哪了", "SO-9001 什么时候发货",
+# "帮我查一下订单 SO-9001 的状态", "订单 SO-9001 现在什么状态", "SO-9001 发货了
+# 吗" - all routed to `knowledge_qa` and selected **zero** read tools, while the
+# two English equivalents selected `order.get_status`.
+#
+# The cost is larger than a missing card. `business_read` is the only route into
+# the identity gate (feature 2.2/2.5), so a Chinese customer asking about their
+# order never reached the "prove this order is yours" prompt at all: the whole
+# verify-then-read flow was unreachable in the language the pilot's customers
+# actually write. ADR 0006 makes the same point from the other side - a
+# live-data question must not be answered from the corpus, so `knowledge_qa` is
+# the wrong route for it even when the honest outcome is abstention.
+#
+# Two properties stop this from swallowing the policy questions the guard tests
+# protect:
+#
+# 1. **Every frame names a state in progress, not a topic.** `到哪了`,
+#    `什么时候发货`, `发货了吗`, `查…状态`. A topic noun alone is never enough:
+#    "PCB 订单的增值税专用发票怎么开？" and "ADS1110 现在有货吗？" each name a
+#    record and must stay on the knowledge path, and neither carries a frame.
+# 2. **`多久` / `几天` are deliberately absent from the ETA frame.** They ask how
+#    long the *process* takes - "退款多久到账？" is the existing guard test's own
+#    case, and the corpus answers it - whereas `什么时候` asks about this record.
+#
+# Same substring caveat as the rest of this vocabulary: CJK has no word
+# boundaries, so `\b` cannot appear here and every alternative is a substring
+# match.
+_CN_LIVE_DATA = re.compile(
+    # Where has it got to - "我的订单 SO-9001 到哪了".
+    r"到(?:哪|哪儿|哪里)了?"
+    # An ETA question - "SO-9001 什么时候发货". See (2) above for why not 多久.
+    r"|什么时候\S{0,4}?(?:发货|发出|出库|寄出|到货|到账|送达|送到|处理|完成)"
+    # A completion question - "SO-9001 发货了吗".
+    r"|(?:发货|发出|出库|寄出|到货|到账|送达|送到|处理|完成)了\s*[吗嘛么没]"
+    # An explicit lookup of a named record - "帮我查一下订单 SO-9001 的状态".
+    r"|(?:查|查询|查下|看一下|看下|看看|问一下|告诉我)\S{0,8}?"
+    r"(?:状态|进度|物流|快递|运单|单号|订单|工单|发票|库存|余额|用量|配额)"
+    # A status interrogative - "订单 SO-9001 现在什么状态".
+    r"|(?:什么|啥|怎么样|咋样|如何)\s*(?:状态|进度)"
+    r"|(?:状态|进度)\s*(?:怎么样|咋样|如何|是什么)"
+    # A balance/quota question - "我的额度还有多少".
+    r"|(?:余额|额度|配额|用量|库存)\S{0,4}?(?:还有|剩余|剩|是多少)"
+)
+
+# The counter-guard, and a deliberately narrow one. `_CN_PROCEDURE` cannot be
+# reused here: it lists `什么` / `哪` / `什么时候`, which are the frames above
+# ("现在什么状态", "到哪了", "什么时候发货"), so it would veto every true
+# positive. What is actually needed is the *how-to* question, where the customer
+# asks for the procedure rather than for their own record: "怎么查订单状态"
+# matches the lookup frame and is a knowledge question.
+_CN_HOW = re.compile(r"(?:怎么|如何|怎样|为什么)")
 
 
 def _is_cn_action_request(question: str) -> bool:

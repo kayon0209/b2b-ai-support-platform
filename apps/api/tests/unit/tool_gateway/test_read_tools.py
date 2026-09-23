@@ -112,3 +112,94 @@ def test_business_read_adapter_reads_one_record() -> None:
     assert out["record"]["status"] == "shipped"
     assert result["verified"] is True
     assert "api_token" not in json.dumps(out)
+
+
+# --- Chinese live-data selection (audit 2026-09-23: the order card never
+# appeared for a Chinese customer) ---------------------------------------------
+#
+# `intent.py` already records that five Chinese phrasings of "where is my
+# order" used to route to `knowledge_qa` and select **zero** read tools. That
+# was fixed on the routing side. The selection side was not: with no Chinese
+# noun on `order.get_status`, every one of these scored only the scene weight
+# - a four-way tie at 0.40 - and the tie-break was the alphabet, so
+# `billing.get_invoice` won all five. The customer's question went to the
+# invoice system, which has no such record, which is why the ticket-looking
+# outcome was `TOOL_EXECUTION_UNVERIFIED` and a notice saying the ERP was
+# down.
+#
+# These cases assert on the *selected tool*, not on the route: asserting the
+# route is what let the original regression through.
+_CN_ORDER_QUESTIONS = (
+    "我的订单 SO-9001 到哪了？",
+    "我的订单 SO-9001 到哪了",
+    "SO-9001 什么时候发货",
+    "帮我查一下订单 SO-9001 的状态",
+    "订单 SO-9001 现在什么状态",
+    "SO-9001 发货了吗",
+)
+
+
+def test_chinese_order_questions_select_the_order_tool() -> None:
+    for question in _CN_ORDER_QUESTIONS:
+        detection = classify(question)
+        candidates = select_read_tools(detection, question)
+        assert candidates, f"no read candidate for {question!r}"
+        assert candidates[0].tool_name == "order.get_status", (
+            f"{question!r} selected {candidates[0].tool_name}; "
+            f"full order: {[c.tool_name for c in candidates]}"
+        )
+
+
+def test_chinese_order_question_beats_the_invoice_tool_on_a_tie() -> None:
+    """The alphabet is not a policy: `b` must not beat `o`.
+
+    `发货` is deliberately a noun of both `order.get_status` and
+    `shipment.track`, so this question ties at 1.40 and only the tie-break
+    decides. It must resolve to the order, because the order record is what
+    carries the shipping node and the ETA.
+    """
+    question = "SO-9001 什么时候发货"
+    candidates = select_read_tools(classify(question), question)
+    tied = [c for c in candidates if c.score == candidates[0].score]
+    assert len(tied) > 1, "expected a genuine tie, so the tie-break is what is under test"
+    assert candidates[0].tool_name == "order.get_status"
+    assert "billing.get_invoice" not in [c.tool_name for c in tied[:1]]
+
+
+def test_chinese_invoice_question_still_selects_the_invoice_tool() -> None:
+    """The order fix must not swallow the invoice path.
+
+    The phrasing carries the lookup frame (`查…状态`) on purpose. Written as
+    "我的发票开好了吗" the question does not reach `business_read` at all -
+    `_CN_LIVE_DATA` has no frame that matches it - so it would assert the
+    routing gate instead of the selection under test, and fail for a reason
+    that has nothing to do with this change.
+    """
+    question = "帮我查一下发票 INV-9001 的状态"
+    candidates = select_read_tools(classify(question), question)
+    assert candidates
+    assert candidates[0].tool_name == "billing.get_invoice"
+
+
+def test_chinese_parcel_question_selects_the_shipment_tool() -> None:
+    question = "运单 SH-7001 的物流到哪了？"
+    candidates = select_read_tools(classify(question), question)
+    assert candidates
+    assert candidates[0].tool_name == "shipment.track"
+
+
+def test_read_selection_order_is_declared_not_alphabetical() -> None:
+    """Every read tool that can score the same must have a declared rank.
+
+    A tool missing from `_READ_PRIORITY` falls back to alphabetical ordering
+    among the unranked, which is exactly the accident this change removes. The
+    assertion is deliberately about the map, so adding a tool without ranking
+    it fails here rather than in production.
+    """
+    from platform_core.tool_gateway.selector import (
+        _READ_PRIORITY,
+        _READ_SCENE_AFFINITY,
+        _READ_SUBJECT_NOUNS,
+    )
+
+    assert set(_READ_SCENE_AFFINITY) == set(_READ_PRIORITY) == set(_READ_SUBJECT_NOUNS)

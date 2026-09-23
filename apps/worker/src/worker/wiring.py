@@ -17,9 +17,10 @@ assembled, and it is deliberately explicit:
 - **One shared model bundle.** The chat, embedding and rerank providers
   share a circuit breaker, so a provider outage degrades one capability
   rather than three independent failure domains.
-- **The sender and reader are the same Chatwoot client.** Both are
-  idempotent-by-command-id and share a breaker; splitting them would give
-  the outbound path two different notions of "Chatwoot is down".
+- **The outbound transports are the channels themselves.** Built from
+  whichever channels have credentials (ADR 0014); a channel with none is
+  absent from the registry, so the orchestrator can tell "receive-only" from
+  "delivery failed" instead of reporting a send that never happened.
 """
 
 from __future__ import annotations
@@ -29,10 +30,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime.orchestrator import OrchestratorDeps
+from platform_core.channels.outbound import build_channel_sender
 from platform_core.config import get_settings
 from platform_core.llm.factory import get_model_bundle
 from platform_core.retrieval.hybrid import ProviderEmbedder
@@ -53,7 +54,7 @@ class IngestionDeps:
     """Capabilities the ingestion pipeline needs. Deliberately narrow.
 
     A separate container from `OrchestratorDeps` so the ingestion worker
-    cannot accidentally reach for a chat provider or a Chatwoot sender:
+    cannot accidentally reach for a chat provider or an outbound transport:
     parsing, chunking and embedding have no business sending anything.
     """
 
@@ -64,20 +65,6 @@ class IngestionDeps:
         return self.embedder is not None
 
 
-def _has_chatwoot_token(token: SecretStr | None) -> bool:
-    """True only for a token that could actually authenticate.
-
-    Compose injects `APP_CHATWOOT_API_TOKEN: ${APP_CHATWOOT_API_TOKEN:-}`,
-    so the variable being *set* proves nothing — an unset host variable
-    becomes an empty string, which is `not None` and would bind a client
-    whose every request 401s. Treating blank as absent keeps the outbound
-    path honest: a token that cannot authenticate is not a sender.
-    """
-    if token is None:
-        return False
-    return bool(token.get_secret_value().strip())
-
-
 @dataclass(frozen=True)
 class WorkerWiring:
     """What was actually wired, for startup logging and health reporting."""
@@ -85,16 +72,17 @@ class WorkerWiring:
     has_chat: bool
     has_embedding: bool
     has_rerank: bool
-    has_sender: bool
-    has_reader: bool
+    # Whether any outbound channel transport is wired. `False` is a legitimate
+    # deployment state (receive-only, or drafts for human review), but it must
+    # never be reported as "the customer was answered".
+    has_channel_sender: bool
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "has_chat": self.has_chat,
             "has_embedding": self.has_embedding,
             "has_rerank": self.has_rerank,
-            "has_sender": self.has_sender,
-            "has_reader": self.has_reader,
+            "has_channel_sender": self.has_channel_sender,
         }
 
     @property
@@ -104,7 +92,7 @@ class WorkerWiring:
     @property
     def can_send(self) -> bool:
         """A run that cannot send must not be reported as answered."""
-        return self.has_sender
+        return self.has_channel_sender
 
 
 def build_interactive_deps(
@@ -135,21 +123,22 @@ def build_interactive_deps(
         # reports as abstention rather than fabricating an answer.
         return OrchestratorDeps(extra={"draft_only": True})
 
-    sender: Any = None
-    reader: Any = None
-    if _has_chatwoot_token(settings.chatwoot_api_token):
-        from platform_core.support_bridge.chatwoot_client import ChatwootClient
+    # ADR 0014. Built unconditionally: which channels have credentials is a
+    # deployment fact, and a channel with none is simply absent from the
+    # registry - the orchestrator then records OUTBOUND_NOT_CONFIGURED rather
+    # than reporting a delivery that never happened.
+    channel_sender = build_channel_sender(settings)
 
-        # One client, two roles: both share connection config and the
-        # circuit breaker, so the inbound read and outbound send agree on
-        # whether Chatwoot is reachable.
-        client = ChatwootClient()
-        sender = client
-        reader = client
-    elif require_sender:
+    if require_sender and not channel_sender.systems:
+        # The guard exists to refuse a *silent no-op*: a worker that claims real
+        # customer messages, marks the rows processed and never delivers
+        # anything is the worst failure shape this repository has, because every
+        # log line and dashboard reads healthy. "No transport at all" is exactly
+        # that, so it is a startup error rather than a runtime surprise.
         raise WorkerConfigurationError(
-            "APP_CHATWOOT_API_TOKEN is required to send customer replies; "
-            "unset it or run with require_sender=False for draft-only mode"
+            "no outbound transport is configured: set the email or WeChat "
+            "settings from ADR 0014, or run with require_sender=False for "
+            "draft-only mode"
         )
 
     # Embeddings are optional: retrieval degrades to lexical-only, which is
@@ -182,8 +171,7 @@ def build_interactive_deps(
         embedder=embedder,
         generator=generator,
         reranker=reranker,
-        sender=sender,
-        reader=reader,
+        channel_sender=channel_sender,
         extra={"chat": bundle.chat, "bundle": bundle},
     )
 
@@ -234,9 +222,8 @@ async def queue_bookkeeping_session() -> AsyncIterator[AsyncSession]:
 
     The alternative - a `SECURITY DEFINER` claim function, the way
     `claim_ingestion_versions` (migration 0018) solves the same problem - needs a
-    migration, and the migration counter is currently coupled to an untracked
-    revision in the shared worktree (`HANDOVER-2026-09-21-THREE-SURFACES.md` §5-E).
-    Splitting the session achieves the same boundary with no schema change.
+    migration. Splitting the session achieves the same boundary with no schema
+    change.
     """
     from platform_core.db import session_scope
 
@@ -285,8 +272,14 @@ def audit_wiring(deps: OrchestratorDeps) -> WorkerWiring:
         has_chat=deps.generator is not None,
         has_embedding=deps.embedder is not None,
         has_rerank=bundle is not None and getattr(bundle, "rerank", None) is not None,
-        has_sender=deps.sender is not None,
-        has_reader=deps.reader is not None,
+        # NOT `is not None`: `build_channel_sender` always returns a
+        # `ChannelSender`, even when no channel has credentials. Testing the
+        # object would make `can_send` report True for a deployment that can
+        # deliver nothing - the exact "looks healthy, the customer hears
+        # nothing" shape this report exists to expose. A channel with no
+        # credentials is *absent* from the registry, so the registry is what
+        # answers the question.
+        has_channel_sender=bool(getattr(deps.channel_sender, "systems", ())),
     )
 
 

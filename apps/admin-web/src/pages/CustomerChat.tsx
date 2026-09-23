@@ -83,11 +83,12 @@ const COPY = {
     failedRetry: "Not delivered",
     internal: "Internal",
     internalTitle:
-      "An internal verification surface, not the customer experience. The customer channel is Chatwoot.",
+      "An internal verification surface, not the customer experience. The customer surface is /support.",
     waitTimeout:
       "No one has picked this up yet. Your question is saved - ask for a human and an agent will see it.",
     problemAuth:
       "This chat needs an operator access token. Open the console, paste one, then reload.",
+    problemNoSession: "This chat is still opening its conversation. Try again in a moment.",
     retry: "Retry",
     handoff: "Talk to a human",
     handoffDone: "You are in the queue for a human agent.",
@@ -122,10 +123,11 @@ const COPY = {
     sending: "发送中…",
     failedRetry: "未送达",
     internal: "内部验证面",
-    internalTitle: "内部验证用界面，不是客户侧体验。客户渠道是 Chatwoot。",
+    internalTitle: "内部验证用界面，不是客户侧体验。客户侧入口是 /support。",
     waitTimeout:
       "暂时还没有人应答。你的问题已保存，点「转人工」坐席会看到它。",
     problemAuth: "此界面需要运营访问令牌：请先在后台粘贴令牌，然后刷新。",
+    problemNoSession: "会话还在建立中，请稍候再发送。",
     retry: "重试",
     handoff: "转人工",
     handoffDone: "您已进入人工客服队列。",
@@ -188,6 +190,21 @@ export function CustomerChat() {
   const offlineNow = scenario === "offline";
   const open = view !== "collapsed";
 
+  // The conversation's platform id, minted rather than invented.
+  //
+  // This panel used to generate a UUID and use it as an *external* id, because
+  // the endpoints it calls derived a ref from whatever the path segment held.
+  // They no longer do: a `conversation_ref` segment is the platform's own id,
+  // used verbatim (`support_bridge.conversation_ref`). So the id has to come
+  // from the one place that mints it, exactly as a customer client receives
+  // it — `POST /v1/support/sessions` — and this panel stands in for that client
+  // instead of keeping a second rule of its own.
+  //
+  // Empty until the mint returns. Every caller below is guarded on it, so the
+  // panel shows an empty thread for one round trip instead of querying with a
+  // ref that does not exist yet.
+  const [conversationRef, setConversationRef] = useState<string>("");
+
   // The tenant's own branding, not a constant. The branding screen says it
   // configures "how this tenant appears to customers", and this is the one
   // customer-facing surface - so a hardcoded name meant that setting had no
@@ -196,14 +213,39 @@ export function CustomerChat() {
   const [branding, setBranding] = useState<TenantBranding | null>(null);
   useEffect(() => {
     let active = true;
-    void apiGet<{ branding: TenantBranding }>("/v1/tenant/branding")
-      .then((res) => {
-        if (active) setBranding(res.branding);
-      })
-      .catch(() => {
-        // A chat that cannot read branding still has to work; the fallback
-        // name is not worth an error banner in front of a customer.
-      });
+    void (async () => {
+      // A stable id for this browser, so a reload resumes the same
+      // conversation: the ref is derived from it, and the derivation is
+      // deterministic. Kept out of the ref itself - the ref is what the
+      // platform returns and could change derivation; the visitor id is the
+      // caller's own identity and must not.
+      const KEY = "b2b_chat_visitor_id";
+      let visitor = localStorage.getItem(KEY);
+      if (!visitor) {
+        visitor = (crypto.randomUUID?.() ?? `visitor-${Date.now()}`).toString();
+        localStorage.setItem(KEY, visitor);
+      }
+      try {
+        // Branding doubles as the tenant lookup: the session endpoint is keyed
+        // by slug, and the slug is the one thing this panel does not hold. This
+        // call needs no policy beyond a resolved token, so if it fails the
+        // token is broken and nothing else here would work either.
+        const { branding: own } = await apiGet<{ branding: TenantBranding }>(
+          "/v1/tenant/branding",
+        );
+        if (active) setBranding(own);
+        const session = await apiPost<{ conversation_ref: string }>("/v1/support/sessions", {
+          tenant_slug: own.slug,
+          visitor_id: visitor,
+        });
+        if (active) setConversationRef(session.conversation_ref);
+      } catch (err) {
+        // Not swallowed: a panel that cannot open a conversation must say so
+        // rather than render a permanently empty thread, which is
+        // indistinguishable from "no messages yet".
+        if (active) setProblem(describeFailure(err));
+      }
+    })();
     return () => {
       active = false;
     };
@@ -252,20 +294,10 @@ export function CustomerChat() {
     return full;
   }
 
-  const [conversationRef] = useState<string>(() => {
-    // A conversation is identified by a client-generated UUID: the platform
-    // keys runs on `conversation_ref` and never creates the conversation
-    // itself, so the caller owns the identity. Persisted so a reload keeps
-    // the same thread.
-    const KEY = "b2b_conversation_ref";
-    const saved = localStorage.getItem(KEY);
-    if (saved) return saved;
-    const fresh = (crypto.randomUUID?.() ?? `conv-${Date.now()}`).toString();
-    localStorage.setItem(KEY, fresh);
-    return fresh;
-  });
-
   const loadTimeline = useCallback(async () => {
+    // No ref yet means the session is still being opened. Returning rather
+    // than querying keeps a stray 404 from being reported as a failure.
+    if (!conversationRef) return;
     try {
       const res = await apiGet<{ items: { role: string; text: string; at: number }[] }>(
         `/v1/customer/conversations/${conversationRef}/timeline`,
@@ -337,6 +369,13 @@ export function CustomerChat() {
   function send(text: string) {
     const body = text.trim();
     if (!body) return;
+    // Sending before the conversation exists would post a message nobody can
+    // answer. Rare (one round trip at mount) and worth naming rather than
+    // failing at the API with a 404 the operator has to interpret.
+    if (!conversationRef) {
+      setProblem(c.problemNoSession);
+      return;
+    }
 
     push({ role: "customer", text: body, state: "sending" });
     setDraft("");
@@ -352,7 +391,6 @@ export function CustomerChat() {
         // platform has its own copy; then queue the run, pointing it at
         // that turn. The orchestrator reads the question back by id, and
         // for platform-originated turns that id resolves locally rather
-        // than through Chatwoot.
         const saved = await apiPost<{ turn_id: string }>(
           `/v1/customer/conversations/${conversationRef}/messages`,
           { text: body },
@@ -427,7 +465,7 @@ export function CustomerChat() {
             </div>
             {/*
               ADR 0010: this panel is an internal verification surface, not the
-              customer experience - the customer surface is Chatwoot. Saying so
+              customer experience - the customer surface is /support. Saying so
               on the surface itself is what stops it being shipped as one, since
               nothing else about it (a real brand, a working send) would.
             */}

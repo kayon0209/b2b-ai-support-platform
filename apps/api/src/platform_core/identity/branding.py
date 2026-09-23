@@ -45,6 +45,12 @@ _ALLOWED_URL_SCHEMES = ("https://", "http://")
 # only angle brackets and control characters are refused, so "Acme & Co" and
 # "华秋电子" keep working.
 _MARKUP = re.compile(r"[<>]")
+# Whole tags, applied before `_MARKUP`. Stripping only the angle brackets turned
+# `<img src=x onerror=alert(2)>Acme & Co` into `img src=x onerror=alert(2)Acme &
+# Co` - neither the tenant's name nor valid markup, just debris. Same shape as
+# migration 0053's `REGEXP_REPLACE`, and the two must agree: a reader and a
+# repair that disagree leave a value that changes shape on the next write.
+_TAG = re.compile(r"<[^>]*>")
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -55,11 +61,37 @@ class BrandingIn(BaseModel):
     support_email: str | None = Field(default=None, max_length=255)
 
 
+def sanitize_display_name(value: str | None) -> str | None:
+    """A stored display name with markup and control characters removed.
+
+    `_validate` refuses markup on write, and validation only ever governs the
+    *next* write. A tenant that stored `<img src=x onerror=alert(2)>Acme & Co`
+    before that rule existed still has it, and every reader renders it
+    verbatim - measured 2026-09-23, that string was the `<h1>` of the customer
+    support window, on desktop and on mobile.
+
+    Stripping rather than refusing to serve, because the repair should keep as
+    much of the tenant's own words as is safe: "Acme & Co" survives, and a
+    customer-facing window does not go blank over a value the tenant cannot
+    see. Control characters go for the same reason as the angle brackets - the
+    value is a label, and a label has no use for either.
+
+    Returns None when nothing readable is left, so callers fall back to the
+    tenant's own `name` rather than rendering an empty heading.
+    """
+    if value is None:
+        return None
+    cleaned = _CONTROL_CHARS.sub("", _MARKUP.sub("", _TAG.sub("", value))).strip()
+    return cleaned or None
+
+
 def _out(tenant: Tenant) -> dict[str, Any]:
     return {
         "tenant_id": str(tenant.id),
         "slug": tenant.slug,
-        "display_name": tenant.brand_display_name,
+        # Sanitised on the way out as well as refused on the way in: the two
+        # are not substitutes. This one repairs what is already stored.
+        "display_name": sanitize_display_name(tenant.brand_display_name),
         "logo_url": tenant.brand_logo_url,
         "primary_color": tenant.brand_primary_color,
         "support_email": tenant.support_email,
@@ -164,4 +196,4 @@ async def update_branding(request: Request, body: BrandingIn) -> Any:
     return ok_response({"branding": result}, trace_id=trace_id)
 
 
-__all__ = ["router"]
+__all__ = ["router", "sanitize_display_name"]

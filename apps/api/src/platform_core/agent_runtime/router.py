@@ -4,6 +4,14 @@ POST /v1/conversations/{conversation_ref}/agent-runs
 
 Queues an agent run for a conversation and returns immediately.
 
+`{conversation_ref}` is the platform's own conversation id everywhere under
+this prefix - the value `GET /v1/conversations` lists and the value
+`POST /v1/support/sessions` returns - and it is used verbatim. It used to be
+read as an external id and derived a second time, which is a silent failure:
+the listing returned refs, `/replay` derived them, and the console showed a
+different conversation's transcript. See
+`support_bridge.conversation_ref` for the one rule.
+
 Contract notes:
 - docs/api-contracts.md requires the webhook path to respond within 300 ms
   and to never call an LLM synchronously. The same rule governs this
@@ -24,7 +32,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from platform_core.agent_runtime import chat_service, replay
-from platform_core.agent_runtime.models import AgentRun
+from platform_core.agent_runtime.models import VALID_MODES, AgentRun
 from platform_core.api import (
     IDEMPOTENCY_KEY_REQUIRED,
     NOT_FOUND,
@@ -33,19 +41,18 @@ from platform_core.api import (
     get_context,
     new_trace_id,
     ok_response,
-    parse_uuid,
     require_idempotency_key,
     require_policy,
     tenant_session,
 )
-from platform_core.support_bridge.conversation_ref import (
-    conversation_ref_for as conversation_ref_for,
-)
+from platform_core.support_bridge.conversation_ref import parse_conversation_ref
 from platform_policy import Action
 
 router = APIRouter(prefix="/v1/conversations", tags=["agent-runtime"])
 
-VALID_MODES = frozenset({"customer_reply", "internal_draft"})
+# Imported from the model module so the API cannot accept a mode the
+# orchestrator does not implement.
+VALID_MODES = VALID_MODES
 
 
 class AgentRunIn(BaseModel):
@@ -80,15 +87,9 @@ async def create_agent_run(request: Request, conversation_ref: str, body: AgentR
         )
 
     try:
-        external_ref = parse_uuid(conversation_ref, field="conversation_ref")
+        conversation_ref_id = parse_conversation_ref(conversation_ref)
     except ValueError as exc:
         return error_response(VALIDATION_FAILED, str(exc), status_code=400)
-    # Derived, not the path value verbatim: the worker answers under the
-    # derived id, so a run queued under the raw id is filed in a different
-    # conversation from the one that produces the answer - which is exactly
-    # why a listing of "runs for this conversation" used to show only the
-    # queued placeholder and never the run that answered.
-    conversation_ref_id = conversation_ref_for(ctx.tenant_id, str(external_ref))
 
     trace_id = new_trace_id()
     async with tenant_session(ctx) as session:
@@ -104,12 +105,13 @@ async def create_agent_run(request: Request, conversation_ref: str, body: AgentR
                 session,
                 ctx=ctx,
                 conversation_ref_id=conversation_ref_id,
-                # `str(external_ref)`, not the raw path string: the ref above was
-                # derived from the parsed form, and hashing a different spelling
-                # of the same uuid ("{...}", an urn prefix, upper case) produces a
-                # different conversation - which is the double-derivation defect
-                # this module's docstring warns about, one step earlier.
-                external_ref=str(external_ref),
+                # No external id: this caller reached the conversation by its
+                # platform ref, so there is nothing left to derive from. The
+                # payload carries the ref itself instead, and the worker uses
+                # it verbatim - handing over an id for the worker to derive is
+                # exactly how the run used to be filed under a second
+                # conversation from the turn it was answering.
+                external_ref=None,
                 trigger_message_ref=body.trigger_message_ref,
                 idem=idem,
                 mode=body.mode,
@@ -143,14 +145,9 @@ async def list_agent_runs(
         return denied
 
     try:
-        external_ref = parse_uuid(conversation_ref, field="conversation_ref")
+        conversation_ref_id = parse_conversation_ref(conversation_ref)
     except ValueError as exc:
         return error_response(VALIDATION_FAILED, str(exc), status_code=400)
-    # Same derivation as the create path and as the worker, so this listing
-    # can actually see the runs that answered. Rows queued before the two
-    # agreed were stored under the raw id and are no longer listed here;
-    # they were unreachable placeholders anyway.
-    conversation_ref_id = conversation_ref_for(ctx.tenant_id, str(external_ref))
 
     async with tenant_session(ctx) as session:
         rows = (
@@ -221,9 +218,10 @@ async def conversation_replay(
 ) -> Any:
     """One conversation: what was said, and every decision taken in it.
 
-    The same ref derivation as the two endpoints above, for the reason the
-    create path documents - a replay looked up under the raw id would be filed
-    against a different conversation from the one the runs answered in.
+    The path segment is the platform ref that `GET /v1/conversations` lists,
+    used verbatim. It used to be treated as an external id and derived again,
+    which is why opening a conversation from the console showed a second
+    conversation's transcript - or nothing at all.
     """
     ctx = get_context(request)
     if ctx is None:
@@ -233,10 +231,9 @@ async def conversation_replay(
         return denied
 
     try:
-        external_ref = parse_uuid(conversation_ref, field="conversation_ref")
+        conversation_ref_id = parse_conversation_ref(conversation_ref)
     except ValueError as exc:
         return error_response(VALIDATION_FAILED, str(exc), status_code=400)
-    conversation_ref_id = conversation_ref_for(ctx.tenant_id, str(external_ref))
 
     trace_id = new_trace_id()
     async with tenant_session(ctx) as session:
@@ -250,3 +247,78 @@ async def conversation_replay(
     if bundle is None:
         return error_response(NOT_FOUND, "conversation not found", status_code=404)
     return ok_response(bundle, trace_id=trace_id)
+
+
+@router.get("/{conversation_ref}/related")
+async def get_related_conversations(
+    request: Request,
+    conversation_ref: str,
+    limit: int = Query(default=10, ge=1, le=50),
+) -> Any:
+    """Other conversations the same person had, newest first.
+
+    Feature 1.5's payoff, and the consumer `continuity.prior_conversations` never
+    had. That function has existed since migration 0045 and was called **only
+    from its own tests**, so the feature was built, tested and unreachable: a
+    customer who asked on WeChat and then wrote an email was one person the
+    platform could not connect.
+
+    Returns an **empty list, not a 404**, when the conversation has no contact.
+    An anonymous visitor and a conversation predating the table are both real
+    states, and "we do not know who this is" is an answer rather than an error -
+    a 404 would make a client treat a normal case as a failure.
+
+    The path segment is the platform ref, like every other `conversation_ref`
+    segment. It was the raw external string before, which is what made a
+    channel conversation (`<root@acme.test>`) addressable here and not at
+    `/replay`. Both are addressable now: the platform ref exists for a channel
+    conversation too - the adapter derives it when it ingests - so the caller
+    needs the ref rather than the channel's own key.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return error_response("AUTH_UNRESOLVED", "tenant context not resolved", status_code=401)
+    denied = require_policy(ctx, Action.CASE_READ)
+    if denied is not None:
+        return denied
+
+    from platform_core.support_bridge.continuity import (
+        contact_for_conversation,
+        prior_conversations,
+    )
+
+    try:
+        conversation_ref_id = parse_conversation_ref(conversation_ref)
+    except ValueError as exc:
+        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+    async with tenant_session(ctx) as session:
+        contact = await contact_for_conversation(
+            session, tenant_id=ctx.tenant_id, conversation_ref_id=conversation_ref_id
+        )
+        if not contact:
+            return ok_response(
+                {"contact_id": None, "count": 0, "items": []}, trace_id=new_trace_id()
+            )
+        prior = await prior_conversations(
+            session,
+            tenant_id=ctx.tenant_id,
+            external_contact_id=contact,
+            exclude_conversation_ref_id=conversation_ref_id,
+            limit=limit,
+        )
+    return ok_response(
+        {
+            "contact_id": contact,
+            "count": len(prior),
+            "items": [
+                {
+                    "conversation_ref": str(p.conversation_ref_id),
+                    "channel": p.channel,
+                    "opened_at": p.opened_at,
+                    "lease_version": p.lease_version,
+                }
+                for p in prior
+            ],
+        },
+        trace_id=new_trace_id(),
+    )

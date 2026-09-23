@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 
 # Bounded, because the query space is not: every distinct customer question is
@@ -65,7 +66,7 @@ class TtlCache[T]:
         *,
         max_entries: int = DEFAULT_MAX_ENTRIES,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
-        clock=time.monotonic,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._max_entries = max(1, max_entries)
         self._ttl_seconds = ttl_seconds

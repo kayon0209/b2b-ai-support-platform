@@ -9,6 +9,8 @@ import { Approvals } from "./pages/Approvals";
 import { Branding } from "./pages/Branding";
 import { Cases } from "./pages/Cases";
 import { CustomerChat } from "./pages/CustomerChat";
+import { Channels } from "./pages/Channels";
+import { Experiments } from "./pages/Experiments";
 import { FeatureFlags } from "./pages/FeatureFlags";
 import { GapQueue } from "./pages/GapQueue";
 import { Conversations } from "./pages/Conversations";
@@ -48,6 +50,8 @@ const router = createBrowserRouter([
       { path: "conversations", element: <Conversations /> },
       { path: "prompts", element: <PromptRelease /> },
       { path: "flags", element: <FeatureFlags /> },
+      { path: "channels", element: <Channels /> },
+      { path: "experiments", element: <Experiments /> },
       { path: "cases", element: <Cases /> },
       { path: "workbench", element: <Workbench /> },
       // The case id is part of the address so a refresh keeps the agent where

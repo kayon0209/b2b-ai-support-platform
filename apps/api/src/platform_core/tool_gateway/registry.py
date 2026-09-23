@@ -229,10 +229,17 @@ class ConnectorOutcomeExecutor:
         # provider returns None (cannot prove), which the caller treats as a
         # refusal. Without this delegation the wrapper hid the method and
         # /verify always 503'd.
-        inner = self._inner
-        if not hasattr(inner, "verify_ownership"):
+        verify = getattr(self._inner, "verify_ownership", None)
+        if verify is None:
             return None
-        return await inner.verify_ownership(tool_name, record_id, proof)
+        account = await verify(tool_name, record_id, proof)
+        # Only a non-empty account name counts as proof. A provider that answers
+        # with anything else has not proved ownership, and `None` is what the
+        # caller already treats as a refusal - so an unrecognised answer fails
+        # closed instead of being bound into the visitor's token. `getattr` is
+        # what keeps the probe optional: the inner executor is typed as the
+        # narrow `ToolExecutor` protocol, which has no such method.
+        return account if isinstance(account, str) and account else None
 
 
 class ConnectorExecutorResolver:

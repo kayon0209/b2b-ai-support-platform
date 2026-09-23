@@ -27,6 +27,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.channels.outbound import ChannelSender, SendResult
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -201,7 +203,7 @@ async def _execute_write_run(
         orch = AgentOrchestrator(
             session,
             OrchestratorDeps(
-                sender=_RecordingSender(),
+                channel_sender=ChannelSender({"email": _RecordingTransport()}),
                 generator=generator,
                 tool_factories=tool_factories,
             ),
@@ -212,8 +214,9 @@ async def _execute_write_run(
             question=question,
             principal=principal,
             expected_lease_version=expected_version,
-            chatwoot_account_id="1",
-            chatwoot_conversation_id="1",
+            channel_system="email",
+            channel_address="buyer@example.test",
+            channel_conversation_key="1",
         )
         await session.commit()
 
@@ -270,21 +273,30 @@ async def _execute_write_run(
     return outcome, proposals, executions, int(confirmations), citations
 
 
-class _RecordingSender:
-    """ChatwootClient-compatible transport double."""
+class _RecordingTransport:
+    """Channel transport double: records every outbound answer.
+
+    It replaced a Chatwoot-shaped `sender` double. The channel path is the only
+    path that still leaves the platform, so it is the only delivery an outside
+    observer can see; the platform's own surface delivers by persisting the
+    agent turn, which these tests read back from the database.
+    """
+
+    system = "email"
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(self, *, account_id, conversation_id, content, command_id):
+    async def send(self, *, address, conversation_key, content, command_id):
         self.calls.append(
             {
-                "account_id": account_id,
-                "conversation_id": conversation_id,
+                "address": address,
+                "conversation_key": conversation_key,
                 "content": content,
                 "command_id": command_id,
             }
         )
+        return SendResult()
 
         class _Result:
             ambiguous = False

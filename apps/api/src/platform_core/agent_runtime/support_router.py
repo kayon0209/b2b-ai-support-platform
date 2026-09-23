@@ -39,8 +39,11 @@ import uuid
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime import chat_service
+from platform_core.agent_runtime.hours import is_open, opening_hour
+from platform_core.agent_runtime.language import answers_in_chinese
 from platform_core.api import (
     AUTH_UNRESOLVED,
     IDEMPOTENCY_KEY_REQUIRED,
@@ -51,6 +54,8 @@ from platform_core.api import (
     require_idempotency_key,
     tenant_session,
 )
+from platform_core.identity import lease_service
+from platform_core.identity.branding import sanitize_display_name
 from platform_core.identity.models import Tenant, TenantStatus
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.support_bridge.conversation_ref import conversation_ref_for
@@ -136,18 +141,23 @@ async def open_session(request: Request, body: SessionIn) -> object:
                 trace_id=new_trace_id(),
             )
         tenant_id = tenant.id
-        branding = {
-            "display_name": tenant.brand_display_name or tenant.name,
-            "logo_url": tenant.brand_logo_url,
-            "primary_color": tenant.brand_primary_color,
-            "support_email": tenant.support_email,
-        }
+        branding = await _branding_for(session, tenant_id)
+        # Read inside the same scope as the tenant row: `is_open` touches
+        # settings, not the database, but the window is part of the same
+        # "what the customer sees on arrival" answer.
+        support_window = {"open": is_open(), "opens_at_hour": opening_hour()}
 
     external = body.visitor_id or str(uuid.uuid4())
+    # The one place a visitor conversation's identity is minted, from the
+    # channel id the visitor holds. Everything downstream - the worker, the
+    # operator's `/v1/conversations` surfaces, the agent's reply - reads the
+    # ref this returns and never derives one again; that is the whole rule
+    # (`support_bridge.conversation_ref`).
     conversation_ref = conversation_ref_for(tenant_id, external)
-    # The external id goes into the token as well as the derived ref. The worker
-    # re-derives the ref from what we hand it, so only the raw id reproduces the
-    # same conversation; passing the ref back would derive it a second time.
+    # The external id still goes into the token as well as the ref, because
+    # the worker re-derives from the payload it receives. A caller that later
+    # needs a human to answer addresses the conversation by `conversation_ref`
+    # - not by this id, which the platform surfaces never accept.
     token, expires_at = issue(
         tenant_id, conversation_ref, external, ttl_seconds=SESSION_TTL_SECONDS
     )
@@ -157,6 +167,7 @@ async def open_session(request: Request, body: SessionIn) -> object:
             "conversation_ref": str(conversation_ref),
             "expires_at": expires_at,
             "branding": branding,
+            "support_window": support_window,
         },
         trace_id=new_trace_id(),
     )
@@ -167,7 +178,15 @@ async def timeline(
     request: Request,
     limit: int = Query(default=50, ge=1, le=200),
 ) -> object:
-    """The visitor's own exchange, oldest first."""
+    """The visitor's own exchange, oldest first.
+
+    Carries the conversation's ownership alongside the turns, because the turns
+    alone cannot express the one state a customer most needs to understand: the
+    AI is no longer the one who will answer. I didn't say anything and nobody
+    said anything" and "a colleague has this and will reply" are the same
+    timeline and opposite experiences - the second one is why the customer keeps
+    the window open.
+    """
     claim = _claim(request)
     if not isinstance(claim, VisitorClaim):
         return claim
@@ -176,7 +195,79 @@ async def timeline(
         items = await chat_service.read_timeline(
             session, ref_id=claim.conversation_ref, limit=limit
         )
-    return ok_response({"items": items}, trace_id=new_trace_id())
+        owner, mode = await lease_service.current_owner(
+            session,
+            tenant_id=claim.tenant_id,
+            conversation_ref_id=claim.conversation_ref,
+        )
+        branding = await _branding_for(session, claim.tenant_id)
+    return ok_response(
+        {
+            "items": items,
+            "conversation": {"owner": owner, "mode": mode},
+            # Three things the window needs on *every* load, not only on the one
+            # that opens the session: the tenant's own name and colour, and
+            # whether anyone is there. Returning them here rather than from
+            # `/sessions` alone is what stops a returning customer - the one who
+            # reloads, or comes back tomorrow - from losing the brand name to the
+            # hardcoded fallback, which is exactly what happened before
+            # (measured 2026-09-23).
+            "branding": branding,
+            "support_window": {
+                "open": is_open(),
+                "opens_at_hour": opening_hour(),
+            },
+        },
+        trace_id=new_trace_id(),
+    )
+
+
+async def _branding_for(session: AsyncSession, tenant_id: uuid.UUID) -> dict[str, object]:
+    """The tenant's public branding, for a surface that already holds a token.
+
+    Small enough to inline, but it exists as a function because two responses
+    need it and a copy that drifted would show one customer two different brand
+    names on the same page load.
+    """
+    tenant = (
+        await session.execute(select(Tenant).where(Tenant.id == tenant_id))
+    ).scalar_one_or_none()
+    if tenant is None:
+        return {}
+    return {
+        "display_name": sanitize_display_name(tenant.brand_display_name) or tenant.name,
+        "logo_url": tenant.brand_logo_url,
+        "primary_color": tenant.brand_primary_color,
+        "support_email": tenant.support_email,
+    }
+
+
+# --- When the AI is not the one who will answer ---------------------------
+#
+# Served by two routes: `GET /timeline` returns it as the conversation state,
+# and `POST /messages` writes it as a `system` turn when it declines to queue an
+# answer.
+#
+# Two texts rather than one, because "a person is on it" and "waiting for one"
+# are different situations and the customer acts differently on each - waiting
+# quietly versus expecting a name. Blurring them is the same class of error as
+# reporting a missing record as a systems outage. Neither promises a time: how
+# long a queue takes is not something this platform knows.
+def _handed_off_notice(owner_type: str, question: str) -> str:
+    chinese = answers_in_chinese(question)
+    if owner_type == "human":
+        return (
+            "这条对话已由人工同事接手，他们会看到您刚发的消息。"
+            if chinese
+            else "A human colleague has taken over this conversation and will "
+            "see your message."
+        )
+    return (
+        "这条对话正在等待人工同事接入，您发的消息他们会看到，请稍候。"
+        if chinese
+        else "This conversation is waiting for a human colleague to pick it "
+        "up. They will see your message."
+    )
 
 
 class MessageIn(BaseModel):
@@ -266,6 +357,16 @@ async def post_message(request: Request, body: MessageIn) -> object:
     customer page should not have to know that turns and runs are separate
     things, and a customer who loses the second call would leave a question
     stored but never answered.
+
+    **It does not queue when the AI is not the owner**, and that is the point of
+    the ownership check below rather than an optimisation. A conversation handed
+    to a person - or to the queue - can never receive an AI reply, because the
+    pre-send lease gate refuses one. Queuing anyway meant the model was paid
+    for, the draft was generated, and then discarded, with nothing written to
+    the conversation: measured 2026-09-23, a customer who asked a follow-up
+    question after a handoff saw no answer, no notice and no error, forever. So
+    the question is still recorded, the customer is told who has it, and no run
+    is spent on a reply that could not be delivered.
     """
     claim = _claim(request)
     if not isinstance(claim, VisitorClaim):
@@ -289,6 +390,34 @@ async def post_message(request: Request, body: MessageIn) -> object:
             ref_id=claim.conversation_ref,
             text=body.text,
         )
+
+        owner, mode = await lease_service.current_owner(
+            session,
+            tenant_id=ctx.tenant_id,
+            conversation_ref_id=claim.conversation_ref,
+        )
+        if owner != "ai":
+            # The question is kept either way, so declining to answer the AI's
+            # way is not data loss - a person will read it. `append_system_turn`
+            # dedupes, so two messages in a row do not produce two copies of the
+            # same sentence.
+            await chat_service.append_system_turn(
+                session,
+                tenant_id=ctx.tenant_id,
+                ref_id=claim.conversation_ref,
+                text=_handed_off_notice(owner, body.text),
+            )
+            return ok_response(
+                {
+                    "turn_id": str(turn.id),
+                    "conversation_ref": str(claim.conversation_ref),
+                    "duplicate": duplicate,
+                    "status": "waiting_for_human",
+                    "conversation": {"owner": owner, "mode": mode},
+                },
+                trace_id=trace_id,
+            )
+
         try:
             queued = await chat_service.queue_agent_run(
                 session,
@@ -313,6 +442,8 @@ async def post_message(request: Request, body: MessageIn) -> object:
             "turn_id": str(turn.id),
             "conversation_ref": str(claim.conversation_ref),
             "duplicate": duplicate,
+            "status": "queued",
+            "conversation": {"owner": owner, "mode": mode},
             **queued,
         },
         trace_id=trace_id,

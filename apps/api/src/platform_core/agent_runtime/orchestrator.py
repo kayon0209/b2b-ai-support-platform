@@ -20,7 +20,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,6 +50,8 @@ from platform_core.agent_runtime.intent import (
     classify,
 )
 from platform_core.agent_runtime.models import (
+    MODE_CUSTOMER_REPLY,
+    MODE_INTERNAL_DRAFT,
     AgentRun,
     Citation,
     RunStatus,
@@ -67,6 +69,7 @@ from platform_core.agent_runtime.qa_path import (
     ABSTAIN_SENSITIVE_REQUEST,
     ABSTAIN_STRATEGIC_ACCOUNT_REQUIRES_HUMAN,
     SYSTEM_OUTAGE_REASONS,
+    UNVERIFIED_READ_REASONS,
     AbstentionDecision,
     DraftAnswer,
     claim_contradiction_candidates,
@@ -75,6 +78,7 @@ from platform_core.agent_runtime.qa_path import (
     redline_violations,
     safe_abstention_text,
     system_outage_notice,
+    unverified_read_notice,
     validate_citations,
 )
 from platform_core.agent_runtime.queue_status import queue_notice, queue_status
@@ -138,12 +142,14 @@ class RunOutcome:
 @dataclass
 class OrchestratorDeps:
     """Injected collaborators. Keeps the orchestrator testable without a
-    live provider, Chatwoot or Redis."""
+    live provider or Redis."""
 
     embedder: Embedder | None = None
     generator: LlmAnswerGenerator | None = None
-    sender: object | None = None  # ChatwootClient-compatible send_message
-    reader: object | None = None  # ChatwootClient-compatible fetch_message
+    # Delivers an answer back over the channel it arrived on (ADR 0014). `None`
+    # means every channel is receive-only, which is a deployment state and is
+    # recorded as one rather than being reported as a successful delivery.
+    channel_sender: object | None = None  # ChannelSender-compatible send_message
     # Applied only when `RERANK_FLAG_KEY` resolves true for the tenant, so the
     # rollout is a per-tenant decision rather than a deployment-wide switch.
     reranker: Reranker | None = None
@@ -523,6 +529,24 @@ class AgentOrchestrator:
         self._top_k = deps.top_k
         self._target_team: str | None = None
         self._attachment_types: list[str] = []
+        # Which channel this run answers on (ADR 0014), stored rather than
+        # threaded for the same reason `_target_team` is: there is one value per
+        # run, and *three* places dispatch - the answer, the abstention notice
+        # and the clarification. Threading it means one of the three is missed,
+        # and the one that is missed is the notice: the most common outcome in
+        # the system is "we could not answer", so a missed notice is the
+        # customer waiting for a reply that never arrives.
+        self._channel_system: str | None = None
+        self._channel_address: str | None = None
+        # Read from the run's own `model_config` at adoption. Defaulted here so
+        # an orchestrator driven directly (tests, probes) behaves as before.
+        self._mode: str = MODE_CUSTOMER_REPLY
+        # The A/B arms this run is in, and the generator they imply. Both are
+        # per-run state, resolved once at the start of the pipeline: looking
+        # them up again mid-run could disagree with what the run recorded if an
+        # experiment were edited between the two reads.
+        self._experiments: dict[str, Any] = {}
+        self._generator_override: object | None = None
         # Set per run in `_run_pipeline`; defaulted so a handoff reached
         # without a classification cannot raise on the way out.
         self._business_line_note: str | None = None
@@ -535,8 +559,7 @@ class AgentOrchestrator:
         question: str,
         principal: PrincipalScope,
         trace: TraceContext | None = None,
-        chatwoot_account_id: str | None = None,
-        chatwoot_conversation_id: str | None = None,
+        channel_conversation_key: str | None = None,
         expected_lease_version: int | None = None,
         restricted_query: bool = False,
         history: list[Turn] | None = None,
@@ -554,6 +577,15 @@ class AgentOrchestrator:
         #   "acme"        - a visitor who proved ownership of that account: the
         #                   tools run, and each receipt is checked against it.
         verified_account: str | None = None,
+        # ADR 0014. Which channel the question arrived on, and where to answer.
+        # `None` means a conversation the platform itself carries (`/support`, an
+        # operator run), for which `_dispatch`'s existing branches are correct.
+        # A value means an email or WeChat conversation that has no Chatwoot
+        # account behind it and must be delivered by its own transport.
+        channel_system: str | None = None,
+        # The destination: the customer's address for email, the openid for
+        # WeChat. It arrives as the event's `contact_id`.
+        channel_address: str | None = None,
     ) -> RunOutcome:
         """Execute the pipeline for one inbound customer message.
 
@@ -571,6 +603,8 @@ class AgentOrchestrator:
         """
         started = time.monotonic()
         ctx = trace or new_trace_context()
+        self._channel_system = channel_system
+        self._channel_address = channel_address
         # One root span per run. Everything the pipeline does hangs off it, so
         # a trace shows the whole journey rather than a scatter of spans that
         # have to be stitched together by timestamp.
@@ -584,8 +618,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 run_span=run_span,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
                 expected_lease_version=expected_lease_version,
                 restricted_query=restricted_query,
                 history=history,
@@ -594,6 +627,8 @@ class AgentOrchestrator:
                 contact_id=contact_id,
                 attachment_types=attachment_types,
                 verified_account=verified_account,
+                channel_system=channel_system,
+                channel_address=channel_address,
             )
         except Exception as exc:
             # An unexpected failure still has to be visible in metrics and in
@@ -646,8 +681,7 @@ class AgentOrchestrator:
         ctx: TraceContext,
         started: float,
         run_span: Any,
-        chatwoot_account_id: str | None,
-        chatwoot_conversation_id: str | None,
+        channel_conversation_key: str | None,
         expected_lease_version: int | None,
         restricted_query: bool,
         history: list[Turn] | None,
@@ -658,6 +692,9 @@ class AgentOrchestrator:
         # Feature 2.5 ownership gate - threaded from run() (see that parameter's
         # docstring for the three states).
         verified_account: str | None = None,
+        # ADR 0014 - threaded from run(); see there for the two states.
+        channel_system: str | None = None,
+        channel_address: str | None = None,
     ) -> RunOutcome:
 
         # --- 1. Acquire/observe the control lease. ---
@@ -794,6 +831,29 @@ class AgentOrchestrator:
             }
         )
 
+        # Resolved before adoption so the arms land in `model_config` in the
+        # same write as the rest of the lineage, rather than being patched in
+        # afterwards - a run whose recorded arms disagreed with the prompt it
+        # actually used would make the results unreadable.
+        from platform_core.evaluation.ab_service import (
+            assign_experiments,
+            resolve_prompt_override,
+        )
+
+        self._experiments = await assign_experiments(
+            self._session, tenant_id=tenant_id, conversation_ref_id=conversation_ref_id
+        )
+        if self._experiments and self._deps.generator is not None:
+            # Sorted so two experiments that both name a prompt resolve the same
+            # way on every run; otherwise which arm wins depends on dict order.
+            for _key in sorted(self._experiments):
+                _template = await resolve_prompt_override(
+                    self._session, tenant_id=tenant_id, arm=self._experiments[_key]
+                )
+                if _template is not None:
+                    self._generator_override = self._deps.generator.with_template(_template)
+                    break
+
         run = await self._adopt_or_create_run(
             tenant_id=tenant_id,
             conversation_ref_id=conversation_ref_id,
@@ -805,6 +865,68 @@ class AgentOrchestrator:
             retrieval_query=retrieval_query,
             question=question,
         )
+
+        # The mode lives on the run, so it is read from the run rather than
+        # threaded through every call site - and an execution path that forgets
+        # to pass it cannot silently ignore it. See the shadow check below.
+        self._mode = str((run.model_config or {}).get("mode") or MODE_CUSTOMER_REPLY)
+
+        # --- 1b-3. Is the AI still the one who may speak? ---
+        #
+        # Placed after the run is adopted (so the run row exists to carry the
+        # outcome) and before retrieval and the model call, which is the whole
+        # point: a conversation parked in the handoff queue can never receive an
+        # AI reply, because the pre-send lease gate refuses one. Reaching that
+        # gate is still the authoritative check and still runs - but a run that
+        # gets there has already paid for a retrieval and a generation to
+        # produce a draft that is then thrown away, while the customer is told
+        # nothing. Measured 2026-09-23: after a handoff into the queue, every
+        # following question in that conversation did exactly that,
+        # indefinitely. `lease_service.current_owner` records the same finding.
+        #
+        # **The queue specifically, not "anything that is not the AI."** A
+        # specific agent's takeover (`owner_type == "human"`, `transfer_to_human`)
+        # is left to the pre-send gate, which keeps the draft for that agent -
+        # see `_finish_answer`'s LeaseConflict branch and
+        # `test_human_takeover_mid_generation_blocks_outbound_send`. Skipping
+        # generation for a conversation someone is actively working would throw
+        # away the draft they were about to use; skipping it for one parked in
+        # the queue loses nothing, because no one is there to read it.
+        #
+        # The customer is deliberately not told from here, and cannot be: the
+        # same lease that stops the answer stops any notice this path could
+        # send. The surface that accepts the question is what says so - see
+        # `support_router._handed_off_notice`.
+        #
+        # `run` is bound above (the guard used to sit before adoption, which
+        # crashed with UnboundLocalError the moment it fired - caught by
+        # `test_orchestrator_lease_race.py`).
+        if str(lease.owner_type) == "queue":
+            run.route = route
+            run.status = RunStatus.HANDED_OFF.value
+            run.latency_ms = int((time.monotonic() - started) * 1000)
+            await self._session.flush()
+            logger.info(
+                "run_skipped_not_owner",
+                ctx,
+                reason_code=f"owner is {lease.owner_type}",
+            )
+            get_metrics().observe_run(
+                outcome="handed_off",
+                route=route,
+                latency_seconds=run.latency_ms / 1000.0,
+                citation_count=0,
+            )
+            return RunOutcome(
+                run_id=run.id,
+                status=RunStatus.HANDED_OFF,
+                route=route,
+                answer_text="",
+                send_blocked_reason=f"AI_NOT_OWNER: owner is {lease.owner_type}",
+                citation_count=0,
+                latency_ms=run.latency_ms,
+                trace_id=ctx.trace_id,
+            )
 
         # --- 2. Restricted and non-knowledge routes never reach the model. ---
         if restricted_query or route in PRE_RETRIEVAL_ROUTES:
@@ -822,8 +944,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         # --- 2b. Clarification, before spending retrieval. ---
@@ -877,8 +998,7 @@ class AgentOrchestrator:
                     ctx=ctx,
                     started=started,
                     question=question,
-                    chatwoot_account_id=chatwoot_account_id,
-                    chatwoot_conversation_id=chatwoot_conversation_id,
+                    channel_conversation_key=channel_conversation_key,
                 )
 
         # --- 2b-complaint. A claim against the company (L6 争议归责). ---
@@ -927,8 +1047,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
                 handoff_context=account_label,
             )
 
@@ -950,8 +1069,7 @@ class AgentOrchestrator:
                     ctx=ctx,
                     started=started,
                     question=question,
-                    chatwoot_account_id=chatwoot_account_id,
-                    chatwoot_conversation_id=chatwoot_conversation_id,
+                    channel_conversation_key=channel_conversation_key,
                 )
             return await self._finish_clarify(
                 run=run,
@@ -962,8 +1080,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         # --- 2c. Business read tools (plan 3.2/3.4; flag off by default). ---
@@ -985,8 +1102,7 @@ class AgentOrchestrator:
                     started=started,
                     conversation_ref_id=conversation_ref_id,
                     expected_lease_version=expected_lease_version,
-                    chatwoot_account_id=chatwoot_account_id,
-                    chatwoot_conversation_id=chatwoot_conversation_id,
+                    channel_conversation_key=channel_conversation_key,
                 )
                 if isinstance(read_result, RunOutcome):
                     return read_result
@@ -1045,8 +1161,7 @@ class AgentOrchestrator:
                         ctx=ctx,
                         started=started,
                         question=question,
-                        chatwoot_account_id=chatwoot_account_id,
-                        chatwoot_conversation_id=chatwoot_conversation_id,
+                        channel_conversation_key=channel_conversation_key,
                     )
                 return await self._finish_clarify(
                     run=run,
@@ -1057,8 +1172,7 @@ class AgentOrchestrator:
                     ctx=ctx,
                     started=started,
                     question=question,
-                    chatwoot_account_id=chatwoot_account_id,
-                    chatwoot_conversation_id=chatwoot_conversation_id,
+                    channel_conversation_key=channel_conversation_key,
                 )
             write_result = await self._attempt_business_write(
                 run=run,
@@ -1069,8 +1183,7 @@ class AgentOrchestrator:
                 started=started,
                 conversation_ref_id=conversation_ref_id,
                 expected_lease_version=expected_lease_version,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
             if isinstance(write_result, RunOutcome):
                 return write_result
@@ -1146,8 +1259,7 @@ class AgentOrchestrator:
                     ctx=ctx,
                     started=started,
                     question=question,
-                    chatwoot_account_id=chatwoot_account_id,
-                    chatwoot_conversation_id=chatwoot_conversation_id,
+                    channel_conversation_key=channel_conversation_key,
                 )
 
             # --- 3b. Relative score floor (plan 1.7, flag off by default). ---
@@ -1199,8 +1311,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         # --- 5. Generate a draft. ---
@@ -1216,8 +1327,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
         # --- 4c. Evidence-first budget (plan 2.7). ---
         # Evidence and context share one prompt. When they contend, evidence
@@ -1266,8 +1376,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         # --- 6. Validate citations. Unsupported output is not publishable. ---
@@ -1296,8 +1405,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
         # Red-line guard (华秋 research difficulty 4; feature list 6.1/6.2):
         # a draft that commits the company to a price, a delivery date, a
@@ -1326,8 +1434,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
         if not validation.ok:
             return await self._finish_abstain(
@@ -1341,8 +1448,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         # --- 7. Persist citations with the run still RUNNING. ---
@@ -1399,7 +1505,14 @@ class AgentOrchestrator:
         # says "these 42 handoffs are evidence gaps", someone writes the
         # document, and this is the step where you watch what the platform
         # *would* have said before letting it talk to customers.
-        shadow = await self._flag_enabled(self._settings().flag_shadow_mode, tenant_id)
+        # `internal_draft` joins shadow mode here rather than getting its own
+        # suppression branch. The API has accepted this mode since it was
+        # written and **nothing read it** - so an operator asking for a draft
+        # got a message sent to the customer, which is the one outcome the mode
+        # exists to prevent.
+        shadow = self._mode == MODE_INTERNAL_DRAFT or await self._flag_enabled(
+            self._settings().flag_shadow_mode, tenant_id
+        )
         if shadow:
             # Logged rather than metered for now; the counter belongs with the
             # rest of the run metrics and is not worth a half-added one here.
@@ -1417,15 +1530,22 @@ class AgentOrchestrator:
                 tenant_id=tenant_id,
                 draft_text=draft.text,
                 ctx=ctx,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
                 conversation_ref_id=conversation_ref_id,
+                channel_system=channel_system,
+                channel_address=channel_address,
             )
         # Deliberately not a failure: the answer exists and was reviewed by
         # every gate, only the delivery was withheld. Marking it FAILED would
         # make a shadow run indistinguishable from a broken one, which is the
         # opposite of what the observation is for.
-        if send_error and not shadow:
+        #
+        # `OUTBOUND_NOT_CONFIGURED` belongs in the same bucket for a harder
+        # reason: the agent turn is only written for a COMPLETED run, so failing
+        # here would discard the answer *and* the platform's only record of it,
+        # leaving a receive-only deployment unable to show what it produced.
+        withheld_delivery = shadow or send_error == "OUTBOUND_NOT_CONFIGURED"
+        if send_error and not withheld_delivery:
             run.status = RunStatus.FAILED.value
             run.latency_ms = int((time.monotonic() - started) * 1000)
             await self._session.flush()
@@ -1545,7 +1665,12 @@ class AgentOrchestrator:
         started = time.monotonic()
         span = ctx.span("model.generate", **{"span.kind": "client"})
         try:
-            draft = await self._deps.generator.generate(
+            # Cast rather than `Any`: the override is either the injected
+            # generator or a `with_template` copy of it, so it has the same
+            # contract - and losing that would make this call untyped for every
+            # future reader.
+            _effective = cast(LlmAnswerGenerator, self._generator_override or self._deps.generator)
+            draft = await _effective.generate(
                 question,
                 evidence,
                 context=context,
@@ -1581,8 +1706,7 @@ class AgentOrchestrator:
         started: float,
         conversation_ref_id: uuid.UUID,
         expected_lease_version: int,
-        chatwoot_account_id: str | None,
-        chatwoot_conversation_id: str | None,
+        channel_conversation_key: str | None,
     ) -> RunOutcome | list[RetrievedChunk]:
         """Attempt the read-tool path for a BUSINESS_READ run (plan 3.2/3.4).
 
@@ -1615,8 +1739,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         candidates = select_read_tools(detection, question)
@@ -1630,8 +1753,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         resolver = ConnectorExecutorResolver(
@@ -1658,8 +1780,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
         chosen = usable[0]
         arguments = _extract_tool_args(chosen.tool_name, question)
@@ -1673,8 +1794,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         # The AI acts as the integration service for READS: TOOL_READ is the
@@ -1736,8 +1856,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         if execution.status not in ("executed", "verified"):
@@ -1752,8 +1871,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         output = execution.sanitized_output or {}
@@ -1795,8 +1913,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         receipt_json = _json.dumps(output, sort_keys=True, ensure_ascii=False, default=str)
@@ -1983,8 +2100,7 @@ class AgentOrchestrator:
         started: float,
         conversation_ref_id: uuid.UUID,
         expected_lease_version: int,
-        chatwoot_account_id: str | None,
-        chatwoot_conversation_id: str | None,
+        channel_conversation_key: str | None,
     ) -> RunOutcome | list[RetrievedChunk]:
         """Attempt the write path for a BUSINESS_WRITE run (plan 3.5).
 
@@ -2025,8 +2141,7 @@ class AgentOrchestrator:
                 ctx=ctx,
                 started=started,
                 question=question,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
             )
 
         candidates = select_write_tools(detection, question)
@@ -2200,8 +2315,7 @@ class AgentOrchestrator:
         ctx: TraceContext,
         started: float,
         question: str,
-        chatwoot_account_id: str | None,
-        chatwoot_conversation_id: str | None,
+        channel_conversation_key: str | None,
     ) -> RunOutcome:
         return await self._finish_abstain(
             run=run,
@@ -2212,8 +2326,7 @@ class AgentOrchestrator:
             ctx=ctx,
             started=started,
             question=question,
-            chatwoot_account_id=chatwoot_account_id,
-            chatwoot_conversation_id=chatwoot_conversation_id,
+            channel_conversation_key=channel_conversation_key,
         )
 
     async def _finish_abstain(
@@ -2227,8 +2340,7 @@ class AgentOrchestrator:
         ctx: TraceContext,
         started: float,
         question: str,
-        chatwoot_account_id: str | None,
-        chatwoot_conversation_id: str | None,
+        channel_conversation_key: str | None,
         handoff_context: str | None = None,
     ) -> RunOutcome:
         """Record abstention, release the lease to the human queue, and send
@@ -2269,10 +2381,35 @@ class AgentOrchestrator:
         # this path records the run and hands off, and "已留工单" when nothing
         # was filed would be the same lie as a tool reporting success it never
         # verified.
+        #
+        # `TOOL_EXECUTION_UNVERIFIED` has its own notice rather than sharing
+        # this one: an ambiguous or absent record is not the third party's
+        # outage, and reporting it as one sends the operator to look for a
+        # failure that never happened (see `UNVERIFIED_READ_REASONS`).
         if decision.reason_code in SYSTEM_OUTAGE_REASONS:
-            notice = system_outage_notice()
+            notice = system_outage_notice(question)
+        elif decision.reason_code in UNVERIFIED_READ_REASONS:
+            notice = unverified_read_notice(question)
+            # The same queue/out-of-hours enrichment applies: this notice also
+            # promises a person, so it must not promise one who is not there.
+            if decision.handoff and not is_open():
+                notice = f"{notice} {offline_notice(question=question)}"
+            elif decision.handoff:
+                try:
+                    position_notice = queue_notice(
+                        await queue_status(
+                            self._session,
+                            tenant_id=tenant_id,
+                            conversation_ref_id=conversation_ref_id,
+                        ),
+                        question,
+                    )
+                except Exception:  # noqa: BLE001 - enrichment, not a dependency
+                    position_notice = None
+                if position_notice:
+                    notice = f"{notice} {position_notice}"
         else:
-            notice = safe_abstention_text(decision.reason_code)
+            notice = safe_abstention_text(decision.reason_code, question)
             # 7.5: never promise a person who is not there. The reason code
             # still says why the run stopped - that is for the receiving agent
             # and the audit log - but the customer is told the truth about when
@@ -2280,7 +2417,7 @@ class AgentOrchestrator:
             # says "we are closed" would strand a customer who could have
             # answered and been answered.
             if decision.handoff and not is_open():
-                notice = offline_notice()
+                notice = offline_notice(question=question)
             elif decision.handoff:
                 # 1.7: where they are in the queue, now that someone is
                 # actually there to work it. Mutually exclusive with the
@@ -2294,7 +2431,8 @@ class AgentOrchestrator:
                             self._session,
                             tenant_id=tenant_id,
                             conversation_ref_id=conversation_ref_id,
-                        )
+                        ),
+                        question,
                     )
                 except Exception:  # noqa: BLE001 - enrichment, not a dependency
                     position_notice = None
@@ -2329,24 +2467,24 @@ class AgentOrchestrator:
                 tenant_id=tenant_id,
                 draft_text=notice,
                 ctx=ctx,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
                 conversation_ref_id=conversation_ref_id,
+                # The channel travels with the notice, not only with the
+                # answer. Without this the notice fell through to the
+                # platform-surface branch, returned "" - which means
+                # *delivered* - and an email or WeChat customer whose question
+                # could not be answered heard nothing at all.
+                channel_system=self._channel_system,
+                channel_address=self._channel_address,
             )
-            # Evidence-carrying handoff (plan 5.4): the receiving agent gets
-            # the reason code and the evidence the run gathered, as a PRIVATE
-            # note - the customer never sees it, and the agent does not have
-            # to reconstruct "why did the bot give up" from the audit log.
-            if not send_error and decision.handoff and self._settings().handoff_evidence_enabled:
-                await self._send_handoff_note(
-                    run=run,
-                    question=question,
-                    reason_code=decision.reason_code,
-                    ctx=ctx,
-                    chatwoot_account_id=chatwoot_account_id,
-                    chatwoot_conversation_id=chatwoot_conversation_id,
-                    handoff_context=handoff_context,
-                )
+            # The evidence-carrying handoff note is gone with its transport.
+            # It existed to push the reason code and the gathered evidence into
+            # Chatwoot as a private note, because Chatwoot was where the agent
+            # worked. The agent now works in `Workbench`, which reads the case,
+            # the conversation, the run's citations and the account contacts
+            # straight from the platform's own tables (`/v1/cases/{id}/workbench`).
+            # Re-sending that as a note would be a second copy of data the
+            # operator is already looking at.
 
         if decision.reason_code == ABSTAIN_CONFLICT:
             # Conflicting sources become a review-able gap (plan 4.5): the
@@ -2373,6 +2511,26 @@ class AgentOrchestrator:
                 reason=f"abstain:{decision.reason_code}",
             )
 
+        # The routing decision is `metadata`, not `after`, and that is
+        # deliberate: `after` is hashed and unreadable, while these three
+        # values are the *parameters* of the handoff - which team it went to,
+        # which product line it is, and the context the run gathered. They used
+        # to travel in a private Chatwoot note; with that transport gone
+        # (ADR 0012), this is the record an operator or reviewer reads to answer
+        # "where did this handoff go, and why".
+        handoff_metadata = {
+            key: value
+            for key, value in (
+                ("team", self._target_team),
+                ("business_line", self._business_line_note),
+                ("context", handoff_context),
+                # 1.3: "please send a photo" when the customer already sent two
+                # is the exchange that makes a handoff feel like starting over.
+                # Content types only - the files never entered the platform.
+                ("customer_attachments", ",".join(self._attachment_types) or None),
+            )
+            if value
+        }
         await audit_service.record(
             self._session,
             ctx=TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="service"),
@@ -2382,6 +2540,7 @@ class AgentOrchestrator:
             decision="abstained",
             reason_code=decision.reason_code[:63],
             after={"handoff": decision.handoff, "notice_sent": not send_error},
+            metadata=handoff_metadata or None,
             trace_id=ctx.trace_id,
         )
         logger.info(
@@ -2426,60 +2585,6 @@ class AgentOrchestrator:
         )
         get_metrics().run_cost_cents.observe(max(0.0, cost))
 
-    async def _send_handoff_note(
-        self,
-        *,
-        run: AgentRun,
-        question: str,
-        reason_code: str,
-        ctx: TraceContext,
-        chatwoot_account_id: str | None,
-        chatwoot_conversation_id: str | None,
-        handoff_context: str | None = None,
-    ) -> None:
-        """Private note for the receiving agent: reason + evidence refs."""
-        if self._deps.sender is None or not chatwoot_account_id or not chatwoot_conversation_id:
-            return
-        # No raw content: the hash links to the audit log, which is the
-        # record a reviewer is allowed to read.
-        note = (
-            f"[handoff] reason_code={reason_code}"
-            f" | question_hash={getattr(run, 'input_hash', '')}"
-            f" | run_id={run.id}"
-        )
-        if self._attachment_types:
-            # 1.3: "请提供照片" when the customer already sent two is the
-            # exchange that makes handoffs feel like starting over. The types
-            # are metadata; the files themselves stay in Chatwoot.
-            supplied = ",".join(self._attachment_types)
-            marker = f"customer_attachments={supplied}"
-            handoff_context = f"{handoff_context} | {marker}" if handoff_context else marker
-        if self._target_team:
-            # Which team, so the note lands somewhere specific instead of in a
-            # queue where whoever reads it first is probably the wrong person.
-            note = f"{note} | team={self._target_team}"
-        if self._business_line_note:
-            # 3.2/7.3: the product line, so a handoff that lands in the general
-            # queue still says what it is about. "A complaint" and "a PCB
-            # complaint" are different jobs for whoever opens the note, and the
-            # classification is already done - dropping it here would discard a
-            # fact the platform just established.
-            note = f"{note} | line={self._business_line_note}"
-        if handoff_context:
-            # Which account, so the note is actionable: "a strategic account
-            # complained" without a name still leaves the agent guessing.
-            note = f"{note} | {handoff_context}"
-        try:
-            await self._deps.sender.send_message(  # type: ignore[attr-defined]
-                account_id=chatwoot_account_id,
-                conversation_id=chatwoot_conversation_id,
-                content=note,
-                command_id=f"run:{run.id}:note",
-                private=True,
-            )
-        except Exception as exc:  # noqa: BLE001 - the note is best-effort
-            logger.warning("handoff_note_failed", ctx, error_code=type(exc).__name__)
-
     async def _finish_clarify(
         self,
         *,
@@ -2491,8 +2596,7 @@ class AgentOrchestrator:
         ctx: TraceContext,
         started: float,
         question: str,
-        chatwoot_account_id: str | None,
-        chatwoot_conversation_id: str | None,
+        channel_conversation_key: str | None,
     ) -> RunOutcome:
         """Ask the customer for the missing detail; keep the conversation.
 
@@ -2512,7 +2616,7 @@ class AgentOrchestrator:
         run.latency_ms = int((time.monotonic() - started) * 1000)
         await self._session.flush()
 
-        notice = safe_abstention_text(ABSTAIN_CLARIFICATION)
+        notice = safe_abstention_text(ABSTAIN_CLARIFICATION, question)
 
         send_error = ""
         try:
@@ -2532,9 +2636,15 @@ class AgentOrchestrator:
                 tenant_id=tenant_id,
                 draft_text=notice,
                 ctx=ctx,
-                chatwoot_account_id=chatwoot_account_id,
-                chatwoot_conversation_id=chatwoot_conversation_id,
+                channel_conversation_key=channel_conversation_key,
                 conversation_ref_id=conversation_ref_id,
+                # The channel travels with the notice, not only with the
+                # answer. Without this the notice fell through to the
+                # platform-surface branch, returned "" - which means
+                # *delivered* - and an email or WeChat customer whose question
+                # could not be answered heard nothing at all.
+                channel_system=self._channel_system,
+                channel_address=self._channel_address,
             )
 
         await audit_service.record(
@@ -2585,52 +2695,91 @@ class AgentOrchestrator:
         tenant_id: uuid.UUID,
         draft_text: str,
         ctx: TraceContext,
-        chatwoot_account_id: str | None,
-        chatwoot_conversation_id: str | None,
+        # Optional: the platform's own surface has no channel conversation key,
+        # and it is the channel branch that needs one.
+        channel_conversation_key: str | None = None,
         conversation_ref_id: uuid.UUID,
+        channel_system: str | None = None,
+        channel_address: str | None = None,
     ) -> str:
-        """Send the customer-visible reply. Returns "" on success, else a
-        reason code. The outbound idempotency key is derived from the run id
-        so a retry of the same run cannot double-send."""
-        if self._deps.sender is None:
-            # No transport wired (unit/local): treat as un-sent, not failed.
-            return ""
-        if not chatwoot_account_id:
-            # No Chatwoot account means the conversation is not backed by
-            # Chatwoot at all - the customer typed into the platform's own
-            # chat surface, and that surface is the delivery channel. This is
-            # not a failed send, and treating it as one is what made every
-            # such answer vanish: the run was marked FAILED even though the
-            # answer had been produced, and the agent turn is only written
-            # for a COMPLETED run, so nothing was ever persisted or shown.
-            #
-            # Note that `conversation_id` is present on these events too. It
-            # is the external correlation id the conversation ref is derived
-            # from, not evidence that a Chatwoot conversation exists to send
-            # to - the account id is what says the conversation is Chatwoot's.
-            return ""
-        if not chatwoot_conversation_id:
-            # An account with no conversation is a misconfiguration: we did
-            # mean to reach Chatwoot and cannot. That has to fail rather than
-            # report a success nobody can observe.
-            return "OUTBOUND_TARGET_MISSING"
+        """Deliver the customer-visible reply. Returns "" on success, else a
+        reason code.
 
-        command_id = f"run:{run.id}"
+        Exactly two destinations remain, and the distinction is the whole
+        method:
+
+        - **A channel** (email, WeChat): the answer has to leave the platform,
+          so a transport that is absent, unaddressed or failing is a real
+          failure and is reported as one. Never a silent success — that is the
+          `worker_cannot_send` defect, where every health check passes and the
+          customer simply never hears back.
+        - **The platform's own surface** (`/support`): the answer is persisted
+          as an agent turn and read back by the page. There is nothing to send,
+          so returning "" here is success by construction rather than a
+          swallowed failure.
+
+        The outbound idempotency key is derived from the run id, so a retry of
+        the same run cannot double-send.
+        """
+        if channel_system:
+            return await self._dispatch_channel(
+                run=run,
+                draft_text=draft_text,
+                ctx=ctx,
+                channel_system=channel_system,
+                address=channel_address or "",
+                conversation_key=channel_conversation_key or "",
+            )
+        del tenant_id, conversation_ref_id
+        return ""
+
+    async def _dispatch_channel(
+        self,
+        *,
+        run: AgentRun,
+        draft_text: str,
+        ctx: TraceContext,
+        channel_system: str,
+        address: str,
+        conversation_key: str,
+    ) -> str:
+        """Deliver over the channel the question arrived on (ADR 0014)."""
+        sender = self._deps.channel_sender
+        if sender is None or not sender.configured(channel_system):  # type: ignore[attr-defined]
+            # A receive-only deployment. This must NOT be reported as a
+            # successful delivery - that is the `worker_cannot_send` class of
+            # defect, where everything looks healthy and the customer hears
+            # nothing. It must not fail the run either: a FAILED run never
+            # writes the agent turn, so the answer would vanish from the
+            # platform too and nobody could even see what had been produced.
+            # So it is a *withheld* delivery, recorded and logged.
+            logger.warning(
+                "outbound_channel_not_configured",
+                ctx,
+                run_id=str(run.id),
+                channel=channel_system,
+            )
+            return "OUTBOUND_NOT_CONFIGURED"
+        if not address:
+            # We know the channel and cannot address it. That is a
+            # misconfiguration rather than a withheld delivery, so it fails.
+            return "OUTBOUND_TARGET_MISSING"
         try:
-            result = await self._deps.sender.send_message(  # type: ignore[attr-defined]
-                account_id=chatwoot_account_id,
-                conversation_id=chatwoot_conversation_id,
+            result = await sender.send_message(  # type: ignore[attr-defined]
+                system=channel_system,
+                address=address,
+                conversation_key=conversation_key,
                 content=draft_text,
-                command_id=command_id,
+                # Same rule as the Chatwoot path: one run, one command id, so a
+                # retry of this run cannot deliver the same answer twice.
+                command_id=f"run:{run.id}",
             )
         except Exception as exc:  # noqa: BLE001 - mapped to a retryable outcome
-            logger.error("outbound_failed", ctx, error_code=type(exc).__name__)
+            logger.error("outbound_channel_failed", ctx, error_code=type(exc).__name__)
             return "OUTBOUND_FAILED"
-
         if getattr(result, "ambiguous", False):
             # Outcome unknown: retry idempotently later; never claim success.
             return "OUTBOUND_AMBIGUOUS"
-        del tenant_id, conversation_ref_id
         return ""
 
     async def _adopt_or_create_run(
@@ -2684,6 +2833,20 @@ class AgentOrchestrator:
             )
         ).scalar_one_or_none()
 
+        # What the *enqueue* path recorded about this run's purpose, read before
+        # the overwrite below destroys it.
+        #
+        # This is the actual reason `internal_draft` never worked, and it is
+        # worse than "nothing reads it": `queue_agent_run` writes
+        # `model_config={"mode": mode}`, and adoption replaced `model_config`
+        # wholesale with the lineage snapshot - so the mode was not merely
+        # ignored, it was erased before any executor could have seen it. An
+        # operator asking for a draft got a customer-visible message, and the
+        # field that would have said otherwise no longer existed.
+        requested_mode = ""
+        if placeholder is not None and isinstance(placeholder.model_config, dict):
+            requested_mode = str(placeholder.model_config.get("mode") or "")
+
         # `started_at` is rewritten to the moment execution actually begins.
         # The dashboard windows over it, and the placeholder's value was the
         # enqueue time; keeping that would report latency that never happened.
@@ -2691,7 +2854,9 @@ class AgentOrchestrator:
             "route": route,
             "status": RunStatus.RUNNING.value,
             "started_at": int(time.time()),
-            "model_config": self._model_config(context=context, detection=detection),
+            "model_config": self._model_config(
+                context=context, detection=detection, mode=requested_mode
+            ),
             "retrieval_config": self._retrieval_config(
                 rewritten=rewritten, retrieval_query=retrieval_query
             ),
@@ -2712,9 +2877,10 @@ class AgentOrchestrator:
                 **values,
             )
             self._session.add(run)
-        if self._deps.generator is not None:
+        _lineage_generator = self._generator_override or self._deps.generator
+        if _lineage_generator is not None:
             run.prompt_version_id = await _get_or_create_prompt(
-                self._session, tenant_id, self._deps.generator
+                self._session, tenant_id, _lineage_generator
             )
         await self._session.flush()
         return run
@@ -2724,6 +2890,7 @@ class AgentOrchestrator:
         *,
         context: CompactedContext | None = None,
         detection: IntentDetection | None = None,
+        mode: str = "",
     ) -> dict[str, Any]:
         """Versioned lineage for this run, plus the multi-turn audit snapshot.
 
@@ -2748,6 +2915,17 @@ class AgentOrchestrator:
             "prompt_version": gen.template.version if gen else 0,
             "temperature": 0.0,
         }
+        if mode:
+            # Carried through from the enqueue path - see `_adopt_or_create_run`
+            # for why it has to be re-stated here rather than surviving the
+            # overwrite.
+            config["mode"] = mode
+        if self._experiments:
+            # Arm names, not weights: the results endpoint must read what
+            # actually happened rather than re-bucket history, because
+            # re-deriving would silently re-bucket every past run the moment a
+            # weight changed.
+            config["experiments"] = {k: v.name for k, v in self._experiments.items()}
         if detection is not None:
             config["intent"] = detection.as_dict()
         if context is not None:

@@ -135,6 +135,71 @@ async def append_customer_turn(
     return turn, False
 
 
+async def append_system_turn(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    ref_id: uuid.UUID,
+    text: str,
+) -> ConversationTurn | None:
+    """Persist one platform notice. Returns None when it is already there.
+
+    The platform speaking in its own voice - "a colleague has this
+    conversation" - rather than the customer or the assistant, which is why the
+    role is `system` and why the customer surface renders it without a bubble.
+
+    Two callers need this and they are the reason it exists rather than each
+    writing its own insert. One is the out-of-hours notice on the abstain path.
+    The other is `support_router`, which writes "someone has this conversation"
+    when a customer asks something the AI is no longer allowed to answer - the
+    state where the run path *cannot* speak, because the pre-send lease gate
+    refuses on a conversation owned by a person or the queue. Without a path
+    that can say so, the customer saw nothing at all.
+
+    Not redacted, unlike `append_customer_turn`: this text is authored here, not
+    supplied by the customer, so there is no PII to remove and running it
+    through the redactor would only risk mangling a time like "09:00".
+
+    Deduplicated on the text, like `append_customer_turn`, and for a reason that
+    shows up immediately in use: the notice is written from the request that
+    triggered it, so a customer sending three messages while a person owns the
+    conversation would otherwise collect three copies of the same sentence.
+    """
+    digest = payload_hash(text.encode())
+
+    await session.execute(
+        sa_text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"{tenant_id}:{ref_id}:{digest}"},
+    )
+
+    existing = (
+        await session.execute(
+            select(ConversationTurn)
+            .where(
+                ConversationTurn.conversation_ref_id == ref_id,
+                ConversationTurn.text_hash == digest,
+                ConversationTurn.role == "system",
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return None
+
+    turn = ConversationTurn(
+        tenant_id=tenant_id,
+        conversation_ref_id=ref_id,
+        role="system",
+        text_redacted=text,
+        text_hash=digest,
+        ts=int(time.time()),
+        source="platform",
+    )
+    session.add(turn)
+    await session.flush()
+    return turn
+
+
 class QueueRefused(Exception):
     """A gate declined the run. Carries the response the caller should return."""
 
@@ -148,7 +213,7 @@ async def queue_agent_run(
     *,
     ctx: TenantContext,
     conversation_ref_id: uuid.UUID,
-    external_ref: str,
+    external_ref: str | None,
     trigger_message_ref: str,
     idem: str,
     mode: str,
@@ -158,12 +223,22 @@ async def queue_agent_run(
 ) -> dict[str, Any]:
     """Queue one agent run for a persisted turn, or raise `QueueRefused`.
 
-    `external_ref` is the **raw** id the conversation ref was derived from, not
-    the ref itself. The worker re-derives the ref from this payload, so handing
-    it an already-derived value makes it derive twice: the run is then filed
-    under a different conversation than the turn it answers, and the answer is
-    produced and never found. Measured before the fix - the API wrote the turn
-    under `6995d1b4-...` while the worker's run landed on `92c2a744-...`.
+    The payload carries the conversation **both** ways, and the worker prefers
+    the resolved one:
+
+    - `conversation_ref` - the platform id, already resolved by the caller.
+      Always present, because this function receives it.
+    - `conversation_id` - the external id this ref was derived from, or absent
+      when the caller never had one. Only a caller holding a channel id (the
+      visitor session's `visitor_id`, a webhook's conversation id) can supply
+      it, and the worker derives from it only in that case.
+
+    Why both: a caller that reached the conversation by its platform ref has no
+    external id to give, and handing the worker the ref *as if* it were one
+    makes it derive a second time - the run is then filed under a different
+    conversation from the turn it answers, and the answer is produced and never
+    found. Measured before the fix - the API wrote the turn under
+    `6995d1b4-...` while the worker's run landed on `92c2a744-...`.
 
     Two gates run before any model spend, and both refuse with 429 on purpose: a
     caller must be able to tell "declined for capacity" from "no supporting
@@ -215,12 +290,24 @@ async def queue_agent_run(
 
     # The inbox row is keyed by delivery id, which gives this the same
     # at-least-once + dedup semantics as a webhook delivery.
-    raw_payload = {
-        "event": "message_created",
-        "id": trigger_message_ref,
+    # The routing fields the worker's consumer reads, written out rather than
+    # handed to a generic extractor: this function knows exactly what it means,
+    # and a payload it does not understand is a payload it must not guess at.
+    minimized: dict[str, Any] = {
+        "message_id": str(trigger_message_ref),
         "message_type": "incoming",
-        "conversation": {"id": external_ref},
+        # The resolved platform id. The worker uses it verbatim, which is what
+        # lets an operator-initiated run name a conversation directly rather
+        # than through a channel id it does not have.
+        "conversation_ref": str(conversation_ref_id),
     }
+    if external_ref is not None:
+        # Only for callers that hold one. The worker derives from this when
+        # `conversation_ref` is absent, and the channel delivery path reads it
+        # as the address to answer on - neither applies to a run that arrived
+        # by platform ref, so an absent key is the honest encoding and not a
+        # missing field.
+        minimized["conversation_id"] = str(external_ref)
     # Feature 2.5: the account this visitor proved ownership of, so the worker
     # can refuse to publish somebody else's order. Omitted entirely for operator
     # runs (verified_account is None) - the worker reads its *absence* as "no
@@ -229,7 +316,7 @@ async def queue_agent_run(
     # always passes a string ("" when unverified), so only operators leave this
     # key absent.
     if verified_account is not None:
-        raw_payload["verified_account"] = verified_account
+        minimized["verified_account"] = verified_account
 
     result = await inbox.persist_inbox_event(
         session,
@@ -237,7 +324,7 @@ async def queue_agent_run(
         delivery_id=f"agent-run:{idem}",
         event_type="message_created",
         raw_body=b"",
-        raw_payload=raw_payload,
+        minimized_payload=minimized,
     )
     if result.duplicate:
         return {

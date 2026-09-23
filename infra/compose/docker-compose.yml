@@ -1,7 +1,7 @@
 name: b2b-ai-support
 
 services:
-  # --- Custom AI platform (separate DB and Redis from Chatwoot, ADR-0001) ---
+  # --- Custom AI platform (its own database, Redis and object storage) ---
   ai-postgres:
     image: docker.1ms.run/pgvector/pgvector:pg16
     environment:
@@ -87,11 +87,6 @@ services:
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
       APP_REDIS_URL: redis://ai-redis:6379/0
       APP_SECRET_KEY: local-dev-secret
-      # Must match the secret on Chatwoot's webhook row. Read from the
-      # environment so the .env value and this one cannot disagree - they
-      # did, and an API run outside Docker would have rejected every
-      # delivery with a 401 that looks like silence, not misconfiguration.
-      APP_CHATWOOT_BASE_URL: http://chatwoot-web:3000
       # Same class of remap as the two above, and it was missing: the setting
       # defaults to `localhost:9000`, which inside this container is the
       # container itself. Document upload failed with
@@ -118,10 +113,10 @@ services:
   # API, different entrypoint (docs/deployment-and-operations.md worker
   # classes). Runs against the AI database and the AI Redis only.
   #
-  # APP_CHATWOOT_API_TOKEN is required here and NOT optional: the orchestrator
-  # treats a missing sender as "un-sent, not failed", so a worker without a
-  # token would consume real customer messages and reply to nobody while
-  # reporting success. worker.wiring fails closed on this.
+  # Outbound delivery needs at least one channel transport (ADR 0014). A worker
+  # with none would consume real customer messages and reply to nobody while
+  # reporting success - the `worker_cannot_send` shape - so `worker.wiring`
+  # refuses to start when the deployment asks for outbound capability.
   ai-worker-interactive:
     # Reuses the image `ai-api` builds. Building it a second time
     # produced a second image that silently drifted from the API's:
@@ -143,7 +138,6 @@ services:
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
       APP_REDIS_URL: redis://ai-redis:6379/0
       APP_SECRET_KEY: local-dev-secret
-      APP_CHATWOOT_BASE_URL: http://chatwoot-web:3000
     depends_on:
       ai-postgres:
         condition: service_healthy
@@ -277,81 +271,7 @@ services:
       ai-redis:
         condition: service_healthy
 
-  # --- Chatwoot support kernel (upstream, separate storage) ---
-  chatwoot-postgres:
-    profiles: ["chatwoot"]
-    image: docker.1ms.run/pgvector/pgvector:pg16
-    environment:
-      POSTGRES_USER: chatwoot
-      POSTGRES_PASSWORD: chatwoot
-      POSTGRES_DB: chatwoot
-    ports:
-      - "5434:5432"
-    volumes:
-      - chatwoot_postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U chatwoot"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  chatwoot-redis:
-    profiles: ["chatwoot"]
-    image: redis:7-alpine
-    ports:
-      - "6381:6379"
-    volumes:
-      - chatwoot_redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  chatwoot-web:
-    profiles: ["chatwoot"]
-    image: docker.1ms.run/chatwoot/chatwoot:latest
-    command: bundle exec rails s -p 3000 -b 0.0.0.0
-    environment:
-      RAILS_ENV: production
-      SECRET_KEY_BASE: 3f8a1c9d2e7b4a6f8d0c2e4b6a8d0f2h4j6l8n0p2r4t6v8x0z2b4d6f8h1j3l
-      FRONTEND_URL: http://localhost:3000
-      DATABASE_URL: postgres://chatwoot:chatwoot@chatwoot-postgres:5432/chatwoot
-      REDIS_URL: redis://chatwoot-redis:6379/0
-      NODE_ENV: production
-      SAFE_FETCH_ALLOW_PRIVATE_NETWORK: "true"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    ports:
-      - "3000:3000"
-    depends_on:
-      chatwoot-postgres:
-        condition: service_healthy
-      chatwoot-redis:
-        condition: service_healthy
-
-  chatwoot-sidekiq:
-    profiles: ["chatwoot"]
-    image: docker.1ms.run/chatwoot/chatwoot:latest
-    command: bundle exec sidekiq
-    environment:
-      RAILS_ENV: production
-      SECRET_KEY_BASE: 3f8a1c9d2e7b4a6f8d0c2e4b6a8d0f2h4j6l8n0p2r4t6v8x0z2b4d6f8h1j3l
-      FRONTEND_URL: http://localhost:3000
-      DATABASE_URL: postgres://chatwoot:chatwoot@chatwoot-postgres:5432/chatwoot
-      REDIS_URL: redis://chatwoot-redis:6379/0
-      SAFE_FETCH_ALLOW_PRIVATE_NETWORK: "true"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      chatwoot-postgres:
-        condition: service_healthy
-      chatwoot-redis:
-        condition: service_healthy
-
 volumes:
   ai_postgres_data:
   ai_redis_data:
   minio_data:
-  chatwoot_postgres_data:
-  chatwoot_redis_data:

@@ -272,6 +272,134 @@ def test_abstention_text_never_invents_explanation() -> None:
     assert len(text) < 300  # concise; no fabricated detail
 
 
+# --- Regression: the notice language follows the customer's (audit 2026-09-23) --
+#
+# The copy was split three ways: most branches English-only, three Chinese-only
+# and returned unconditionally, and the queue/out-of-hours notices with no rule
+# at all. A Chinese customer therefore got an English clarification prompt for
+# "交期是多久？", and an English customer got Chinese for a queued handoff.
+#
+# These assert the rule rather than the wording: whatever the reason code, a
+# Chinese question gets Chinese and an English one gets no CJK characters.
+_ZH_QUESTION = "交期是多久？"
+_EN_QUESTION = "What is the lead time?"
+
+
+def test_every_notice_follows_the_question_language() -> None:
+    """The property, over the whole reason-code space rather than a list.
+
+    An earlier version of this test enumerated the codes it knew about, and it
+    passed while a Chinese customer asking about their order was still answered
+    with "I couldn't verify an answer from our authorized knowledge base" - the
+    run's reason was `NO_CLAIMS`, which the list did not contain. A test that
+    asserts a remembered subset cannot catch the next code either, so this one
+    asserts the rule for codes that exist, codes that do not, and codes nobody
+    has written yet.
+    """
+    from platform_core.agent_runtime.hours import offline_notice
+    from platform_core.agent_runtime.qa_path import (
+        ABSTAIN_CLARIFICATION,
+        ABSTAIN_COMPLAINT_REQUIRES_HUMAN,
+        ABSTAIN_CONFLICT,
+        ABSTAIN_EMOTION_ESCALATION,
+        ABSTAIN_HUMAN_REQUIRED,
+        ABSTAIN_LOW_RELEVANCE,
+        ABSTAIN_NO_EVIDENCE,
+        ABSTAIN_OUT_OF_SCOPE,
+        ABSTAIN_SENSITIVE_REQUEST,
+        ABSTAIN_STRATEGIC_ACCOUNT_REQUIRES_HUMAN,
+        SYSTEM_OUTAGE_REASONS,
+        UNVERIFIED_READ_REASONS,
+        system_outage_notice,
+        unverified_read_notice,
+    )
+
+    reason_codes = [
+        # Every abstention reason the runtime can produce, plus two that it
+        # cannot, which is the point.
+        ABSTAIN_RESTRICTED,
+        ABSTAIN_ACTION_REQUEST,
+        ABSTAIN_AMBIGUOUS_IDENTITY,
+        ABSTAIN_CLARIFICATION,
+        ABSTAIN_OUT_OF_SCOPE,
+        ABSTAIN_HUMAN_REQUIRED,
+        ABSTAIN_SENSITIVE_REQUEST,
+        ABSTAIN_COMPLAINT_REQUIRES_HUMAN,
+        ABSTAIN_STRATEGIC_ACCOUNT_REQUIRES_HUMAN,
+        ABSTAIN_EMOTION_ESCALATION,
+        ABSTAIN_NO_EVIDENCE,
+        ABSTAIN_LOW_RELEVANCE,
+        ABSTAIN_CONFLICT,
+        "IDENTITY_REQUIRED",
+        "IDENTITY_MISMATCH",
+        "NO_CLAIMS",
+        "UNSUPPORTED_CLAIM",
+        "TOOL_NO_CANDIDATE",
+        "TOOL_ARGUMENT_MISSING",
+        "CLARIFICATION_LIMIT",
+        "MODEL_UNAVAILABLE",
+        "GENERATOR_UNAVAILABLE",
+        "RETRIEVAL_UNAVAILABLE",
+        "EQ_CONFIRMATION_REQUIRES_HUMAN",
+        "WRITE_INTENT_UNCERTAIN",
+        "REDLINE_COMMERCIAL_COMMITMENT",
+        "A_REASON_CODE_INVENTED_IN_2030",
+        "",
+    ]
+
+    def has_cjk(text: str) -> bool:
+        return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+    for code in reason_codes:
+        zh = safe_abstention_text(code, _ZH_QUESTION)
+        en = safe_abstention_text(code, _EN_QUESTION)
+        assert has_cjk(zh), f"{code!r} did not answer a Chinese question in Chinese: {zh!r}"
+        assert not has_cjk(en), f"{code!r} answered an English question in Chinese: {en!r}"
+        assert zh != en, f"{code!r} produced the same text in both languages"
+
+    for notice in (system_outage_notice, unverified_read_notice):
+        assert has_cjk(notice(_ZH_QUESTION))
+        assert not has_cjk(notice(_EN_QUESTION))
+
+    assert has_cjk(offline_notice(question=_ZH_QUESTION))
+    assert not has_cjk(offline_notice(question=_EN_QUESTION))
+
+    # The two sets must stay disjoint: a code in both would make the
+    # orchestrator pick the outage wording for the unverified case again.
+    assert not (SYSTEM_OUTAGE_REASONS & UNVERIFIED_READ_REASONS)
+
+
+def test_the_codes_customers_actually_hit_have_their_own_wording() -> None:
+    """"Something went wrong" is the fallback, not the answer.
+
+    `_ABSTENTION_ZH_FALLBACK` guarantees the *language*, so the property test
+    above passes whether or not a code was translated. This one guards the
+    other half: the codes that carry a distinct next step for the customer must
+    not quietly collapse into the generic sentence.
+    """
+    from platform_core.agent_runtime.qa_path import (
+        ABSTAIN_CONFLICT,
+        ABSTAIN_LOW_RELEVANCE,
+        ABSTAIN_NO_EVIDENCE,
+        _ABSTENTION_ZH_FALLBACK,
+    )
+
+    for code in (ABSTAIN_NO_EVIDENCE, ABSTAIN_LOW_RELEVANCE, ABSTAIN_CONFLICT, "NO_CLAIMS"):
+        text = safe_abstention_text(code, _ZH_QUESTION)
+        assert text != _ABSTENTION_ZH_FALLBACK, f"{code} fell back to the generic sentence"
+
+
+def test_an_unknown_reason_code_still_says_something() -> None:
+    """Falling through must land on text, never on an empty message.
+
+    A code with no Chinese entry reverts to the generic Chinese sentence rather
+    than to English; a code with no English entry either still gets the English
+    generic. Neither path may produce "".
+    """
+    assert safe_abstention_text("NO_SUCH_REASON_CODE", _ZH_QUESTION)
+    assert safe_abstention_text("NO_SUCH_REASON_CODE", _EN_QUESTION)
+
+
 def test_excerpt_hash_stable() -> None:
     assert excerpt_hash("abc") == excerpt_hash("abc")
     assert excerpt_hash("abc") != excerpt_hash("abd")

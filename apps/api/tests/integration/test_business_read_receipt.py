@@ -23,6 +23,8 @@ import sqlalchemy as sa
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.channels.outbound import ChannelSender, SendResult
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -121,14 +123,30 @@ class _FailingBusinessApiFactory:
         return _FailingExecutor()
 
 
-class _RecordingSender:
+class _RecordingTransport:
+    """Channel transport double: records every outbound answer.
+
+    It replaced a Chatwoot-shaped `sender` double. The channel path is the only
+    path that still leaves the platform, so it is the only delivery an outside
+    observer can see; the platform's own surface delivers by persisting the
+    agent turn, which these tests read back from the database.
+    """
+
+    system = "email"
+
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(
-        self, *, account_id, conversation_id, content, command_id, private: bool = False
-    ):
-        self.calls.append({"content": content, "private": private})
+    async def send(self, *, address, conversation_key, content, command_id):
+        self.calls.append(
+            {
+                "address": address,
+                "conversation_key": conversation_key,
+                "content": content,
+                "command_id": command_id,
+            }
+        )
+        return SendResult()
 
         class _Result:
             ambiguous = False
@@ -212,7 +230,7 @@ async def _execute(
 
     tid = uuid.UUID(TENANT)
     conv = uuid.uuid4()
-    sender = _RecordingSender()
+    sender = _RecordingTransport()
     engine = create_engine(APP_URL)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -226,7 +244,7 @@ async def _execute(
         orch = AgentOrchestrator(
             session,
             OrchestratorDeps(
-                sender=sender,
+                channel_sender=ChannelSender({"email": sender}),
                 tool_factories=(
                     None
                     if use_default_provider
@@ -245,8 +263,9 @@ async def _execute(
             question=QUESTION,
             principal=PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",)),
             expected_lease_version=int(lease.lease_version),
-            chatwoot_account_id="1",
-            chatwoot_conversation_id="1",
+            channel_system="email",
+            channel_address="buyer@example.test",
+            channel_conversation_key="1",
         )
         await session.commit()
     await engine.dispose()
@@ -305,7 +324,7 @@ def test_an_unreachable_erp_tells_the_customer_what_is_wrong() -> None:
     # schema-validated before execution, so this is the other system.
     assert outcome.abstain_reason == "TOOL_EXECUTION_FAILED", outcome.abstain_reason
 
-    customer_visible = [c["content"] for c in sent if not c["private"]]
+    customer_visible = [c["content"] for c in sent]
     assert customer_visible, "an outage that says nothing leaves them waiting"
     joined = " ".join(customer_visible).lower()
     assert "not responding" in joined

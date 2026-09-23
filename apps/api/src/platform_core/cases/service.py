@@ -24,8 +24,8 @@ from platform_core.cases.models import (
     check_transition,
     check_version,
     sla_deadline,
-    sla_policy_for_tier,
 )
+from platform_core.cases.sla_service import resolve_sla_policy
 
 
 class CaseError(Exception):
@@ -34,6 +34,31 @@ class CaseError(Exception):
     def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
+
+
+async def cases_for_conversation(
+    session: AsyncSession, *, tenant_id: uuid.UUID, conversation_ref_id: uuid.UUID
+) -> list[uuid.UUID]:
+    """Cases linked to this conversation. A reader, so callers outside `cases`
+    do not have to import `CaseConversation` (AGENTS.md: no cross-module model
+    imports).
+
+    More than one is possible and not an error - a conversation can spawn a
+    second case (an escalation, a separate request), and the reply path has to
+    satisfy the first-response clock on every case it answers.
+    """
+    return list(
+        (
+            await session.execute(
+                select(CaseConversation.case_id).where(
+                    CaseConversation.tenant_id == tenant_id,
+                    CaseConversation.conversation_ref_id == conversation_ref_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
 
 
 class CaseService:
@@ -90,7 +115,15 @@ class CaseService:
                 raise CaseError("ACCOUNT_NOT_FOUND", str(enterprise_account_id))
             tier, contract_status = facts
 
-        policy = sla_policy_for_tier(tier, contract_status=contract_status)
+        # Configured targets if the tenant set any, else the code default -
+        # `resolve_sla_policy` delegates to `sla_policy_for_tier` when there is
+        # no row, so a tenant with no configuration is unaffected.
+        policy = await resolve_sla_policy(
+            self._session,
+            tenant_id=tenant_id,
+            tier=tier,
+            contract_status=contract_status,
+        )
 
         case = Case(
             tenant_id=tenant_id,
@@ -183,7 +216,7 @@ class CaseService:
             # that happened in between is not, and letting it through here
             # would mean the same Case had a different contractual window
             # depending on when the deadline happened to be recomputed.
-            policy = sla_policy_for_tier(row.sla_tier)
+            policy = await resolve_sla_policy(self._session, tenant_id=tenant_id, tier=row.sla_tier)
             row.first_response_due_at = sla_deadline(
                 policy,
                 priority=row.priority,

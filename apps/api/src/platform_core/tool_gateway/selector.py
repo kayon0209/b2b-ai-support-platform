@@ -49,15 +49,64 @@ _READ_SCENE_AFFINITY: dict[str, tuple[Scene, ...]] = {
     "inventory.check_stock": (Scene.ORDER_FULFILMENT, Scene.PRE_SALES),
 }
 
-# Nouns that name a tool's subject explicitly, per tool. Matched as whole
-# lowercase tokens against the question.
+# Nouns that name a tool's subject explicitly, per tool. Latin nouns match
+# whole lowercase tokens against the question; CJK nouns match as substrings
+# (see `_noun_hit`), because whitespace tokenisation cannot split them.
+#
+# The CJK entries are not optional decoration, and adding them only to
+# `inventory.check_stock` was a measurable defect. With no Chinese noun on
+# `order.get_status`, every Chinese live-data phrasing scored only the scene
+# weight (0.40) - the same as three other tools - so the tie-break below
+# decided, and it decided alphabetically. A customer who had already proved
+# ownership of SO-9001 and asked "我的订单 SO-9001 到哪了？" was answered from
+# the invoice system, which holds no such record: the order card never
+# appeared and the platform told the customer its ERP was down. The English
+# equivalent had always worked, because "order" is a noun here.
 _READ_SUBJECT_NOUNS: dict[str, tuple[str, ...]] = {
-    "order.get_status": ("order", "purchase"),
-    "shipment.track": ("shipment", "delivery", "parcel", "package", "tracking", "shipped"),
-    "billing.get_invoice": ("invoice", "receipt", "credit note", "billing"),
-    "case.read": ("case", "ticket"),
-    # CJK nouns are matched as substrings of the lowered question (see
-    # _noun_hit): whitespace tokenisation cannot split them.
+    # Order lifecycle. `交期` / `发货` / `出货` / `到货` are grouped here rather
+    # than with `shipment.track` on purpose: in this domain they are asked
+    # about the *order* ("SO-9001 什么时候发货"), and the order record is what
+    # carries the 出货 node and the ETA. A parcel question names 物流 / 运单 /
+    # 快递 instead. `发货` appears in both so that either reading is a
+    # candidate; `_READ_PRIORITY` then decides which one runs.
+    "order.get_status": (
+        "order",
+        "purchase",
+        "订单",
+        "订单号",
+        "下单",
+        "订购",
+        "交期",
+        "发货",
+        "出货",
+        "到货",
+    ),
+    "shipment.track": (
+        "shipment",
+        "delivery",
+        "parcel",
+        "package",
+        "tracking",
+        "shipped",
+        "物流",
+        "运单",
+        "快递",
+        "签收",
+        "派送",
+        "发货",
+    ),
+    "billing.get_invoice": (
+        "invoice",
+        "receipt",
+        "credit note",
+        "billing",
+        "发票",
+        "开票",
+        "账单",
+        "税号",
+        "抬头",
+    ),
+    "case.read": ("case", "ticket", "工单", "单据", "故障单"),
     "inventory.check_stock": (
         "stock",
         "inventory",
@@ -68,7 +117,27 @@ _READ_SUBJECT_NOUNS: dict[str, tuple[str, ...]] = {
         "库存",
         "货期",
         "现货",
+        "备料",
     ),
+}
+
+# Tie-break, and it is a policy statement rather than a formality. Two tools
+# that score identically used to be ordered by `tool_name`, i.e. by the
+# alphabet: `b` beat `o` and `s`, so `billing.get_invoice` won every tied
+# question. Ordering *is* part of the answer here - `candidates[0]` is the
+# tool that runs - so a tie has to express which tool is more likely.
+#
+# Lower runs first. A tool absent from the map sorts last, then by name, so
+# the ordering stays total and reproducible for anything added later without
+# being added here.
+_UNRANKED = 99
+
+_READ_PRIORITY: dict[str, int] = {
+    "order.get_status": 0,
+    "shipment.track": 1,
+    "inventory.check_stock": 2,
+    "billing.get_invoice": 3,
+    "case.read": 4,
 }
 
 # Write tools (plan 3.5). Same shape, different consequence: selecting one
@@ -96,6 +165,18 @@ _WRITE_SUBJECT_NOUNS: dict[str, tuple[str, ...]] = {
     "im.send_notification": ("notify", "notification", "alert", "escalate", "通知", "告警", "升级"),
 }
 
+# Same reasoning as `_READ_PRIORITY`, with one difference: the values here
+# reproduce the order the alphabetical tie-break already produced (`im` <
+# `jira` < `linear`), so declaring it changes nothing about what runs today.
+# That is deliberate - the read side is being fixed because its accidental
+# order was wrong, and the write side should not be reordered in the same
+# change on the strength of a hunch.
+_WRITE_PRIORITY: dict[str, int] = {
+    "im.send_notification": 0,
+    "jira.create_issue": 1,
+    "linear.create_issue": 2,
+}
+
 SCENE_WEIGHT = 0.4
 SUBJECT_WEIGHT = 1.0
 
@@ -115,11 +196,16 @@ def _rank(
     detection: IntentDetection,
     question: str,
     available: set[str] | None,
+    priority: dict[str, int],
 ) -> list[ToolCandidate]:
     """Score and order the tools in one vocabulary.
 
-    Shared by the read and write selectors so the weights, the CJK handling
-    and the tie-break cannot drift apart between them.
+    Shared by the read and write selectors so the weights, the CJK handling,
+    the tie-break and the reasons string cannot drift apart between them.
+
+    `priority` breaks score ties. It is a parameter rather than a constant
+    because the two vocabularies need different orders, and because the order
+    has to be read alongside the vocabulary it belongs to.
     """
     lowered = question.lower()
     tokens = lowered.replace("-", " ").split()
@@ -149,7 +235,7 @@ def _rank(
             candidates.append(
                 ToolCandidate(tool_name=tool_name, score=score, reason=";".join(reasons))
             )
-    candidates.sort(key=lambda c: (-c.score, c.tool_name))
+    candidates.sort(key=lambda c: (-c.score, priority.get(c.tool_name, _UNRANKED), c.tool_name))
     return candidates
 
 
@@ -168,7 +254,9 @@ def select_read_tools(
     # questions only (plan 3.3). The kind axis is the gate.
     if detection.route.value != "business_read":
         return []
-    return _rank(_READ_SCENE_AFFINITY, _READ_SUBJECT_NOUNS, detection, question, available)
+    return _rank(
+        _READ_SCENE_AFFINITY, _READ_SUBJECT_NOUNS, detection, question, available, _READ_PRIORITY
+    )
 
 
 def select_write_tools(
@@ -198,4 +286,6 @@ def select_write_tools(
     # customer never asked for.
     if detection.route.value != "business_write":
         return []
-    return _rank(_WRITE_SCENE_AFFINITY, _WRITE_SUBJECT_NOUNS, detection, question, available)
+    return _rank(
+        _WRITE_SCENE_AFFINITY, _WRITE_SUBJECT_NOUNS, detection, question, available, _WRITE_PRIORITY
+    )

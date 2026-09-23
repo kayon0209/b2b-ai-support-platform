@@ -28,7 +28,7 @@ from platform_core.identity.tenant_context import TenantContext
 logger = logging.getLogger(__name__)
 
 # Exempt paths: health and unauthenticated webhooks (webhooks resolve tenant
-# from connector configuration, implemented in support_bridge).
+# from connector configuration - `integrations/inbound.py`).
 EXEMPT_PATHS = {
     "/healthz",
     # Prometheus scrapes on a timer and cannot present a bearer token. The
@@ -39,9 +39,6 @@ EXEMPT_PATHS = {
     "/openapi.json",
     "/docs",
     "/redoc",
-    # Webhook authenticates via HMAC signature and resolves tenant from
-    # trusted connector configuration, not bearer tokens.
-    "/v1/webhooks/chatwoot",
     # Invite acceptance is how someone *joins* a tenant, so the caller has no
     # membership and therefore no bearer token yet. The single-use token in
     # the request body is the credential: the handler resolves the tenant from

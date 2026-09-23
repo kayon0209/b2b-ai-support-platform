@@ -13,6 +13,8 @@ const NAV = [
   { to: "/conversations", key: "nav.conversations", icon: "🔁" },
   { to: "/prompts", key: "nav.prompts", icon: "✍️" },
   { to: "/flags", key: "nav.flags", icon: "🚩" },
+  { to: "/channels", key: "nav.channels", icon: "📡" },
+  { to: "/experiments", key: "nav.experiments", icon: "🧪" },
   { to: "/cases", key: "nav.cases", icon: "🎫" },
   { to: "/workbench", key: "nav.workbench", icon: "🛠️" },
   { to: "/approvals", key: "nav.approvals", icon: "✅" },
@@ -52,6 +54,19 @@ function Shell() {
       ? `${t(section.key)} · ${t("brand.name")}`
       : `${t("notFound.title")} · ${t("brand.name")}`;
   }, [pathname, t]);
+
+  // The customer window needs a tenant slug, and the console knows it only
+  // through the operator token's `pt_<slug>_<user-id>` shape. Parsed rather
+  // than hardcoded, so a second tenant does not silently preview the first
+  // one's window. With no token there is no slug, and the page falls back to
+  // its own default instead of being pointed at a tenant we guessed.
+  const customerTenant = (() => {
+    const parts = (getToken() ?? "").split("_");
+    return parts.length >= 3 && parts[0] === "pt" ? parts[1] : "";
+  })();
+  const customerWindowHref = customerTenant
+    ? `/support?tenant=${encodeURIComponent(customerTenant)}`
+    : "/support";
 
   return (
     <div className="app-shell">
@@ -117,6 +132,19 @@ function Shell() {
               <span>{t(item.key)}</span>
             </NavLink>
           ))}
+          {/* The customer window is not a console section — it is the page a
+              customer opens, and `main.tsx` mounts it outside this shell. So it
+              gets a link *out*, in a new tab, rather than a NavLink that would
+              navigate the operator away and lose their place. It was reachable
+              only by typing the URL, which is how it went unnoticed. */}
+          <a className="nav-item" href={customerWindowHref} target="_blank" rel="noreferrer">
+            <span className="nav-icon" aria-hidden>
+              💬
+            </span>
+            <span>
+              {t("nav.customerWindow")} <span aria-hidden>↗</span>
+            </span>
+          </a>
         </nav>
         <footer className="sidebar-footer muted">
           <span>{t("footer.controlPlane")}</span>

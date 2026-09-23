@@ -4,19 +4,55 @@
  * shell, and a customer page that inherits it would drift back toward looking
  * like the console. The accent comes from the tenant's branding via
  * `--support-accent`, which the component sets from `brand_primary_color`.
+ *
+ * Colour rules, since they are the part that is easy to get wrong by eye:
+ * every foreground here is at least 4.5:1 against the surface it sits on
+ * (WCAG 2.2 AA for body text). The lightest grey used for running text is
+ * `#5f6b7a`; `#9ca3af` - which this file used for the empty state - measures
+ * 2.39:1 on `#f7f8f8` and was the one failing pair in the set.
  */
 
 .support-shell {
   --support-accent: #1a393d;
+  --support-text: #1c1c1e;
+  --support-muted: #5f6b7a;
+  --support-line: #e3e6e6;
+  --support-surface: #f7f8f8;
   display: flex;
   flex-direction: column;
+  width: 100%;
   max-width: 720px;
-  min-height: 100vh;
+  /* `dvh`, not `vh`: on a phone with the soft keyboard open, `vh` is the
+   * height the viewport would have without it, which pushes the composer off
+   * screen exactly when the customer is typing. */
+  min-height: 100dvh;
   margin: 0 auto;
   padding: 0 16px 16px;
-  background: #f7f8f8;
-  color: #1c1c1e;
+  background: var(--support-surface);
+  color: var(--support-text);
   font: 15px/1.6 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+/* On a wide screen the column used to be a grey strip in an unbounded white
+ * page, with no edge to say where the product ended - it read as a fragment
+ * embedded in someone else's site. Giving it a surface (border, radius, a
+ * shadow, and a page background that is not the same white) makes it read as
+ * the window it is, and the page keeps the mobile layout untouched. */
+@media (min-width: 760px) {
+  /* Scoped to the page that has the shell, so the console's own background is
+   * untouched. The operator console and this page are one bundle. */
+  body:has(.support-shell) {
+    background: #eef1f2;
+  }
+
+  .support-shell {
+    min-height: min(100dvh - 48px, 880px);
+    margin: 24px auto;
+    border: 1px solid var(--support-line);
+    border-radius: 16px;
+    box-shadow: 0 12px 32px rgb(16 24 24 / 8%);
+    overflow: hidden;
+  }
 }
 
 .support-head {
@@ -24,26 +60,76 @@
   align-items: center;
   gap: 12px;
   padding: 20px 4px 14px;
-  border-bottom: 1px solid #e3e6e6;
+  border-bottom: 1px solid var(--support-line);
 }
 
-.support-head h1 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 600;
-  color: var(--support-accent);
+.support-head-text {
+  min-width: 0;
 }
 
 .support-logo {
   width: 36px;
   height: 36px;
   object-fit: contain;
+  flex: 0 0 auto;
 }
 
-.support-sub {
+/* One heading that names both the tenant and the page. Previously the `<h1>`
+ * was the brand name alone, so the document's only heading told a screen
+ * reader "Acme & Co" and nothing about what the page was. */
+.support-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.support-title-brand {
+  color: var(--support-accent);
+  overflow-wrap: anywhere;
+}
+
+.support-title-kind {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--support-muted);
+}
+
+.support-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin: 2px 0 0;
   font-size: 13px;
-  color: #6b7280;
+  color: var(--support-muted);
+}
+
+.support-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #2f9e6b;
+  flex: 0 0 auto;
+}
+
+/* Colour is never the only signal: the text next to the dot says which state
+ * it is, so an out-of-hours window is readable without distinguishing green
+ * from grey. */
+.support-status.off .support-dot {
+  background: #9aa5a5;
+}
+
+.support-banner {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid #f0dcb0;
+  border-radius: 10px;
+  background: #fdf6e6;
+  color: #7a5b12;
+  font-size: 13.5px;
 }
 
 .support-thread {
@@ -53,13 +139,61 @@
   gap: 10px;
   padding: 18px 0;
   overflow-y: auto;
+  scroll-behavior: smooth;
 }
 
+/* Centred in the thread, which puts the greeting and the suggestions near the
+ * composer instead of at the far end of a tall empty column. */
 .support-empty {
   margin: auto;
-  color: #9ca3af;
-  font-size: 14px;
+  max-width: 34em;
+  padding: 0 4px;
+  text-align: center;
 }
+
+.support-empty-title {
+  margin: 0 0 6px;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--support-text);
+}
+
+.support-empty-body {
+  margin: 0;
+  font-size: 14px;
+  color: var(--support-muted);
+}
+
+.support-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 14px;
+}
+
+/* A suggestion is a real button, not a link-styled label: it sends the
+ * question. 32px tall and padded, so it is a comfortable target. */
+.support-chip {
+  padding: 7px 14px;
+  border: 1px solid #c3cdcd;
+  border-radius: 999px;
+  background: #fff;
+  color: var(--support-text);
+  font-size: 13.5px;
+  cursor: pointer;
+}
+
+.support-chip:hover:not(:disabled) {
+  border-color: var(--support-accent);
+  color: var(--support-accent);
+}
+
+.support-chip:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 
 .support-bubble {
   max-width: 78%;
@@ -86,10 +220,75 @@
   border-bottom-left-radius: 4px;
 }
 
+/* The time a message was sent. Small, but not so small it stops being legible:
+ * `--support-muted` on white measures 5.2:1. Without it a customer has no way
+ * to say *when* they asked, which is the first thing anyone needs when chasing
+ * an unanswered question. */
+.support-time {
+  display: block;
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--support-muted);
+  text-align: right;
+}
+
+.support-bubble.is-agent .support-time {
+  text-align: left;
+}
+
 .support-typing {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   align-self: flex-start;
-  color: #6b7280;
+  color: var(--support-muted);
   font-size: 13px;
+}
+
+.support-typing-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.support-typing-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #9aa5a5;
+  animation: support-typing-pulse 1.2s infinite ease-in-out;
+}
+
+.support-typing-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.support-typing-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes support-typing-pulse {
+  0%,
+  60%,
+  100% {
+    opacity: 0.35;
+  }
+
+  30% {
+    opacity: 1;
+  }
+}
+
+/* Motion is decoration here; anyone who has asked the OS for less of it gets
+ * a still indicator rather than a pulsing one. */
+@media (prefers-reduced-motion: reduce) {
+  .support-typing-dots i {
+    animation: none;
+    opacity: 0.6;
+  }
+
+  .support-thread {
+    scroll-behavior: auto;
+  }
 }
 
 /* Platform notices (a clarification, a handoff). Neither the customer's words
@@ -242,7 +441,14 @@
   color: #1c1c1e;
 }
 
+/* A failure the customer can act on, so it carries its own remedy. The old
+ * shape was a line of red text and a disabled composer: the only way out was
+ * to guess that a refresh might help. */
 .support-problem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin: 0 0 10px;
   padding: 9px 12px;
   border-radius: 10px;
@@ -252,40 +458,238 @@
   font-size: 13px;
 }
 
-.support-composer {
-  display: flex;
-  gap: 8px;
-  padding-top: 12px;
-  border-top: 1px solid #e3e6e6;
+.support-problem-retry {
+  flex: 0 0 auto;
+  padding: 5px 14px;
+  border: 1px solid #8a1c1c;
+  border-radius: 999px;
+  background: #fff;
+  color: #8a1c1c;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
 }
 
-.support-composer input {
-  flex: 1;
-  padding: 11px 14px;
+.support-problem-retry:hover {
+  background: #8a1c1c;
+  color: #fff;
+}
+
+/* --- Who will answer ------------------------------------------------------
+ *
+ * Persistent, not a one-off message: the state stays true for the rest of the
+ * conversation and it is the only thing on the page that explains a silence.
+ * Before this existed, a customer whose question had been handed to a person
+ * watched a window do nothing at all, indefinitely. */
+.support-handoff {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 9px 12px;
+  border: 1px solid #cfd9e6;
+  border-radius: 10px;
+  background: #eef3fa;
+  color: #2c4a6e;
+  font-size: 13px;
+}
+
+/* --- Identity step (feature 2.2/2.5) -------------------------------------
+ *
+ * A block rather than a bubble, for the same reason the card is: nobody said
+ * this, so attributing it to a speaker would be wrong. It sits above the
+ * composer because it is what makes an order question answerable at all —
+ * anonymous, the read path refuses before it calls any connector.
+ *
+ * A card rather than the dashed outline it used to be. The old shape read as
+ * disabled chrome - `dashed` is what this platform uses elsewhere for a value
+ * that is not real yet - and it is now the primary thing a new customer is
+ * asked to do, so it looks like one. */
+.support-verify {
+  margin: 0 0 10px;
+  padding: 13px 14px;
+  border: 1px solid #dfe4e4;
+  border-left: 3px solid var(--support-accent);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.support-verify-title {
+  margin: 0 0 4px;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--support-text);
+}
+
+.support-verify-lead {
+  margin: 0 0 11px;
+  color: var(--support-muted);
+  font-size: 13px;
+}
+
+.support-verify-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* Each input owns its label, so the two boxes are distinguishable after the
+ * customer has typed into them and the placeholder has gone. */
+.support-field {
+  flex: 1 1 150px;
+  min-width: 0;
+}
+
+.support-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--support-muted);
+  font-size: 12.5px;
+}
+
+.support-verify-row input {
+  width: 100%;
+  min-height: 40px;
+  padding: 9px 12px;
   border: 1px solid #d5d9d9;
-  border-radius: 22px;
-  font-size: 15px;
+  border-radius: 8px;
   background: #fff;
   color: inherit;
+  font: inherit;
+  font-size: 14px;
 }
 
-.support-composer input:focus {
+.support-verify-row input:focus,
+.support-input:focus {
   outline: 2px solid var(--support-accent);
   outline-offset: 1px;
 }
 
-.support-composer button {
-  padding: 0 22px;
+.support-verify-submit {
+  flex: 0 0 auto;
+  min-height: 40px;
+  padding: 0 18px;
   border: none;
-  border-radius: 22px;
+  border-radius: 8px;
   background: var(--support-accent);
   color: #fff;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.support-verify-submit:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* On a phone the two fields already fill the row, so the button wraps to a line
+ * of its own - where, at its natural width, it sat left-aligned and read as an
+ * afterthought rather than as the action. Full width makes it read as one. */
+@media (max-width: 480px) {
+  .support-verify-submit {
+    flex: 1 1 100%;
+  }
+}
+
+.support-verified {
+  align-self: flex-start;
+  margin: 0 0 10px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #e6f0ec;
+  color: #1f5c46;
+  font-size: 12.5px;
+}
+
+/* --- Composer -------------------------------------------------------------
+ *
+ * A textarea, not an input: an `<input>` cannot hold a newline, so a customer
+ * pasting a stack trace, an address or a set of process parameters had it
+ * silently collapsed onto one line. It starts one row tall and grows to
+ * `max-height`, which is what keeps a long paste from pushing the thread out
+ * of the window. */
+.support-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--support-line);
+}
+
+.support-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  max-height: 132px;
+  padding: 11px 14px;
+  border: 1px solid #d5d9d9;
+  border-radius: 22px;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+  font-size: 15px;
+  resize: none;
+  overflow-y: auto;
+}
+
+.support-human,
+.support-send {
+  flex: 0 0 auto;
+  min-height: 44px;
+  padding: 0 18px;
+  border-radius: 22px;
   font-size: 15px;
   font-weight: 500;
   cursor: pointer;
 }
 
-.support-composer button:disabled {
+/* Secondary weight on purpose: asking for a person is a legitimate move, but
+ * it is not the primary action on this page and it should not compete with
+ * "send" for the eye. */
+.support-human {
+  border: 1px solid #c3cdcd;
+  background: #fff;
+  color: var(--support-text);
+}
+
+.support-human:hover:not(:disabled) {
+  border-color: var(--support-accent);
+  color: var(--support-accent);
+}
+
+.support-send {
+  border: none;
+  background: var(--support-accent);
+  color: #fff;
+}
+
+.support-human:disabled,
+.support-send:disabled {
   opacity: 0.5;
   cursor: default;
 }
+
+.support-foot-note {
+  margin: 8px 0 0;
+  color: var(--support-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* Text that is for screen readers only. Used for the composer's label, which
+ * has no visible counterpart because the placeholder plus the send button make
+ * the purpose obvious to anyone who can see it. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+

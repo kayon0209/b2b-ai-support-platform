@@ -35,22 +35,30 @@ def _status(ahead: int, minutes: int | None, *, open_now: bool = True) -> QueueS
     )
 
 
+# The language of this notice follows the customer's question, so every case
+# that asserts wording passes one. Without it the call returns the English text
+# and an assertion like `"预计等待" not in notice` would pass for the wrong
+# reason - it would be testing the absence of a phrase from a sentence that was
+# never going to contain it.
+_ZH = "转人工"
+
+
 def test_a_conversation_that_is_not_queued_gets_no_notice() -> None:
     """Not waiting means not told about waiting."""
     notice = queue_notice(
-        QueueStatus(position=0, ahead=0, estimated_wait_minutes=None, open_now=True)
+        QueueStatus(position=0, ahead=0, estimated_wait_minutes=None, open_now=True), _ZH
     )
     assert notice is None
 
 
 def test_nobody_ahead_means_being_connected_not_a_queue_number() -> None:
-    notice = queue_notice(_status(ahead=0, minutes=None))
+    notice = queue_notice(_status(ahead=0, minutes=None), _ZH)
     assert notice is not None
     assert "前面还有" not in notice
 
 
 def test_people_ahead_are_counted() -> None:
-    notice = queue_notice(_status(ahead=3, minutes=None))
+    notice = queue_notice(_status(ahead=3, minutes=None), _ZH)
     assert notice is not None
     assert "前面还有 3 位" in notice
 
@@ -58,16 +66,29 @@ def test_people_ahead_are_counted() -> None:
 def test_no_estimate_when_no_average_was_declared(monkeypatch) -> None:
     """The no-fabrication guard: a count is given, a time is not."""
     monkeypatch.delenv(_AVG_HANDLE_ENV, raising=False)
-    notice = queue_notice(_status(ahead=3, minutes=None))
+    notice = queue_notice(_status(ahead=3, minutes=None), _ZH)
     assert notice is not None
     assert "预计等待" not in notice
 
 
 def test_an_estimate_is_given_only_when_there_is_a_source_for_it() -> None:
     status = _status(ahead=2, minutes=15)
-    notice = queue_notice(status)
+    notice = queue_notice(status, _ZH)
     assert notice is not None
     assert "预计等待约 15 分钟" in notice
+
+
+def test_the_notice_is_english_for_an_english_question() -> None:
+    """The mirror of the above, and the reason the parameter exists.
+
+    This notice used to be Chinese unconditionally, so an English-speaking
+    customer in a queue was told their position in a language they did not
+    write - and it is appended to the handoff notice, so the mismatch landed
+    mid-sentence.
+    """
+    notice = queue_notice(_status(ahead=3, minutes=None), "talk to a human")
+    assert notice is not None
+    assert not any("\u4e00" <= ch <= "\u9fff" for ch in notice)
 
 
 def test_average_handling_time_is_read_from_the_environment(monkeypatch) -> None:

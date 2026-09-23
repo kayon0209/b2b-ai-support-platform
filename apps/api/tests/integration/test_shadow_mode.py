@@ -21,6 +21,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.channels.outbound import ChannelSender, SendResult
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -147,19 +149,30 @@ class _FixedGenerator:
         return DraftAnswer(text=DRAFT, claims={0: [evidence[0].chunk_id]} if evidence else {})
 
 
-class _RecordingSender:
+class _RecordingTransport:
+    """Channel transport double: records every outbound answer.
+
+    It replaced a Chatwoot-shaped `sender` double. The channel path is the only
+    path that still leaves the platform, so it is the only delivery an outside
+    observer can see; the platform's own surface delivers by persisting the
+    agent turn, which these tests read back from the database.
+    """
+
+    system = "email"
+
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(
-        self, *, account_id, conversation_id, content, command_id, private: bool = False
-    ):
-        self.calls.append({"content": content, "private": private})
-
-        class _Result:
-            ambiguous = False
-
-        return _Result()
+    async def send(self, *, address, conversation_key, content, command_id):
+        self.calls.append(
+            {
+                "address": address,
+                "conversation_key": conversation_key,
+                "content": content,
+                "command_id": command_id,
+            }
+        )
+        return SendResult()
 
 
 async def _execute() -> tuple[object, list[str]]:
@@ -170,7 +183,7 @@ async def _execute() -> tuple[object, list[str]]:
 
     tid = uuid.UUID(TENANT)
     conv = uuid.uuid4()
-    sender = _RecordingSender()
+    sender = _RecordingTransport()
     engine = create_engine(APP_URL)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -182,7 +195,10 @@ async def _execute() -> tuple[object, list[str]]:
     async with factory() as session:
         await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT})
         orch = AgentOrchestrator(
-            session, OrchestratorDeps(sender=sender, generator=_FixedGenerator())
+            session,
+            OrchestratorDeps(
+                channel_sender=ChannelSender({"email": sender}), generator=_FixedGenerator()
+            ),
         )
         outcome = await orch.run(
             tenant_id=tid,
@@ -190,12 +206,13 @@ async def _execute() -> tuple[object, list[str]]:
             question=QUESTION,
             principal=PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",)),
             expected_lease_version=int(lease.lease_version),
-            chatwoot_account_id="1",
-            chatwoot_conversation_id="1",
+            channel_system="email",
+            channel_address="buyer@example.test",
+            channel_conversation_key="1",
         )
         await session.commit()
     await engine.dispose()
-    return outcome, [c["content"] for c in sender.calls if not c["private"]]
+    return outcome, [c["content"] for c in sender.calls]
 
 
 def test_shadow_mode_answers_but_does_not_send() -> None:

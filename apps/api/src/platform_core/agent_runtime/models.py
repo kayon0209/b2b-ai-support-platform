@@ -133,6 +133,38 @@ class Citation(Base, PkMixin, TenantMixin):
     retrieval_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
 
 
+# What a run is for, as stored on `AgentRun.model_config["mode"]`.
+#
+# `internal_draft` means "produce the answer, send nothing" - the operator is
+# looking at what the platform *would* say. It shares the suppression mechanism
+# with shadow mode (feature 9.2) because the two differ only in who asked: a
+# flag asks for every conversation, a mode asks for this one.
+MODE_CUSTOMER_REPLY = "customer_reply"
+MODE_INTERNAL_DRAFT = "internal_draft"
+VALID_MODES: frozenset[str] = frozenset({MODE_CUSTOMER_REPLY, MODE_INTERNAL_DRAFT})
+
+
+# How an agent's reply was composed, as stored on `ConversationTurn.origin`.
+#
+# `ORIGIN_UNKNOWN` (empty) and `ORIGIN_FREE` are **different facts** and must not
+# share a value:
+#
+# - unknown  - the client did not say. Every row written before migration 0051
+#              says this, and so does any client that does not report provenance.
+# - free     - the agent typed it themselves, and the client said so.
+#
+# Collapsing them makes "nobody reported" indistinguishable from "everybody
+# typed", and the only place that difference lands is the adoption denominator -
+# so the error always flatters the feature it is measuring.
+ORIGIN_UNKNOWN = ""
+ORIGIN_FREE = "free"
+ORIGIN_CANNED = "canned"
+ORIGIN_AI_SUGGESTION = "ai_suggestion"
+KNOWN_ORIGINS: frozenset[str] = frozenset(
+    {ORIGIN_UNKNOWN, ORIGIN_FREE, ORIGIN_CANNED, ORIGIN_AI_SUGGESTION}
+)
+
+
 class ConversationTurn(Base, PkMixin, TenantMixin):
     """One redacted turn of one conversation (iteration plan 2.1).
 
@@ -159,6 +191,18 @@ class ConversationTurn(Base, PkMixin, TenantMixin):
     # Source of the turn: "chatwoot" (fetched live) or "platform" (our own
     # reply). Local rows win when merging with a live fetch.
     source: Mapped[str] = mapped_column(String(15), nullable=False, default="platform")
+    # How the text was composed. Empty means *unknown*, not *free-typed* - see
+    # migration 0051 for why that distinction is kept rather than resolved.
+    origin: Mapped[str] = mapped_column(String(31), nullable=False, default="")
+    # Which template, when one was used. `canned_replies.usage_count` counts
+    # insertions; this records what was actually sent.
+    canned_reply_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("canned_replies.id"), nullable=True
+    )
+    # Who wrote it, when the platform authored the turn. NULL for customer turns.
+    # The lease holds current ownership, so it cannot answer "who said this" for
+    # a conversation that has since changed hands.
+    author_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
 
 

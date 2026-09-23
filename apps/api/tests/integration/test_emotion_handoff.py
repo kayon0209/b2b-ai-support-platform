@@ -26,6 +26,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.channels.outbound import ChannelSender, SendResult
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -62,21 +64,30 @@ async def _with_ctx(session, tenant_id: str) -> None:
     await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
 
 
-class _RecordingSender:
-    """ChatwootClient-compatible transport double."""
+class _RecordingTransport:
+    """Channel transport double: records every outbound answer.
+
+    It replaced a Chatwoot-shaped `sender` double. The channel path is the only
+    path that still leaves the platform, so it is the only delivery an outside
+    observer can see; the platform's own surface delivers by persisting the
+    agent turn, which these tests read back from the database.
+    """
+
+    system = "email"
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(
-        self, *, account_id, conversation_id, content, command_id, private: bool = False
-    ):
-        self.calls.append({"content": content, "private": private})
-
-        class _Result:
-            ambiguous = False
-
-        return _Result()
+    async def send(self, *, address, conversation_key, content, command_id):
+        self.calls.append(
+            {
+                "address": address,
+                "conversation_key": conversation_key,
+                "content": content,
+                "command_id": command_id,
+            }
+        )
+        return SendResult()
 
 
 def _seed_tenant() -> None:
@@ -126,7 +137,7 @@ async def _execute(question: str) -> tuple[list[dict], str | None, int]:
     tid = uuid.UUID(TENANT)
     conv = uuid.uuid4()
     principal = PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",))
-    sender = _RecordingSender()
+    sender = _RecordingTransport()
     engine = create_engine(APP_URL)
     factory = _factory(engine)
 
@@ -138,15 +149,18 @@ async def _execute(question: str) -> tuple[list[dict], str | None, int]:
 
     async with factory() as session:
         await _with_ctx(session, TENANT)
-        orch = AgentOrchestrator(session, OrchestratorDeps(sender=sender))
+        orch = AgentOrchestrator(
+            session, OrchestratorDeps(channel_sender=ChannelSender({"email": sender}))
+        )
         await orch.run(
             tenant_id=tid,
             conversation_ref_id=conv,
             question=question,
             principal=principal,
             expected_lease_version=expected_version,
-            chatwoot_account_id="1",
-            chatwoot_conversation_id="1",
+            channel_system="email",
+            channel_address="buyer@example.test",
+            channel_conversation_key="1",
         )
         await session.commit()
 

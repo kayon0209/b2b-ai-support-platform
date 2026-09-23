@@ -54,12 +54,19 @@ async def link_conversation(
     conversation_ref_id: uuid.UUID,
     external_contact_id: str,
     channel: str | None = None,
+    external_conversation_key: str | None = None,
 ) -> ConversationContact:
     """Record which contact a conversation belongs to.
 
     Idempotent per conversation: a re-delivered inbound event updates the
     channel rather than failing the unique constraint, because a duplicate
     delivery is normal and must not look like an error.
+
+    `external_conversation_key` is the channel's own conversation id, kept so an
+    outbound reply can join the same thread. A later event may know a field the
+    first one did not, so both the channel and the key are filled in on an
+    existing row rather than only on insert - an adapter that learned the key
+    after the contact would otherwise leave every reply starting a new thread.
     """
     if not external_contact_id:
         raise ValueError("external_contact_id is required to link a conversation")
@@ -75,9 +82,15 @@ async def link_conversation(
 
     now = int(time.time())
     if existing is not None:
-        # A later event may know the channel the first one did not.
+        # A later event may know a field the first one did not.
+        changed = False
         if channel and not existing.channel:
             existing.channel = channel
+            changed = True
+        if external_conversation_key and not existing.external_conversation_key:
+            existing.external_conversation_key = external_conversation_key
+            changed = True
+        if changed:
             existing.updated_at = now
             await session.flush()
         return existing
@@ -88,6 +101,7 @@ async def link_conversation(
         conversation_ref_id=conversation_ref_id,
         external_contact_id=external_contact_id,
         channel=channel,
+        external_conversation_key=external_conversation_key,
         created_at=now,
         updated_at=now,
     )
@@ -158,6 +172,45 @@ async def prior_conversations(
         )
         for row in rows
     ]
+
+
+async def delivery_target(
+    session: AsyncSession, *, tenant_id: uuid.UUID, conversation_ref_id: uuid.UUID
+) -> tuple[str, str, str] | None:
+    """Where to send a reply: `(channel, address, conversation_key)`.
+
+    The key is what makes the reply join the existing thread instead of starting
+    a new one - see `channels/outbound.py`. It may be empty when the row
+    predates the column; the caller decides what to do about that, and an empty
+    key is not a reason to refuse the send.
+
+    Returns None when there is nowhere to send it - which is the honest answer
+    for a conversation carried by the platform's own surface. `/support` reads
+    its answers back from `conversation_turns`, so for that surface *persisting
+    the turn is the delivery*, and a caller that treated None as a failure would
+    refuse to answer the customers it can most easily reach.
+
+    `channel` may be empty on a row that knows the contact but not the channel
+    (a CRM sync often cannot name one). That is returned as-is rather than
+    guessed: `( "", address)` still tells a caller "there is a person here",
+    while inventing "web" would send an email customer's reply to the wrong
+    transport.
+    """
+    row = (
+        await session.execute(
+            select(
+                ConversationContact.external_contact_id,
+                ConversationContact.channel,
+                ConversationContact.external_conversation_key,
+            ).where(
+                ConversationContact.tenant_id == tenant_id,
+                ConversationContact.conversation_ref_id == conversation_ref_id,
+            )
+        )
+    ).one_or_none()
+    if row is None or not row[0]:
+        return None
+    return (str(row[1] or ""), str(row[0]), str(row[2] or ""))
 
 
 async def contact_for_conversation(

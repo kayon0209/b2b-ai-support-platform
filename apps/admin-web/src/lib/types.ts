@@ -97,6 +97,56 @@ export interface ActivePrompt {
   template_name: string;
 }
 
+/**
+ * A channel or external system, as `/v1/connectors` projects it.
+ *
+ * `credential_ref` is deliberately absent from the API response (its *presence*
+ * is reported as `credential_configured`), so it is absent here too - the type
+ * should not promise a field the server never sends.
+ */
+export interface ExperimentArm {
+  name: string;
+  weight: number;
+  prompt_version_id: string | null;
+}
+
+export interface ExperimentDefinition {
+  key: string;
+  description: string;
+  variants: ExperimentArm[];
+  enabled: boolean;
+  updated_at: number;
+}
+
+/** Per-arm totals. `automation_rate` is null, never 0, when an arm has no runs:
+ * "nobody was bucketed here" and "everything escalated" are opposite facts. */
+export interface ArmTotals {
+  runs: number;
+  automated: number;
+  escalated: number;
+  automation_rate: number | null;
+}
+
+export interface ExperimentResults {
+  key: string;
+  enabled: boolean;
+  arms: Record<string, ArmTotals>;
+}
+
+export interface Connector {
+  connector_id: string;
+  provider: string;
+  name: string;
+  status: string;
+  capabilities: string[];
+  credential_configured: boolean;
+  last_health_at: number | null;
+  /** Whether the connector may currently be used, which is not the same as its
+   * `status`: a failed probe holds an otherwise-active connector out of the
+   * write path. */
+  executable: boolean;
+}
+
 export interface FeatureFlag {
   key: string;
   description: string;
@@ -406,6 +456,57 @@ export interface ConversationReplay {
   turns: ReplayTurn[];
   runs: ReplayRun[];
   cases: ReplayCase[];
+}
+
+/**
+ * One row of the agent directory — `GET /v1/agents`.
+ *
+ * Mirrors `cases/agent_router._agent_out`. `skills` is a list rather than the
+ * comma-separated string the add form takes: the form is a convenience for the
+ * operator, and the wire shape is what the router matches on.
+ */
+export interface AgentProfile {
+  user_ref: string;
+  display_name: string;
+  skills: string[];
+  max_concurrent: number;
+  status: string;
+}
+
+/**
+ * One row of the per-agent report — `GET /v1/quality/agents`.
+ *
+ * Mirrors `evaluation/agent_metrics_router._agent_out`. Every rate is
+ * `number | null`, and that is load-bearing rather than defensive: the router
+ * returns `None` rather than `0.0` when a rate has no denominator, because
+ * "nobody asked" and "everyone was unhappy" are different facts and a zero
+ * blends them. A component that renders `null` as `0%` undoes that, which is
+ * why `Agents.tsx` formats through a `rate()` helper that shows an em dash.
+ */
+export interface AgentPerformance {
+  user_ref: string;
+  display_name: string;
+  status: string;
+  max_concurrent: number;
+  open_cases: number;
+  /** `open_cases / max_concurrent`; above 1 means over capacity. */
+  utilisation: number | null;
+  resolved_in_window: number;
+  reopened_in_window: number;
+  first_time_fix_rate: number | null;
+  first_response_minutes_p50: number | null;
+  first_response_minutes_p95: number | null;
+  resolution_minutes_p50: number | null;
+  resolution_minutes_p95: number | null;
+  replies_sent: number;
+  replies_from_ai_suggestion: number;
+  replies_from_canned: number;
+  replies_free: number;
+  /** Kept apart from `replies_free`: a client that reports no provenance is
+   *  not evidence that its agents type everything by hand. */
+  replies_unknown_origin: number;
+  ai_suggestion_adoption: number | null;
+  canned_adoption: number | null;
 }
 
 export class ApiError extends Error {

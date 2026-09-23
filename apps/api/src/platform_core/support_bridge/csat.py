@@ -26,7 +26,6 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -189,7 +188,11 @@ async def response_rate(
     )
     if asked == 0:
         return None
-    summary: Any = await csat_summary(session, tenant_id=tenant_id, window_seconds=window_seconds)
+    # No `: Any` here on purpose. Annotating the summary as `Any` is what let
+    # this return an untyped value from a function declared `float | None`, so
+    # the arithmetic below was never actually checked. `csat_summary` returns
+    # `CsatSummary`, and letting mypy infer it is the point of the annotation.
+    summary = await csat_summary(session, tenant_id=tenant_id, window_seconds=window_seconds)
     return round(summary.responses / asked, 3)
 
 

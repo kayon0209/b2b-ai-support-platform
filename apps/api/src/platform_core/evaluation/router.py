@@ -26,6 +26,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.api import error_response, tenant_session
+from platform_core.evaluation.categories import category_report
+from platform_core.evaluation.category_service import CategoryStateError, set_category_state
+from platform_core.evaluation.channels import aggregate_channel_distribution
 from platform_core.evaluation.metrics import (
     aggregate_intent_distribution,
     aggregate_quality_metrics,
@@ -257,6 +260,179 @@ async def get_intent_distribution(
                 "by_business_line": bucket.by_business_line,
             }
             for bucket in dist.trend
+        ],
+    }
+
+
+# --- The last mile: issue categories ----------------------------------------
+#
+# `/metrics` answers "which *reasons* are we handing off for". That is the
+# signal, but the operator's unit of work is a *kind of question* ("加急咨询"),
+# and a reason does not map one-to-one onto a kind. `categories` is that object,
+# and `/categories/state` is the mark that turns the leak analysis into an
+# action someone took. See `evaluation/categories.py`.
+
+
+class CategoryStateIn(BaseModel):
+    """One operator decision about one category.
+
+    `category_key` is in the body rather than the path on purpose: the key
+    contains `|`, and a path segment carrying it needs escaping on every client
+    for no benefit - this is not a resource being addressed, it is a command.
+    """
+
+    category_key: str = Field(min_length=1, max_length=191)
+    state: str = Field(min_length=1, max_length=31)
+    fix_type: str = Field(default="", max_length=31)
+    note: str = Field(default="", max_length=1024)
+
+
+def _category_out(stat: Any) -> dict[str, Any]:
+    return {
+        "category_key": stat.category_key,
+        "business_line": stat.business_line,
+        "scene": stat.scene,
+        "primary_kind": stat.primary_kind,
+        "state": stat.state,
+        "confirmed_fix_type": stat.confirmed_fix_type,
+        "proposed_fix_type": stat.proposed_fix_type,
+        "note": stat.note,
+        "marked_at": stat.marked_at,
+        "automated_at": stat.automated_at,
+        "runs": stat.runs,
+        "automated": stat.automated,
+        "escalated": stat.escalated,
+        "fix_type_counts": stat.fix_type_counts,
+        "automation_rate": stat.automation_rate,
+        "leak_volume": stat.leak_volume,
+        "rate_before": stat.rate_before,
+        "rate_after": stat.rate_after,
+    }
+
+
+@router.get("/categories")
+async def get_issue_categories(
+    request: Request,
+    window_seconds: int = Query(default=7 * 24 * 3600, ge=60, le=MAX_WINDOW_SECONDS),
+) -> Any:
+    """Per-category volume, automation rate and gap attribution.
+
+    `candidates` is the proposed work list - ranked, and with `routing` and
+    `policy` gaps excluded, because those are decisions a person makes and
+    proposing to automate them is how a red line gets automated by a dashboard.
+    `rate_before` / `rate_after` are populated only for a category that has
+    been automated, and are how an operator sees that a change worked.
+    """
+    ctx = getattr(request.state, "tenant_context", None)
+    if ctx is None:
+        ctx = tenant_context.get_tenant_context()
+
+    gate = PolicyEngine().check(_principal_from_ctx(ctx), Action.AUDIT_READ)
+    if gate.decision != Decision.ALLOW.value:
+        return _denied(gate.reason_code)
+
+    async with tenant_session(ctx) as session:
+        report = await category_report(
+            session, tenant_id=ctx.tenant_id, window_seconds=window_seconds
+        )
+    return {
+        "window_seconds": report.window_seconds,
+        "total_runs": report.total_runs,
+        "unrecorded_runs": report.unrecorded_runs,
+        "never_executed_runs": report.never_executed_runs,
+        "truncated": report.truncated,
+        "automation_rate": report.automation_rate,
+        "categories": [_category_out(c) for c in report.categories],
+        "candidates": [_category_out(c) for c in report.candidates],
+    }
+
+
+@router.post("/categories/state")
+async def post_category_state(request: Request, body: CategoryStateIn) -> Any:
+    """Record an operator's decision about one category.
+
+    This is the action the leak analysis was missing: the list proposed, and
+    now something has been decided. Illegal transitions return 409 rather than
+    being silently normalised - a state machine that accepts anything is a text
+    field, and the two transitions refused (observed→automated, and anything
+    out of human_only straight to automated) are the ones that would put a claim
+    on the report that no work stands behind.
+    """
+    ctx = getattr(request.state, "tenant_context", None)
+    if ctx is None:
+        ctx = tenant_context.get_tenant_context()
+
+    gate = PolicyEngine().check(_principal_from_ctx(ctx), Action.AUDIT_READ)
+    if gate.decision != Decision.ALLOW.value:
+        return _denied(gate.reason_code)
+
+    try:
+        async with tenant_session(ctx) as session:
+            row = await set_category_state(
+                session,
+                tenant_id=ctx.tenant_id,
+                category_key=body.category_key,
+                state=body.state,
+                actor_id=ctx.actor_id,
+                fix_type=body.fix_type,
+                note=body.note,
+            )
+    except CategoryStateError as exc:
+        return error_response("CATEGORY_STATE_INVALID", str(exc), status_code=409)
+
+    return {
+        "category_key": row.category_key,
+        "state": row.state,
+        "fix_type": row.fix_type,
+        "marked_at": row.marked_at,
+        "automated_at": row.automated_at,
+    }
+
+
+@router.get("/channels")
+async def get_channel_distribution(
+    request: Request,
+    window_seconds: int = Query(default=7 * 24 * 3600, ge=60, le=MAX_WINDOW_SECONDS),
+) -> Any:
+    """Volume and automation rate per channel (8.2's third axis).
+
+    A channel is something an operator can act on, which is why this sits beside
+    the quality metrics rather than inside them: "the WeChat rate is half the web
+    rate" is a finding, and "the rate is 61%" is not.
+
+    `(unlinked)` and `(unnamed)` are buckets, not channel names. They are reported
+    so the channels add up to the total - the platform's own surface has no
+    channel, and a reader who could not see that traffic would assume the numbers
+    were wrong.
+    """
+    ctx = getattr(request.state, "tenant_context", None)
+    if ctx is None:
+        ctx = tenant_context.get_tenant_context()
+
+    gate = PolicyEngine().check(_principal_from_ctx(ctx), Action.AUDIT_READ)
+    if gate.decision != Decision.ALLOW.value:
+        return _denied(gate.reason_code)
+
+    async with tenant_session(ctx) as session:
+        dist = await aggregate_channel_distribution(
+            session, tenant_id=ctx.tenant_id, window_seconds=window_seconds
+        )
+    return {
+        "window_seconds": dist.window_seconds,
+        "total_runs": dist.total_runs,
+        "unlinked_runs": dist.unlinked_runs,
+        "unnamed_channel_runs": dist.unnamed_channel_runs,
+        "truncated": dist.truncated,
+        "automation_rate": dist.automation_rate,
+        "channels": [
+            {
+                "channel": stat.channel,
+                "runs": stat.runs,
+                "automated": stat.automated,
+                "escalated": stat.escalated,
+                "automation_rate": stat.automation_rate,
+            }
+            for stat in sorted(dist.by_channel.values(), key=lambda s: (-s.runs, s.channel))
         ],
     }
 

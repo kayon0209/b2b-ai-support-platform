@@ -15,6 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from platform_core.agent_runtime.language import answers_in_chinese
 from platform_core.retrieval.hybrid import RetrievedChunk
 
 if TYPE_CHECKING:
@@ -1145,9 +1146,126 @@ def decide_abstention(
     return AbstentionDecision(abstain=False)
 
 
-def safe_abstention_text(reason_code: str) -> str:
+# --- The language the customer is answered in ------------------------------
+#
+# Resolved from the customer's own words by `language.answers_in_chinese` -
+# see that module for why the rule lives there and not in a tenant setting.
+#
+# Chinese copy for every customer-visible notice, mirroring the English chain
+# below branch for branch - including its omissions, which are the load-bearing
+# part: no promised time, no admission of fault, no naming of what was withheld
+# and no naming of why a topic is restricted.
+#
+# It is a map rather than a second `if` chain so the two languages cannot drift
+# apart: a reason code with no Chinese entry falls through to the English text
+# rather than to silence, and adding a branch without translating it is visible
+# in one place.
+#
+# Three of these (IDENTITY_REQUIRED, IDENTITY_MISMATCH, the emotion escalation)
+# were already Chinese and returned unconditionally, which was the same defect
+# pointing the other way - an English-speaking customer answered in Chinese.
+# They are entries here now, so the language is decided once.
+_ABSTENTION_ZH: dict[str, str] = {
+    ABSTAIN_RESTRICTED: "这条信息我无法提供。我会请人工同事来协助您。",
+    ABSTAIN_ACTION_REQUEST: (
+        "我无法直接修改您账户上的内容。我会把这件事转给可以操作的人工同事。"
+    ),
+    ABSTAIN_AMBIGUOUS_IDENTITY: (
+        "这取决于您的合同条款，而我看不出哪一条适用于您。"
+        "我会请人工同事为您确认具体的条款。"
+    ),
+    ABSTAIN_CLARIFICATION: "能否再多说一点？我想确认自己回答的是您真正要问的问题。",
+    "IDENTITY_REQUIRED": (
+        "为了保护您的数据，查询订单信息前需要先验证身份：请提供订单号和"
+        "下单时预留的手机尾号（后四位），或由人工同事为您处理。"
+    ),
+    "IDENTITY_MISMATCH": (
+        "这条信息与当前会话已验证的账户不一致，我无法提供。如需查询其他"
+        "订单，请完成对应验证，或由人工同事为您处理。"
+    ),
+    ABSTAIN_EMOTION_ESCALATION: (
+        "很抱歉给您带来了不好的体验。我已把这条对话连同上下文转给人工同事，"
+        "由他们来为您跟进处理。"
+    ),
+    # Deliberately identical for both sensitive codes: see the English branch
+    # for why naming the reason is what must not happen here.
+    ABSTAIN_HUMAN_REQUIRED: "我会请人工同事来协助您处理这件事。",
+    ABSTAIN_SENSITIVE_REQUEST: "我会请人工同事来协助您处理这件事。",
+    ABSTAIN_OUT_OF_SCOPE: (
+        "我可以回答关于您的账户、订单以及我们已公开政策的问题。"
+        "您想问哪一项？也可以由人工同事为您处理。"
+    ),
+    ABSTAIN_COMPLAINT_REQUIRES_HUMAN: (
+        "感谢您把这个问题提出来。赔付与质量认定由人工同事判断，不由我决定，"
+        "所以我已经把它转给能查看本次对话上下文的人工同事。"
+        "如果能提供订单号和问题照片，会有助于他们核实。"
+    ),
+    ABSTAIN_STRATEGIC_ACCOUNT_REQUIRES_HUMAN: (
+        "感谢您把这个问题提出来。我正在把它转给您的客户团队，"
+        "他们会带着本次对话的上下文直接与您跟进。"
+    ),
+    # The abstention reasons the knowledge path produces. Written out rather
+    # than left to the generic fallback because each says something different,
+    # and the difference is the customer's next move: rephrasing (low
+    # relevance), waiting for a person (no evidence), or nothing they can do at
+    # all (a conflict only a human can settle).
+    ABSTAIN_NO_EVIDENCE: "我在已授权的资料里找不到能回答这个问题的依据。我会请人工同事来为您查证。",
+    ABSTAIN_LOW_RELEVANCE: (
+        "我查到的资料和您问的这件事对不上，所以不敢据此回答。"
+        "您可以换个说法再问，或者由人工同事为您确认。"
+    ),
+    ABSTAIN_CONFLICT: (
+        "我查到的几份资料说法互相不一致，我不愿意替您从中挑一份。"
+        "我会请人工同事来确认适用哪一条。"
+    ),
+    "NO_CLAIMS": (
+        "我没能组织出一个有依据的答案，所以不打算凭猜测回答您。"
+        "这次提问已经记在这条对话里，可以转人工同事为您处理。"
+    ),
+    "UNSUPPORTED_CLAIM": (
+        "我能给出的说法没有可靠依据支撑，所以不打算这样回答您。"
+        "我会请人工同事来为您确认。"
+    ),
+    # A read path that could not even find the tool, or could not build its
+    # arguments, is not an outage (`TOOL_NO_CANDIDATE` is deliberately outside
+    # `SYSTEM_OUTAGE_REASONS` for the same reason), so it lands here.
+    "TOOL_NO_CANDIDATE": "这个问题我没能找到可以查证的接口。我会请人工同事来为您处理。",
+    "TOOL_ARGUMENT_MISSING": (
+        "要查这条记录还缺一个关键信息。请把单号（或编号）一起告诉我，我再查一次。"
+    ),
+    "CLARIFICATION_LIMIT": (
+        "问了这几轮我还是没能弄清您具体想问什么，再追问下去只会让您来回重复。"
+        "我这就把这条对话转给人工同事。"
+    ),
+}
+
+# The Chinese counterpart of the English chain's final `return`, and the reason
+# it exists: the map above is keyed by reason code, so a code nobody translated
+# would send a Chinese customer an English sentence - which is the defect this
+# whole block was written to remove, and it would come back the next time a
+# reason code is added. Mirroring the fallback makes the language guarantee hold
+# for codes that do not exist yet.
+#
+# Deliberately NOT the sum of the specific entries: it says only what is true of
+# every abstention (nothing was verified, a person can help, rephrasing is
+# allowed) and promises no time.
+_ABSTENTION_ZH_FALLBACK = (
+    "我没能从已授权的资料里核实出答案，所以不能凭猜测回答您。"
+    "可以转人工同事为您处理，也可以换个说法再问一次。"
+)
+
+
+def safe_abstention_text(reason_code: str, question: str = "") -> str:
     """Customer-safe abstention reply: state what cannot be verified,
-    offer handoff, never invent an explanation (docs/agent.md)."""
+    offer handoff, never invent an explanation (docs/agent.md).
+
+    `question` is what decides the language. It is optional so a caller with
+    no question - a test, a run being reported on after the fact - still gets a
+    usable string; without it the English text is returned, which is what this
+    function returned before the language was resolved at all.
+    """
+    if answers_in_chinese(question):
+        return _ABSTENTION_ZH.get(reason_code) or _ABSTENTION_ZH_FALLBACK
     if reason_code == ABSTAIN_RESTRICTED:
         return (
             "I can't provide that information. Let me connect you with a "
@@ -1186,15 +1304,19 @@ def safe_abstention_text(reason_code: str) -> str:
         # the data, it just cannot prove the caller is its owner. This is the
         # difference between a gate and a dead end.
         return (
-            "为了保护您的数据，查询订单信息前需要先验证身份：请提供订单号和"
-            "下单时预留的手机尾号（后四位），或由人工同事为您处理。"
+            "To protect your data, I need to check who you are before looking "
+            "up order information. Please give me the order number and the "
+            "last four digits of the phone number on that order - or a human "
+            "colleague can handle it for you."
         )
     if reason_code == "IDENTITY_MISMATCH":
         # Deliberately does not say whose data was requested: naming it would
         # make this reply an order-number oracle.
         return (
-            "这条信息与当前会话已验证的账户不一致，我无法提供。如需查询其他"
-            "订单，请完成对应验证，或由人工同事为您处理。"
+            "That does not match the account already verified in this "
+            "conversation, so I can't provide it. To look up a different "
+            "order, please complete the matching verification - or a human "
+            "colleague can handle it for you."
         )
     if reason_code == ABSTAIN_EMOTION_ESCALATION:
         # 7.2: acknowledges the situation, promises nothing. No "尽快", no
@@ -1204,8 +1326,9 @@ def safe_abstention_text(reason_code: str) -> str:
         # the context travelled with the handoff, which is the one true thing
         # that reduces the frustration: they will not have to repeat it.
         return (
-            "很抱歉给您带来了不好的体验。我已把这条对话连同上下文转给人工同事，"
-            "由他们来为您跟进处理。"
+            "I am sorry this has been a bad experience. I have passed this "
+            "conversation, with its context, to a human colleague who will "
+            "follow up with you."
         )
     if reason_code in (ABSTAIN_HUMAN_REQUIRED, ABSTAIN_SENSITIVE_REQUEST):
         # Does not explain itself beyond "a person will help". Naming *why*
@@ -1335,12 +1458,25 @@ is_action_request = _is_action_request
 # before the gateway ever calls out: by the time execution fails, the request
 # was well-formed and the failure is the other system's. A malformed request
 # never reaches this code path.
-SYSTEM_OUTAGE_REASONS = frozenset(
-    {"TOOL_UNAVAILABLE", "TOOL_EXECUTION_UNVERIFIED", "TOOL_EXECUTION_FAILED"}
-)
+#
+# `TOOL_EXECUTION_UNVERIFIED` used to be in this set, and that was the wrong
+# call - measured 2026-09-23. It covers "the record was not found" and "the
+# postcondition could not be confirmed" as well as a real outage, so a customer
+# was told our order systems were down when in fact the platform had asked the
+# wrong system for the wrong record. That is a false statement about a third
+# party's availability, and it sends both the customer and the operator to
+# investigate an outage that is not happening. It gets its own notice below.
+SYSTEM_OUTAGE_REASONS = frozenset({"TOOL_UNAVAILABLE", "TOOL_EXECUTION_FAILED"})
+
+# A read that ran and could not be confirmed: not found, or a postcondition the
+# provider would not stand behind. Kept apart from an outage because the honest
+# answer ("we looked and could not confirm it") is actionable for a person,
+# whereas "our systems are down" is not - and because one of them is the
+# platform's own error, which should not be reported as someone else's.
+UNVERIFIED_READ_REASONS = frozenset({"TOOL_EXECUTION_UNVERIFIED"})
 
 
-def system_outage_notice() -> str:
+def system_outage_notice(question: str = "") -> str:
     """What to say when an external system is down (10.2).
 
     Names the actual cause, says the request is kept, and says someone will
@@ -1349,9 +1485,34 @@ def system_outage_notice() -> str:
     because this path does not file one. Both omissions are deliberate: an
     outage is exactly when a customer needs the truth and not a reassurance.
     """
+    if answers_in_chinese(question):
+        return (
+            "我们对接的订单与物流系统目前没有响应，所以这次查询我无法完成。"
+            "这次请求已经记录在这条对话里，系统恢复后会有同事跟进。"
+        )
     return (
         "Our order and logistics systems are not responding at the moment, so "
         "I can't look this up right now. Your request has been recorded with "
         "this conversation and someone will follow up once the systems are "
         "back."
+    )
+
+
+def unverified_read_notice(question: str = "") -> str:
+    """What to say when a read ran but its result could not be confirmed.
+
+    Owns up to the platform's side of it rather than blaming a system we do not
+    own, and does not report a figure it cannot stand behind - the same
+    discipline as `abstain` itself. It says what happens next, which is the one
+    thing the customer can act on.
+    """
+    if answers_in_chinese(question):
+        return (
+            "我没能核实到这条记录，所以无法把结果给您。"
+            "这次查询已经记在这条对话里，会由人工同事为您查证。"
+        )
+    return (
+        "I could not confirm that record, so I am not going to give you a "
+        "result I cannot stand behind. I have noted this request on the "
+        "conversation and a human colleague will check it for you."
     )

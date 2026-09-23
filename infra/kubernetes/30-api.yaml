@@ -80,16 +80,6 @@ spec:
                 secretKeyRef:
                   name: platform-secrets
                   key: APP_SECRET_KEY
-            - name: APP_CHATWOOT_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: platform-secrets
-                  key: APP_CHATWOOT_API_TOKEN
-            - name: APP_CHATWOOT_WEBHOOK_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: platform-secrets
-                  key: APP_CHATWOOT_WEBHOOK_SECRET
             - name: APP_LLM_API_KEY
               valueFrom:
                 secretKeyRef:

@@ -59,6 +59,59 @@ async def append_turn(
     return row_id
 
 
+async def append_authored_turn(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_ref_id: uuid.UUID,
+    text: str,
+    role: TurnRole | str,
+    source: str,
+    ts: int | None = None,
+    origin: str = "",
+    canned_reply_id: uuid.UUID | None = None,
+    author_ref: str | None = None,
+) -> uuid.UUID:
+    """Persist a turn the **platform authored**, verbatim. Returns the row id.
+
+    Not redacted, and that is the whole reason this is a separate function
+    rather than a flag on `append_turn`. Redaction exists to keep customer PII
+    out of storage; it is not a property of the *column*, and applying it here
+    would corrupt the content rather than protect anyone:
+
+    - `redact_text` masks any 10+ digit run, so an agent answering "your order
+      SO-9001 ships on 20260930" would have the number replaced with a marker -
+      the one thing the message existed to convey.
+    - It would also make the stored copy differ from what the customer
+      received, which breaks the question this table is read to answer: *what
+      did we actually tell them*.
+
+    The caller is a human's own words, already attributed to that human in the
+    audit trail. A separate name rather than a `redact=False` argument because a
+    defaulted boolean can be flipped at a call site by someone who has not read
+    the reason, and this is not a behaviour anyone should change by accident.
+    """
+    row_id = uuid.uuid4()
+    session.add(
+        ConversationTurn(
+            tenant_id=tenant_id,
+            id=row_id,
+            conversation_ref_id=conversation_ref_id,
+            role=_role_value(role),
+            text_redacted=text,
+            text_hash=hashlib.sha256(text.encode()).hexdigest(),
+            ts=ts or int(time.time()),
+            ref="",
+            source=source,
+            created_at=int(time.time()),
+            origin=origin,
+            canned_reply_id=canned_reply_id,
+            author_ref=author_ref,
+        )
+    )
+    return row_id
+
+
 async def load_turns(
     session: AsyncSession,
     *,

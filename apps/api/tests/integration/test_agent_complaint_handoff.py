@@ -25,6 +25,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.channels.outbound import ChannelSender, SendResult
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -119,24 +121,30 @@ def clean_tenant() -> None:
     _clear()
 
 
-class _RecordingSender:
-    """ChatwootClient-compatible transport double."""
+class _RecordingTransport:
+    """Channel transport double: records every outbound answer.
+
+    It replaced a Chatwoot-shaped `sender` double. The channel path is the only
+    path that still leaves the platform, so it is the only delivery an outside
+    observer can see; the platform's own surface delivers by persisting the
+    agent turn, which these tests read back from the database.
+    """
+
+    system = "email"
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(
-        self, *, account_id, conversation_id, content, command_id, private: bool = False
-    ):
+    async def send(self, *, address, conversation_key, content, command_id):
         self.calls.append(
             {
-                "account_id": account_id,
-                "conversation_id": conversation_id,
+                "address": address,
+                "conversation_key": conversation_key,
                 "content": content,
                 "command_id": command_id,
-                "private": private,
             }
         )
+        return SendResult()
 
         class _Result:
             ambiguous = False
@@ -162,7 +170,7 @@ async def _execute(
     tid = uuid.UUID(TENANT)
     conv = uuid.uuid4()
     principal = PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",))
-    sender = _RecordingSender()
+    sender = _RecordingTransport()
 
     engine = create_engine(APP_URL)
     factory = _factory(engine)
@@ -175,15 +183,18 @@ async def _execute(
 
     async with factory() as session:
         await _with_ctx(session, TENANT)
-        orch = AgentOrchestrator(session, OrchestratorDeps(sender=sender))
+        orch = AgentOrchestrator(
+            session, OrchestratorDeps(channel_sender=ChannelSender({"email": sender}))
+        )
         outcome = await orch.run(
             tenant_id=tid,
             conversation_ref_id=conv,
             question=question,
             principal=principal,
             expected_lease_version=expected_version,
-            chatwoot_account_id="1",
-            chatwoot_conversation_id="1",
+            channel_system="email",
+            channel_address="buyer@example.test",
+            channel_conversation_key="1",
             attachment_types=attachment_types,
         )
         await session.commit()
@@ -237,7 +248,14 @@ def test_a_compensation_claim_is_handed_off_and_nothing_is_retrieved() -> None:
     # Not "" - the notice is the text, because 弃权必须出声. What it must not
     # contain is anything the knowledge path produced, which is what the
     # citation count below is really asserting.
-    assert outcome.answer_text == safe_abstention_text(COMPLAINT_REQUIRES_HUMAN)
+    #
+    # The question is passed because the language of the notice is derived from
+    # it (see `language.answers_in_chinese`), and `COMPENSATION_CLAIM` is
+    # Chinese - so the expected text is the Chinese one. Calling without it
+    # would compare against the English default and assert that a Chinese
+    # customer is answered in English, which is the defect the language rule
+    # exists to remove.
+    assert outcome.answer_text == safe_abstention_text(COMPLAINT_REQUIRES_HUMAN, COMPENSATION_CLAIM)
     assert counts["citations"] == 0
     assert counts["proposals"] == 0
     assert counts["executions"] == 0
@@ -271,8 +289,12 @@ def test_the_customer_is_told_a_person_will_take_over() -> None:
     customer_visible = [c["content"] for c in sent if c["content"]]
     assert customer_visible, "an abstention that says nothing is a red line"
     notice = customer_visible[0]
-    assert "human colleague" in notice
-    assert "rephrase" not in notice.lower()
+    # `COMPENSATION_CLAIM` above is Chinese, so the notice follows it
+    # (`language.answers_in_chinese`): "人工同事" is the handoff promise and
+    # "换个说法" is the rephrase deflection the fallback would use. The
+    # assertions were English-only before the copy was localised.
+    assert "人工同事" in notice
+    assert "换个说法" not in notice
 
 
 def test_the_notice_makes_no_payout_promise_and_no_admission() -> None:
@@ -335,23 +357,42 @@ def test_a_stalled_order_is_not_hijacked() -> None:
     assert outcome.abstain_reason != COMPLAINT_REQUIRES_HUMAN
 
 
-def test_supplied_evidence_is_named_on_the_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The private note is off by default; this test is about its contents.
-    from platform_core.config import get_settings
-
-    monkeypatch.setenv("APP_HANDOFF_EVIDENCE_ENABLED", "true")
-    get_settings.cache_clear()
+def test_supplied_evidence_is_named_on_the_handoff() -> None:
     """1.3: don't ask again for what the customer already sent.
 
     "Please send a photo" when two images are attached is the exchange that
-    makes a handoff feel like starting over. The note carries the content
-    types - metadata only, the files stay in Chatwoot - so the agent opens
-    the conversation already knowing evidence exists.
+    makes a handoff feel like starting over. The content types travel with the
+    handoff so the agent opens the conversation already knowing evidence
+    exists - content types only; the files never entered the platform.
+
+    They used to ride in a private Chatwoot note. That transport is gone
+    (ADR 0012), so the handoff's audit event carries them - the same record an
+    operator or reviewer reads.
     """
-    outcome, sent, _counts = _run(
+    outcome, _sent, _counts = _run(
         _execute(question=COMPENSATION_CLAIM, attachment_types=["image/png", "image/jpeg"])
     )
 
     assert outcome.abstain_reason == "COMPLAINT_REQUIRES_HUMAN"
-    notes = [c["content"] for c in sent if c["private"]]
-    assert any("customer_attachments=image/png,image/jpeg" in note for note in notes), notes
+    metadata = _handoff_metadata(outcome.run_id)
+    assert metadata.get("customer_attachments") == "image/png,image/jpeg", metadata
+
+
+def _handoff_metadata(run_id: object) -> dict:
+    """The handoff's audit metadata: what the receiving side actually reads.
+
+    `after=` on an audit event is hashed and unreadable by design; `metadata`
+    is the documented narrow exception for an event's own parameters, which is
+    why the handoff's routing facts live there.
+    """
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        row = conn.execute(
+            text(
+                "SELECT metadata FROM audit_events "
+                "WHERE resource_id = :r AND action = 'agent_run.abstained'"
+            ),
+            {"r": str(run_id)},
+        ).first()
+    admin.dispose()
+    return dict(row[0]) if row and row[0] else {}

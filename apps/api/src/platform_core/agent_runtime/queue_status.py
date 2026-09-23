@@ -25,11 +25,14 @@ exclusive by design, never concatenated.
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime.hours import is_open
+from platform_core.agent_runtime.language import answers_in_chinese
 from platform_core.identity.control_lease import ConversationControlLease
 
 # Set by an operator from their own figures (queue service, historical
@@ -67,7 +70,9 @@ def _avg_handle_minutes() -> int | None:
     return value if value > 0 else None
 
 
-async def queue_status(session, *, tenant_id, conversation_ref_id) -> QueueStatus:
+async def queue_status(
+    session: AsyncSession, *, tenant_id: uuid.UUID, conversation_ref_id: uuid.UUID
+) -> QueueStatus:
     """Count how many queue-owned conversations entered before this one."""
     mine = (
         await session.execute(
@@ -110,7 +115,7 @@ async def queue_status(session, *, tenant_id, conversation_ref_id) -> QueueStatu
     )
 
 
-def queue_notice(status: QueueStatus) -> str | None:
+def queue_notice(status: QueueStatus, question: str = "") -> str | None:
     """What to append to a handoff notice, or None when there is nothing true
     to add.
 
@@ -118,12 +123,23 @@ def queue_notice(status: QueueStatus) -> str | None:
     not waiting is not told they are. Saying "you are number 1 in the queue"
     to someone whose conversation went straight to a person is a small lie
     that costs trust and buys nothing.
+
+    `question` decides the language, as it does for the notice this one is
+    appended to - the two are concatenated into a single message, so a language
+    mismatch would show up mid-sentence.
     """
     if not status.queued:
         return None
+    if answers_in_chinese(question):
+        if status.ahead <= 0:
+            return "正在为您接入人工同事。"
+        text = f"您已进入人工队列，前面还有 {status.ahead} 位。"
+        if status.estimated_wait_minutes is not None:
+            text += f"预计等待约 {status.estimated_wait_minutes} 分钟。"
+        return text
     if status.ahead <= 0:
-        return "正在为您接入人工同事。"
-    text = f"您已进入人工队列，前面还有 {status.ahead} 位。"
+        return "A human colleague is joining this conversation now."
+    text = f"You are in the queue for a human colleague, with {status.ahead} ahead of you."
     if status.estimated_wait_minutes is not None:
-        text += f"预计等待约 {status.estimated_wait_minutes} 分钟。"
+        text += f" The estimated wait is about {status.estimated_wait_minutes} minutes."
     return text

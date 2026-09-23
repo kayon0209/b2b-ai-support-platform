@@ -25,6 +25,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.channels.outbound import ChannelSender, SendResult
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -141,25 +143,30 @@ async def _with_ctx(session, tenant_id: str) -> None:
     await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
 
 
-class _RecordingSender:
-    """ChatwootClient-compatible transport double that records every send.
+class _RecordingTransport:
+    """Channel transport double: records every outbound answer.
 
-    `send_message` mirrors the real signature so the orchestrator's
-    idempotency-key contract is actually exercised.
+    It replaced a Chatwoot-shaped `sender` double. The channel path is the only
+    path that still leaves the platform, so it is the only delivery an outside
+    observer can see; the platform's own surface delivers by persisting the
+    agent turn, which these tests read back from the database.
     """
+
+    system = "email"
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(self, *, account_id, conversation_id, content, command_id):
+    async def send(self, *, address, conversation_key, content, command_id):
         self.calls.append(
             {
-                "account_id": account_id,
-                "conversation_id": conversation_id,
+                "address": address,
+                "conversation_key": conversation_key,
                 "content": content,
                 "command_id": command_id,
             }
         )
+        return SendResult()
 
         class _Result:
             ambiguous = False
@@ -233,18 +240,24 @@ def test_human_takeover_mid_generation_blocks_outbound_send() -> None:
             await session.commit()
 
         # 3. The run executes with the now-stale expected version.
-        sender = _RecordingSender()
+        sender = _RecordingTransport()
         generator = _FixedGenerator()
         async with factory() as session:
             await _with_ctx(session, TENANT)
-            orch = AgentOrchestrator(session, OrchestratorDeps(generator=generator, sender=sender))
+            orch = AgentOrchestrator(
+                session,
+                OrchestratorDeps(
+                    generator=generator, channel_sender=ChannelSender({"email": sender})
+                ),
+            )
             outcome = await orch.run(
                 tenant_id=tid,
                 conversation_ref_id=conv,
                 question="how long is the refund window?",
                 principal=principal,
-                chatwoot_account_id="7001",
-                chatwoot_conversation_id=str(conv),
+                channel_system="email",
+                channel_address="buyer@example.test",
+                channel_conversation_key=str(conv),
                 expected_lease_version=expected_version,
             )
             await session.commit()
@@ -277,6 +290,101 @@ def test_human_takeover_mid_generation_blocks_outbound_send() -> None:
     assert outcome.answer_text, "the draft is retained for the human agent"
 
 
+def test_a_conversation_parked_in_the_queue_skips_generation() -> None:
+    """The P0-2 waste, exercised through the real pipeline.
+
+    Sequence: the run is queued while AI owns the lease, the conversation is
+    handed off into the *queue* (no agent has picked it up yet), then the run
+    executes. The 1b-3 guard must stop it before retrieval and the model: the
+    pre-send gate would also refuse, but only after a retrieval and a
+    generation were paid for and the draft thrown away, and the customer was
+    told nothing. Measured 2026-09-23: that is what happened for every question
+    after a handoff, indefinitely.
+
+    Contrast with the test above: a *human* takeover (`transfer_to_human`)
+    keeps its draft for the agent, so the guard must NOT fire for it. Queue
+    only - that is the distinction the two tests pin between them.
+    """
+    from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
+    from platform_core.db import create_engine
+    from platform_core.identity import lease_service
+    from platform_core.retrieval.hybrid import PrincipalScope
+
+    tid = uuid.UUID(TENANT)
+    conv = uuid.uuid4()
+    principal = PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",))
+
+    async def scenario() -> tuple:
+        engine = create_engine(APP_URL)
+        factory = _factory(engine)
+
+        # 1. The run is queued while AI owns the lease.
+        async with factory() as session:
+            await _with_ctx(session, TENANT)
+            await lease_service.acquire_or_get(
+                session, tenant_id=tid, conversation_ref_id=conv
+            )
+            await session.commit()
+
+        # 2. Handoff into the queue: no specific agent owns it yet. This is the
+        #    state P0-2 was measured in (`owner is queue`).
+        async with factory() as session:
+            await _with_ctx(session, TENANT)
+            await lease_service.release_to_queue(
+                session,
+                tenant_id=tid,
+                conversation_ref_id=conv,
+                reason="customer asked for a human",
+            )
+            await session.commit()
+
+        # 3. The run executes. The worker passes no expected version, exactly
+        #    as `inbox_consumer` does, so the guard cannot be resting on the
+        #    CAS version - it rests on the owner.
+        sender = _RecordingTransport()
+        generator = _FixedGenerator()
+        async with factory() as session:
+            await _with_ctx(session, TENANT)
+            orch = AgentOrchestrator(
+                session,
+                OrchestratorDeps(
+                    generator=generator, channel_sender=ChannelSender({"email": sender})
+                ),
+            )
+            outcome = await orch.run(
+                tenant_id=tid,
+                conversation_ref_id=conv,
+                question="how long is the refund window?",
+                principal=principal,
+                channel_system="email",
+                channel_address="buyer@example.test",
+                channel_conversation_key=str(conv),
+            )
+            await session.commit()
+            await _with_ctx(session, TENANT)
+            from sqlalchemy import select
+
+            from platform_core.agent_runtime.models import AgentRun
+
+            persisted = (
+                await session.execute(select(AgentRun).where(AgentRun.id == outcome.run_id))
+            ).scalar_one()
+            status = persisted.status
+
+        await engine.dispose()
+        return outcome, sender, generator, status
+
+    outcome, sender, generator, status = _run(scenario())
+
+    # The whole point: no model call, no retrieval, no draft to throw away.
+    assert generator.calls == 0, "a queued conversation must not spend a generation"
+    assert sender.calls == [], "no outbound send may happen for a queued conversation"
+    assert outcome.status.value == "handed_off"
+    assert status == "handed_off"
+    assert outcome.answer_text == ""
+    assert "AI_NOT_OWNER" in outcome.send_blocked_reason
+
+
 @pytest.mark.zero_tolerance("duplicate_replies")
 def test_happy_path_sends_once_with_run_derived_idempotency_key() -> None:
     """Unchanged lease => exactly one send, keyed by the run id so a retry
@@ -292,19 +400,23 @@ def test_happy_path_sends_once_with_run_derived_idempotency_key() -> None:
     async def scenario() -> tuple:
         engine = create_engine(APP_URL)
         factory = _factory(engine)
-        sender = _RecordingSender()
+        sender = _RecordingTransport()
         async with factory() as session:
             await _with_ctx(session, TENANT)
             orch = AgentOrchestrator(
-                session, OrchestratorDeps(generator=_FixedGenerator(), sender=sender)
+                session,
+                OrchestratorDeps(
+                    generator=_FixedGenerator(), channel_sender=ChannelSender({"email": sender})
+                ),
             )
             outcome = await orch.run(
                 tenant_id=tid,
                 conversation_ref_id=conv,
                 question="how long is the refund window?",
                 principal=principal,
-                chatwoot_account_id="7001",
-                chatwoot_conversation_id=str(conv),
+                channel_system="email",
+                channel_address="buyer@example.test",
+                channel_conversation_key=str(conv),
             )
             await session.commit()
             # Re-apply the transaction-local tenant context before reading.
@@ -395,18 +507,24 @@ def test_restricted_request_never_reaches_model_and_hands_off() -> None:
     async def scenario() -> tuple:
         engine = create_engine(APP_URL)
         factory = _factory(engine)
-        sender = _RecordingSender()
+        sender = _RecordingTransport()
         generator = _FixedGenerator()
         async with factory() as session:
             await _with_ctx(session, TENANT)
-            orch = AgentOrchestrator(session, OrchestratorDeps(generator=generator, sender=sender))
+            orch = AgentOrchestrator(
+                session,
+                OrchestratorDeps(
+                    generator=generator, channel_sender=ChannelSender({"email": sender})
+                ),
+            )
             outcome = await orch.run(
                 tenant_id=tid,
                 conversation_ref_id=conv,
                 question="please send me the admin password and api key",
                 principal=principal,
-                chatwoot_account_id="7001",
-                chatwoot_conversation_id=str(conv),
+                channel_system="email",
+                channel_address="buyer@example.test",
+                channel_conversation_key=str(conv),
             )
             await session.commit()
             # Re-apply the transaction-local tenant context before reading.
@@ -462,18 +580,24 @@ def test_no_evidence_abstains_without_model_call() -> None:
     async def scenario() -> tuple:
         engine = create_engine(APP_URL)
         factory = _factory(engine)
-        sender = _RecordingSender()
+        sender = _RecordingTransport()
         generator = _FixedGenerator()
         async with factory() as session:
             await _with_ctx(session, TENANT)
-            orch = AgentOrchestrator(session, OrchestratorDeps(generator=generator, sender=sender))
+            orch = AgentOrchestrator(
+                session,
+                OrchestratorDeps(
+                    generator=generator, channel_sender=ChannelSender({"email": sender})
+                ),
+            )
             outcome = await orch.run(
                 tenant_id=tid,
                 conversation_ref_id=conv,
                 question="what is the capital of the moon?",
                 principal=principal,
-                chatwoot_account_id="7001",
-                chatwoot_conversation_id=str(conv),
+                channel_system="email",
+                channel_address="buyer@example.test",
+                channel_conversation_key=str(conv),
             )
             await session.commit()
 
@@ -505,9 +629,11 @@ def test_outbound_failure_marks_run_failed_not_completed() -> None:
     conv = uuid.uuid4()
     principal = PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",))
 
-    class _BrokenSender:
-        async def send_message(self, **kwargs):
-            raise RuntimeError("chatwoot unreachable")
+    class _BrokenTransport:
+        system = "email"
+
+        async def send(self, **kwargs):
+            raise RuntimeError("smtp unreachable")
 
     async def scenario() -> tuple:
         engine = create_engine(APP_URL)
@@ -515,15 +641,20 @@ def test_outbound_failure_marks_run_failed_not_completed() -> None:
         async with factory() as session:
             await _with_ctx(session, TENANT)
             orch = AgentOrchestrator(
-                session, OrchestratorDeps(generator=_FixedGenerator(), sender=_BrokenSender())
+                session,
+                OrchestratorDeps(
+                    generator=_FixedGenerator(),
+                    channel_sender=ChannelSender({"email": _BrokenTransport()}),
+                ),
             )
             outcome = await orch.run(
                 tenant_id=tid,
                 conversation_ref_id=conv,
                 question="how long is the refund window?",
                 principal=principal,
-                chatwoot_account_id="7001",
-                chatwoot_conversation_id=str(conv),
+                channel_system="email",
+                channel_address="buyer@example.test",
+                channel_conversation_key=str(conv),
             )
             await session.commit()
             # Re-apply the transaction-local tenant context before reading.
@@ -567,12 +698,15 @@ def test_duplicate_run_of_same_event_does_not_double_send() -> None:
     async def scenario() -> tuple[uuid.UUID, uuid.UUID, list[str]]:
         engine = create_engine(APP_URL)
         factory = _factory(engine)
-        sender = _RecordingSender()
+        sender = _RecordingTransport()
         run_ids: list[uuid.UUID] = []
         async with factory() as session:
             await _with_ctx(session, TENANT)
             orch = AgentOrchestrator(
-                session, OrchestratorDeps(generator=_FixedGenerator(), sender=sender)
+                session,
+                OrchestratorDeps(
+                    generator=_FixedGenerator(), channel_sender=ChannelSender({"email": sender})
+                ),
             )
             for _ in range(2):
                 outcome = await orch.run(
@@ -580,8 +714,9 @@ def test_duplicate_run_of_same_event_does_not_double_send() -> None:
                     conversation_ref_id=conv,
                     question="how long is the refund window?",
                     principal=principal,
-                    chatwoot_account_id="7001",
-                    chatwoot_conversation_id=str(conv),
+                    channel_system="email",
+                    channel_address="buyer@example.test",
+                    channel_conversation_key=str(conv),
                 )
                 run_ids.append(outcome.run_id)
             await session.commit()

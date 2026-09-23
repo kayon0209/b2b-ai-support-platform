@@ -962,6 +962,24 @@ select:focus-visible {
   min-width: 180px;
 }
 
+/* Repeatable arm row on the experiments page: a name, a weight and a remove
+   button on one line, so several arms can be read at a glance. */
+.arm-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.text-input-narrow {
+  width: 6rem;
+}
+
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .prompt-error {
   margin: 0;
   font-size: 13px;

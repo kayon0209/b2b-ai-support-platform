@@ -71,6 +71,13 @@ ALLOWED_LOG_FIELDS = {
     "aggregate_type",
     "tenant_ref",
     "message_type",
+    # ADR 0014: which channel an answer is delivered on ("email" | "wechat").
+    # A bounded identifier from a closed set, the same class as `message_type`
+    # and `route` - not free text, so it belongs here. Without it the outbound
+    # warning says a delivery was withheld but not *which channel*, and that is
+    # the one thing an operator needs to fix it. Added deliberately, which is
+    # what `test_log_fields.py` exists to force.
+    "channel",
     "notice_sent",
     "has_embedding",
     "has_chatwoot_account",

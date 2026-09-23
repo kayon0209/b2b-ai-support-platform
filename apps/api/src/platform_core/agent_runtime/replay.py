@@ -37,9 +37,10 @@ as `nothing_to_replay`, because a view that silently drops rows reads as
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import func, select, union_all
+from sqlalchemy import func, literal, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime.models import AgentRun, Citation, ConversationTurn
@@ -138,7 +139,7 @@ async def list_conversations(
 
     merged = union_all(
         select(turns.c.ref, turns.c.last_ts, turns.c.turn_count),
-        select(runs.c.ref, runs.c.last_ts, func.cast(0, runs.c.last_ts.type)),
+        select(runs.c.ref, runs.c.last_ts, func.cast(literal(0), runs.c.last_ts.type)),
     ).subquery()
 
     rows = (
@@ -371,7 +372,7 @@ async def _cases(
     *,
     tenant_id: uuid.UUID,
     conversation_ref_id: uuid.UUID,
-    runs: list[AgentRun],
+    runs: Sequence[AgentRun],
 ) -> list[dict[str, Any]]:
     """Cases this conversation produced.
 

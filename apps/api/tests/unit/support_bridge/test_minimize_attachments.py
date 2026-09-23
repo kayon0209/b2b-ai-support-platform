@@ -6,7 +6,7 @@ The extraction is deliberately narrow - content types only - and the tests are
 mostly about what is *not* kept.
 """
 
-from platform_core.support_bridge.minimize import minimize_chatwoot_payload
+from platform_core.support_bridge.minimize import minimize_inbound_payload
 
 
 def _message(**extra: object) -> dict:
@@ -16,7 +16,7 @@ def _message(**extra: object) -> dict:
 
 
 def test_attachment_types_are_recorded() -> None:
-    out = minimize_chatwoot_payload(
+    out = minimize_inbound_payload(
         "message_created",
         _message(
             attachments=[
@@ -39,13 +39,13 @@ def test_no_attachment_urls_or_filenames_are_kept() -> None:
     filename or the bytes themselves would put customer IP at rest in a table
     the platform does not need it in - the files stay in Chatwoot.
     """
-    out = minimize_chatwoot_payload(
+    out = minimize_inbound_payload(
         "message_created",
         _message(
             attachments=[
                 {
                     "file_type": "image/png",
-                    "data_url": "https://chatwoot.example/rails/active_storage/abc",
+                    "data_url": "https://files.example/x/abc",
                     "filename": "defective-board-rev2.png",
                 }
             ]
@@ -54,20 +54,20 @@ def test_no_attachment_urls_or_filenames_are_kept() -> None:
 
     assert out["attachment_types"] == ["image/png"]
     serialised = repr(out)
-    assert "https://chatwoot.example" not in serialised
+    assert "https://files.example" not in serialised
     assert "defective-board-rev2" not in serialised
 
 
 def test_a_message_without_attachments_has_no_key() -> None:
-    assert "attachment_types" not in minimize_chatwoot_payload("message_created", _message())
-    assert "attachment_types" not in minimize_chatwoot_payload(
+    assert "attachment_types" not in minimize_inbound_payload("message_created", _message())
+    assert "attachment_types" not in minimize_inbound_payload(
         "message_created", _message(attachments=[])
     )
 
 
 def test_malformed_attachments_do_not_break_minimisation() -> None:
     """Outside input: an unusable attachment is skipped, never fatal."""
-    out = minimize_chatwoot_payload(
+    out = minimize_inbound_payload(
         "message_created",
         _message(attachments=["not-a-dict", {}, {"file_type": 42}, {"file_type": "text/csv"}]),
     )
@@ -78,7 +78,7 @@ def test_malformed_attachments_do_not_break_minimisation() -> None:
 
 def test_the_type_list_is_bounded() -> None:
     """One event row is metadata for routing, not a document store."""
-    out = minimize_chatwoot_payload(
+    out = minimize_inbound_payload(
         "message_created",
         _message(attachments=[{"file_type": f"type/{i}"} for i in range(50)]),
     )

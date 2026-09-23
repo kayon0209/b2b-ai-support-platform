@@ -21,6 +21,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.channels.outbound import ChannelSender, SendResult
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -147,19 +149,30 @@ class _FixedGenerator:
         return DraftAnswer(text=self._text, claims=cited)
 
 
-class _RecordingSender:
+class _RecordingTransport:
+    """Channel transport double: records every outbound answer.
+
+    It replaced a Chatwoot-shaped `sender` double. The channel path is the only
+    path that still leaves the platform, so it is the only delivery an outside
+    observer can see; the platform's own surface delivers by persisting the
+    agent turn, which these tests read back from the database.
+    """
+
+    system = "email"
+
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(
-        self, *, account_id, conversation_id, content, command_id, private: bool = False
-    ):
-        self.calls.append({"content": content, "private": private})
-
-        class _Result:
-            ambiguous = False
-
-        return _Result()
+    async def send(self, *, address, conversation_key, content, command_id):
+        self.calls.append(
+            {
+                "address": address,
+                "conversation_key": conversation_key,
+                "content": content,
+                "command_id": command_id,
+            }
+        )
+        return SendResult()
 
 
 async def _execute(*, draft_text: str):
@@ -170,7 +183,7 @@ async def _execute(*, draft_text: str):
 
     tid = uuid.UUID(TENANT)
     conv = uuid.uuid4()
-    sender = _RecordingSender()
+    sender = _RecordingTransport()
     engine = create_engine(APP_URL)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -182,7 +195,11 @@ async def _execute(*, draft_text: str):
     async with factory() as session:
         await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT})
         orch = AgentOrchestrator(
-            session, OrchestratorDeps(sender=sender, generator=_FixedGenerator(draft_text))
+            session,
+            OrchestratorDeps(
+                channel_sender=ChannelSender({"email": sender}),
+                generator=_FixedGenerator(draft_text),
+            ),
         )
         outcome = await orch.run(
             tenant_id=tid,
@@ -190,8 +207,9 @@ async def _execute(*, draft_text: str):
             question=QUESTION,
             principal=PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",)),
             expected_lease_version=int(lease.lease_version),
-            chatwoot_account_id="1",
-            chatwoot_conversation_id="1",
+            channel_system="email",
+            channel_address="buyer@example.test",
+            channel_conversation_key="1",
         )
         await session.commit()
     await engine.dispose()
@@ -206,7 +224,7 @@ def test_a_committing_draft_is_blocked_with_the_flag_off() -> None:
     assert outcome.handoff is True
     # What the customer never sees. An abstention that still delivered the
     # sentence is not an abstention.
-    customer_visible = [c["content"] for c in sent if not c["private"]]
+    customer_visible = [c["content"] for c in sent]
     assert not any("保证交期" in text for text in customer_visible)
 
 
@@ -223,27 +241,39 @@ def test_the_same_topic_stated_as_policy_is_allowed_through() -> None:
     # Non-vacuous: the run must actually have answered. Without this the
     # assertion above would also hold for a run that clarified or found no
     # evidence, and the guard could block everything without anyone noticing.
-    customer_visible = [c["content"] for c in sent if not c["private"]]
+    customer_visible = [c["content"] for c in sent]
     assert any(POLICY_ONLY in content for content in customer_visible), customer_visible
 
 
-def test_a_handoff_note_names_the_team_it_is_for(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The private note is off by default; this test is about its contents.
-    from platform_core.config import get_settings
+def _handoff_metadata(run_id: object) -> dict:
+    """The handoff's audit metadata: the record an operator actually reads."""
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        row = conn.execute(
+            text(
+                "SELECT metadata FROM audit_events "
+                "WHERE resource_id = :r AND action = 'agent_run.abstained'"
+            ),
+            {"r": str(run_id)},
+        ).first()
+    admin.dispose()
+    return dict(row[0]) if row and row[0] else {}
 
-    monkeypatch.setenv("APP_HANDOFF_EVIDENCE_ENABLED", "true")
-    get_settings.cache_clear()
+
+def test_a_handoff_records_the_team_it_is_for() -> None:
     """7.3: "transfer to a human" is not a destination.
 
-    The private note is what the receiving side reads, so the team has to be
-    on it - otherwise every handoff lands in one queue and whoever picks it
-    up first is probably the wrong person.
+    The team used to travel in a private Chatwoot note, so that whoever opened
+    the conversation knew which queue it belonged to. That transport is gone
+    (ADR 0012), and the handoff would have become a transfer to *nobody* if the
+    value had simply been dropped - so it is recorded on the handoff's audit
+    event, which is the record the ops console and a reviewer read.
 
     The platform recommends; it does not assign. Claiming an assignee would be
     reporting an outcome this platform cannot observe.
     """
-    outcome, sent = _run(_execute(draft_text=COMMITTING))
+    outcome, _sent = _run(_execute(draft_text=COMMITTING))
 
     assert outcome.abstain_reason == "REDLINE_COMMERCIAL_COMMITMENT"
-    notes = [c["content"] for c in sent if c["private"]]
-    assert any("team=" in note for note in notes), notes
+    metadata = _handoff_metadata(outcome.run_id)
+    assert metadata.get("team"), f"the handoff names no team: {metadata}"

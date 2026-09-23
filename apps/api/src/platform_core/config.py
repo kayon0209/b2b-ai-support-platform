@@ -24,9 +24,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://platform:platform@localhost:5435/platform"
     # Reserved. The durable work queue is a Postgres table (inbox_events /
     # outbox_events claimed with SKIP LOCKED), not Redis, so nothing reads this
-    # today. It is kept, and kept separate from Chatwoot's Redis (6381), so
-    # that a future cache/rate-limit feature does not have to invent a setting
-    # or accidentally share Chatwoot's instance.
+    # today. It is kept so a future cache or rate-limit feature does not have
+    # to invent a setting.
     redis_url: str = "redis://localhost:6380/0"
 
     # --- Authentication (docs/security.md) --------------------------------
@@ -48,10 +47,21 @@ class Settings(BaseSettings):
     # Webhook replay protection (docs/api-contracts.md)
     webhook_timestamp_tolerance_seconds: int = 300
 
-    # Chatwoot integration (ticket 4/8 will consume these)
-    chatwoot_base_url: str = "http://localhost:3000"
-    chatwoot_api_token: SecretStr | None = None
-    chatwoot_webhook_secret: SecretStr | None = None
+    # Outbound channel delivery (ADR 0014). An unset value means that channel is
+    # receive-only: the answer is still produced and persisted, but the run
+    # records `OUTBOUND_NOT_CONFIGURED` rather than pretending it was delivered.
+    # Deliberately separate from the inbound secret - the connector's
+    # `webhook_secret_ref` authenticates *their* traffic to us, and must never be
+    # reused to authenticate ours to them.
+    email_smtp_host: str | None = None
+    email_smtp_port: int = 587
+    email_smtp_username: str | None = None
+    email_smtp_password: SecretStr | None = None
+    # The envelope sender. Providers reject a From that is not the authenticated
+    # mailbox, so this is configuration rather than a per-tenant value today.
+    email_from_address: str | None = None
+    wechat_app_id: str | None = None
+    wechat_app_secret: SecretStr | None = None
 
     # LLM provider (Gitee AI / 模力方舟, OpenAI-compatible surface).
     # Credentials are resolved server-side and never reach the model or logs
@@ -167,12 +177,8 @@ class Settings(BaseSettings):
     # Consecutive clarification rounds before the run hands off instead of
     # asking again - an ask-loop is a dead conversation with extra steps.
     clarification_max_streak: int = 2
-    # Chatwoot history fetch (2.2). Failure degrades to single-turn; it never
-    # blocks the run.
-    history_fetch_limit: int = 20
-    history_fetch_timeout_seconds: float = 3.0
-    # Local redacted turns are pruned after N days (retention policy), and
-    # Chatwoot stays the system of record for raw content.
+    # Local redacted turns are pruned after N days (retention policy). They are
+    # the only record of the conversation the platform keeps.
     conversation_turn_days: int = 90
 
     # --- Cost, concurrency and fallback (iteration plan 5.1/5.3/5.5) ----------
@@ -203,10 +209,6 @@ class Settings(BaseSettings):
     # Estimated model pricing for the cost metric, cents per 1k tokens.
     cost_prompt_cents_per_1k: float = 0.15
     cost_completion_cents_per_1k: float = 0.60
-    # Evidence-carrying handoff notes (5.4): private Chatwoot note with the
-    # reason code and evidence references, readable by the receiving agent.
-    handoff_evidence_enabled: bool = False
-
     # --- Feature flags for new behaviour (constraint 4) -----------------------
     # Every behaviour change below defaults OFF and flips per tenant through
     # the flag service, following agent.rerank_enabled.

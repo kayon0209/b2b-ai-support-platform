@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from typing import Any
 
 # Why a run was drawn, in the order the strata are filled. A reviewer reading
 # "you are looking at this because it abstained" can judge the abstention; the
@@ -79,7 +80,7 @@ def _stable_key(run_id: str, seed: str) -> str:
 
 
 def select_review_sample(
-    runs: list[dict],
+    runs: list[dict[str, Any]],
     *,
     size: int,
     seed: str,
@@ -93,7 +94,7 @@ def select_review_sample(
     if size <= 0 or not runs:
         return []
 
-    strata: dict[str, list[dict]] = {
+    strata: dict[str, list[dict[str, Any]]] = {
         STRATUM_ABSTAINED: [],
         STRATUM_HANDOFF: [],
         STRATUM_FAILED: [],
@@ -124,7 +125,7 @@ def select_review_sample(
     risky_budget = int(size * RISKY_SHARE)
     routine_budget = size - risky_budget
 
-    picked: list[tuple[str, dict]] = []
+    picked: list[tuple[str, dict[str, Any]]] = []
     remaining_risky = risky_budget
     # Fill the risky strata in priority order, each taking what is left of the
     # budget; a stratum with fewer rows than its share simply yields them all

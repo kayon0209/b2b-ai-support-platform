@@ -12,6 +12,19 @@ Kept in its own module on purpose: `intent.py`, `conversation.py` and
 `qa_path.py` are under active development elsewhere, and this adds no
 behaviour to the write path — it only reads what is already stored.
 
+The conversation, and what the path segment means
+-------------------------------------------------
+`{conversation_ref}` is the platform's own conversation id — the one the
+worker writes turns under, the one `POST /v1/support/sessions` returns, the
+one `GET /v1/conversations` lists — and these endpoints use it verbatim.
+
+They used to take a caller-chosen external id and derive the ref from it,
+because this surface was the first to keep its own conversation identity. The
+cost was a name that meant one thing here and another at `/v1/conversations`,
+and no way for a caller to tell which it held: both are UUIDs. A caller that
+arrived by session did the right thing and a caller that arrived by listing
+did not, silently. See `support_bridge.conversation_ref`.
+
 Authentication
 --------------
 These endpoints currently resolve a tenant from the normal bearer token and
@@ -23,7 +36,6 @@ than silently publishing conversations.
 """
 
 import time
-import uuid
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
@@ -43,26 +55,11 @@ from platform_core.api import (
     tenant_session,
 )
 from platform_core.evaluation.pii import redact_text
-from platform_core.support_bridge.conversation_ref import conversation_ref_for
+from platform_core.support_bridge.conversation_ref import parse_conversation_ref
 from platform_core.support_bridge.minimize import payload_hash
 from platform_policy import Action
 
 router = APIRouter(prefix="/v1/customer", tags=["customer"])
-
-
-def _conversation_ref(tenant_id: uuid.UUID, external: str) -> uuid.UUID:
-    """The conversation id the worker actually uses.
-
-    `inbox_consumer._conversation_ref` derives a stable id from the external
-    conversation id rather than using it verbatim, so a caller that keeps its
-    own raw UUID would write turns under one id while the worker reads and
-    answers under another — the answer gets produced and then never found.
-    Deriving the same way here keeps one id for the whole exchange.
-
-    Both sides now call the shared helper rather than repeating the rule, so
-    they cannot drift apart again.
-    """
-    return conversation_ref_for(tenant_id, external)
 
 
 class TurnOut(BaseModel):
@@ -97,7 +94,10 @@ async def conversation_timeline(
     if denied is not None:
         return denied
 
-    ref_id = _conversation_ref(ctx.tenant_id, conversation_ref)
+    try:
+        ref_id = parse_conversation_ref(conversation_ref)
+    except ValueError as exc:
+        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
 
     async with tenant_session(ctx) as session:
         rows = (
@@ -162,7 +162,10 @@ async def post_message(request: Request, conversation_ref: str, body: MessageIn)
             status_code=400,
         )
 
-    ref_id = _conversation_ref(ctx.tenant_id, conversation_ref)
+    try:
+        ref_id = parse_conversation_ref(conversation_ref)
+    except ValueError as exc:
+        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
 
     redacted, _count = redact_text(body.text)
     digest = payload_hash(body.text.encode())

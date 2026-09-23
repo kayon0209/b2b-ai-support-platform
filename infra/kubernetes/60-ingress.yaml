@@ -1,6 +1,6 @@
 # Ingress for the API, and a note on what is not routed.
 #
-# The webhook paths are public by necessity - Chatwoot and the connector
+# The webhook paths are public by necessity - the connector and the channel
 # providers call them - and they authenticate by HMAC signature rather than by
 # a bearer token, so they must not be behind an auth proxy that expects one.
 # Streaming and long-polling endpoints need a read timeout above the model

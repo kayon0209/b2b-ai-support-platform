@@ -2,7 +2,6 @@
 
 Exposes /healthz plus one router per bounded context:
 
-- support_bridge: Chatwoot webhook intake (persist-before-enqueue)
 - audit:          append-only audit read API
 - cases:          case lifecycle and the command API
 - retrieval:      authorized knowledge search (diagnostics, evaluations)
@@ -33,6 +32,9 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from platform_core import db
+from platform_core.agent_runtime.agent_reply_router import (
+    router as agent_reply_router,
+)
 from platform_core.agent_runtime.customer_router import router as customer_router
 from platform_core.agent_runtime.prompt_router import router as prompt_router
 from platform_core.agent_runtime.router import router as agent_runtime_router
@@ -44,9 +46,20 @@ from platform_core.api import (
     new_trace_id,
 )
 from platform_core.audit.router import router as audit_router
+from platform_core.cases.agent_router import router as agent_directory_router
+from platform_core.cases.assignment_router import router as case_assignment_router
+from platform_core.cases.canned_router import router as canned_router
 from platform_core.cases.router import router as cases_router
+from platform_core.cases.sla_router import router as sla_policy_router
+from platform_core.channels.router import router as channels_router
 from platform_core.compliance.router import router as compliance_router
 from platform_core.config import Settings, get_settings
+from platform_core.evaluation.agent_metrics_router import (
+    router as agent_metrics_router,
+)
+from platform_core.evaluation.experiment_router import (
+    router as experiment_router,
+)
 from platform_core.evaluation.router import router as quality_router
 from platform_core.http_metrics import HttpMetricsMiddleware
 from platform_core.identity.branding import router as tenant_branding_router
@@ -80,7 +93,6 @@ from platform_core.rate_limit import (
     policies_from_settings,
 )
 from platform_core.retrieval.router import router as retrieval_router
-from platform_core.support_bridge.router import router as support_bridge_router
 from platform_core.tool_gateway.router import (
     catalog_router as tool_catalog_router,
 )
@@ -197,17 +209,24 @@ async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
-app.include_router(support_bridge_router)
+app.include_router(channels_router)
 app.include_router(audit_router)
 app.include_router(compliance_router)
 app.include_router(cases_router)
+app.include_router(agent_directory_router)
+app.include_router(case_assignment_router)
+app.include_router(canned_router)
+app.include_router(sla_policy_router)
 app.include_router(retrieval_router)
 app.include_router(agent_runtime_router)
 app.include_router(customer_router)
+app.include_router(agent_reply_router)
 app.include_router(support_router)
 app.include_router(tool_gateway_router)
 app.include_router(tool_catalog_router)
 app.include_router(quality_router)
+app.include_router(agent_metrics_router)
+app.include_router(experiment_router)
 app.include_router(prompt_router)
 app.include_router(knowledge_gap_router)
 app.include_router(correction_router)

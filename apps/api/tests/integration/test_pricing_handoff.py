@@ -20,6 +20,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.channels.outbound import ChannelSender, SendResult
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -38,14 +40,30 @@ def _run(coro):
     return asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)
 
 
-class _RecordingSender:
+class _RecordingTransport:
+    """Channel transport double: records every outbound answer.
+
+    It replaced a Chatwoot-shaped `sender` double. The channel path is the only
+    path that still leaves the platform, so it is the only delivery an outside
+    observer can see; the platform's own surface delivers by persisting the
+    agent turn, which these tests read back from the database.
+    """
+
+    system = "email"
+
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(
-        self, *, account_id, conversation_id, content, command_id, private: bool = False
-    ):
-        self.calls.append({"content": content, "private": private})
+    async def send(self, *, address, conversation_key, content, command_id):
+        self.calls.append(
+            {
+                "address": address,
+                "conversation_key": conversation_key,
+                "content": content,
+                "command_id": command_id,
+            }
+        )
+        return SendResult()
 
         class _Result:
             ambiguous = False
@@ -93,7 +111,7 @@ async def _execute() -> tuple[object, list[dict]]:
 
     tid = uuid.UUID(TENANT)
     conv = uuid.uuid4()
-    sender = _RecordingSender()
+    sender = _RecordingTransport()
     engine = create_engine(APP_URL)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -104,15 +122,18 @@ async def _execute() -> tuple[object, list[dict]]:
 
     async with factory() as session:
         await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT})
-        orch = AgentOrchestrator(session, OrchestratorDeps(sender=sender))
+        orch = AgentOrchestrator(
+            session, OrchestratorDeps(channel_sender=ChannelSender({"email": sender}))
+        )
         outcome = await orch.run(
             tenant_id=tid,
             conversation_ref_id=conv,
             question=QUESTION,
             principal=PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",)),
             expected_lease_version=int(lease.lease_version),
-            chatwoot_account_id="1",
-            chatwoot_conversation_id="1",
+            channel_system="email",
+            channel_address="buyer@example.test",
+            channel_conversation_key="1",
         )
         await session.commit()
     await engine.dispose()
@@ -138,9 +159,11 @@ def test_a_pricing_question_hands_off_with_a_band(monkeypatch: pytest.MonkeyPatc
     assert outcome.route == "human_required", outcome.route
     assert outcome.handoff is True
 
-    notes = [c["content"] for c in calls if c["private"]]
-    assert notes, "no handoff note was sent"
-    joined = " ".join(notes)
+    # The band used to travel in a private Chatwoot note. The handoff's audit
+    # metadata is where it lives now (ADR 0012), and every field below still
+    # has to be there: a figure that arrives without its label is worse than no
+    # figure at all.
+    joined = _handoff_metadata(outcome.run_id).get("context", "")
     assert "quote_band=" in joined, joined
     # The figure must arrive labelled: a public reference number that reads as
     # this company's price is worse than no number at all.
@@ -148,3 +171,23 @@ def test_a_pricing_question_hands_off_with_a_band(monkeypatch: pytest.MonkeyPatc
     assert "version=public-reference-2026.08" in joined
     assert "qty=500" in joined
     assert "total_for_order" in joined
+
+
+def _handoff_metadata(run_id: object) -> dict:
+    """The handoff's audit metadata: what the receiving side actually reads.
+
+    `after=` on an audit event is hashed and unreadable by design; `metadata`
+    is the documented narrow exception for an event's own parameters, which is
+    why the handoff's routing facts live there.
+    """
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        row = conn.execute(
+            text(
+                "SELECT metadata FROM audit_events "
+                "WHERE resource_id = :r AND action = 'agent_run.abstained'"
+            ),
+            {"r": str(run_id)},
+        ).first()
+    admin.dispose()
+    return dict(row[0]) if row and row[0] else {}

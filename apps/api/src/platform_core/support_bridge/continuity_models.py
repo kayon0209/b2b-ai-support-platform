@@ -27,5 +27,12 @@ class ConversationContact(Base, PkMixin, TenantMixin):
     external_contact_id: Mapped[str] = mapped_column(String(255), nullable=False)
     # Which door they came in through. Nullable because a sync often cannot say.
     channel: Mapped[str | None] = mapped_column(String(31), nullable=True)
+    # The channel's own conversation identifier: the email thread root, the
+    # WeChat openid's session key. The outbound path needs it to join the
+    # thread rather than start a new one (channels/outbound.py), and it cannot
+    # be recovered from `conversation_ref_id` because that is a uuid5 of it.
+    # NULL means "there is no thread to join" - a platform-surface conversation
+    # - which is not the same as an empty string.
+    external_conversation_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)

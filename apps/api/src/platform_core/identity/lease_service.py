@@ -90,6 +90,48 @@ async def transfer_to_human(
     return int(result)
 
 
+async def current_owner(
+    session: AsyncSession, *, tenant_id: uuid.UUID, conversation_ref_id: uuid.UUID
+) -> tuple[str, str]:
+    """Who owns the conversation now: ``(owner_type, mode)``.
+
+    Read-only, and deliberately the *same* question `assert_can_send` answers,
+    asked earlier. A caller that is about to spend a model call on a
+    conversation can find out first whether the answer would be allowed to
+    reach anybody.
+
+    Before this existed, the only way to discover that the owner was the queue
+    was to generate a reply and watch the pre-send gate refuse it: the model
+    was paid for, the draft was thrown away, and the customer was told nothing
+    at all. Measured 2026-09-23 - a customer whose first question was handed off
+    got silence for every question after it, indefinitely.
+
+    A conversation with no lease row reads as owned by the AI: nobody has
+    claimed it and `acquire_or_get` will create it as ``ai`` when the run
+    starts. Reporting that as "unknown" would make every new conversation
+    unanswerable.
+    """
+    row = (
+        await session.execute(
+            select(
+                ConversationControlLease.owner_type,
+                ConversationControlLease.mode,
+                ConversationControlLease.expires_at,
+            ).where(
+                ConversationControlLease.tenant_id == tenant_id,
+                ConversationControlLease.conversation_ref_id == conversation_ref_id,
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return "ai", "AI_ACTIVE"
+    owner_type, mode, expires_at = row
+    if expires_at is not None and int(expires_at) <= int(time.time()):
+        # Same reading as `assert_can_send`: an expired lease is not the AI's.
+        return "expired", "LEASE_EXPIRED"
+    return str(owner_type), str(mode)
+
+
 async def assert_can_send(
     session: AsyncSession,
     *,

@@ -24,6 +24,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.channels.outbound import ChannelSender, SendResult
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -131,14 +133,30 @@ async def _bind(*, tenant_id: str, account_id: str, external_contact_id: str = C
     await engine.dispose()
 
 
-class _RecordingSender:
+class _RecordingTransport:
+    """Channel transport double: records every outbound answer.
+
+    It replaced a Chatwoot-shaped `sender` double. The channel path is the only
+    path that still leaves the platform, so it is the only delivery an outside
+    observer can see; the platform's own surface delivers by persisting the
+    agent turn, which these tests read back from the database.
+    """
+
+    system = "email"
+
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(
-        self, *, account_id, conversation_id, content, command_id, private: bool = False
-    ):
-        self.calls.append({"content": content, "command_id": command_id, "private": private})
+    async def send(self, *, address, conversation_key, content, command_id):
+        self.calls.append(
+            {
+                "address": address,
+                "conversation_key": conversation_key,
+                "content": content,
+                "command_id": command_id,
+            }
+        )
+        return SendResult()
 
         class _Result:
             ambiguous = False
@@ -154,7 +172,7 @@ async def _execute(*, question: str = COMPLAINT, contact_id: str | None = CONTAC
 
     tid = uuid.UUID(TENANT)
     conv = uuid.uuid4()
-    sender = _RecordingSender()
+    sender = _RecordingTransport()
     engine = create_engine(APP_URL)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -166,15 +184,18 @@ async def _execute(*, question: str = COMPLAINT, contact_id: str | None = CONTAC
 
     async with factory() as session:
         await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT})
-        orch = AgentOrchestrator(session, OrchestratorDeps(sender=sender))
+        orch = AgentOrchestrator(
+            session, OrchestratorDeps(channel_sender=ChannelSender({"email": sender}))
+        )
         outcome = await orch.run(
             tenant_id=tid,
             conversation_ref_id=conv,
             question=question,
             principal=PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",)),
             expected_lease_version=expected_version,
-            chatwoot_account_id="1",
-            chatwoot_conversation_id="1",
+            channel_system="email",
+            channel_address="buyer@example.test",
+            channel_conversation_key="1",
             contact_id=contact_id,
         )
         await session.commit()
@@ -182,38 +203,23 @@ async def _execute(*, question: str = COMPLAINT, contact_id: str | None = CONTAC
     return outcome, sender.calls
 
 
-@pytest.fixture
-def handoff_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Turn on the private handoff note, which is off by default.
+def test_a_bound_strategic_contact_hands_off_to_the_account_team() -> None:
+    """The consumer: tier changes who is told, not whether a handoff happens.
 
-    The note is the only place the account reaches the receiving human, so the
-    test that asserts on it has to have it on. `get_settings` is lru_cached, so
-    setting the environment alone does nothing without clearing it - and it is
-    cleared again on the way out so this test cannot change the next one.
+    The account used to reach the receiving agent inside a private Chatwoot
+    note. That note went with Chatwoot (ADR 0012); the operator reads the same
+    account from `Workbench`, which aggregates the case, the conversation, the
+    account contacts and the run's citations from the platform's own tables.
+    What this test still owns is the decision itself - and that is what its
+    docstring always claimed.
     """
-    from platform_core.config import get_settings
-
-    monkeypatch.setenv("APP_HANDOFF_EVIDENCE_ENABLED", "true")
-    get_settings.cache_clear()
-    yield
-    get_settings.cache_clear()
-
-
-def test_a_bound_strategic_contact_hands_off_to_the_account_team(
-    handoff_evidence: None,
-) -> None:
-    """The consumer: tier changes who is told, not whether a handoff happens."""
     account_id = _seed_account(tenant_id=TENANT, tier="strategic")
     _run(_bind(tenant_id=TENANT, account_id=account_id))
 
-    outcome, sent = _run(_execute())
+    outcome, _sent = _run(_execute())
 
     assert outcome.handoff is True
     assert outcome.abstain_reason == STRATEGIC
-    # The private note names the account, so the receiving team is not left
-    # guessing which strategic account this was.
-    notes = [c["content"] for c in sent if "account_id" in c["content"]]
-    assert notes and account_id in notes[0]
 
 
 def test_an_unbound_contact_gets_the_ordinary_handoff() -> None:

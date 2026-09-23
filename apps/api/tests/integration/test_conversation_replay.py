@@ -69,17 +69,20 @@ def _digest(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def _derived(tenant: str, external_ref: uuid.UUID) -> uuid.UUID:
-    """The id the HTTP endpoints will compute for a path ref.
+def _ref(tenant: str, seed: uuid.UUID) -> uuid.UUID:
+    """A conversation's platform ref, which is both the stored id and the path value.
 
-    The endpoints derive; they do not take the path value verbatim. Seeding
-    under the raw id instead would make the endpoint-level tests pass their
-    404 assertions for the wrong reason - the rows would simply be filed under
-    a conversation nobody asked about.
+    Seeding and requesting name the **same** id. The HTTP tests used to store
+    under a derived id and pass the pre-derivation value in the path, because
+    the endpoints derived; they no longer do, so the two must agree or the
+    tests prove nothing about the endpoint.
+
+    The value is still minted with `conversation_ref_for` rather than picked at
+    random, so the rows look like the rows real writers produce.
     """
     from platform_core.support_bridge.conversation_ref import conversation_ref_for
 
-    return conversation_ref_for(uuid.UUID(tenant), str(external_ref))
+    return conversation_ref_for(uuid.UUID(tenant), str(seed))
 
 
 def _seed_tenants() -> None:
@@ -560,19 +563,69 @@ def _auth() -> dict[str, str]:
 
 
 def test_replay_over_http_returns_the_exchange() -> None:
-    external = default_uuid()
+    ref = _ref(TENANT, default_uuid())
     asked = "what is the MOQ"
-    _add_turn(_derived(TENANT, external), role="customer", raw=asked)
-    _add_run(_derived(TENANT, external), raw=asked)
+    _add_turn(ref, role="customer", raw=asked)
+    _add_run(ref, raw=asked)
 
     resp = _client(TENANT, "support_admin").get(
-        f"/v1/conversations/{external}/replay", headers=_auth()
+        f"/v1/conversations/{ref}/replay", headers=_auth()
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["turn_count"] == 1
     assert body["turns"][0]["decision"]["matched_by"] == "input_hash"
     assert body["trace_id"]
+
+
+def test_the_ref_a_listing_returns_is_the_ref_replay_accepts() -> None:
+    """The console's whole flow: list, click, read. It used to dead-end.
+
+    `/v1/conversations` lists `conversation_ref_id`, and the replay screen feeds
+    that value straight back into `/{ref}/replay`. While replay derived the path
+    segment, the listing's own value resolved to a second conversation - three
+    of four sampled conversations returned `NOT_FOUND` and the fourth returned
+    an unrelated transcript, with no error anywhere to say so.
+
+    Asserting the round trip rather than the two halves separately, because
+    each half was already correct; only the join was wrong.
+    """
+    ref = _ref(TENANT, default_uuid())
+    asked = "does the listing agree with the replay"
+    _add_turn(ref, role="customer", raw=asked)
+    _add_run(ref, raw=asked)
+
+    listing = _client(TENANT, "support_admin").get("/v1/conversations", headers=_auth())
+    assert listing.status_code == 200, listing.text
+    listed = [item["conversation_ref_id"] for item in listing.json()["items"]]
+    assert str(ref) in listed, f"the conversation is not listed at all: {listed}"
+
+    resp = _client(TENANT, "support_admin").get(
+        f"/v1/conversations/{ref}/replay", headers=_auth()
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # The identity, not just "some conversation": a 200 carrying a different
+    # transcript is the failure mode that made this defect invisible.
+    assert body["conversation_ref_id"] == str(ref)
+    assert body["turn_count"] == 1
+    assert body["turns"][0]["text"] == asked
+
+
+def test_the_path_segment_is_not_an_external_id() -> None:
+    """A ref is used verbatim - the pre-derivation value must not resolve.
+
+    This is the contract, stated as a negative case. If a derivation comes back,
+    this turns green and the test above turns red, which is the pair a future
+    reader needs to see.
+    """
+    external = default_uuid()
+    _add_turn(_ref(TENANT, external), role="customer", raw="stored under the ref")
+
+    resp = _client(TENANT, "support_admin").get(
+        f"/v1/conversations/{external}/replay", headers=_auth()
+    )
+    assert resp.status_code == 404, resp.text
 
 
 def test_an_unknown_conversation_is_a_404() -> None:
@@ -593,9 +646,9 @@ def test_a_malformed_ref_is_a_validation_error_not_a_500() -> None:
 
 
 def test_another_tenants_conversation_is_a_404_over_http() -> None:
-    theirs = default_uuid()
+    theirs = _ref(OTHER_TENANT, default_uuid())
     _add_turn(
-        _derived(OTHER_TENANT, theirs),
+        theirs,
         role="customer",
         raw="their question",
         ts=1_830_000_000,
@@ -611,7 +664,11 @@ def test_another_tenants_conversation_is_a_404_over_http() -> None:
 def test_the_replay_requires_the_case_read_permission() -> None:
     """Reading a customer's exchange is a case read, not a free lookup."""
     external = default_uuid()
-    _add_turn(_derived(TENANT, external), role="customer", raw="permission check", ts=1_840_000_000)
+    # Store under the platform ref (the endpoint takes the path verbatim now,
+    # not an external id to derive). The policy gate is checked before the
+    # replay lookup, so existence is irrelevant to the 403 - this just seeds
+    # a real row so the denial is not an artifact of an empty table.
+    _add_turn(_ref(TENANT, external), role="customer", raw="permission check", ts=1_840_000_000)
 
     denied = _client(TENANT, None).get(f"/v1/conversations/{external}/replay", headers=_auth())
     assert denied.status_code == 403

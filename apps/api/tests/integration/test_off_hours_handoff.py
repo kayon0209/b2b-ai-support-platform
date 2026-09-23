@@ -19,6 +19,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from platform_core.channels.outbound import ChannelSender, SendResult
+
 pytestmark = pytest.mark.integration
 
 ADMIN_URL = os.environ.get(
@@ -69,14 +71,30 @@ def clean() -> None:
     _clear()
 
 
-class _RecordingSender:
+class _RecordingTransport:
+    """Channel transport double: records every outbound answer.
+
+    It replaced a Chatwoot-shaped `sender` double. The channel path is the only
+    path that still leaves the platform, so it is the only delivery an outside
+    observer can see; the platform's own surface delivers by persisting the
+    agent turn, which these tests read back from the database.
+    """
+
+    system = "email"
+
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(
-        self, *, account_id, conversation_id, content, command_id, private: bool = False
-    ):
-        self.calls.append({"content": content, "private": private})
+    async def send(self, *, address, conversation_key, content, command_id):
+        self.calls.append(
+            {
+                "address": address,
+                "conversation_key": conversation_key,
+                "content": content,
+                "command_id": command_id,
+            }
+        )
+        return SendResult()
 
         class _Result:
             ambiguous = False
@@ -95,7 +113,7 @@ def _handoff(monkeypatch: pytest.MonkeyPatch, *, open_now: bool):
 
     tid = uuid.UUID(TENANT)
     conv = uuid.uuid4()
-    sender = _RecordingSender()
+    sender = _RecordingTransport()
     engine = create_engine(APP_URL)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -112,15 +130,18 @@ def _handoff(monkeypatch: pytest.MonkeyPatch, *, open_now: bool):
             await session.execute(
                 text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT}
             )
-            orch = AgentOrchestrator(session, OrchestratorDeps(sender=sender))
+            orch = AgentOrchestrator(
+                session, OrchestratorDeps(channel_sender=ChannelSender({"email": sender}))
+            )
             outcome = await orch.run(
                 tenant_id=tid,
                 conversation_ref_id=conv,
                 question=COMPLAINT,
                 principal=PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",)),
                 expected_lease_version=int(lease.lease_version),
-                chatwoot_account_id="1",
-                chatwoot_conversation_id="1",
+                channel_system="email",
+                channel_address="buyer@example.test",
+                channel_conversation_key="1",
             )
             await session.commit()
         return outcome
@@ -128,7 +149,7 @@ def _handoff(monkeypatch: pytest.MonkeyPatch, *, open_now: bool):
     outcome = _run(go())
     await_engine = engine
     _run(await_engine.dispose())
-    return outcome, [c["content"] for c in sender.calls if not c["private"]]
+    return outcome, [c["content"] for c in sender.calls]
 
 
 def test_outside_hours_the_customer_is_not_promised_a_person(
@@ -140,8 +161,13 @@ def test_outside_hours_the_customer_is_not_promised_a_person(
     assert outcome.abstain_reason == "COMPLAINT_REQUIRES_HUMAN"
     assert outcome.handoff is True
     assert messages, "an abstention that says nothing is a red line"
-    assert "offline" in messages[0].lower()
-    assert "human colleague" not in messages[0].lower()
+    # The complaint above is Chinese, so the notice must be too (`language.
+    # answers_in_chinese`). These assertions were English-only and went stale
+    # the moment the copy was localised - the check is the same distinction,
+    # read in the language the customer actually wrote in: the offline notice
+    # says nobody is there and must not promise a colleague.
+    assert "不在线" in messages[0]
+    assert "人工同事" not in messages[0]
 
 
 def test_during_hours_the_ordinary_notice_is_kept(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,5 +176,5 @@ def test_during_hours_the_ordinary_notice_is_kept(monkeypatch: pytest.MonkeyPatc
 
     assert outcome.abstain_reason == "COMPLAINT_REQUIRES_HUMAN"
     assert messages
-    assert "human colleague" in messages[0].lower()
-    assert "offline" not in messages[0].lower()
+    assert "人工同事" in messages[0]
+    assert "不在线" not in messages[0]

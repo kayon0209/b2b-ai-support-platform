@@ -56,25 +56,40 @@ ARTIFACT_DIR = Path(__file__).resolve().parents[4] / "tests" / "artifacts"
 # migration renames or drops a table without updating this list the existence
 # assertion below will fail loudly.
 TENANT_TABLES = (
+    "ab_experiments",
     "action_confirmations",
+    "agent_profiles",
     "agent_runs",
+    "answer_corrections",
     "audit_events",
     "billing_entries",
+    "case_attachments",
     "case_conversations",
+    "canned_replies",
+    "case_escalations",
     "cases",
     "chunks",
     "citations",
     "connectors",
+    "contact_facts",
+    "conversation_contacts",
     "conversation_control_leases",
+    "conversation_turns",
+    "csat_responses",
     "dead_letter_items",
+    "departments",
     "document_versions",
     "documents",
+    "enterprise_account_contacts",
+    "enterprise_accounts",
     "external_identities",
     "external_resource_refs",
     "feature_flag_targets",
     "feature_flags",
     "inbox_events",
+    "issue_categories",
     "knowledge_acls",
+    "knowledge_aliases",
     "knowledge_drafts",
     "knowledge_gaps",
     "knowledge_sources",
@@ -83,7 +98,12 @@ TENANT_TABLES = (
     "memberships",
     "outbox_events",
     "prompt_versions",
+    "saml_connections",
+    "saml_consumed_assertions",
+    "scim_tokens",
+    "sla_policies",
     "sync_cursors",
+    "tenant_domains",
     "tool_definitions",
     "tool_executions",
     "tool_proposals",
@@ -93,7 +113,18 @@ TENANT_TABLES = (
 # migration chain is exercised end-to-end here (down to base and back up on a
 # fresh database), and a new revision that is not reversible fails this test
 # rather than surfacing during a production rollback.
-EXPECTED_MIGRATIONS = 42
+#
+# **Count the tracked set, not the disk.** This read 42 while 45 revisions were
+# registered: migrations 0042-0045 landed without it moving, so every clean
+# checkout failed here. `git ls-tree` on `migrations/versions` lists 46 entries,
+# but the 46th is `.gitkeep` - the real number is the count of revisions
+# `ScriptDirectory.walk_revisions()` returns, which is 45. (A working tree can
+# also hold another session's *untracked* migration, which is how this drifted
+# in the first place.)
+# Counted from `git ls-tree`, not from a local `ls`: the number this guards is
+# "how many revisions are registered", and a stray untracked file on one
+# machine must not be able to satisfy it.
+EXPECTED_MIGRATIONS = 51
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection
@@ -428,7 +459,11 @@ def test_100_concurrent_ingest_p95(perf_tenant: str) -> None:
                 delivery_id=delivery_id,
                 event_type="message_created",
                 raw_body=b"{}",
-                raw_payload={"event": "message_created", "id": delivery_id},
+                minimized_payload={
+                    "message_id": delivery_id,
+                    "message_type": "incoming",
+                    "conversation_id": "perf-conversation",
+                },
             )
             await session.commit()
         return (time.perf_counter() - t0) * 1000.0
@@ -445,7 +480,11 @@ def test_100_concurrent_ingest_p95(perf_tenant: str) -> None:
                 delivery_id=ids[0],
                 event_type="message_created",
                 raw_body=b"{}",
-                raw_payload={"event": "message_created", "id": ids[0]},
+                minimized_payload={
+                    "message_id": ids[0],
+                    "message_type": "incoming",
+                    "conversation_id": "perf-conversation",
+                },
             )
             await session.commit()
             return res.duplicate

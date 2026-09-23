@@ -16,6 +16,7 @@ from platform_core.agent_runtime.intent import (
     classify,
     classify_route,
 )
+from platform_core.tool_gateway.selector import select_read_tools
 
 # --- The distinction that matters most -------------------------------------
 
@@ -464,3 +465,88 @@ def test_a_chinese_policy_question_is_not_read_as_a_complaint() -> None:
 
     assert detection.scene is Scene.TECHNICAL_SUPPORT
     assert detection.scene is not Scene.COMPLAINT
+
+
+# --- Chinese live-data questions: the read path (2026-09-22) ---------------
+
+
+def test_chinese_live_data_questions_reach_the_read_path() -> None:
+    """The read path was English-only, which made the identity gate unreachable.
+
+    Measured 2026-09-22: these five Chinese phrasings of "where is my order"
+    all routed to `knowledge_qa` and selected **zero** read tools, while
+    "What is the status of order SO-9001?" selected `order.get_status`.
+
+    The cost is not only the missing card. `business_read` is the only route
+    into the identity gate (feature 2.2/2.5), so a Chinese customer asking
+    about their order never reached the "prove this order is yours" prompt -
+    the whole verify-then-read flow was unreachable in the language the pilot's
+    customers write. ADR 0006 makes the same point from the other side: a
+    live-data question must not be answered from the corpus, so `knowledge_qa`
+    is the wrong route even when the honest outcome is abstention.
+    """
+    for utterance in (
+        "我的订单 SO-9001 到哪了",
+        "SO-9001 什么时候发货",
+        "帮我查一下订单 SO-9001 的状态",
+        "订单 SO-9001 现在什么状态",
+        "SO-9001 发货了吗",
+    ):
+        detection = classify(utterance)
+        assert detection.route is Route.BUSINESS_READ, utterance
+        # The route alone is not the contract: the defect's symptom was an
+        # empty candidate list, and a read route with no tool behind it still
+        # ends in a handoff rather than in an answer.
+        selected = [c.tool_name for c in select_read_tools(detection, utterance)]
+        assert "order.get_status" in selected, (utterance, selected)
+
+
+def test_chinese_policy_questions_do_not_become_live_data_reads() -> None:
+    """The counter-guard: naming a record is not asking about it.
+
+    Every one of these mentions an order, an invoice, stock or a lead time, and
+    every one is a question about a *rule* - which the corpus answers and a
+    record read cannot. "ADS1110 现在有货吗？货期几天？" is the sharpest of them:
+    it carries no how-to opener at all, so only the frame requirement (a state
+    in progress, not a topic noun) keeps it on the knowledge path.
+    """
+    for utterance in (
+        "退款多久到账？",
+        "取消订单的政策是什么？",
+        "质量问题怎么申请赔付？",
+        "怎么申请退款",
+        "如何取消订单",
+        "帮我取消订单是什么流程",
+        "PCB 订单的增值税专用发票怎么开？",
+        "元器件的增值税普通发票什么时候开？",
+        "EQ 确认后交期怎么算？",
+        "ADS1110 现在有货吗？货期几天？",
+    ):
+        assert classify(utterance).route is Route.KNOWLEDGE_QA, utterance
+
+
+def test_the_how_to_guard_is_the_only_thing_keeping_this_on_the_knowledge_path() -> None:
+    """A case that the `_CN_HOW` guard alone decides.
+
+    "怎么查订单状态" carries the lookup frame verbatim - `查` … `状态` - so it
+    matches `_CN_LIVE_DATA` and becomes a live-data read if the how-to guard is
+    dropped from the call site. The pair is what makes that observable: the
+    frame cases in the test above cannot see the guard's removal, which is
+    exactly how the first mutation run of the write-side guard failed.
+    """
+    assert classify("怎么查订单状态").route is Route.KNOWLEDGE_QA
+    assert classify("查订单状态").route is Route.BUSINESS_READ
+    assert classify("如何查询物流进度").route is Route.KNOWLEDGE_QA
+    assert classify("查询物流进度").route is Route.BUSINESS_READ
+
+
+def test_the_eta_frame_asks_when_not_how_long() -> None:
+    """`什么时候` is this record's ETA; `多久` is the process's duration.
+
+    The pair differs by one word and must not share a route: the corpus answers
+    "退款多久到账？" (a refund window) while the record answers "什么时候到账".
+    Adding `多久` to the ETA frame is the tempting simplification - it reads
+    like a synonym - and this is the case that catches it.
+    """
+    assert classify("退款多久到账？").route is Route.KNOWLEDGE_QA
+    assert classify("退款什么时候到账").route is Route.BUSINESS_READ

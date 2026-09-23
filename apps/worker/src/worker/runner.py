@@ -445,7 +445,7 @@ def main() -> None:
         # Not fatal, but loud: a run that cannot send still records its
         # outcome, and an operator must not read that as "the customer was
         # answered".
-        logger.warning("worker_cannot_send", reason_code="NO_CHATWOOT_TOKEN")
+        logger.warning("worker_cannot_send", reason_code="NO_OUTBOUND_TRANSPORT")
 
     run(_run_both(interactive_deps))
 
