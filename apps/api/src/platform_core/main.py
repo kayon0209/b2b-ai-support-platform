@@ -93,6 +93,7 @@ from platform_core.rate_limit import (
     policies_from_settings,
 )
 from platform_core.retrieval.router import router as retrieval_router
+from platform_core.support_bridge.csat_router import router as csat_router
 from platform_core.tool_gateway.router import (
     catalog_router as tool_catalog_router,
 )
@@ -226,6 +227,7 @@ app.include_router(tool_gateway_router)
 app.include_router(tool_catalog_router)
 app.include_router(quality_router)
 app.include_router(agent_metrics_router)
+app.include_router(csat_router)
 app.include_router(experiment_router)
 app.include_router(prompt_router)
 app.include_router(knowledge_gap_router)

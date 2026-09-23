@@ -35,6 +35,7 @@ and the global queue cap are what actually bound it, and both already existed.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
@@ -43,7 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime import chat_service
 from platform_core.agent_runtime.hours import is_open, opening_hour
-from platform_core.agent_runtime.language import answers_in_chinese
+from platform_core.agent_runtime.language import conversation_is_chinese
 from platform_core.api import (
     AUTH_UNRESOLVED,
     IDEMPOTENCY_KEY_REQUIRED,
@@ -201,6 +202,7 @@ async def timeline(
             conversation_ref_id=claim.conversation_ref,
         )
         branding = await _branding_for(session, claim.tenant_id)
+        rating = await _rating_for(session, claim)
     return ok_response(
         {
             "items": items,
@@ -217,9 +219,33 @@ async def timeline(
                 "open": is_open(),
                 "opens_at_hour": opening_hour(),
             },
+            # The score this conversation already has, so a reload shows the
+            # rating the customer gave rather than an empty survey they have
+            # already answered.
+            "rating": rating,
         },
         trace_id=new_trace_id(),
     )
+
+
+async def _rating_for(session: AsyncSession, claim: VisitorClaim) -> int | None:
+    """This conversation's recorded satisfaction score, or None.
+
+    A read, so it is allowed to return None for "not asked yet" and "asked but
+    unanswered" alike - the surface treats both the same way, and a conversation
+    that is neither handed off nor rated shows no survey at all.
+    """
+    from platform_core.support_bridge.csat_models import CsatResponse
+
+    row = (
+        await session.execute(
+            select(CsatResponse.score).where(
+                CsatResponse.tenant_id == claim.tenant_id,
+                CsatResponse.conversation_ref_id == claim.conversation_ref,
+            )
+        )
+    ).scalar_one_or_none()
+    return int(row) if row is not None else None
 
 
 async def _branding_for(session: AsyncSession, tenant_id: uuid.UUID) -> dict[str, object]:
@@ -253,14 +279,31 @@ async def _branding_for(session: AsyncSession, tenant_id: uuid.UUID) -> dict[str
 # quietly versus expecting a name. Blurring them is the same class of error as
 # reporting a missing record as a systems outage. Neither promises a time: how
 # long a queue takes is not something this platform knows.
-def _handed_off_notice(owner_type: str, question: str) -> str:
-    chinese = answers_in_chinese(question)
+# How far back to look when deciding the language of a handoff notice. Bounded
+# because this is a language sniff, not a transcript: one Chinese message
+# anywhere in recent history settles it, and reading a whole conversation to
+# answer a two-way question would make the notice path the slowest thing on
+# `POST /messages`.
+_NOTICE_HISTORY_TURNS = 50
+
+
+def _handed_off_notice(owner_type: str, question: str, history: Sequence[str] = ()) -> str:
+    """The notice a customer gets when a person, not the AI, owns the thread.
+
+    The language comes from the **conversation**, not from `question` alone.
+    Passing only the current message meant a customer who replied to the
+    platform's own request for an order number ("请把单号一起告诉我" ->
+    `SO-9001`) got the English text, because that message carries no CJK
+    character - measured 2026-09-23, and it is the same class of error as
+    answering a Chinese question in English. `history` is the customer's
+    earlier messages; any Chinese among them makes the conversation Chinese.
+    """
+    chinese = conversation_is_chinese((question, *history))
     if owner_type == "human":
         return (
             "这条对话已由人工同事接手，他们会看到您刚发的消息。"
             if chinese
-            else "A human colleague has taken over this conversation and will "
-            "see your message."
+            else "A human colleague has taken over this conversation and will see your message."
         )
     return (
         "这条对话正在等待人工同事接入，您发的消息他们会看到，请稍候。"
@@ -349,6 +392,62 @@ async def verify_ownership(request: Request, body: VerifyIn) -> object:
     )
 
 
+class RatingIn(BaseModel):
+    score: int = Field(ge=1, le=5)
+    comment: str | None = Field(default=None, max_length=500)
+
+
+@router.post("/rating")
+async def rate_conversation(request: Request, body: RatingIn) -> object:
+    """Record this conversation's satisfaction score (feature 7.10).
+
+    The customer-facing half of a capability that had none. `csat.record_response`
+    and `csat_summary` were written, migrated (0044) and tested, and **called by
+    nothing** - so the platform asked no one how it did, and the satisfaction
+    number the operations dashboard needs did not exist. Measured 2026-09-23 by
+    grepping for production callers; there were none.
+
+    Where the ask belongs is settled by industry practice and by this module's
+    own docstring: at the end of an interaction, and only for one that happened.
+    The only unambiguous "this interaction is over" signal this product has is a
+    handoff, so that is where the surface offers it - and a conversation the
+    customer abandoned mid-sentence is never asked about.
+
+    A second score replaces the first rather than adding a row, so a re-tap is
+    not a second opinion (`record_response` says the same thing, and 0044's
+    unique constraint enforces it).
+    """
+    claim = _claim(request)
+    if not isinstance(claim, VisitorClaim):
+        return claim
+
+    from platform_core.support_bridge import csat
+
+    try:
+        async with tenant_session(_ctx_for(claim)) as session:
+            row = await csat.record_response(
+                session,
+                tenant_id=claim.tenant_id,
+                conversation_ref_id=claim.conversation_ref,
+                score=body.score,
+                comment=(body.comment or "").strip() or None,
+                channel="web",
+            )
+            score = row.score
+    except csat.CsatError as exc:
+        # A refused score is the caller's mistake, so it is a 400 with the
+        # service's own reason - not a 200 carrying an error body, which is the
+        # shape five routers here used to have.
+        return error_response(
+            VALIDATION_FAILED,
+            exc.detail or exc.code,
+            status_code=400,
+            trace_id=new_trace_id(),
+        )
+
+    return ok_response({"score": score}, trace_id=new_trace_id())
+
+
 @router.post("/messages")
 async def post_message(request: Request, body: MessageIn) -> object:
     """Accept a customer question and queue the run that answers it.
@@ -401,11 +500,25 @@ async def post_message(request: Request, body: MessageIn) -> object:
             # way is not data loss - a person will read it. `append_system_turn`
             # dedupes, so two messages in a row do not produce two copies of the
             # same sentence.
+            #
+            # The notice's language is decided from the whole conversation, not
+            # from `body.text`. A customer who has written Chinese is writing
+            # Chinese, and a reply consisting only of an order number - which is
+            # exactly what the platform asked for - must not switch the notice
+            # to English. Read through the same function the timeline uses, so
+            # the notice sees what the customer sees.
+            history = [
+                row["text"]
+                for row in await chat_service.read_timeline(
+                    session, ref_id=claim.conversation_ref, limit=_NOTICE_HISTORY_TURNS
+                )
+                if row.get("role") == "customer"
+            ]
             await chat_service.append_system_turn(
                 session,
                 tenant_id=ctx.tenant_id,
                 ref_id=claim.conversation_ref,
-                text=_handed_off_notice(owner, body.text),
+                text=_handed_off_notice(owner, body.text, history),
             )
             return ok_response(
                 {
