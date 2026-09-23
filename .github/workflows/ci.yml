@@ -219,8 +219,10 @@ jobs:
     #
     # Of the two runtime guards this is the one CI can honestly enforce. The
     # other, scripts/ui_smoke.cjs, needs a browser and a served front end, so
-    # it stays a pre-release manual step; its verified invocation, including
-    # the NODE_PATH it needs, is in .workbuddy-ai/memory/REFERENCE.md.
+    # it stays a pre-release manual step; its verified invocation - including
+    # the NODE_PATH it needs - is documented at the top of the script itself.
+    # Keep it there: that knowledge used to live in the session notes, which are
+    # local-only now, so a reader of this file could no longer follow it.
     #
     # The API runs straight from the checkout rather than as a built image.
     # The guard tests *running* code, so a cached image would test yesterday's
