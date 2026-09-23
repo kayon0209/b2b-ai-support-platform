@@ -18,7 +18,6 @@ data:
   # migration owner is a superuser and would bypass row-level security.
   APP_DATABASE_URL: "postgresql+psycopg://platform_app:CHANGE_ME@postgres-primary.b2b-support.svc.cluster.local:5432/platform"
   APP_REDIS_URL: "redis://redis.b2b-support.svc.cluster.local:6379/0"
-  APP_CHATWOOT_BASE_URL: "https://support.example.com"
   APP_LLM_BASE_URL: "https://ai.gitee.com/v1"
   APP_LLM_MODEL: "qwen3.8-flash"
   APP_LLM_EMBEDDING_MODEL: "Qwen3-Embedding-8B"

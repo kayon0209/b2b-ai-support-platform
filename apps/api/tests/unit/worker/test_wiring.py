@@ -44,21 +44,19 @@ class _StubChat:
 
 @pytest.fixture
 def _configured(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pretend the LLM boundary and Chatwoot are configured.
+    """Pretend the LLM boundary and an outbound channel are configured.
 
-    The stubs are the real types, not `object()`: `ChatwootClient` reads
-    `chatwoot_api_token.get_secret_value()` and `factory` tests
-    `llm_api_key is None`, so a bare object would fail for the wrong
-    reason and hide whether the wiring itself is correct.
+    The stubs are the real types, not `object()`, so a bare object cannot
+    fail for the wrong reason and hide whether the wiring itself is correct.
     """
     import platform_core.config as config
 
     settings = config.get_settings()
     monkeypatch.setattr(settings, "llm_api_key", SecretStr("stub-llm-key"), raising=False)
-    monkeypatch.setattr(
-        settings, "chatwoot_api_token", SecretStr("stub-chatwoot-token"), raising=False
-    )
-    monkeypatch.setattr(settings, "chatwoot_base_url", "http://chatwoot.test", raising=False)
+    # An SMTP host and a from-address are what `build_channel_sender` needs to
+    # register the email transport (ADR 0014).
+    monkeypatch.setattr(settings, "email_smtp_host", "smtp.test", raising=False)
+    monkeypatch.setattr(settings, "email_from_address", "support@acme.test", raising=False)
 
     monkeypatch.setattr(
         "worker.wiring.get_model_bundle",
@@ -99,48 +97,37 @@ def test_draft_only_mode_allows_no_chat_provider(monkeypatch: pytest.MonkeyPatch
     deps = build_interactive_deps(require_chat=False)
 
     assert deps.generator is None
-    assert deps.sender is None
+    assert deps.channel_sender is None
     wiring_report = audit_wiring(deps)
     assert wiring_report.can_generate is False
 
 
 def test_configured_worker_binds_every_collaborator(_configured: None) -> None:
     """The happy path must produce a worker that can generate AND send."""
-    from platform_core.support_bridge.chatwoot_client import ChatwootClient
+    from platform_core.channels.outbound import ChannelSender
 
     deps = build_interactive_deps()
     report = audit_wiring(deps)
 
     assert isinstance(deps.generator, LlmAnswerGenerator)
     assert isinstance(deps.embedder, ProviderEmbedder)
-    assert isinstance(deps.sender, ChatwootClient)
-    assert isinstance(deps.reader, ChatwootClient)
+    assert isinstance(deps.channel_sender, ChannelSender)
+    assert deps.channel_sender.systems == ("email",)
 
     assert report.can_generate is True
     assert report.can_send is True
     assert report.has_embedding is True
     assert report.has_rerank is True
-    assert report.has_reader is True
 
 
-def test_sender_and_reader_share_one_client(_configured: None) -> None:
-    """Inbound read and outbound send must agree on Chatwoot's health.
-
-    Two clients would mean two circuit breakers and two notions of "is
-    Chatwoot up", which makes an outage produce inconsistent behaviour
-    between fetching a question and sending the answer.
-    """
-    deps = build_interactive_deps()
-    assert deps.sender is deps.reader
-
-
-def test_missing_chatwoot_token_disables_send_but_not_generate(
+def test_no_outbound_transport_disables_send_but_not_generate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without a Chatwoot token the worker can still draft, and says so.
+    """With no channel transport the worker can still draft, and says so.
 
-    `can_send=False` is the signal an operator needs: runs will record
-    their outcome without a customer-visible reply.
+    `can_send=False` is the signal an operator needs: runs will record their
+    outcome without a customer-visible reply. It must never be reported as a
+    delivery - that is the `worker_cannot_send` defect.
     """
     import worker.wiring as wiring
 
@@ -154,14 +141,18 @@ def test_missing_chatwoot_token_disables_send_but_not_generate(
             breaker=CircuitBreaker(),
         ),
     )
-    monkeypatch.setattr(wiring.get_settings(), "chatwoot_api_token", None, raising=False)
+    monkeypatch.setattr(wiring.get_settings(), "email_smtp_host", None, raising=False)
+    monkeypatch.setattr(wiring.get_settings(), "email_from_address", None, raising=False)
+    monkeypatch.setattr(wiring.get_settings(), "wechat_app_id", None, raising=False)
+    monkeypatch.setattr(wiring.get_settings(), "wechat_app_secret", None, raising=False)
 
     deps = build_interactive_deps()
     report = audit_wiring(deps)
 
     assert report.can_generate is True
     assert report.can_send is False
-    assert deps.sender is None
+    assert deps.channel_sender is not None
+    assert deps.channel_sender.systems == ()
 
 
 def test_required_sender_fails_closed_when_token_absent(
@@ -180,42 +171,15 @@ def test_required_sender_fails_closed_when_token_absent(
             breaker=CircuitBreaker(),
         ),
     )
-    monkeypatch.setattr(wiring.get_settings(), "chatwoot_api_token", None, raising=False)
+    monkeypatch.setattr(wiring.get_settings(), "email_smtp_host", None, raising=False)
+    monkeypatch.setattr(wiring.get_settings(), "email_from_address", None, raising=False)
+    monkeypatch.setattr(wiring.get_settings(), "wechat_app_id", None, raising=False)
+    monkeypatch.setattr(wiring.get_settings(), "wechat_app_secret", None, raising=False)
 
     with pytest.raises(WorkerConfigurationError) as excinfo:
         build_interactive_deps(require_sender=True)
 
-    assert "CHATWOOT" in str(excinfo.value).upper()
-
-
-def test_blank_chatwoot_token_is_treated_as_absent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An empty token must not bind a client that 401s on every send.
-
-    `compose` passes `${APP_CHATWOOT_API_TOKEN:-}`, so the variable is
-    always *set* — often to "". Checking only for None would bind a
-    sender that cannot authenticate, and the run would look answered
-    right up until the customer noticed nobody replied.
-    """
-    import worker.wiring as wiring
-
-    monkeypatch.setattr(
-        wiring,
-        "get_model_bundle",
-        lambda: ConcreteModelBundle(
-            chat=_StubChat(),  # type: ignore[arg-type]
-            embedding=_StubChat(),  # type: ignore[arg-type]
-            rerank=_StubChat(),  # type: ignore[arg-type]
-            breaker=CircuitBreaker(),
-        ),
-    )
-    monkeypatch.setattr(wiring.get_settings(), "chatwoot_api_token", SecretStr(""), raising=False)
-
-    deps = build_interactive_deps()
-
-    assert deps.sender is None
-    assert audit_wiring(deps).can_send is False
+    assert "outbound transport" in str(excinfo.value)
 
 
 def test_audit_reports_generation_from_generator_not_bundle() -> None:
@@ -227,8 +191,6 @@ def test_audit_reports_generation_from_generator_not_bundle() -> None:
     deps = OrchestratorDeps(
         generator=None,
         embedder=None,
-        sender=None,
-        reader=None,
         extra={"bundle": object()},
     )
     assert audit_wiring(deps).can_generate is False

@@ -48,6 +48,50 @@ ALLOWED_LOG_FIELDS = {
     "error_code",
     "queue",
     "attempt",
+    # --- The rest of the vocabulary -----------------------------------------
+    #
+    # This set *is* the log schema, and `logger.log` drops anything not in it -
+    # silently, by design, because it is also the redaction boundary. Nothing
+    # enforced the other side of that contract, so call sites invented names
+    # and the fields vanished: 37 call sites across the workers, the
+    # orchestrator and the identity middleware were logging nothing they
+    # thought they were logging. `apps/api/tests/unit/test_log_fields.py` now
+    # enforces it, so additions are deliberate and a typo cannot be quiet.
+    #
+    # Only bounded identifiers and counts belong here. Free text does not:
+    # `error` and `detail` were carrying exception messages and are named
+    # `error_code` (the class) instead, because that is the part an operator
+    # greps for and the part that cannot contain customer content.
+    "conversation_id",
+    "conversation_ref_id",
+    "turn_id",
+    "event_id",
+    "proposal_id",
+    "aggregate_id",
+    "aggregate_type",
+    "tenant_ref",
+    "message_type",
+    # ADR 0014: which channel an answer is delivered on ("email" | "wechat").
+    # A bounded identifier from a closed set, the same class as `message_type`
+    # and `route` - not free text, so it belongs here. Without it the outbound
+    # warning says a delivery was withheld but not *which channel*, and that is
+    # the one thing an operator needs to fix it. Added deliberately, which is
+    # what `test_log_fields.py` exists to force.
+    "channel",
+    "notice_sent",
+    "has_embedding",
+    "has_chatwoot_account",
+    "local_turns",
+    "output_hash",
+    "count",
+    "tenants",
+    "attempts",
+    "consecutive_failures",
+    "expired_versions",
+    "pruned_dead_letters",
+    "pruned_inbox_events",
+    "abandoned_runs",
+    "reason",
 }
 
 # Patterns redacted defensively even inside allowlisted fields.
@@ -178,6 +222,14 @@ class JsonLogger:
             self._logger.propagate = False
 
     def log(self, level: int, event: str, ctx: TraceContext | None = None, **fields: Any) -> None:
+        # `exc_info` is a logging facility, not a field: passing it through the
+        # field path meant it was filtered out by the allowlist and no
+        # traceback was ever emitted. Two call sites asked for one - the
+        # membership-resolution warning and the span-processor shutdown - and
+        # silently got nothing. Forwarded to the stdlib logger, which appends
+        # the traceback after the JSON line rather than embedding it in the
+        # record, so the structured line stays parseable.
+        exc_info = fields.pop("exc_info", None)
         record: dict[str, Any] = {
             "ts": datetime.now(UTC).isoformat(),
             "level": logging.getLevelName(level),
@@ -188,7 +240,11 @@ class JsonLogger:
         else:
             allowed = {k: v for k, v in fields.items() if k in ALLOWED_LOG_FIELDS}
             record.update(redact_value(allowed))
-        self._logger.log(level, json.dumps(record, ensure_ascii=False, default=str))
+        self._logger.log(
+            level,
+            json.dumps(record, ensure_ascii=False, default=str),
+            exc_info=exc_info,
+        )
 
     def info(self, event: str, ctx: TraceContext | None = None, **fields: Any) -> None:
         self.log(logging.INFO, event, ctx, **fields)

@@ -14,3 +14,24 @@ raw-scan.json
 
 # Generated test reports (regenerated on every migration/perf run).
 tests/artifacts/
+
+# 验收脚本产物（截图、驱动脚本、报告）：由会话驱动产生，不属于代码库。
+.workbuddy-ai/acceptance/
+.workbuddy-ai/artifacts/
+
+# 交付报告与运行产物：不属于代码库内容。
+# `outputs/` 里混有个人求职材料（面试题库、项目案例），此前未被忽略，
+# 任何一次 `git add .` 都会把它们带进仓库。- 2026-09-20
+outputs/
+output/
+
+# 运行日志：由本地跑出来，不是源码，且每次运行都会变。
+docs/acceptance/*.log
+
+# 本机生成的标识（种子脚本的 demo 身份等）。每台机器不同，不该进仓库；
+# `scripts/seed_admin_demo.py` 首次运行会创建它。- 2026-09-20
+.local/
+
+# 工作区记忆目录：由本机工具自动维护，内容与本机会话绑定，不进仓库。
+# 项目长期记忆的正本在 `.workbuddy-ai/memory/`（那个是要提交的）。- 2026-09-20
+.workbuddy/

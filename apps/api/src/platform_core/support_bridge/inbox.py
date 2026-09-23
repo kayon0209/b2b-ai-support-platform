@@ -10,11 +10,10 @@ import time
 import uuid
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_core.support_bridge.minimize import minimize_chatwoot_payload, payload_hash
+from platform_core.support_bridge.minimize import payload_hash
 from platform_core.support_bridge.models import InboxEvent, InboxEventStatus
 
 
@@ -34,14 +33,20 @@ async def persist_inbox_event(
     delivery_id: str,
     event_type: str,
     raw_body: bytes,
-    raw_payload: dict[str, Any],
+    minimized_payload: dict[str, Any],
 ) -> IngestResult:
     """Insert-on-conflict-do-nothing dedup by (tenant_id, delivery_id).
 
     Returns duplicate=True when this delivery was already persisted. The
     caller never reprocesses; the original row keeps its state.
+
+    `minimized_payload` is **required and explicit**: every producer already
+    knows what its own payload means, so it hands over the routing fields the
+    consumer reads rather than a raw body this function would have to guess at.
+    A generic extractor run over a payload the caller understood is how a
+    silently empty row gets stored, and a silent empty row is worse than an
+    error.
     """
-    minimized = minimize_chatwoot_payload(event_type, raw_payload)
     stmt = (
         pg_insert(InboxEvent)
         .values(
@@ -49,7 +54,7 @@ async def persist_inbox_event(
             delivery_id=delivery_id,
             event_type=event_type,
             payload_hash=payload_hash(raw_body),
-            minimized_payload=minimized,
+            minimized_payload=minimized_payload,
             status=InboxEventStatus.RECEIVED.value,
             received_at=int(time.time()),
         )
@@ -60,14 +65,3 @@ async def persist_inbox_event(
     if row is None:
         return IngestResult(tenant_id=tenant_id, event_id=None, duplicate=True)
     return IngestResult(tenant_id=tenant_id, event_id=row, duplicate=False)
-
-
-async def get_event(
-    session: AsyncSession, tenant_id: uuid.UUID, delivery_id: str
-) -> InboxEvent | None:
-    result = await session.execute(
-        select(InboxEvent).where(
-            InboxEvent.tenant_id == tenant_id, InboxEvent.delivery_id == delivery_id
-        )
-    )
-    return result.scalar_one_or_none()

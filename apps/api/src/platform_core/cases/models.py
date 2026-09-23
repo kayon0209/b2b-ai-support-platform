@@ -39,6 +39,26 @@ class CaseStatus(enum.StrEnum):
     REOPENED = "reopened"
 
 
+class CaseCategory(enum.StrEnum):
+    """What kind of work a case represents.
+
+    `Case.category` is a free-form column, so this is a **vocabulary, not a
+    constraint**: naming the values here is what lets a tool, a test and the
+    admin UI agree on them without a migration. An unrecognised value stays
+    readable rather than becoming an error, which is the right trade for a
+    field a tenant may want to extend.
+    """
+
+    GENERAL = "general"
+    # A customer's answer to an engineering question is outstanding, and
+    # production waits on it. The case sits in WAITING_CUSTOMER until the
+    # customer confirms; recording that confirmation is what
+    # `case.eq_confirm` does, and it is deliberately restricted to cases
+    # carrying this category so the tool cannot be pointed at an ordinary
+    # ticket.
+    EQ_CONFIRMATION = "eq_confirmation"
+
+
 # Explicit transition table (docs/domain-model.md case states).
 TRANSITIONS: dict[CaseStatus, set[CaseStatus]] = {
     CaseStatus.NEW: {CaseStatus.TRIAGED, CaseStatus.CLOSED},
@@ -288,3 +308,42 @@ class CaseEscalation(Base, PkMixin, TenantMixin):
     assignee_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     team_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     escalated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class CaseAttachment(Base, PkMixin, TenantMixin):
+    """Evidence attached to a case, held as an object-store reference.
+
+    The research report's stage 3 pairs a quality complaint with its evidence:
+    the adjudication is a person's, and they cannot make it from a subject
+    line. A board photograph or a Gerber archive does not belong in a row, and
+    the platform already has an object store under the same immutability rule
+    the knowledge originals use, so this table holds the *reference* and the
+    bytes live there.
+
+    `object_key` is unique per tenant rather than globally: a collision between
+    tenants is then unrepresentable, and the storage layout can still be
+    tenant-prefixed. Two guards on one property, which is the pattern this
+    repository uses wherever one tenant could otherwise reach another's data.
+    """
+
+    __tablename__ = "case_attachments"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "object_key", name="uq_case_attachment_key"),
+        Index("ix_case_attachments_case", "case_id"),
+    )
+
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id"), nullable=False)
+    # Built by `cases.attachments.attachment_object_key` from the tenant, the
+    # case and a generated id - never from anything the uploader typed, so a
+    # filename cannot escape its prefix. See the traversal test.
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    # What the uploader called it, for display only.
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(127), nullable=False)
+    # Recorded rather than read back from the store: listing evidence must not
+    # cost a HEAD per row, and the size is part of what was accepted.
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Who attached it. An opaque ref, like `assignee_ref`: the actor is an
+    # external identity the platform does not own.
+    uploaded_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

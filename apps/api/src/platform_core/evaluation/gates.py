@@ -160,6 +160,71 @@ def evaluate_release_gates(
         )
     )
 
+    # ADR 0009. The exemption above is only honest if the excluded cases are
+    # still counted and still bounded. Two guards, both necessary:
+    #
+    # 1. Every declaration that COULD have produced an exclusion must have
+    #    produced one. The comparison is against declarations on cases the
+    #    exemption can actually apply to, which is why the runner reports
+    #    `exemptible_cross_lingual` separately from `declared_cross_lingual`:
+    #    a `must_abstain` cross-lingual case is counted correct already, so it
+    #    is declared but never excluded, and comparing against all
+    #    declarations would fail for a correct run. A case that *should* have
+    #    been exempted and was not is the silent failure this catches - the
+    #    declaration claims one thing and the run did another.
+    # 2. The excluded set must stay a strict minority. Otherwise the exemption
+    #    can be widened case by case until `abstention_correct_rate` is computed
+    #    over nothing - and `abstention_correct_rate` returns 1.0 when its
+    #    denominator is zero, so that would read as a perfect score.
+    #
+    # The `-1` sentinel means the artifact predates ADR 0009 and carries none of
+    # these fields. Defaulting it to 0 would make `excluded == exemptible` a
+    # `0 == 0` comparison that passes without measuring anything - verified: the
+    # pre-ADR artifact on disk passed the match gate at `observed=0
+    # threshold=0`. A report that cannot answer the question must not be read as
+    # answering it, so both gates fail and name the remedy. They are appended
+    # rather than returned early: every other gate in this function still has to
+    # run, and bailing out here would silently drop the rest of the decision.
+    exemptible = getattr(report, "exemptible_cross_lingual", -1)
+    excluded = getattr(report, "cross_lingual_unreachable", -1)
+    total_cases = max(report.total, 1)
+    _not_reported = excluded < 0 or exemptible < 0
+    gates.append(
+        GateResult(
+            gate="cross_lingual_exclusions_match",
+            passed=False if _not_reported else excluded == exemptible,
+            observed=excluded,
+            threshold=exemptible,
+            detail=(
+                "artifact predates ADR 0009 and reports no cross-lingual "
+                "counts; regenerate the eval report with "
+                "`scripts/run_eval.py` before trusting this gate"
+                if _not_reported
+                else ""
+                if excluded == exemptible
+                else "a case declared cross_lingual on an answerable question did "
+                "not abstain with NO_AUTHORIZED_EVIDENCE, so the declaration and "
+                "the run disagree"
+            ),
+        )
+    )
+    gates.append(
+        GateResult(
+            gate="cross_lingual_exclusions_bounded",
+            passed=False if _not_reported else excluded * 2 < total_cases,
+            observed=round(excluded / total_cases, 4) if not _not_reported else float(excluded),
+            threshold=0.5,
+            detail=(
+                "artifact predates ADR 0009; no exclusion count to bound"
+                if _not_reported
+                else ""
+                if excluded * 2 < total_cases
+                else "exclusions cover half the dataset or more; the abstention "
+                "rate would be computed over a remainder that cannot fail"
+            ),
+        )
+    )
+
     forbidden_rate = report.forbidden_claim_hits / total
     gates.append(
         GateResult(

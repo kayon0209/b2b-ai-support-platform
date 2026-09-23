@@ -170,6 +170,10 @@ GAP_REASON_CODES: frozenset[str] = frozenset(
         "NO_AUTHORIZED_EVIDENCE",
         "EVIDENCE_BELOW_THRESHOLD",
         "CONFLICTING_SOURCES",
+        # A wrong answer is a knowledge defect too: the corpus produced it.
+        # Same family as CONFLICTING_SOURCES - the documentation is wrong
+        # rather than absent - so it opens a gap the same way (7.8).
+        "AGENT_CORRECTION",
     }
 )
 

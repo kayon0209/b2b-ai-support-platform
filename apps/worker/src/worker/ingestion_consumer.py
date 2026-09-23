@@ -49,7 +49,8 @@ Three decisions worth stating
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import delete, select, text, update
@@ -60,6 +61,7 @@ from platform_core.identity.tenant_context import TenantContext, apply_rls_tenan
 from platform_core.knowledge import ingest
 from platform_core.knowledge.ingest import IngestionError
 from platform_core.knowledge.models import Chunk, DocumentVersion, IngestionStatus
+from platform_core.knowledge.storage import ObjectNotFound
 
 logger = JsonLogger("platform.worker")
 
@@ -106,7 +108,16 @@ class _Retryable(Exception):
     FAILED means a human has to notice and requeue, for a failure that is
     about the dependency rather than the document. The claim is released
     (status back to UPLOADED) so the next cycle picks it up.
+
+    Carries a stable `code`, because the class name is not a reason. Every
+    dependency outage raised the same `_Retryable`, so the log read
+    `reason_code: "_Retryable"` and said nothing about which dependency to
+    look at - observed while debugging a document that would never ingest.
     """
+
+    def __init__(self, message: str, *, code: str = "DEPENDENCY_UNAVAILABLE") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass
@@ -131,13 +142,21 @@ class IngestStats:
     failed: int = 0
     deferred: int = 0
     reclaimed: int = 0
+    # The specific ids this cycle reached, whatever the outcome. Counts cannot
+    # answer "did the cycle handle *my* row?" - and that is precisely the
+    # question the original bug turned on (`ready=8` in a summary said nothing
+    # about the row the caller asked about). `drain_versions` uses this to
+    # decide what it still owes; a caller can use it to attribute an outcome.
+    handled_ids: list[uuid.UUID] = field(default_factory=list)
 
     @property
     def processed(self) -> int:
         return self.ready + self.failed + self.deferred
 
 
-async def claim_versions(session: AsyncSession, *, batch: int = 5) -> list[ClaimedVersion]:
+async def claim_versions(
+    session: AsyncSession, *, batch: int = 5, version_ids: Sequence[uuid.UUID] | None = None
+) -> list[ClaimedVersion]:
     """Claim versions awaiting ingestion.
 
     Claiming goes through `claim_ingestion_versions` (migration 0018) rather
@@ -160,6 +179,14 @@ async def claim_versions(session: AsyncSession, *, batch: int = 5) -> list[Claim
     worker: a row locked by another transaction is skipped rather than waited
     on, so two workers get disjoint batches and neither blocks.
 
+    `version_ids` narrows the claim to specific rows (migration 0039). It
+    exists because the claim is a **global FIFO**, and "claim the oldest N"
+    is the wrong question when the caller has a document in hand: see
+    `drain_versions`. The lock semantics are unchanged - the same
+    `FOR UPDATE SKIP LOCKED` runs over the same table - only the candidate
+    set is narrowed, and a row another worker holds is still skipped rather
+    than waited on.
+
     The status transition that makes the claim durable happens next, in the
     caller's transaction: a committed row write, not an in-memory reservation,
     so a crash mid-ingest is recoverable by `reclaim_stale_ingestion` instead
@@ -168,8 +195,8 @@ async def claim_versions(session: AsyncSession, *, batch: int = 5) -> list[Claim
     rows = (
         (
             await session.execute(
-                text("SELECT * FROM claim_ingestion_versions(CAST(:batch AS integer))"),
-                {"batch": batch},
+                text("SELECT * FROM claim_ingestion_versions(CAST(:batch AS integer), :ids)"),
+                {"batch": batch, "ids": list(version_ids) if version_ids else None},
             )
         )
         .mappings()
@@ -290,13 +317,22 @@ async def _embed_chunks(texts: list[str], embedder: Any) -> list[list[float]]:
         except ModelRejected as exc:
             raise IngestionError(f"embedding request rejected: {exc}") from exc
         except Exception as exc:  # noqa: BLE001 - provider boundary
-            raise _Retryable(f"embedding provider unavailable: {type(exc).__name__}") from exc
+            raise _Retryable(
+                f"embedding provider unavailable: {type(exc).__name__}",
+                code="EMBEDDING_UNAVAILABLE",
+            ) from exc
         got = list(result.vectors)
         if len(got) != len(batch):
-            raise _Retryable(f"embedder returned {len(got)} vectors for {len(batch)} inputs")
+            raise _Retryable(
+                f"embedder returned {len(got)} vectors for {len(batch)} inputs",
+                code="EMBEDDING_SHAPE_MISMATCH",
+            )
         vectors.extend(got)
     if len(vectors) != len(texts):
-        raise _Retryable(f"embedding count mismatch: {len(vectors)} for {len(texts)} chunks")
+        raise _Retryable(
+            f"embedding count mismatch: {len(vectors)} for {len(texts)} chunks",
+            code="EMBEDDING_SHAPE_MISMATCH",
+        )
     return vectors
 
 
@@ -325,8 +361,20 @@ async def ingest_version(
 
     try:
         raw = service.get_object(version.object_uri)
+    except ObjectNotFound as exc:
+        # Permanent, and it used to be retried forever. An upload whose bytes
+        # never landed leaves exactly this row behind (the API registers the
+        # document, then fails to store it), so the worker spent a hot loop
+        # re-reading an object that cannot appear. Marking it failed makes the
+        # problem visible in the document list instead of in a log nobody
+        # reads - the same reasoning the `_Retryable` docstring gives, applied
+        # in the other direction.
+        raise IngestionError(f"stored object is missing: {version.object_uri}") from exc
     except Exception as exc:  # noqa: BLE001 - storage boundary
-        raise _Retryable(f"object storage unavailable: {type(exc).__name__}") from exc
+        raise _Retryable(
+            f"object storage unavailable: {type(exc).__name__}",
+            code="OBJECT_STORAGE_UNAVAILABLE",
+        ) from exc
 
     text = ingest.parse_document(version.content_type, raw)
 
@@ -575,12 +623,18 @@ async def drain_ingestion_once(
     embedder: Any,
     batch: int = 5,
     reclaim_timeout_seconds: int = STALE_INGESTION_SECONDS,
+    version_ids: Sequence[uuid.UUID] | None = None,
 ) -> IngestStats:
     """Claim and ingest one batch. Returns what happened.
 
     Per-version isolation mirrors `inbox_consumer.drain_once`: one poison
     document is marked FAILED and the batch continues, so a single bad
     upload cannot stall the queue.
+
+    `version_ids` passes the narrowing through to `claim_versions`. Without
+    it the claim takes the globally oldest rows regardless of what the caller
+    asked for - which is the bug `drain_versions` exists to fix, and the
+    reason that parameter is threaded here rather than left to the caller.
     """
     stats = IngestStats()
     reclaimed = await reclaim_stale_ingestion(session, timeout_seconds=reclaim_timeout_seconds)
@@ -590,12 +644,17 @@ async def drain_ingestion_once(
         logger.warning("stale_ingestions_reclaimed", count=reclaimed)
         stats.reclaimed = reclaimed
 
-    versions = await claim_versions(session, batch=batch)
+    versions = await claim_versions(session, batch=batch, version_ids=version_ids)
     stats.claimed = len(versions)
     if not versions:
         return stats
 
     for version in versions:
+        # Record every claimed id up front, not at each outcome: a version the
+        # loop reaches has been *handled* whichever branch it takes, and the
+        # caller asking "did you deal with my row?" does not care which one.
+        stats.handled_ids.append(version.version_id)
+
         # Scope the session to the claimed version's tenant before touching
         # any content. `apply_rls_tenant` sets `app.tenant_id` transaction-
         # locally, so a missing scope returns zero rows rather than every
@@ -608,11 +667,17 @@ async def drain_ingestion_once(
             count = await ingest_version(session, version, embedder=embedder)
         except _Retryable as exc:
             await release_claim(session, version)
+            # Field names come from ALLOWED_LOG_FIELDS. `version_id` and
+            # `detail` were not on it, and JsonLogger drops non-allowlisted
+            # keys **silently** - so this line logged neither the document nor
+            # the reason, and the document that never ingested left no trace
+            # of why. `reason_code` is the stable code; the exception class
+            # goes in `error_code`, which is where a class name belongs.
             logger.warning(
                 "ingestion_deferred",
-                version_id=str(version.version_id),
-                reason_code=type(exc).__name__,
-                detail=str(exc)[:200],
+                document_version_id=str(version.version_id),
+                reason_code=exc.code,
+                error_code=type(exc).__name__,
             )
             stats.deferred += 1
             continue
@@ -623,7 +688,7 @@ async def drain_ingestion_once(
             await mark_failed(session, version.version_id, f"{type(exc).__name__}: {exc}")
             logger.error(
                 "ingestion_failed",
-                version_id=str(version.version_id),
+                document_version_id=str(version.version_id),
                 error_code=type(exc).__name__,
             )
             stats.failed += 1
@@ -631,10 +696,255 @@ async def drain_ingestion_once(
 
         logger.info(
             "ingestion_completed",
-            version_id=str(version.version_id),
+            document_version_id=str(version.version_id),
             tenant_id=str(version.tenant_id),
-            chunks=count,
+            # `chunk_count`, not `chunks`: the allowlist has the former, so
+            # the success path was silently reporting no chunk count either.
+            chunk_count=count,
         )
         stats.ready += 1
 
     return stats
+
+
+async def drain_versions(
+    session: AsyncSession,
+    version_ids: Sequence[uuid.UUID],
+    *,
+    embedder: Any,
+    max_rounds: int = 20,
+) -> IngestStats:
+    """Ingest *these* versions, claiming repeatedly until none are left.
+
+    Why this exists, and why it is not `drain_ingestion_once`
+    ---------------------------------------------------------
+    `drain_ingestion_once` claims the oldest `batch` rows *in the database* -
+    the claim is deliberately tenant-agnostic ("one bulk worker serves every
+    tenant"). That is correct for the worker, which does not care which
+    document it gets next. It is wrong for a caller that does care, and the
+    difference is not theoretical:
+
+    Claiming 13 rows with `batch=10` and then looping "one drain per row"
+    starves rows 11-13. `FOR UPDATE SKIP LOCKED` skips any row another
+    transaction holds, so a claim can return fewer than `batch`, and the rows
+    it returns are the *oldest* claimable - not the caller's. Measured on a
+    live queue: 13 claimable rows, `claim(10)` returned 9, and the oldest row
+    was absent; every subsequent round re-claimed from the same head and the
+    tail never got a turn. The caller saw
+
+        RuntimeError: ingesting <key> left ingestion_status='uploaded'
+
+    for a document that was uploaded, stored, and perfectly ingestable.
+
+    The loop here terminates on *absence from the queue*, not on a round
+    count: a version that is claimed and ingested leaves the claimable set in
+    the same transaction, so the next claim does not see it. Rounds therefore
+    do not scale with the workload - one claim gets everything that fits in a
+    batch, and `max_rounds` only bounds a queue that keeps refilling.
+
+    Why each round runs in its own transaction
+    ------------------------------------------
+    The claim runs `... FOR UPDATE SKIP LOCKED`, so it takes a **row lock** on
+    every row it returns. Those locks live until the transaction ends. When the
+    whole loop shared one transaction the loop held round 1's locks while
+    round 2 claimed, and since `SKIP LOCKED` *skips* a row it cannot lock
+    instead of waiting on it, round 2 could return fewer rows than requested -
+    including rows this loop was still trying to finish.
+
+    Measured, before the fix: the settle probe for a requested id sat `idle in
+    transaction` for **44 seconds** while holding that row's lock, and a
+    `claim(3)` over 3 requested ids returned **2**, missing exactly the locked
+    one. The symptoms were all indirect, which is why it is worth naming them:
+
+    - `IngestionError: ... never ingested` for documents that were uploaded and
+      perfectly ingestable, failing a *different* test on one run in three.
+    - `psycopg.errors.DeadlockDetected` when a teardown
+      `DELETE FROM document_versions` met the loop's still-held locks; the
+      aborted cleanup then left `documents` rows pointing at a deleted
+      `knowledge_spaces` row, so the *next* run died on a foreign key that had
+      nothing to do with what it was testing.
+
+    Committing per round is the fix, but it is only half of it. `apply_rls_tenant`
+    sets `app.tenant_id` with `set_config(..., true)`, which is
+    **transaction-scoped**, so the commit clears the binding - and the loop's
+    settle probe then became an *unbound* read of a FORCE-RLS table. That
+    returns zero rows and reports every requested id as unsettled; measured, it
+    turned 3 failures into 11.
+
+    The binding is therefore not refreshed, it is **removed**. The probe is gone
+    entirely and "is this id settled?" is answered from the round's own report
+    of the ids it *handled* (`IngestStats.handled_ids`), not by asking the
+    database a second time. The round already knows what it touched, and that
+    is strictly better information than a re-read: the probe needed a tenant
+    binding the commit had just cleared, while the round's own result needs
+    nothing. One earlier attempt answered this question from `claim_versions`
+    instead - a `SECURITY DEFINER` function that needs no binding - but the
+    claim is a *write* path (it moves rows out of the claimable set), so
+    calling it purely to re-read left the caller unable to roll back without
+    discarding that write. The round's own report has no such coupling.
+
+    The caller's contract is unchanged: it still owns the final commit for
+    anything it cares about. Each round commits only its own claim-and-ingest
+    unit, which must be durable anyway - a version that reached READY cannot be
+    rolled back to `uploaded` on a later round's failure without lying about
+    what the model was already told.
+
+    A round that claims nothing ends the loop rather than spinning: either
+    every id is settled, or what remains is held by another worker (SKIP
+    LOCKED skips it) and waiting would be a livelock. `max_rounds` is the
+    second ceiling, for the case where a *different* claimable row at the
+    head keeps consuming the batch - which on a shared queue is the normal
+    case, not an edge case, because `created_at` is whole seconds and every
+    row written in the same second is one ordering tie the LIMIT cuts
+    arbitrarily. The default is sized for that: a caller with a handful of
+    ids converges in one or two rounds, and the ceiling only bounds a queue
+    that keeps refilling in front of the caller's rows.
+
+    Raises `IngestionError` for ids that never settled - the caller asked for
+    specific documents, so silence is not an acceptable outcome.
+
+    ⚠️ THE SURVIVING FLAKE IS ENVIRONMENTAL, NOT THIS CODE
+    ------------------------------------------------------
+    The per-round commit above removes the *self*-locking (the loop no longer
+    meets its own previous round's locks), and that was measurable: the whole
+    file went from ~62s and 1-3 differing failures per run to ~20s and a
+    steady 1 failure, with five consecutive runs failing 25/26.
+
+    One flake survived, and it took a later investigation to identify it. It
+    is **not** a defect in this loop: a live outbox/ingestion consumer was
+    claiming rows concurrently with the test process. It turned out to be
+    **four orphan `worker.runner` host processes** left by earlier agent
+    sessions, running ~30 hours - not a container and not a shell, which is
+    why a day of looking at `docker ps` found nothing. Stopping them turned
+    this file's 1-failed/25-passed into 26 passed. Symptoms that fit that one
+    cause:
+
+    - a failing test differs every run (`test_drain_versions_narrows_the_claim
+      _it_issues` twice, then `test_chunks_carry_section_paths_and_ordinals`,
+      `test_an_ingested_document_is_retrievable_by_hybrid_search`,
+      `test_an_api_style_upload_with_a_content_type_ingests_to_ready`,
+      `test_a_missing_object_fails_rather_than_retrying_forever`);
+    - always the same shape: `IngestStats(claimed=0, ...)` from a **narrowed**
+      claim over an id that is claimable and not locked by this loop;
+    - `test_billing_ledger.py` shows the identical signature on the outbox
+      side - six consecutive runs, two passing and four failing, with the
+      failing test varying and every failure `RelayStats(claimed=0)`;
+    - a plain SQL insert into `outbox_events` with no relay code in the
+      process is marked `sent, attempts=1` within half a second, and
+      `pg_trigger`/`pg_rules`/column defaults rule out the database doing it.
+
+    `claim_ingestion_versions` is a **global** FIFO and needs no tenant
+    binding, so a concurrent consumer competes with a narrowed claim for the
+    same row; which one wins is timing, which is why the failing test moves.
+
+    **What to do if it comes back**: stop the consumer before treating any
+    failure here as a code defect. Orphan workers recur - the shell that
+    starts one can exit while the process keeps running - so the full chain,
+    the re-detection command and the false trails are in
+    `docs/acceptance/08-live-outbox-consumer.md`. The three fastest checks:
+
+        1. `pytest apps/api/tests/integration/test_outbox_relay.py -rs`
+           - the suite's own `_assert_no_live_relay` guard skips itself and
+             says a live worker is consuming rows;
+        2. insert a `status='queued'` row into `outbox_events` by plain SQL
+           from a script with no relay imported, then read it back after
+             half a second - it is already `sent, attempts=1`;
+        3. `pg_trigger` (non-internal), `pg_rules` and the column defaults on
+           `outbox_events` are all clean, so the database is not doing it.
+
+    Established as *not* the cause: session leakage, the fixture's uuid
+    version, and this loop's own locks. Two of five attempts at a fix were
+    outright wrong (a per-round commit without reworking the probe turned 3
+    failures into 11).
+
+    The improvement stays rather than reverting to the old shape: the old
+    shape was strictly worse on every measurement taken, and this one is
+    correct on the mechanism it set out to fix.
+    """
+    remaining = list(dict.fromkeys(version_ids))
+    total = IngestStats()
+    if not remaining:
+        return total
+
+    for _round in range(max_rounds):
+        # What did this round do, per requested id? Answering that is what
+        # replaces the old settle probe, and it is strictly better
+        # information: the probe asked the database "is this id still
+        # claimable?" and needed a tenant binding to do it, while the round
+        # already knows which ids it *handled*.
+        #
+        # This matters because the binding is gone by now. `apply_rls_tenant`
+        # sets `app.tenant_id` with `set_config(..., true)` - transaction
+        # scoped - so the `commit()` below clears it, and any *read* of
+        # `document_versions` after that returns zero rows (FORCE RLS) and
+        # would report every requested id as unsettled. Measured: a per-round
+        # commit plus a SELECT probe turned 3 failures into 11.
+        before = set(remaining)
+        round_stats = await drain_ingestion_once(
+            session,
+            embedder=embedder,
+            batch=max(len(remaining), 1),
+            version_ids=remaining,
+        )
+        total.reclaimed = max(total.reclaimed, round_stats.reclaimed)
+        total.claimed += round_stats.claimed
+        total.ready += round_stats.ready
+        total.failed += round_stats.failed
+        total.deferred += round_stats.deferred
+        # Carry the per-id attribution up too, not just the counters: the
+        # caller's question is "did you handle *my* row?", and a total that
+        # dropped the ids could answer it only by arithmetic, which is exactly
+        # the summary-vs-row confusion this function exists to remove.
+        for handled in round_stats.handled_ids:
+            if handled not in total.handled_ids:
+                total.handled_ids.append(handled)
+
+        # End this round's transaction *before* the next claim. The claim holds
+        # `FOR UPDATE` locks on everything it returned, and those survive until
+        # commit - so without this the next round's claim meets its own
+        # previous round's locks and `SKIP LOCKED` silently drops rows this
+        # loop is still trying to finish. See this function's docstring.
+        await session.commit()
+
+        # A requested id is settled once the round has *handled* it, whatever
+        # the outcome: READY, FAILED and re-released-to-UPLOADED (deferred) all
+        # mean the loop no longer owes that id a decision.
+        #
+        #   - READY / FAILED are terminal. Leaving them in `remaining` would
+        #     make the loop re-claim a row that can never be claimed again, so
+        #     `max_rounds` would exhaust and raise a false "never ingested" -
+        #     which is exactly what the earlier version of this function did to
+        #     `test_drain_versions_raises_rather_than_returning_partial_success`.
+        #   - Deferred is *not* terminal, but re-rounding it would mean the
+        #     loop spins on a dependency outage: this round released the claim
+        #     precisely so a *later cycle* retries it, not an inner loop.
+        #
+        # The ids the round did not touch are the only ones still owed
+        # something, and those stay in `remaining` for the next round.
+        remaining = [v for v in before if v not in set(round_stats.handled_ids)]
+
+        if not remaining:
+            break
+
+        # Termination is "did the requested set shrink", not "did this round
+        # claim anything". The two differ on a shared queue, and the
+        # difference is not academic: a round can come back with rows the
+        # caller never asked about (a tie group's LIMIT cut) or, if a tie is
+        # held elsewhere and skipped, with fewer rows than requested.
+        # Measured: 13 rows sharing `created_at = 1789827361`.
+        if round_stats.claimed == 0:
+            # Nothing was claimed and nothing of ours moved. Either everything
+            # left is held by another transaction - another round would return
+            # the same answer and spinning would be a livelock - or the queue
+            # is gone. Stop and let the check below decide whether that was
+            # acceptable.
+            break
+
+    if remaining:
+        raise IngestionError(
+            f"{len(remaining)} version(s) were never ingested after "
+            f"{max_rounds} claim round(s): {[str(v) for v in remaining]}. "
+            "The claim is a global FIFO, so a busy queue can starve a "
+            "specific row - see drain_versions."
+        )
+    return total

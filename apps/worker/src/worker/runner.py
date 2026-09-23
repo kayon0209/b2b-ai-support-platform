@@ -31,13 +31,12 @@ import asyncio
 import os
 import signal
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
 
 from observability import JsonLogger
 from platform_core.agent_runtime.orchestrator import OrchestratorDeps
-from platform_core.db import session_scope
 from worker.inbox_consumer import drain_once
 from worker.ingestion_consumer import drain_ingestion_once
 from worker.outbox_relay import OutboxRelay, OutboxWorker, build_default_relay
@@ -49,6 +48,7 @@ from worker.wiring import (
     audit_wiring,
     build_ingestion_deps,
     build_interactive_deps,
+    queue_bookkeeping_session,
 )
 
 logger = JsonLogger("platform.worker")
@@ -184,9 +184,17 @@ class InboxWorker:
         return self._stopping
 
     async def run_once(self) -> int:
-        """One claim-and-process cycle against a fresh unit of work."""
-        async with session_scope() as session:
-            return await drain_once(session, deps=self._deps, batch=self._config.batch)
+        """One claim-and-process cycle against a fresh unit of work.
+
+        The session opened here is the queue's **bookkeeping** session - the
+        owner role, because a claim runs before any tenant is known. It is not
+        where the run happens: `drain_once` opens a `tenant_session` per event,
+        so the agent reaches tenant data as `platform_app` with RLS enforced.
+        See `worker.wiring.queue_bookkeeping_session` for why one role cannot do
+        both jobs.
+        """
+        async with queue_bookkeeping_session() as bookkeeping:
+            return await drain_once(bookkeeping, deps=self._deps, batch=self._config.batch)
 
     async def run_forever(self) -> None:
         """Poll until stopped, with the shared drain/backoff policy."""
@@ -369,7 +377,7 @@ def resolve_queue(argv: list[str] | None = None) -> str:
     return raw
 
 
-def run(coro: "Awaitable[None]") -> None:
+def run(coro: "Coroutine[Any, Any, None]") -> None:
     """`asyncio.run` with a loop psycopg can actually use.
 
     On Windows `asyncio.run` builds a ProactorEventLoop, which psycopg's
@@ -377,9 +385,15 @@ def run(coro: "Awaitable[None]") -> None:
     already selects a selector loop; the worker did not, so it could not
     start at all on Windows and failed its first poll cycle with
     `RuntimeError: psycopg async cannot run on a ProactorEventLoop`.
+
+    The annotation is `Coroutine`, not `Awaitable`: `asyncio.run` requires a
+    coroutine, and mypy narrows `sys.platform` to the *host*, so this check
+    only ever flagged the Linux branch — invisible on a Windows laptop
+    (the else branch is unreachable there), red in CI. Every caller passes
+    the result of an `async def` call, so the narrower annotation is true.
     """
     if sys.platform == "win32":
-        asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)  # type: ignore[arg-type]
+        asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)
     else:
         asyncio.run(coro)
 
@@ -396,7 +410,12 @@ def main() -> None:
     try:
         queue = resolve_queue(sys.argv[1:])
     except WorkerConfigurationError as exc:
-        logger.error("worker_misconfigured", detail=str(exc))
+        # `error_code`, not the message: the allowlist drops free text, and the
+        # readable text is not lost by doing so - this exception subclasses
+        # SystemExit (see `wiring.WorkerConfigurationError`), so re-raising it
+        # prints the message to stderr immediately below this line. What the
+        # structured field has to carry is the part that gets grepped.
+        logger.error("worker_misconfigured", error_code=type(exc).__name__)
         raise
 
     if queue == ROLE_OUTBOX:
@@ -432,7 +451,7 @@ def main() -> None:
         # Not fatal, but loud: a run that cannot send still records its
         # outcome, and an operator must not read that as "the customer was
         # answered".
-        logger.warning("worker_cannot_send", reason_code="NO_CHATWOOT_TOKEN")
+        logger.warning("worker_cannot_send", reason_code="NO_OUTBOUND_TRANSPORT")
 
     run(_run_both(interactive_deps))
 

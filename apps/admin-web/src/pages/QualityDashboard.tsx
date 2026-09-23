@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { apiGet } from "../lib/api";
 import { useAsync } from "../lib/useAsync";
-import type { QualityMetrics, RouteDistribution } from "../lib/types";
+import type { CsatSummary, QualityMetrics, RouteDistribution } from "../lib/types";
 import { Card, EmptyState, PageHeader, Spinner, Stat, Badge } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { useLang } from "../lib/i18n";
@@ -29,6 +29,14 @@ export function QualityDashboard() {
   );
   const routes = useAsync<RouteDistribution>(
     () => apiGet<RouteDistribution>(`/v1/quality/routes?window_seconds=${window}`),
+    [window],
+  );
+  // The satisfaction numbers. They were collected by nothing at all until
+  // 2026-09-23 - `csat.py` had no production caller - so this is the first time
+  // the platform can answer "are customers happy", which is one of the two
+  // experience metrics the industry tracks (the other being first-time-fix).
+  const csat = useAsync<{ csat: CsatSummary }>(
+    () => apiGet<{ csat: CsatSummary }>(`/v1/quality/csat?window_seconds=${window}`),
     [window],
   );
 
@@ -116,9 +124,49 @@ export function QualityDashboard() {
             </Card>
             <Card>
               <Stat
+                label={t("quality.pendingCorrections")}
+                value={int(metrics.data.pending_corrections)}
+                tone={
+                  metrics.data.pending_corrections > 0 ? ("warn" as const) : ("good" as const)
+                }
+              />
+            </Card>
+            <Card>
+              <Stat
                 label={t("quality.wrongResolution")}
                 value={pct(metrics.data.wrong_resolution_rate)}
                 tone={toneFor(metrics.data.wrong_resolution_rate, 0.05, 0.15)}
+              />
+            </Card>
+            <Card>
+              {/* An em dash, not 0 or "-": no responses yet is not a score of
+                  zero, and showing 0.00 would read as "everyone is furious". */}
+              <Stat
+                label={t("quality.csat")}
+                value={
+                  csat.data?.csat.average != null
+                    ? `${csat.data.csat.average.toFixed(2)} / 5`
+                    : "—"
+                }
+                tone={
+                  csat.data?.csat.average == null
+                    ? undefined
+                    : csat.data.csat.average >= 4
+                      ? ("good" as const)
+                      : csat.data.csat.average >= 3
+                        ? ("warn" as const)
+                        : ("bad" as const)
+                }
+              />
+            </Card>
+            <Card>
+              <Stat
+                label={t("quality.csatRate")}
+                value={
+                  csat.data?.csat.response_rate != null
+                    ? pct(csat.data.csat.response_rate)
+                    : "—"
+                }
               />
             </Card>
           </div>
@@ -206,6 +254,46 @@ export function QualityDashboard() {
                 <Spinner />
               ) : (
                 <p className="muted">{t("quality.routeUnavailable")}</p>
+              )}
+            </Card>
+          </div>
+
+          <div className="grid-2">
+            <Card title={t("quality.leaks")}>
+              {metrics.data.automation_candidates?.length ? (
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>{t("quality.reason")}</th>
+                      <th>{t("quality.count")}</th>
+                      <th>{t("quality.action")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {metrics.data.automation_candidates.map((item) => (
+                      <tr key={item.reason}>
+                        <td>{item.reason}</td>
+                        <td>{int(item.count)}</td>
+                        <td>
+                          <Badge tone={item.automatable ? "good" : "neutral"}>
+                            {item.automatable
+                              ? t("quality.automatable")
+                              : t("quality.keepHuman")}
+                          </Badge>
+                          {item.sample_questions.length > 0 ? (
+                            <ul className="leak-samples">
+                              {item.sample_questions.map((q) => (
+                                <li key={q}>{q}</li>
+                              ))}
+                            </ul>
+                          ) : null}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <p className="muted">{t("quality.noHandoffs")}</p>
               )}
             </Card>
           </div>

@@ -962,6 +962,24 @@ select:focus-visible {
   min-width: 180px;
 }
 
+/* Repeatable arm row on the experiments page: a name, a weight and a remove
+   button on one line, so several arms can be read at a glance. */
+.arm-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.text-input-narrow {
+  width: 6rem;
+}
+
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .prompt-error {
   margin: 0;
   font-size: 13px;
@@ -1540,4 +1558,239 @@ select:focus-visible {
   text-align: center;
   font-size: 11px;
   color: var(--muted, #6b7280);
+}
+
+/* Agent workbench (feature list 7.6): queue beside context, so the agent
+   reads both without navigating. The two columns are independent scroll
+   areas - a long conversation must not push the queue out of reach. */
+.workbench {
+  display: grid;
+  grid-template-columns: minmax(200px, 280px) 1fr;
+  gap: var(--space-4, 1rem);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .workbench {
+    grid-template-columns: 1fr;
+  }
+}
+
+.workbench-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.workbench-item {
+  display: flex;
+  width: 100%;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem;
+  margin-bottom: 0.25rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.workbench-item:hover {
+  border-color: var(--border, #ccc);
+}
+
+.workbench-item.selected {
+  border-color: var(--accent, #4c6ef5);
+  background: var(--surface-hover, rgba(76, 110, 245, 0.08));
+}
+
+.workbench-subject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workbench-detail {
+  display: grid;
+  gap: var(--space-4, 1rem);
+}
+
+.workbench-detail .timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.workbench-detail .timeline li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border, #eee);
+}
+
+.workbench-detail .sources {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.85rem;
+}
+
+/* Tool receipts as cards (4A.3): the customer scans for a stage, so the
+   receipt renders as a dated list of nodes rather than as prose. */
+.cw-tool {
+  border-left: 3px solid var(--accent, #4c6ef5);
+}
+
+.data-card {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.data-card-head {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 0.9rem;
+}
+
+.data-card-nodes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.data-card-nodes li {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: space-between;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid var(--border, #eee);
+  font-size: 0.9rem;
+}
+
+.data-card-nodes li:last-child {
+  border-bottom: none;
+}
+
+.data-card-node-label {
+  font-weight: 600;
+}
+
+.leak-samples {
+  list-style: none;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  font-size: 0.8rem;
+}
+
+.leak-samples li {
+  padding: 0.1rem 0;
+  color: var(--muted, #666);
+}
+
+.workbench-contacts {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 0.35rem;
+}
+
+/* ADR 0010: the panel is an internal verification surface, and the label has
+   to be visible without competing with the conversation itself. */
+.cw-internal {
+  align-self: flex-start;
+  margin-left: auto;
+  padding: 0.1rem 0.4rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
+/* --- Conversation replay (feature list 8.3) ------------------------------- */
+
+/* Layout only, and only because the nearest existing class cannot do the
+   job: `.timeline` is scoped to `.workbench-detail` and lays every entry out
+   as one baseline row, which has no room for the decision panel a replay
+   hangs underneath its question. Colours, tones and typography all come from
+   the tokens above and the Badge component, so both themes are inherited
+   rather than restated. */
+.replay-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.replay-timeline > li {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.replay-timeline > li:last-child {
+  border-bottom: none;
+}
+
+.replay-turn {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  /* Wraps rather than truncating: a replay is read for the words, and an
+     ellipsis in the middle of a customer's sentence is the one thing that
+     makes it unreadable. */
+  flex-wrap: wrap;
+}
+
+.replay-turn > span:nth-child(2) {
+  flex: 1 1 240px;
+}
+
+.replay-decision {
+  margin: 8px 0 0 12px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+  background: var(--surface-2);
+  border-radius: 0 6px 6px 0;
+  font-size: 13px;
+}
+
+.replay-decision-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.replay-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.replay-chips li {
+  display: flex;
+  gap: 4px;
+}
+
+.replay-small {
+  font-size: 12px;
+}
+
+.replay-pager {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
 }

@@ -28,7 +28,7 @@ from platform_core.identity.tenant_context import TenantContext
 logger = logging.getLogger(__name__)
 
 # Exempt paths: health and unauthenticated webhooks (webhooks resolve tenant
-# from connector configuration, implemented in support_bridge).
+# from connector configuration - `integrations/inbound.py`).
 EXEMPT_PATHS = {
     "/healthz",
     # Prometheus scrapes on a timer and cannot present a bearer token. The
@@ -39,9 +39,6 @@ EXEMPT_PATHS = {
     "/openapi.json",
     "/docs",
     "/redoc",
-    # Webhook authenticates via HMAC signature and resolves tenant from
-    # trusted connector configuration, not bearer tokens.
-    "/v1/webhooks/chatwoot",
     # Invite acceptance is how someone *joins* a tenant, so the caller has no
     # membership and therefore no bearer token yet. The single-use token in
     # the request body is the credential: the handler resolves the tenant from
@@ -77,6 +74,13 @@ EXEMPT_PREFIXES = (
     # resolved - see `scim_router._authenticate`.
     "/scim/v2/",
     "/v1/webhooks/",
+    # The visitor chat surface. A customer holds no membership and therefore no
+    # operator token, so the middleware cannot resolve a context for them - the
+    # visitor token *establishes* the tenant and the conversation instead
+    # (`support_router._claim`). Everything under this prefix must verify that
+    # token itself, except `POST /v1/support/sessions`, which is the one route
+    # allowed to be unauthenticated and does nothing but mint a token.
+    "/v1/support/",
 )
 
 
@@ -151,11 +155,16 @@ async def bootstrap_token_resolver(request: Request) -> TenantContext:
 
     # MVP bootstrap token format: pt_<tenant-slug>_<user-id>
     # Phase 2 swaps this for OIDC introspection; call sites do not change.
-    parts = token.split("_", 2)
-    if len(parts) != 3 or parts[0] != "pt":
+    #
+    # Split from the RIGHT, not the left: a slug is free-form and may itself
+    # contain "_", and `split("_", 2)` on `pt_my_tenant_<uuid>` would hand the
+    # slug "my" and the id "tenant_<uuid>", failing as a malformed actor id for
+    # a tenant that exists. The id is the fixed-shape part, so it is the one
+    # that must be cut off the end.
+    prefix, separator, rest = token.partition("_")
+    tenant_slug, separator2, user_id_raw = rest.rpartition("_")
+    if prefix != "pt" or not separator or not separator2 or not tenant_slug:
         raise PermissionError("malformed token")
-
-    _, tenant_slug, user_id_raw = parts
     try:
         user_id = uuid.UUID(user_id_raw)
     except ValueError as exc:

@@ -71,15 +71,27 @@ def test_an_empty_external_id_is_refused(external: str) -> None:
 
 
 def test_the_worker_and_the_customer_endpoint_agree() -> None:
-    """The regression this file exists for.
+    """The regression this file exists for, restated for the verbatim contract.
 
-    The worker writes turns and answers under its derived id; the customer
-    endpoint reads the timeline under its own. If they differ, the answer is
-    produced and then never found.
+    The path segment the customer endpoint reads and the `conversation_ref`
+    payload key the worker reads are the SAME platform id, used verbatim on
+    both sides. Neither derives it, so the answer the worker writes under the
+    ref is found by the endpoint reading the same ref. The old failure was two
+    readers that each derived - and derived differently.
     """
-    from platform_core.agent_runtime.customer_router import _conversation_ref as api_ref
+    from platform_core.agent_runtime.customer_router import parse_conversation_ref as api_parse
+    from platform_core.support_bridge.conversation_ref import parse_conversation_ref
 
-    assert api_ref(TENANT_A, KNOWN_EXTERNAL) == KNOWN_REF
+    # The endpoint and the worker share the one parser - identity, not equality,
+    # is what stops them drifting to two rules again.
+    assert api_parse is parse_conversation_ref
+
+    # The customer endpoint reads the path verbatim.
+    assert parse_conversation_ref(str(KNOWN_REF)) == KNOWN_REF
+    # The worker reads the payload's ref verbatim.
+    assert _conversation_ref(_event_ref(KNOWN_REF)) == KNOWN_REF
+    # And the worker can still derive from a channel id when no ref was handed
+    # to it - the one case where derivation is correct.
     assert _conversation_ref(_event(KNOWN_EXTERNAL)) == KNOWN_REF
 
 
@@ -91,16 +103,19 @@ def test_the_worker_ignores_a_missing_or_non_string_conversation_id() -> None:
 
 
 def test_the_run_trigger_uses_the_shared_helper() -> None:
-    """The trigger endpoint must file runs where the worker answers.
+    """The trigger endpoint must read the ref the worker answers under.
 
-    Asserted as identity rather than equal output: a copy of the rule that
-    happens to agree today would pass an equality check and still be free to
-    drift tomorrow.
+    The run endpoint receives a platform ref in its path and uses it verbatim
+    via the shared `parse_conversation_ref`. Asserted as identity rather than
+    equal output: a second copy of the rule that agrees today is free to drift
+    tomorrow, and a drift here is exactly the silent mis-file this whole file
+    guards against.
     """
     from platform_core.agent_runtime import router as agent_router
+    from platform_core.support_bridge.conversation_ref import parse_conversation_ref
 
-    assert agent_router.conversation_ref_for is conversation_ref_for
-    assert agent_router.conversation_ref_for(TENANT_A, KNOWN_EXTERNAL) == KNOWN_REF
+    assert agent_router.parse_conversation_ref is parse_conversation_ref
+    assert parse_conversation_ref(str(KNOWN_REF)) == KNOWN_REF
 
 
 def _event(conversation_id: object) -> ClaimedEvent:
@@ -113,4 +128,24 @@ def _event(conversation_id: object) -> ClaimedEvent:
         delivery_id=str(uuid.uuid4()),
         event_type="message_created",
         minimized_payload=payload,
+    )
+
+
+def _event_ref(ref: uuid.UUID) -> ClaimedEvent:
+    """An inbox event that already carries the platform ref (the 方案A encoding).
+
+    A run queued by an operator reaches the conversation by its platform ref
+    and the API hands that ref to the worker verbatim - no external id to
+    derive from. The worker must return it as-is.
+    """
+    return ClaimedEvent(
+        event_id=uuid.uuid4(),
+        tenant_id=TENANT_A,
+        delivery_id=str(uuid.uuid4()),
+        event_type="message_created",
+        minimized_payload={
+            "message_id": "10",
+            "message_type": "incoming",
+            "conversation_ref": str(ref),
+        },
     )

@@ -6,15 +6,31 @@ import { useTheme } from "../lib/theme";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { TokenDialog } from "./TokenDialog";
 
+/**
+ * The sidebar, and the source of truth for the console's addresses.
+ *
+ * Every entry is under `/admin`, because the root namespace belongs to the
+ * customer: it used to own `/quality`, `/cases` and twelve other top-level
+ * names, which is how a customer who mistyped `/support` ended up looking at
+ * the operator's sidebar. `main.tsx` builds both the `/admin` routes and the
+ * redirects from the old addresses out of the same list, so the two cannot
+ * disagree about where a page lives.
+ */
 const NAV = [
-  { to: "/quality", key: "nav.quality", icon: "📊" },
-  { to: "/gaps", key: "nav.gaps", icon: "🧩" },
-  { to: "/prompts", key: "nav.prompts", icon: "✍️" },
-  { to: "/flags", key: "nav.flags", icon: "🚩" },
-  { to: "/cases", key: "nav.cases", icon: "🎫" },
-  { to: "/members", key: "nav.members", icon: "👥" },
-  { to: "/usage", key: "nav.usage", icon: "📈" },
-  { to: "/branding", key: "nav.branding", icon: "🎨" },
+  { to: "/admin/quality", key: "nav.quality", icon: "📊" },
+  { to: "/admin/gaps", key: "nav.gaps", icon: "🧩" },
+  { to: "/admin/knowledge", key: "nav.knowledge", icon: "📚" },
+  { to: "/admin/conversations", key: "nav.conversations", icon: "🔁" },
+  { to: "/admin/prompts", key: "nav.prompts", icon: "✍️" },
+  { to: "/admin/flags", key: "nav.flags", icon: "🚩" },
+  { to: "/admin/channels", key: "nav.channels", icon: "📡" },
+  { to: "/admin/experiments", key: "nav.experiments", icon: "🧪" },
+  { to: "/admin/cases", key: "nav.cases", icon: "🎫" },
+  { to: "/admin/workbench", key: "nav.workbench", icon: "🛠️" },
+  { to: "/admin/approvals", key: "nav.approvals", icon: "✅" },
+  { to: "/admin/members", key: "nav.members", icon: "👥" },
+  { to: "/admin/usage", key: "nav.usage", icon: "📈" },
+  { to: "/admin/branding", key: "nav.branding", icon: "🎨" },
 ] as const;
 
 function Shell() {
@@ -42,12 +58,32 @@ function Shell() {
   // Every page used to share one title, so browser history, tabs and the
   // back-button menu all read "B2B AI Support · Admin" and told you nothing
   // about which of eight screens you were looking at.
+  //
+  // Matched by **prefix**, not equality: `/admin/workbench/123` is the workbench
+  // with a case open, and an equality test gave that page the "page not found"
+  // title. The longest match wins, so a future `/admin/workbench/settings`-style
+  // child does not get shadowed by its parent.
   useEffect(() => {
-    const section = NAV.find((item) => item.to === pathname);
+    const section = NAV.filter(
+      (item) => pathname === item.to || pathname.startsWith(`${item.to}/`),
+    ).sort((a, b) => b.to.length - a.to.length)[0];
     document.title = section
       ? `${t(section.key)} · ${t("brand.name")}`
       : `${t("notFound.title")} · ${t("brand.name")}`;
   }, [pathname, t]);
+
+  // The customer window needs a tenant slug, and the console knows it only
+  // through the operator token's `pt_<slug>_<user-id>` shape. Parsed rather
+  // than hardcoded, so a second tenant does not silently preview the first
+  // one's window. With no token there is no slug, and the page falls back to
+  // its own default instead of being pointed at a tenant we guessed.
+  const customerTenant = (() => {
+    const parts = (getToken() ?? "").split("_");
+    return parts.length >= 3 && parts[0] === "pt" ? parts[1] : "";
+  })();
+  const customerWindowHref = customerTenant
+    ? `/support?tenant=${encodeURIComponent(customerTenant)}`
+    : "/support";
 
   return (
     <div className="app-shell">
@@ -113,6 +149,19 @@ function Shell() {
               <span>{t(item.key)}</span>
             </NavLink>
           ))}
+          {/* The customer window is not a console section — it is the page a
+              customer opens, and `main.tsx` mounts it outside this shell. So it
+              gets a link *out*, in a new tab, rather than a NavLink that would
+              navigate the operator away and lose their place. It was reachable
+              only by typing the URL, which is how it went unnoticed. */}
+          <a className="nav-item" href={customerWindowHref} target="_blank" rel="noreferrer">
+            <span className="nav-icon" aria-hidden>
+              💬
+            </span>
+            <span>
+              {t("nav.customerWindow")} <span aria-hidden>↗</span>
+            </span>
+          </a>
         </nav>
         <footer className="sidebar-footer muted">
           <span>{t("footer.controlPlane")}</span>

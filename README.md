@@ -1,12 +1,21 @@
 # B2B Enterprise AI Customer Support
 
-A production-oriented implementation plan for an enterprise AI customer support system built with **Chatwoot as the customer-service kernel** and an independent **FastAPI AI control plane**.
+A production-oriented implementation of an enterprise AI customer support
+platform: a **FastAPI AI control plane** that owns tenancy, cases, knowledge,
+agent runs, tool execution, citations, evaluation and audit, and that **hosts its
+own customer channels** (`/support` for customers, `Workbench` for agents,
+an ops console for supervisors).
+
+Chatwoot was the original customer-service kernel. It was removed — see
+[ADR 0012](docs/adr/0012-remove-chatwoot.md), which supersedes ADR 0001.
 
 ## Decision
 
-- Keep Chatwoot close to upstream and treat it as a bounded external subsystem.
+- Own the customer channel. A channel is a `connectors` row plus an adapter in
+  `platform_core/channels/`; adding one is not a change to the run path.
 - Build knowledge, AI orchestration, case/SLA, enterprise identity, tool execution, audit, and evaluation as independently owned modules.
-- Integrate through REST APIs, signed webhooks, and versioned events. Never read or write Chatwoot tables directly.
+- Integrate through REST APIs, signed webhooks, and versioned events. Never read
+  or write another system's database.
 - Start as a modular monolith plus workers; split services only after measured bottlenecks.
 
 ## Document map
@@ -23,14 +32,15 @@ A production-oriented implementation plan for an enterprise AI customer support 
 | [docs/testing-and-evaluation.md](docs/testing-and-evaluation.md) | Test pyramid, LLM evaluation, load and failure testing |
 | [docs/deployment-and-operations.md](docs/deployment-and-operations.md) | Environments, deployment, observability, backup, and runbooks |
 | [docs/integrations.md](docs/integrations.md) | CRM, IM, SSO, issue-tracker, and enterprise connector design |
-| [docs/adr/0001-chatwoot-as-support-kernel.md](docs/adr/0001-chatwoot-as-support-kernel.md) | Architecture decision record for the selected foundation |
+| [docs/product-gap-analysis.md](docs/product-gap-analysis.md) | Target experience (three surfaces + one loop) vs. what is built |
+| [docs/adr/](docs/adr/) | Architecture decision records, newest first |
 
 ## MVP scope
 
 ### Included
 
 - Web Chat and email
-- Chatwoot inbox and human-agent workspace
+- The platform's own customer window, agent workbench and ops console
 - Tenant-aware knowledge ingestion and RAG
 - Evidence citations and abstention
 - Human handoff with control ownership

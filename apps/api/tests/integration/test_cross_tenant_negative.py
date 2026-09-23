@@ -37,6 +37,11 @@ TENANT_TABLES = (
     "citations",
     "cases",
     "audit_events",
+    "issue_categories",
+    "canned_replies",
+    "agent_profiles",
+    "sla_policies",
+    "ab_experiments",
 )
 
 _seed_ids: dict[str, str] = {}
@@ -167,6 +172,33 @@ def seed_all_tables() -> None:
                 "'case', "
                 "'completed', 'OK', 'trace-neg')",
             ),
+            (
+                "issue_categories",
+                "INSERT INTO issue_categories (id, tenant_id, category_key, state, "
+                "created_at, updated_at) VALUES (:i, :t, 'neg|neg|neg', 'observed', 1000, 1000)",
+            ),
+            (
+                "canned_replies",
+                "INSERT INTO canned_replies (id, tenant_id, title, body, created_at, "
+                "updated_at) VALUES (:i, :t, 'neg reply', 'neg body', 1000, 1000)",
+            ),
+            (
+                "agent_profiles",
+                "INSERT INTO agent_profiles (id, tenant_id, user_ref, display_name, "
+                "created_at, updated_at) VALUES (:i, :t, 'neg-agent', 'Neg Agent', 1000, 1000)",
+            ),
+            (
+                "sla_policies",
+                "INSERT INTO sla_policies (id, tenant_id, tier, first_response_minutes, "
+                "resolution_minutes, created_at, updated_at) VALUES "
+                "(:i, :t, 'standard', 60, 480, 1000, 1000)",
+            ),
+            (
+                "ab_experiments",
+                "INSERT INTO ab_experiments (id, tenant_id, key, variants, created_at, "
+                "updated_at) VALUES (:i, :t, 'neg.exp', "
+                'CAST(\'[{"name": "a", "weight": 1}]\' AS jsonb), 1000, 1000)',
+            ),
         ]
         for _table, stmt in stmts:
             if stmt is None:
@@ -230,8 +262,14 @@ def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
                     )
                 ).scalar()
                 await session.rollback()
-            # No context sees nothing
+            # No context sees nothing. RESET rather than relying on a fresh
+            # session: `set_config(..., false)` elsewhere is session-scoped and
+            # survives on a pooled connection, so "no context" would otherwise
+            # mean "whatever the last tenant-scoped test left behind" - which
+            # is a different thing and makes this assertion pass for the wrong
+            # reason.
             async with factory() as session:
+                await session.execute(text("RESET app.tenant_id"))
                 no_ctx = (
                     await session.execute(
                         text(f"SELECT count(*) FROM {table}")  # noqa: S608

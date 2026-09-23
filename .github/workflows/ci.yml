@@ -13,7 +13,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install "ruff>=0.8,<0.9"
+      # Pinned to the ruff the tree is actually developed and verified with
+      # (see requirements-dev.txt). The previous pin (`>=0.8,<0.9`) predated
+      # the formatter's stable style change, so CI disagreed with every local
+      # run - measured 2026-09-23: 0.16.8 passes check + format on the whole
+      # scope, the old pin's lint job failed before reading the tree.
+      - run: pip install "ruff>=0.16,<0.17"
       # `scripts`, `tests` and the release-gate pytest plugin are linted too.
       # Leaving them out was how a whole tree - including the plugin that
       # produces release evidence - stayed outside the style gate.
@@ -46,21 +51,20 @@ jobs:
           python-version: "3.12"
       - run: pip install detect-secrets
       - name: Scan for secrets
+        # Audits against the committed `.secrets.baseline` - the standard
+        # detect-secrets workflow, and the reason that file exists. The
+        # previous version failed on ANY finding, which cannot pass: the test
+        # suites' own fixtures (`Authorization: Bearer pt_...`,
+        # `http://user:pass@localhost` test URLs) are detected as "Basic Auth
+        # Credentials" ~190 times across tracked files, so the job was red on
+        # every run (8/8 as of 2026-09-19). With a baseline, only a secret
+        # that is NEW - not in the baseline - fails the job; the baseline
+        # stores hashed secrets, never the values themselves.
         run: |
-          detect-secrets scan --all-files \
+          detect-secrets scan --baseline .secrets.baseline --all-files \
             --exclude-files '\.venv' \
             --exclude-files '\.lock$' \
-            --exclude-files 'package-lock\.json$' \
-            > .secrets.baseline.new
-          python - <<'EOF'
-          import json, sys
-          with open(".secrets.baseline.new") as f:
-              results = json.load(f)["results"]
-          if results:
-              print("Potential secrets detected:", json.dumps(results, indent=2)[:4000])
-              sys.exit(1)
-          print("No secrets found")
-          EOF
+            --exclude-files 'package-lock\.json$'
 
   dependency-scan:
     # Known-vulnerability scan. Deliberately a *gate*: a new advisory on a
@@ -123,6 +127,13 @@ jobs:
         run: pytest apps/api/tests/unit packages/contracts/tests -m "not integration"
         env:
           PYTHONPATH: apps/api/src:packages/contracts/src
+          # There is no .env in a fresh checkout (it is gitignored), so the
+          # settings that local development reads from it must be stated here.
+          # Without these the unit job died on
+          # "RuntimeError: no authentication configured" before any assertion
+          # ran - measured 2026-09-19.
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
 
   integration-tests:
     runs-on: ubuntu-latest
@@ -133,7 +144,12 @@ jobs:
         with:
           python-version: "3.12"
       - name: Start services
-        run: docker compose -f infra/compose/docker-compose.yml up -d ai-postgres ai-redis
+        # --wait blocks until the healthchecks pass (pg_isready / redis-cli ping).
+        # A plain `up -d` returned before postgres listened, and the very next
+        # step's `exec psql` died on a socket that did not exist yet - the job
+        # never reached a test, and only after the image pull was fixed did
+        # this race become the visible failure.
+        run: docker compose -f infra/compose/docker-compose.yml up -d --wait ai-postgres ai-redis
       - name: Create app role
         run: |
           docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
@@ -152,12 +168,148 @@ jobs:
         env:
           APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src
+          # env.py resolves the URL through get_settings(), which refuses to
+          # start without an auth decision - and this job has no .env to read
+          # (measured: "RuntimeError: no authentication configured" from
+          # config.py:306 via migrations/env.py). Same two variables the test
+          # steps declare.
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+      - name: Grant the app role the migration bookkeeping table
+        # alembic_version is created by alembic, not by a migration, so no
+        # migration grants it - and the schema-privileges suite requires every
+        # public table to be usable by platform_app. A long-lived development
+        # database acquires the grant out of band, which is exactly the
+        # "passes locally, fails fresh" shape that suite exists to catch.
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            psql -U platform -d platform -c \
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
       - name: Run integration tests
         run: pytest apps/api/tests/integration -m integration
         env:
           APP_TEST_DATABASE_URL: postgresql+psycopg://platform_app:platform_app@localhost:5435/platform
           APP_ADMIN_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src
+          # Same reason as the unit job: no .env exists in the checkout.
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+          # `APP_LLM_API_KEY` is deliberately NOT set for this job.
+          #
+          # It was, as a placeholder, to satisfy the configuration gate that the
+          # worker-isolation suite hits when it builds the *real* worker wiring.
+          # But the key is read by the retrieval path too, and a key present
+          # switches it from the deterministic embedder to a real provider - which
+          # the sandbox cannot reach, so `/v1/retrieval/query` answered 500 and two
+          # integration tests failed (CI #18, and reproduced locally with the same
+          # placeholder: `test_m2_http_api.py::test_retrieval_query_requires_knowledge_read`
+          # and `test_cross_tenant_leak_surfaces.py::test_retrieval_never_returns_another_tenants_evidence`).
+          #
+          # The two needs are incompatible at job scope, so the one test that needs
+          # a key sets it itself: `test_inbox_worker_isolation.py` monkeypatches it
+          # and clears `get_settings` before and after, so the placeholder cannot
+          # leak into the rest of the batch.
+
+  concurrency-guard:
+    # Enforces the F-9 invariant: N concurrent writers of one logical message
+    # must collapse to a single row, and the rate limiter must shed load with
+    # 429 rather than queue it. A fully green suite did not catch the original
+    # defect - SELECT-then-INSERT only loses the race under real parallelism,
+    # and TestClient shares one portal so it cannot reproduce it.
+    #
+    # Of the two runtime guards this is the one CI can honestly enforce. The
+    # other, scripts/ui_smoke.cjs, needs a browser and a served front end, so
+    # it stays a pre-release manual step; its verified invocation, including
+    # the NODE_PATH it needs, is in .workbuddy-ai/memory/REFERENCE.md.
+    #
+    # The API runs straight from the checkout rather than as a built image.
+    # The guard tests *running* code, so a cached image would test yesterday's
+    # build and stay green no matter what this commit broke: measured locally,
+    # a two-day-old image answered every probe request with 404 while the same
+    # source run in-process passed 5/5. It also lets this job set
+    # APP_ALLOW_BOOTSTRAP_TOKENS directly, which compose cannot do cleanly
+    # because the token comes from an env file that a fresh checkout lacks.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start database and Redis
+        # --wait blocks until the healthchecks pass (pg_isready / redis-cli ping).
+        # A plain `up -d` returned before postgres listened, and the very next
+        # step's `exec psql` died on a socket that did not exist yet - the job
+        # never reached a test, and only after the image pull was fixed did
+        # this race become the visible failure.
+        run: docker compose -f infra/compose/docker-compose.yml up -d --wait ai-postgres ai-redis
+      - name: Create app role
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            psql -U platform -d platform -c \
+            "DO \$\$ BEGIN
+               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'platform_app') THEN
+                 CREATE ROLE platform_app LOGIN PASSWORD 'platform_app' NOBYPASSRLS;
+               END IF;
+             END \$\$;
+             GRANT platform_app TO platform;
+             GRANT ALL ON SCHEMA public TO platform_app;"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run migrations
+        run: alembic -c apps/api/migrations/alembic.ini upgrade head
+        env:
+          APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
+          PYTHONPATH: apps/api/src
+          # env.py resolves the URL through get_settings(), which refuses to
+          # start without an auth decision - and this job has no .env to read
+          # (measured: "RuntimeError: no authentication configured" from
+          # config.py:306 via migrations/env.py). Same two variables the test
+          # steps declare.
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+      - name: Grant the app role the migration bookkeeping table
+        # alembic_version is created by alembic, not by a migration, so no
+        # migration grants it - and the schema-privileges suite requires every
+        # public table to be usable by platform_app. A long-lived development
+        # database acquires the grant out of band, which is exactly the
+        # "passes locally, fails fresh" shape that suite exists to catch.
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            psql -U platform -d platform -c \
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
+      - name: Seed the demo tenant and capture its token
+        run: |
+          python scripts/seed_admin_demo.py 2>&1 | tee seed.log
+          TOKEN="$(grep -oE 'pt_[A-Za-z0-9_-]+' seed.log | head -1)"
+          if [ -z "$TOKEN" ]; then echo "seed printed no bootstrap token"; exit 1; fi
+          echo "APP_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        env:
+          APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
+          PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
+      - name: Start the API from this checkout
+        run: |
+          nohup python -m platform_core.main > api.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
+              echo "api healthy"; exit 0
+            fi
+            sleep 2
+          done
+          echo "api never became healthy"; cat api.log; exit 1
+        env:
+          APP_API_PORT: "8000"
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+          APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
+          APP_REDIS_URL: redis://localhost:6380/0
+          APP_SECRET_KEY: ci-secret
+          PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
+      - name: Run the concurrency guard
+        run: python scripts/concurrency_probe.py
+        env:
+          APP_BASE_URL: http://127.0.0.1:8000
+          APP_ADMIN_DATABASE_URL: postgresql://platform:platform@localhost:5435/platform
+          PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
 
   release-evidence:
     # Verifies the evidence behind the zero-tolerance release gates.
@@ -182,7 +334,12 @@ jobs:
         with:
           python-version: "3.12"
       - name: Start services
-        run: docker compose -f infra/compose/docker-compose.yml up -d ai-postgres ai-redis
+        # --wait blocks until the healthchecks pass (pg_isready / redis-cli ping).
+        # A plain `up -d` returned before postgres listened, and the very next
+        # step's `exec psql` died on a socket that did not exist yet - the job
+        # never reached a test, and only after the image pull was fixed did
+        # this race become the visible failure.
+        run: docker compose -f infra/compose/docker-compose.yml up -d --wait ai-postgres ai-redis
       - name: Create app role
         run: |
           docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
@@ -201,12 +358,39 @@ jobs:
         env:
           APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src
+          # env.py resolves the URL through get_settings(), which refuses to
+          # start without an auth decision - and this job has no .env to read
+          # (measured: "RuntimeError: no authentication configured" from
+          # config.py:306 via migrations/env.py). Same two variables the test
+          # steps declare.
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+      - name: Grant the app role the migration bookkeeping table
+        # alembic_version is created by alembic, not by a migration, so no
+        # migration grants it - and the schema-privileges suite requires every
+        # public table to be usable by platform_app. A long-lived development
+        # database acquires the grant out of band, which is exactly the
+        # "passes locally, fails fresh" shape that suite exists to catch.
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            psql -U platform -d platform -c \
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
       - name: Run the full suite (produces the release-gate evidence)
         run: pytest
         env:
           APP_TEST_DATABASE_URL: postgresql+psycopg://platform_app:platform_app@localhost:5435/platform
           APP_ADMIN_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
+          # Same reasoning as the unit and integration jobs: this checkout has
+          # no .env, and the auth guard refuses to resolve any settings without
+          # an explicit decision. Left out of this step for the whole run of
+          # rounds before this one, which cost 417 failures from one gap.
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+          # No `APP_LLM_API_KEY` here either, for the same reason the integration
+          # job omits it: a placeholder key switches the retrieval path off the
+          # deterministic embedder and the sandbox has nowhere to call. This job
+          # runs the whole suite, so it contains both sides of that conflict.
       - name: Verify the zero-tolerance evidence is complete
         run: python -m platform_core.evaluation.release_check --evidence-only
         env:

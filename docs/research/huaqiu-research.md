@@ -486,6 +486,27 @@
 | 阶段 1 · 连接器与开关 | ✅ | 同上脚本：`business_api` 连接器（仅当 `HUAQIU_ERP_BASE_URL` 已配置）、`agent.business_read_enabled` 租户定向开启、`agent.rerank_enabled` 10% 灰度 |
 | 阶段 1 · 华秋评估用例 | ✅ | `tests/evals/dataset.py`：发票变体对、赔付、EQ 交期、库存必须弃权（5 例全通过） |
 | 阶段 1 · 读工具 | ✅ | `inventory.check_stock` 已注册，回执带 `fetched_at`（报告风险 1：缓存的进度等于过期承诺） |
+| 阶段 2 · 写执行路径 | ✅ | 工具网关的提议/批准/执行；管理台「写操作审批」页；**"智能体提议、人批准"两侧都有测试**（附录 D、收尾 4） |
+| 阶段 2 · EQ 业务模型 | ✅ | `Case.category = eq_confirmation`；`case.eq_confirm`（**`human_approval`**，见附录 F 第 3 条的修正）；迁移 `0038` |
+| 阶段 2 · 会话↔工单关联 | ✅ | `CaseConversation` 此前**有读无写**（优先认领因此一直空转），已补写入路径 |
+| 阶段 2 · 智能体触发 | ✅ | 识别"确认" → **转人工** `EQ_CONFIRMATION_REQUIRES_HUMAN`；**不提议**（AI 只转述 + 收集，见附录 G） |
+| 阶段 2 · 管理台工作台 | ✅ | `GET /v1/tools`（**按调用者权限过滤**）+ 发起提议 + 新建工单；36 项浏览器断言 |
+| 阶段 2 · 分类器可达性 | ✅ | `ACTION_VERBS` 补 `create/report/raise/submit/file/open`；`expected_route` 从**死字段**变成路由守卫（附录 E） |
+| 阶段 3 · 质量投诉半自动化 | 🟡 | `case.create`（`confirmed_write`，ADR 0008）✅ + **证据附件**（迁移 0040、`POST/GET /v1/cases/{id}/attachments`、预签名读取）✅。**人工裁定**本就由人做，无需再建 |
+| 阶段 3 · BOM 配单进度查询 | ⬜ | **未开始，且被外部依赖阻塞**：`business_api` 适配器需要新增 `bom_read` 能力与 ERP 端点。只建平台侧工具会得到一个永远 `TOOL_UNAVAILABLE` 的工具——正是本仓库反复出现的"宣告存在、实际打不到" |
+| 阶段 3 · 大客户分层（直转专属人工） | ⬜ | **未开始，且被缺失的关联阻塞**：SLA 档位那半已可用（`sla_policy_for_tier`，走 `Case.enterprise_account_id`），但**平台无从得知一个会话属于哪个 `EnterpriseAccount`**——`ExternalResourceRef` 只映射了 chatwoot account/conversation → tenant，没有 contact → account。风险登记册第 9 条要的正是这个，所以先要建那条关联 |
+| 阶段 3 · NextPCB 英文语料按知识空间隔离 | ⬜ | 未开始：`KnowledgeSpace` **没有 language 字段**，检索也没有按语言过滤。需要一次 schema 变更 + 检索侧过滤 + 一条"中英不串"的泄漏测试（跨租户测试是模板） |
+| 阶段 4 · 运营飞轮 | 🟡 | 工具已就位（缺口队列、质量看板、prompt 发布/回滚三页 + 各自服务），**缺的是每周真的去跑**——那是运营节奏，不是代码 |
+
+### 阶段 2 与原计划的两处差异（都已按证据改回/改对）
+
+1. **`WAITING_CUSTOMER → WAITING_INTERNAL` 状态边：没有加。** `DEFAULT_SLA.running_states`
+   把三个 waiting 状态全部排除在计时之外，客户确认后转 `WAITING_INTERNAL` 等于**在平台最该快的
+   区间给自己发延期**；`→ IN_PROGRESS` 本就合法，且会把计时压回我方，同时与"交期自 EQ 确认后起算"
+   的口径一致。状态机与 `docs/domain-model.md` 的状态表**一行未改**。
+2. **`case.eq_confirm` 的风险级：`human_approval`，照计划执行。** 我一度改成 `confirmed_write`
+   以便智能体能够提议，**那是错的**（详见附录 F 第 3 条）：智能体够不到是设计目的。
+   代价是智能体侧只识别不提议——那正是计划说的"AI 只做转述 + 收集确认，放行需人工"。
 
 ### 实施中发现的两个真实缺陷
 
@@ -537,3 +558,895 @@
 - `docs/huaqiu-deployment-analysis.md`（2026-09-19）：偏**部署分析与缺口清单**，已含场景映射与上线路线。
 - 本报告：**补全公司业务调研（第一部分）与岗位协作实证**，并将场景按 **L1–L6 可控性分层**、将难点归纳为**五项根因-应对**、将上线路径拆为**阶段 0–4 + 指标 + 风险登记册**。
 - 两份文档应**合并维护**：本报告的第三部分是 `huaqiu-deployment-analysis.md` 第 5 节的展开版。建议后续以本报告为主文档，部署分析文档保留其**缺口清单**作为唯一来源。
+
+## 附录 D · 阶段 2a 写执行路径已落地（2026-09-19）
+
+附录 B 认定的"智能体没有写路径"已按建议拆分并完成 **2a**。核心设计决策与结果：
+
+**决策一：智能体可提议，永不批准。**
+`integration_service` 原先只持有 `{tool.read, tool.write.low}`，而工具网关在 `propose`
+时会按工具的 risk class 复核动作，于是**智能体连提议都被拒**——AGENTS.md 第 7 条
+"LLM 可以提议写操作"在当时无法实现，人也永远看不到那条提议。修法是授予
+`tool.write.confirmed`，并明确它的边界：
+
+- 提议是惰性的：执行前必须有一条绑定 action hash 的 `ActionConfirmation`；
+- 唯一能创建确认的路径是 `POST /v1/tool-proposals/{id}/confirm`，它要求 `case.update`，
+  而该角色**不持有** `case.update`——所以智能体无法批准自己的提议；
+- `tool.human_approval` 保持不授予，风险阶梯顶端对智能体在任何阶段都不可达。
+
+**曾尝试并撤销的一个守卫。** 一度在 `ToolGateway.confirm` 里加了"确认人不得是提议人"。
+它错在两点：既**不必要**（真正的控制是 `case.update` 这道策略门），又**有害**——坐席在管理台
+自己提议、自己确认是既有且合理的流程，而该守卫会连带改掉两条
+`zero_tolerance("unauthorized_writes")` 测试所固化的语义。改成在
+`test_policy_engine.py` 里断言"该角色持有 `tool.write.confirmed` 但**不**持有
+`case.update` 与 `tool.human_approval`"——这才是一条能被观察到失败的守卫。
+
+**决策二：风险等级决定行为，而不是另立一套规则。**
+
+| 工具 risk | 智能体行为 |
+|---|---|
+| `low_write`（`im.send_notification`） | 提议 → 执行 → 后置校验 → 回执作为证据进入回答 |
+| `confirmed_write`（`jira/linear.create_issue`） | **提议后即止**，转人工，reason code `TOOL_CONFIRMATION_PENDING` |
+| `human_approval` | 策略层直接拒绝，转人工 |
+| 无候选 / 无连接器 / 缺配置 / 未注册 | 各自的 reason code 转人工，**不写提议行** |
+
+**决策三：一半参数来自租户配置，而非客户。**
+"建一张 Jira 单"需要 project key，客户不知道也不该被问。`WRITE_ARG_DEFAULTS` 把它映射到
+连接器配置（`default_project` / `default_team` / `default_channel`）；未配置时**转人工而不是猜**——
+单子开进错误项目比不开更糟。客户那一半是本次发言本身（`summary`/`title`/`text`，截断到 200/500 字）。
+
+**决策四：确认载体是管理台，超时自动作废。**
+新增 `GET /v1/tool-proposals`（`case.read` 鉴权、租户隔离、可选 status 过滤）。它同时返回
+`status`（库中真值）与 `effective_status`：仍为 `authorized` 但已过期的提议报告为 `expired`，
+因为 `confirm`/`execute` 都会拒绝它——否则管理台会展示一个**批不了的审批**，操作者只能靠"点一下试试"发现。
+
+**明确不做的**：`crm.update_account` 不进入选择器。它接受自由格式 `fields` 补丁，
+从一句自然语言推导补丁需要模型，而平台规则是确定性代码决定写入外部系统的内容。
+把它列进选择器只会"每次选中、每次转人工"，与没上线这个工具无法区分。
+（该工具仍可由人在管理台提议。）
+
+**已知边界（下一步的输入）**：意图分类的 `ACTION_VERBS` 里**没有** `create`，
+所以"请帮我建一张工单"目前**不会**路由到写路径（`escalate`/`change`/`cancel` 等会）。
+加入动词属于分类器改动，须先跑全量评估数据集确认无假阳性——本阶段刻意未动。
+
+**验证**：新增 12 条写工具单测、5 条编排器写路径集成测试、4 条提议列表 HTTP 测试、
+1 条策略断言。全量套件 1367 收集（`testpaths` 修复后 +18，见下）、0 失败；
+ruff / mypy 全绿。关键测试做了**变异验证**：把 `if proposal.required_confirmation` 改为恒假后，
+测试立即失败（且失败在网关自身的 `CONFIRMATION_REQUIRED` 上——该性质由两层共同守住）。
+
+**顺带修掉的配置缺陷**：`pyproject.toml` 的 `testpaths` 只列了 `tests/evals`，
+但注释声称套件有 `apps/api/tests` 与 `tests/` **两个**测试根——于是 `tests/unit/` 下的
+18 条测试（含华秋种子守卫 9 条）**从未被默认运行收集**，只在显式指名时才跑。
+
+### 确认载体：管理台「写操作审批」页
+
+决策四说的"管理台载体"已落地：`apps/admin-web/src/pages/Approvals.tsx`（导航「写操作审批」）。
+页面围绕一件事组织——**"有什么在等我"**：
+
+- 顶部一个数字（等待人工处理的提议数），即使当前筛选在看历史也一直可见；
+- 默认筛选 `authorized`（待批准），其余状态可切换；
+- 列表行显示工具名 + 风险等级 + 状态 + 剩余分钟；
+- 详情面板展示**已冻结的参数**（JSON）、动作哈希、权限判定与有效期——
+  因为"批准"绑定的就是这些参数，操作者必须在点之前看到它们；
+- 批准后「执行」才可用；执行结果如实上报：`verified` 才说成功，
+  `unknown` 明确写成"未决，不要当作已完成"，失败显示错误码与 trace。
+
+**三个只有真在浏览器里点一遍才会暴露的缺陷**（都已修）：
+
+1. `effective_status` 起初只加在列表响应上，而详情面板读 `GET /{id}`，
+   于是拿到 `undefined`、两个按钮都是 disabled——页面看起来像权限问题。
+   修法是把该字段放进共用的 `_serialize_proposal`，并在测试里断言详情响应也带它。
+2. `?status=` 过滤匹配的是库里那一列，导致 `?status=authorized` 会返回
+   自己标签写着 `expired` 的提议。过滤器与显示口径必须一致。
+3. 详情里有效期一行把含 `{minutes}` 占位符的**值模板**当标签用，渲染出字面量
+   `(minutes) min left`；以及 "Needs approval" 徽章重复出现两次
+   （risk 徽章已经说过一次）。
+
+验收脚本 `.workbuddy-ai/acceptance/approvals.mjs` 26 项断言全过，含中英切换、
+诚实失败上报、过期筛选、低风险写免批准；页面无 console 错误。
+
+**顺带修掉的测试卫生问题**：`test_m2_http_api` 的 teardown 按 name 删
+`tool_definitions` 却没有 tenant 过滤——在共享开发库上跑一次，就把 pilot 租户
+正在用的 `jira.create_issue` 定义删掉了，下一个请求对本来正常的工具回
+`TOOL_NOT_REGISTERED`。teardown 不得伸到自己没创建的东西之外。
+
+## 附录 E · 写路径的可达性：把分类器改动变成可验证的改动（2026-09-19）
+
+附录 D 末尾记了一条已知边界：`ACTION_VERBS` 里没有 `create`，
+所以"请帮我建一张工单"不会路由到写路径。本轮处理它，但**先修工具，再改分类器**。
+
+### 先发现的问题：`expected_route` 是一个没人读的字段
+
+动手前做基线测量，结果发现 `tests/evals/dataset.py` 里 8 处
+`expected_route="knowledge_qa"` **全仓库无人读取**——而 `EvalCase.expected_route`
+的**默认值就是 `"knowledge_qa"`**。于是 28 条用例里有 7 条明明被分类到
+`sensitive` / `human_required` / `business_read` / `business_write`，
+却因为默认值而"声称"期望知识路径。**任何人审计这份数据集，都会得出"分类器坏得很严重"的结论**，
+而真相是这个字段毫无作用。（`CaseResult.route` 同样只声明不写入。）
+
+这正是本仓库反复出现的那类缺陷：**存在、被声明、无人消费**。而且比"无用"更糟——它会误导。
+
+修法不是删掉它，而是**让它变成真的**：
+
+- 默认值改为 `""`（= 未声明期望）。未声明就不检查，这才是诚实的默认；
+- `EvalRunner.run_case` 在声明非空时比对 `classify()` 的路由，不符则
+  `ROUTE_MISMATCH` 且该用例失败，同时把实际路由写进 `CaseResult.route`；
+- 给 7 条路由本身是**设计决策**的用例补上声明（sensitive / human_required /
+  business_read / business_write），并在注释里说明为什么那条路由是对的。
+
+**这一步是改分类器的前提**：加动词的失败模式正是"某条问题悄悄换了路由"，
+而在此之前，没有任何东西会因此变红。
+
+### 再改分类器，并且双向覆盖
+
+新增 `create / report / raise / submit / file / open` 六个动词。
+先跑**全量数据集测量**（`measure_action_verbs.py`）：六个候选动词**没有一个**移动任何用例的路由。
+但"没移动"只是弱证据——语料里根本没有这些句式。所以补上**双向守卫用例**：
+
+- 正向 5 条："Please create a ticket for this defect." / "I want to report a bug…" 等
+  → 必须路由到 `business_write`；
+- 反向 5 条："How do I create a new workspace?" / "What is the process to file a claim…" 等
+  → 必须留在 `knowledge_qa`；
+- 数据集侧再加一条端到端用例 `business-write-create-ticket`。
+
+**反向守卫立刻抓到一个真实假阳性**：`Where can I report a bug in the dashboard?`
+被路由到 `business_write`。原因是 `_has_request_frame` 会在句子的**任何位置**
+匹配 `can|could|will|would + I|we + <写动词> + <宾语标记>`，
+而 `report` 一旦成为写动词，`where can I report a …` 就命中了。
+
+修法必须**窄**：`_has_request_frame` 存在的理由恰恰是
+"Where is my order, **and can I change the delivery address?**"——
+wh-词开头、请求在后面的从句里。所以判据是**相邻性**而不是开头词：
+wh-词**紧邻**请求框架（`where can I …`）→ 这是 wh-词自己的疑问句，不是请求；
+出现在后续从句里 → 仍然是请求。并且专门加了一条测试锁住后者。
+
+这个假阳性**早于本次改动就存在**（`where can I change my address?` 同样会误触发），
+只是没有 `report` 这种动词时不容易被看见。**这是"写守卫用例"而不是"论证风险可控"的实证。**
+
+### 明确没做的事
+
+`How do I create an API key?` 被判定为 `sensitive`——因为 `api key` 在
+`RESTRICTED_TERMS` 里。这是一次**对合法流程问题的过度拒答**，但它是**安全决策**
+（凭据类词条的收紧），与分类器改动无关，因此**保持不动、记录在案**，
+不顺手夹带进这次改动。
+
+### 验证
+
+- `expected_route` 声明 16 条、不符 0 条；
+- 新增 3 条数据集守卫测试，其中一条**专门证明守卫会失败**
+  （故意声明错误路由 → `ROUTE_MISMATCH`）——无法观察到失败的守卫不构成证据；
+- `apps/api/tests/unit/agent_runtime/test_intent.py` 新增 11 条（5 正 + 5 反 + 1 复合从句）；
+- 顺带修掉 `qa_path._content_terms` docstring 的 `SyntaxWarning`（`\w` 未转义）。
+
+## 附录 F · 阶段 2b：EQ 确认业务模型（2026-09-19）
+
+附录 B 提出的 2b 三项内容里，**一项照做、两项按理由改掉了**。把改动理由写清楚，
+比默默照做更有价值。
+
+### 1. `Case.category = eq_confirmation` —— 照做
+
+`category` 是自由文本列（`String(63)`，默认 `general`），所以不需要迁移。
+新增 `CaseCategory` 枚举把它变成**有名字的词汇表而非约束**：未识别的值仍然可读，
+不会变成错误——这是租户可能想自行扩展的字段该有的取舍。
+
+### 2. `WAITING_CUSTOMER → WAITING_INTERNAL` —— **没做**（理由是 SLA）
+
+报告想加这条状态边。查了 `DEFAULT_SLA` 之后否掉了：
+
+```python
+running_states = {NEW, TRIAGED, IN_PROGRESS, REOPENED}
+```
+
+三个 waiting 状态**都暂停计时**。客户确认之后工作落回我方，此时若转到
+`WAITING_INTERNAL`，等于**在平台最该快的区间里给自己发了无限期延期**。
+`WAITING_CUSTOMER → IN_PROGRESS` 本来就是合法转移，且会把计时重新压回我方——
+这才是这个流程需要的激励。**所以状态机一行没改，`docs/domain-model.md` 的状态表也没改，
+只补了一段说明。**（报告里的这条是首版猜测，实测后发现与 SLA 策略冲突。）
+
+### 3. `human_approval` 风险级 —— 照做（**此条曾被我改错，已改回**）
+
+报告写的是 `human_approval`。我一度把它改成 `confirmed_write`，理由是
+"`integration_service` 不持有 `tool.human_approval`，该等级的工具智能体连提议都做不到"。
+**这个理由是错的，它回答错了问题：智能体够不到，是设计目的，不是缺陷。**
+
+证据是四份一致的：
+
+- 本报告**五处**都写 `HUMAN_APPROVAL`："AI 只能转述 + 收集确认，**不能代替放行**"、
+  "放行需人工"、"EQ 放行、赔付、退款一律 `HUMAN_APPROVAL`"、"⛔ EQ 放行…**必须人工**"；
+- `packages/policy/engine.py` 明确写着该类"**must be unreachable by the agent at every
+  stage, propose included**"，是刻意设计而非疏漏；
+- 业务上：**case 状态就是工厂读的那个信号**，记录确认离放行只有一步，
+  而客户在对话里说的一句话不等于放行。
+
+已改回 `human_approval`，并且**补了一个数据迁移**（见下）。
+代价是智能体侧不能提议——那正是设计要的，见附录 G 的修正。
+
+### 工具本身：`case.eq_confirm`
+
+**两个维度的作用域**，缺一不可：case 必须是 `eq_confirmation` 类（否则工具能指向普通工单），
+且必须处于 `waiting_customer`（否则会在问题提出之前就"确认"）。拒绝都是明确的错误码：
+
+| 情况 | 结果 |
+|---|---|
+| 正常 | 转移到 `in_progress`，后置校验观察行状态 |
+| 非 EQ 类 | `CASE_NOT_AN_EQ_CONFIRMATION` |
+| 不在等客户 | `CASE_NOT_AWAITING_CONFIRMATION` |
+| 已确认 | `already_confirmed: true`（同一事实，不是失败） |
+| 引用不明确（两个 case 匹配） | `CASE_NOT_FOUND`——**绝不挑一个** |
+| 他租户 | `CASE_NOT_FOUND`（RLS 让它不存在） |
+
+转移走 `CaseService.apply_command` 而不是直接写 `status` 列：状态表、乐观并发校验、
+SLA 时间累计都由 service 拥有，直接写列会绕过这三者却"看起来成功了"。
+
+### 顺带发现的真实缺陷：平台自有工具在 HTTP 面不可执行
+
+`case.read` 在 `TOOL_CATALOG` 里有定义、编排器能跑，但它**故意不在**
+`TOOL_PROVIDERS` 里（不需要连接器）。而 `registry._build` 对所有工具都要求连接器，
+于是 `POST /v1/tool-proposals/{id}/execute` 对它一律回 `TOOL_EXECUTOR_MISSING`——
+**目录里宣告存在、但只有一个调用面能跑的工具**。编排器之所以能用，
+是因为读路径**手工 `setdefault` 注入**了执行器。
+
+修法：`registry` 新增 `PLATFORM_TOOLS` 路径，自行构造平台自有工具的执行器；
+编排器里那行手工注入随之删除（它现在是第二处真相）。
+
+### 又一处"有读无写"：`case_conversations` 从来没人写入
+
+追查"智能体触发侧"的前提时发现：**`CaseConversation` 全仓库只有一个读者
+（`inbox_consumer.case_conversation_ref`），没有任何写入者**，数据库里 0 行。
+
+后果是具体的：那个 join 被用来筛选"已升级（SLA 梯子响过）的 case 所在的会话"，
+而 `worker.priority_claim_enabled` 正是用它来做优先认领——
+**join 永远为空 ⇒ 优先认领永远认领不到任何东西 ⇒ 开关打开后行为毫无变化，也不报错。**
+运维把开关打开、看到没有任何变化、以为它在工作，这是最糟的组合。
+
+修法与仓库里已有的同类修复一致（`Case.enterprise_account_id` 当年也是这样：
+"API 不接受、方法不设置"，于是没人能写）：`create_case` 增加
+`conversation_ref_id`，同时写一条 `CaseConversation(relationship="origin")`；
+`CaseCreateIn` 增加该字段。**这是平台唯一可靠地知道这个关联的时刻。**
+
+同时验证了读者的语义没有被顺手放宽：join 仍然是"至少响过一次升级的 case"，
+不是"任意 case"——把空 join 修好不能靠把筛选条件放宽。
+
+### 明确未做：智能体的触发侧
+
+`case.eq_confirm` **没有**进入写工具选择器。原因是触发条件是
+"客户这句话是对**本会话关联的**某张 `waiting_customer` EQ 工单的确认"，
+而选择器是**只依赖单句文本的纯函数**（这是它刻意的设计，见 `selector.py` 文档）。
+把会话→工单的关联接进选择器是另一件事，需要先决定关联从哪里来。
+
+所以本阶段的消费者是**人**：坐席在管理台「写操作审批」页提议、批准、执行——
+正是 2a 建好的载体。**这是一个有意留出的缺口，不是遗漏。**
+
+### 验证
+
+- 新增 11 条集成测试（happy path、UUID 引用、重复确认、四类拒绝、RLS、
+  后置校验"观察而非复述"、平台工具无连接器可解析）；
+- 新增 3 条注册表单测（平台工具必须在目录里、不得有 provider、无任何连接器时仍可解析）；
+- **变异验证**：注释掉 category 守卫 → `test_an_ordinary_case_is_refused` 立刻失败
+  （普通工单被"确认"、生产被按错误规格放行）；
+- 全量套件 1427 → **1440** 收集、0 失败 / 0 错误 / 8 跳过；ruff / mypy 全绿；
+  `release_check --evidence-only` exit 0（15/4/3）。
+
+### 补完：管理台可以自己发起提议了（`GET /v1/tools` + 提议表单）
+
+2b 落地后我写了一句"本阶段的消费者是人：坐席在管理台提议、批准、执行"。
+**但当时的管理台只能批准/执行已存在的提议——它是个队列，不是工作台。**
+坐席要发起一条提议仍然得用 `curl`。那不算工作流，所以补上：
+
+- **`GET /v1/tools`**：本租户可提议的工具目录（租户行 + 共享行，按 name 去重取最高版本，
+  与 propose 路径的解析口径一致）。目录**从数据库读**而不是前端硬编码，
+  否则服务端加一个工具就得改前端。`prohibited` 直接**不列出**——
+  API 永远会拒的选项不是选项，列出来只会把表单变成错误生成器。
+- **管理台「发起写操作提议」面板**：工具下拉（来自该接口）、参数 JSON（**按工具的
+  `input_schema` 预填**，否则任何有必填项的工具都必然 400，而服务端回的是 JSON pointer
+  而不是人认得的字段名）、提交后刷新并选中新提议。
+
+#### 两个只有真点一遍才会发现的问题
+
+1. **成功提示被自己卸载掉了。** 发起成功后 `onCreated` 会关闭面板，
+   而提示 banner 渲染在面板内部——**在同一次 commit 里被卸载**，
+   坐席看到的是表单凭空消失、没有任何确认。修法：把提示交给**页面级**反馈区
+   （它比面板活得久）；面板自己只保留错误提示，因为**失败**应该出现在操作者正看着的地方。
+   *验收脚本一开始断言的是面板内的 banner，正是因为断言不到才暴露了这个缺陷。*
+2. **夹具的 case 引用不唯一。** 固定用 `88001`，第二次运行时
+   `CASE_NOT_FOUND` ——因为引用同时匹配多张 case，而执行器**拒绝猜**。
+   行为是对的，是夹具不够具体。
+
+#### 端到端验收（真实浏览器，31 项断言全过）
+
+`case.eq_confirm` 的完整链路第一次真正跑通：
+**建 EQ case（带会话关联）→ 逐级走到 `waiting_customer` → 管理台发起提议 →
+批准 → 执行 → case 离开 `waiting_customer`（转为 `in_progress`）**，页面无 console 错误。
+
+顺带记录：`POST /v1/cases` 只接受 `subject/description/priority/category/
+enterprise_account_id/conversation_ref_id`，**没有"直接建成 waiting_customer"的捷径**——
+状态机是显式且留痕的，夹具只能像人一样逐级走。这是对的，不是缺陷。
+
+### 收尾：管理台「Cases & SLA」页在浏览器里**每次访问都崩**（已修）
+
+同样的"队列 vs 工作台"问题在工单页更严重：它能 transition、改优先级、改派，
+**但不能建工单**——于是包括 `eq_confirmation` 在内的每一张新工单都只能靠 `curl` 建。
+补上「新建工单」面板后加浏览器断言，**立刻暴露了一个存在已久、且每次访问都触发的崩溃**：
+
+```
+TypeError: Cannot read properties of null (reading 'subject')  in <CaseDetail>
+```
+
+根因是详情 loader 在"未选中"分支返回 `{ case: null as unknown as Case }`——
+**一个骗过类型系统的谎**（没有那个 cast 根本编译不过）。而渲染守卫写的是
+`detail.data ? <CaseDetail c={detail.data.case}/>`：`detail.data` 是**真值对象**
+（里面装着 null），守卫放行，`CaseDetail` 去读 `null.subject` → 崩。
+**页面首次加载 resolve 后必崩。** 修法：未选中分支返回 `null`，守卫改成 `detail.data?.case`。
+
+**没有任何测试发现它，因为从来没有测试在浏览器里打开过 `/cases`。**
+
+> **可复用结论：为了压住类型错误而写的 `as unknown as X`，就是值得去找运行时错误的地方。**
+> 类型系统恰好在会抓到它的那一点被关掉了。
+
+验收：管理台脚本 **36 项断言全过**（新增建单段：本地拒空标题 → 建单成功 →
+面板关闭 → **通过 API 确认工单存在且分类正确**），`Z_page_errors: none`。
+
+## 附录 G · 阶段 2b 的最后一块：智能体的触发侧（2026-09-19）
+
+### 修正：智能体**不**提议，它识别后转人工
+
+附录 G 的初版让智能体在识别到确认后走写路径、提议 `case.eq_confirm`。
+**那是错的**，与 `human_approval` 的设计直接冲突（见附录 F 第 3 条的修正）。
+正确形态是：
+
+- 智能体**识别**"这是一个关联会话正在等的确认"（四个事实全中，见下）；
+- 然后**转人工**，理由码 `EQ_CONFIRMATION_REQUIRES_HUMAN`；
+- **不提议、不记录**。工具是 `human_approval`，只有 `tenant_owner` 能在管理台记录。
+
+这不是"识别了却没做事"：不识别的话，QA 路径会拿语料去回答一句"确认"，
+或者对刚回答完平台提问的客户追问"您是说……吗"——两种都明显是错的。
+识别 + 转人工，正是报告说的"**转述 + 收集确认，放行需人工**"。
+
+四个事实全中才触发：租户已开写路径开关；会话**恰好**关联一张工单（多于一张 → 不触发）；
+该工单是 `eq_confirmation` 且 `waiting_customer`；这句话读起来是同意
+（`agent_runtime/confirmation.py`：纯词法、**短 / 无否定 / 非疑问**）。
+
+**因此我撤掉了这些**（避免留下"有读无写"的死代码）：选择器的 `eq_case_ref` 参数与
+`CONTEXT_WEIGHT`、`_extract_write_args` 的 `case.eq_confirm` 分支、
+写路径的 `eq_case_ref` 透传、以及写分支与追问闸门的两处放行。
+
+### 迁移 0038：改风险级必须迁移，否则只是注释
+
+`ensure_tool_definitions` **只增不改**（刻意如此：租户可能自己改过定义，不该被静默修回）。
+后果是：**在代码里改风险级，只对新租户生效**；而网关读的是**行里的 risk**。
+所以不迁移的话，代码写着 `human_approval`、每个已存在的租户却仍是 `confirmed_write`，
+严格的等级就只是一句注释。
+
+`0038_eq_confirm_human_approval` 把已有的 `case.eq_confirm` 行从
+`confirmed_write` 提到 `human_approval`（`risk` 与 `required_permissions` 一起改，
+否则行会宣称一个它已经没有的控制），并 bump `EXPECTED_MIGRATIONS` 到 38。
+
+### 顺带修掉的目录缺陷：列出调用者根本提议不了的工具
+
+`GET /v1/tools` 原本只排除 `prohibited`。但**写权限很窄**：
+`support_agent` 只有 `CASE_READ/CASE_CREATE/CASE_UPDATE/KNOWLEDGE_READ/TOOL_READ`，
+**一个写权限都没有**。于是坐席会看到一个写工具、选了、然后 403——
+正是我当初排除 `prohibited` 时要避免的"把表单变成错误生成器"。
+
+现在按**调用者是否持有该风险级对应的 action** 过滤，两侧都测：
+坐席看不到写工具（其目录里只有 read 类，本模块甚至没种 read 类，所以为空——这本身就是断言），
+`tenant_owner` 能看到全部。管理台在目录为空时也**说明原因**，而不是给一个空下拉。
+
+**这也修正了我先前的一个错误认知**：管理台的"发起提议"面板**只对 `tenant_owner` 有意义**。
+坐席能**批准**（持有 `CASE_UPDATE`）但不能发起——这正是 2a 设计的人机分工。
+
+### 验证
+
+- 单测 21 条（16 正 + 5 反：长度 / 否定 / 疑问）；**80 字符阈值被测试当场推翻**
+  （`"ok but please also update the delivery address…"` 76 字符含 `ok` 却不是同意），收紧到 48；
+- 集成 6 条：确认 + 关联工单 → **转人工且不产出提议**（`reason=EQ_CONFIRMATION_REQUIRES_HUMAN`）；
+  无关联 / 非 waiting / 非 EQ 类 / 否定句 → 均不触发；
+  以及**断言 `case.eq_confirm` 就是 `human_approval` 且权限是 `tool.human_approval`**——
+  一旦有人把它降级回 `confirmed_write`，这条和上面那条会同时失败；
+- 目录权限过滤两侧测试；**变异验证**：上下文查询恒返回 `None` → 正向测试立刻失败；
+- 管理台 36 项断言全过（`tenant_owner` token），完整链路仍然跑通；
+- 连跑两遍 0 失败、0 残留（夹具按"子表先删"补 `case_conversations`/`cases`）。
+
+## 附录 H · 阶段 3 的第一块：`case.create`（2026-09-19）
+
+阶段 3 的 marker 是"`case.create` + 证据附件 → 人工裁定"（附录 A 表格最后一行）。
+本轮交付**工具本体与控制台路径**，附件与分层留待后续。决策理由写在
+`docs/adr/0008-case-create-risk-class.md`，这里记录实施与实测。
+
+### 1. 风险级：`confirmed_write`（对照 `case.eq_confirm` 的 `human_approval`）
+
+四条证据一致：报告 §2.4 难点 4 在 `HUMAN_APPROVAL` 下**只列**"EQ 放行、赔付、退款"；
+§3.5 说"`case.create` + 证据附件 → **人工裁定**"（人工的裁定在投诉**结论**上，不在开单动作上）；
+`support_agent` **本就持有** `CASE_CREATE`，提级会与既有 RBAC 矛盾；
+`engine.py` 的注释把该类定义为"`integration_service` 可提议、`support_admin` 可批准"。
+
+**顺带解决一处悬空**：`integration_service` 持有 `tool.write.confirmed`，但自 EQ 升到
+`human_approval` 后**全仓库没有任何工具消费它**——权限表里一个无人使用的格子。
+`case.create` 是它的第一个真实消费者。
+
+### 2. 参数从哪来：账号必填、由人给定（用户选定 A 方案）
+
+`create_case` 用 `enterprise_account_id` 解析 SLA 层级并算两个截止时间，且**把 `sla_tier`
+快照到行上**（service 注释：优先级变更会重算 deadline，届时重读账号会让一份中途变更的合同
+移动一个已经在跑的时钟）。所以账号选错 = 时钟从第一秒就是错的且**永不自我纠正**，
+而报告 §2.4 难点 5 说最容易投诉的正是 4 层级客户的顶层。
+
+仓库里**没有**与 `case.eq_confirm._find_locked` 对等的账号解析器（账号名/简称无唯一性保证），
+所以"猜一个账号"等于把字符串相似度喂进 SLA 截止时间。
+
+**沉默降级到 `None` 被否决**：`create_case` 在没有账号时**完全正常成功**，
+工单建出来了、面板是绿的、而这张单永远无法因首次响应超时而升级——**不报错的地方就是最贵的地方**。
+
+三处守卫：schema 的 `required`（提议行建立之前就拒）、执行器的显式检查（绕过网关的调用也拒）、
+一条反向测试（断言库里**不存在** `enterprise_account_id IS NULL` 的工单）。
+
+### 3. 智能体触发侧：**不提议**（用户授权我按对项目最有利的方式决定）
+
+`case.create` **没有**加进 `_WRITE_SCENE_AFFINITY` / `_WRITE_SUBJECT_NOUNS`。
+理由与附录 D 排除 `crm.update_account` 同源但更硬：账号 id 按第 2 条**必须由人决定**，
+而 `subject`/`description` 是自由文本；列进选择器就是"每选中一次必然失败一次"的候选，
+在选择审计里与"根本没发布"不可区分。
+
+对标 `case.eq_confirm` 的落地方式：工具 + 控制台路径（坐席可提议、管理员可批准）。
+**新增工具不需要迁移**（`ensure_tool_definitions` 只增不改，且此前无 `case.create` 行）——
+这条要与迁移 `0038` 对照记住：**改风险级必须迁移，新增工具不用**。
+
+### 4. 实施中发现的真实缺陷：中文写请求根本到不了写路径
+
+写测试时我假设"`ACTION_VERBS` 现在是 `create` 了，所以'帮我建一张工单'会路由到 `business_write`"，
+**这个假设当场被既有守卫推翻**（`_write_detection` 的前置断言直接失败）。实测：
+
+| 话术 | 路由 |
+|---|---|
+| "帮我建一张工单" | `knowledge_qa` |
+| "请开一张工单" | `knowledge_qa` |
+| "我要投诉质量问题" | `knowledge_qa` |
+| "Please create a case for this complaint" | `business_write` ✅ |
+| "I want to report a quality problem, open a ticket" | `business_write` ✅ |
+| "create a case" | `business_write` ✅ |
+| "report a quality problem" | `business_write` ✅ |
+| "open a ticket" | `business_write` ✅ |
+
+**`ACTION_VERBS` 全是拉丁词，没有一个中文写动词。** 附录 E 补的那六个（`create/report/raise/
+submit/file/open`）对中文话术**一条都不生效**。后果具体：华秋的客户说中文，
+而"帮我建一张工单"会被当成知识问答去检索语料并**引用政策文档回答**——
+这是一个错误答案，不是一次擦肩而过。既有测试用英文，所以这个不对称一直没被看见。
+
+> **⚠️ 本节措辞已于附录 I 收窄。** 上句初稿写作"没有任何中文动词"，
+> 过宽：`_QUOTE_REQUEST` 里就有中文词（`多少钱|怎么收费|报个?价|价格是多少`）且工作正常；
+> 中文**知识问答**也是**被设计过**的（dataset 有 5 条华秋中文用例带 `must_abstain`）。
+> 准确的说法是：**缺的是中文写意图与人工请求的词汇**，不是"没有中文支持"。
+
+反过来说，这也让第 3 条的决定更安全：中文话术压根不会触发写路径，
+所以不存在"提了工具却永远转人工"的噪声。
+
+**已将它固化为一条明确的期望失败测试**（`test_chinese_case_requests_do_not_reach_the_write_path_at_all`），
+而不是从测试里略去中文样本：这样它无法被误读成正确行为，补上中文动词时那条测试会翻转，
+与英文那条合并。**修它不在本轮范围**（属分类器改动，牵动评估数据集，
+像附录 E 那样必须先对全量 dataset 做影响测量）。
+
+> **→ 已于附录 I 修复。** 那条期望失败测试已按它 docstring 预告的方式**翻了面**，
+> 现在叫 `test_chinese_case_requests_reach_the_write_path`。
+> 注意：修法**不是**"补上中文动词"——附录 I 证明往 `ACTION_VERBS` 加词按现有逻辑
+> 不可能触发，必须新造中文判别链。
+
+### 5. 变异验证（守卫必须能观察到失败才算证据）
+
+对 5 处关键守卫逐一反转，全部被捕获，且失败的是**正确的那条测试**：
+
+| 变异 | 结果 |
+|---|---|
+| 缺少账号 → 静默降级为 `None` | ✅ `test_a_missing_account_is_refused_rather_than_defaulted` 失败 |
+| 后置校验恒真（信输出不信行） | ✅ `test_the_postcondition_is_observed_not_taken_from_the_output` 失败 |
+| 接受客户端传入的 `tenant_id` | ✅ 6 条失败（含租户归属、跨租户、未解析租户） |
+| 从 `PLATFORM_TOOLS` 移除 | ✅ `test_case_create_resolves_without_a_connector` 失败 |
+| 风险级降为 `low_write` | ✅ `test_case_create_is_a_confirmed_write_...` 失败 |
+
+### 6. 顺带修掉我自己写错的两处（都因静态检查/测试当场暴露）
+
+- **`_iso` 假设了 datetime**：`first_response_due_at` 是 **epoch 秒整数**（仓库用 UTC 整数存时间戳，
+  在边界渲染）。首次运行三条测试同时抛 `AttributeError: 'int' object has no attribute 'isoformat'`。
+- **凭印象写了 `CasePriority` 枚举**：该枚举**不存在**，优先级是 `cases/router.py` 的
+  `VALID_PRIORITIES = {"p0","p1","p2","p3"}`。改为本地常量 + **一条断言它与路由保持一致的测试**
+  （复制的常量只有被检查才安全）。
+
+### 7. 交付与验证
+
+- **新增**：`tool_gateway/case_create.py`（执行器）、`tests/integration/test_case_create_tool.py`（14 条）、
+  `docs/adr/0008-case-create-risk-class.md`；
+- **改动**：`registry.py`（`PLATFORM_TOOLS` + `TOOL_CATALOG` 条目 + `_platform_executor` 传
+  tenant/actor）、`tests/unit/tool_gateway/test_write_tools.py`（+2 条）；
+- 新增工具**无迁移**；`ruff` + `mypy` 双绿；工具网关相关 85 条测试全绿。
+
+---
+
+## 附录 I · 阶段 3 的第二块：中文意图分类（2026-09-19）
+
+附录 H 第 4 条把中文写路径缺口**钉成了期望失败**，第 5 条立了"守卫必须能观察到失败"
+的规矩。本附录按那条规矩，先测量、再实现、最后变异验证。
+
+### 1. 先测量（不测量就动手，是把改动变成不可评价的改动）
+
+新建 `docs/research/chinese-intent-measurement.md`，用 14 条中文话术实测：
+
+| 话术 | 改动前路由 |
+|---|---|
+| 帮我建一张工单 / 请开一张工单 | `knowledge_qa` |
+| 我要退款 / 我要取消订单 | `knowledge_qa` |
+| 我要投诉质量问题 / 把这张单转给人工 | `knowledge_qa` |
+| 转人工客服 | `knowledge_qa` |
+
+**三条结论**：
+
+1. 中文意图分类**整体**未实现——这是**安全级**问题，不只是可达性：
+   `_HUMAN_REQUEST` 的语义承诺是"被无条件立即兑现"，而中文说"转人工"拿到的是
+   一篇政策文档。对只讲中文的试点租户，这条承诺**从未生效过**。
+2. 根因：除 `_QUOTE_REQUEST` 外，所有词表全拉丁。
+3. **但措辞要收窄**（见上方对附录 H 的修正）：中文**知识问答**是被设计过的，
+   缺口是**写意图 + 人工请求**，不是"没有中文支持"。
+
+### 2. 关键判断：往 `ACTION_VERBS` 加中文词**不可能生效**
+
+实测而非推断——三条独立机制**同时失效**：
+
+| 机制 | 位置 | 对中文为何失效 |
+|---|---|---|
+| `_OBJECT_MARKERS` | `is_action_request` | 要求 `rest[0] in {the,a,my,our,this…}`，中文无冠词/限定词 |
+| `_looks_like_a_write` | `qa_path.py` | 分词用 `re.findall(r"[a-z']+", ...)`，中文**零 token** |
+| `\b...\b` | 所有模式 | 两个 CJK 字符之间**不构成词边界**，按构造不适用 |
+
+所以必须**新造中文判别链**。`_QUOTE_REQUEST` 是可行性的**证据**——
+它是唯一带中文词的模式，且中文报价问句路由正确：
+
+```python
+_QUOTE_REQUEST = re.compile(r"(?:多少钱|怎么收费|报个?价|价格是多少|给我报)", re.IGNORECASE)
+```
+
+### 3. 实现：一条中文专有判别链，与英文链并列
+
+新增约 120 行，位于 `_PROCEDURE_QUESTION` 之前：
+
+- `_CN_TICKET_REQUEST` —— 建/开/创建/提/发起/生成 + `\S{0,3}` + 工单类名词。
+  **量词是必须的**：中文写"建**一张**工单"而不是"建工单"，纯动词表会漏掉真实写法；
+- `_CN_BA_CONSTRUCTION` —— 把字句（宾语前置）；
+- `_CN_REQUEST_FRAME` —— 请求框架 + 写动词 + **紧跟中文宾语**；
+- `_CN_HUMAN_REQUEST` —— 人工/真人/专员/转人工；
+- 两道提问否决守卫：`_CN_PROCEDURE`、`_CN_QUESTION_PARTICLE`（句尾 `吗呢吧`）。
+
+**求值顺序刻意放最后**（`elif` 排在 `_looks_like_a_write` 之后）：两种词表零重叠，
+实践中无歧义；放最后使英文所有既有用例的**信号字符串逐字节不变**——
+这是 16/16 基线守得住的前提。这是一次**纯增量**改动。
+
+### 4. 变异验证 4/4 全被捕获（含两次漏网的教训）
+
+| 变异 | 移除 | 被哪条测试抓到 |
+|---|---|---|
+| A | 中文问句否决守卫 | `test_chinese_questions_that_carry_a_full_action_frame_are_still_questions` |
+| B | `_CN_HUMAN_REQUEST` 调用点 | `test_chinese_request_for_a_person_is_honoured` |
+| C | `_is_cn_action_request` 调用点 | `test_chinese_action_requests_reach_the_write_path` 等 3 条 |
+| D | `_CN_BA_CONSTRUCTION` | `test_the_ba_construction_is_detected_on_its_own` |
+
+**A 和 D 第一次都漏网了**，这是本附录最值得记的部分：
+
+- **A 漏网**：早期守卫用例（`我要退款吗？` 之类）**碰巧**仍留在知识路径，
+  不是因为守卫起了作用。补了 3 条**同时带完整动作框架和问句形状**的用例才抓住；
+- **D 漏网**：`把这张单转给人工` 恰好也命中 `_CN_HUMAN_REQUEST`（含"人工"），
+  绕过了把字句逻辑。补了 `把这个订单取消`——无框架、无工单名词、无人工词——才抓住。
+
+**教训**：变异验证测的不是"代码在不在"，而是"测试是否真的锁住了行为"。
+第一次漏网若不复盘就宣称 4/4，等于用假证据交差。
+
+### 5. 门禁耦合：一个架构级发现（未擅自改）
+
+把 12 条中文用例加进 `tests/evals/dataset.py` 后，评估门禁立刻红：
+`abstention_correct_rate: 0.8293 vs 0.9`。
+
+**根因不是用例写错**：`runner.py` 的 `elif decision.abstain:` 把**任何**非 `must_abstain`
+的弃答都记为 `abstention_false`，而中文问句打在英文语料上**必然弃答**
+（`NO_AUTHORIZED_EVIDENCE`，这正是那 5 条华秋 `must_abstain` 用例的设计意图）。
+即：`expected_route` 断言**路由契约**，弃答率统计**检索契约**，
+同一条用例同时被两个契约检验。`test_release_gates.py` 的 `KNOWN_GAPS` 是空的，
+门禁要求全绿，没有豁免口。
+
+**处理**：dataset **完整回退**到原 16 条（0 mismatch），中文路由断言移进
+`test_intent.py`（那才是它的归属）。门禁恢复全绿。
+**代价已明确记录**：中文路由契约目前不在门禁覆盖内。
+两种解法（改 `runner.py` 的弃答语义 / 接受单元测试作唯一守卫），
+**我选了后者并写进文档**——前者改的是门禁语义，属于"不擅自决定"的范围。
+
+### 6. 退役的期望失败钉子
+
+`test_chinese_case_requests_do_not_reach_the_write_path_at_all`
+是我在附录 H 阶段写的**缺口钉子**。缺口补齐后它必然失败，已按它 docstring 里
+**预告的方式翻面**为 `test_chinese_case_requests_reach_the_write_path`。
+
+一个会因修复而变红的测试，是缺口真实存在过的证据。
+**留着它红、或者删掉它，都不如翻面**——翻面同时保住了"曾经是缺口"和"现在是要求"两条信息。
+
+### 7. 全量验证
+
+| 检查 | 结果 |
+|---|---|
+| 全量 pytest | **1510 passed, 8 skipped, 0 failed**（成功的一次） |
+| `release_check --evidence-only` | **exit 0**；1518 collected / cross-tenant 15 / unauthorized-writes 4 / duplicate-replies 3 |
+| `ruff`（改动文件） | All checks passed |
+| `mypy` | Success: no issues found |
+| `test_intent.py` | 41 → **47** |
+
+门禁四项数字与交接基线**逐项一致**，说明本轮是纯增量、无外溢。
+
+**⚠️ 但必须记一条：全量套件存在预存 flaky**。`test_ingestion_worker.py`
+与 `test_billing_ledger.py` 偶发 1–2 条失败（单独跑全绿、失败用例每次不同）。
+**证明与本轮改动无关**：把 `intent.py` 切回 HEAD 后连跑三次仍交替红绿，
+且这两个文件都不 import `intent`。**未修**——属预存问题，不擅自扩大改动面。
+
+**环境陷阱两条**（本轮踩到）：
+1. 项目解释器是 **`.venv/Scripts/python.exe`**，managed python 缺 `sqlalchemy` 会假失败；
+2. **本环境绝不要用 `git stash`**。本轮它被 SIGTERM 打断，导致 `.git/refs/` 消失、
+   `pack-80b70c8b....pack` 丢失、仓库报 `not a git repository`。
+   已按 reflog 取 SHA → `fetch` 拉回对象 → 重建 ref → 清陈旧 pack 索引 → `fsck` 空输出
+   完整恢复，**工作区文件全程完好**。恢复步骤已沉淀为 skill `git-repo-recovery`。
+   临时切版本一律用 `cp` + `git show HEAD:<path>`。
+
+### 8. 有意划的边界（不是疏漏）
+
+- **中文结果补语/趋向补语**（`退掉`/`退回来`/`关掉`）未覆盖：补语形态繁多，
+  `_CN_REQUEST_FRAME` 的"紧跟宾语"条件会被补语吃掉。需要时再单开一条链。
+- ~~**`我要投诉` 未断言为 `human_required`**~~ → **已关闭，见附录 K**。改法**不**是
+  在分类器里断言更强路由（那确实是夹带），而是编排器加了一道"索赔闸门"：分类器的
+  `route` 契约一行未动，但这类消息**根本不进入回答路径**。
+- ~~**中文投诉的 `scene` 是 `unspecified`**~~ → 已由中文场景词表修复（本轮 §2 第 3 项），
+  现为 `complaint`。**但附录 K 实测：这个 scene 不能用来做转人工的判据。**
+- **跨语言检索**：独立且更大的问题，dataset 已用 `must_abstain` 诚实标注。
+
+## 附录 J · 关闭门禁耦合：ADR 0009 让中文路由契约进入评估门禁（2026-09-19）
+
+附录 I 结尾留了一个**明确的未决项**：中文路由契约只由单元测试守卫，
+**不在评估门禁的覆盖范围内**，因为要让它进门禁就得改 `runner.py` 的弃答语义，
+而那是"不擅自决定"的范围。用户本轮明确授权修复，已完成。
+
+**问题本体（两条契约压在一条用例上）**：
+`expected_route` 断言**路由契约**（这条中文问句该走哪条路），
+`abstention_correct_rate` 断言**检索契约**（该弃答时弃答）。而 `runner.py` 把
+**任何**非 `must_abstain` 的弃答都记成 `abstention_false`——中文问句打在英文语料上
+**必然弃答**（`NO_AUTHORIZED_EVIDENCE`）。于是同一条用例被两套独立契约各判一次，
+语言缺口被一个关于"弃答判断"的指标惩罚：实测 `0.8293 vs 0.9`，门禁红。
+
+**三条"偷懒解法"及其为何被否决**（写进 ADR 0009）：
+1. 把中文用例标成 `must_abstain` —— **语义撒谎**：这些问句语料里答得出，
+   标成"本就该弃答"就是把能力缺口记录成设计意图，缺口从此不可见。
+2. 加进 `KNOWN_GAPS` —— 一个**永不关闭的豁免**，且会让门禁失去对语言问题的感知。
+3. 干脆不加这些用例 —— 中文路由这条安全级契约就继续不被门禁覆盖。
+   另两条也一并否决：**降低全局阈值**（拿最重要的安全门去换一个语言问题）、
+   **翻译查询**（正确但更大，属于新基础设施能力）。
+
+**采用的机制**：给 `EvalCase` 加显式 `cross_lingual` 声明，
+豁免**四条子句全中**才生效（`abstain` ∧ 非 `must_abstain` ∧ 已声明 ∧
+`reason_code == ABSTAIN_NO_EVIDENCE`）。三个设计约束各有对应测试：
+
+- **fail-closed**：`CaseResult.abstention_attributable` 默认 `True`——未声明的弃答
+  照旧计入。反过来的话，每条新用例都会悄悄豁免自己。
+- **`EVIDENCE_BELOW_THRESHOLD` 不豁免**：证据检索到了但分数低，是检索器调参问题，
+  必须保持可见。只有"根本没检索到"才是语言缺口的签名。
+- **`must_abstain` 不豁免**：它的弃答本来就记作 correct，豁免只会把一条**通过**的用例
+  从分母里删掉，方向只能让分数变好。这是本实现第一版的**真实漏洞**，
+  被自己写的 `test_a_must_abstain_case_is_never_exempt` 抓到。
+
+**两扇防退化门禁**（因为 `abstention_correct_rate` 分母为空时返回 `1.0`，
+无上限的豁免会被读成满分）：
+`cross_lingual_exclusions_match`（声明数与实得豁免数必须一致）+
+`cross_lingual_exclusions_bounded`（豁免必须是严格少数）。
+
+**豁免有活消费端**：新增两条中文问句（`cn-answerable-warranty-period`
+"质保期是多长时间"、`cn-answerable-after-sales-process` "售后流程是怎样的"），
+语料确实答得出但检索不到，**故意不标** `must_abstain`——它们正是豁免真正生效的地方。
+没有活消费端的豁免比没有豁免更糟：它看起来像覆盖。
+
+**真实数字**：`total=40` / `counted=38` / `excluded=2` / `exemptible=2` /
+`abstention_correct_rate=1.0000`（38 条非空分母）/ `failed=2`（两条真实能力缺口仍红并
+登记 `KNOWN_GAPS`）/ bounded `0.05 vs 0.5`。会计恒等式 `counted + excluded == total`
+已断言，没有用例凭空消失。
+
+**变异验证 6/6 全被捕获**（M1 去掉声明要求 / M2 去掉 `not must_abstain` /
+M3 去掉 reason-code 条件 / M4a 门禁恒真 / M4b match 改比全部声明 / M4c 同 M1 写法），
+每条都精确打在为它而写的那条测试上。
+
+**反向验证**（ADR 自己要求"这一条比正向验证更重要"）：三条仅声明不同、其余全同的
+案例逐案跑 `EvaluationRunner`，豁免恰好只落在那条声明了 `cross_lingual` 的；
+注入一个与语言无关的真实 `false abstention` 后门禁照旧变红。
+并量化了阈值容忍度：分母 38 时，改动后 **4 个真实误弃答仍 PASS（0.8947），第 5 个才 FAIL**；
+改动前 2 个即 FAIL（0.9000 贴线）。**豁免确实放松了容忍度**——但这是把"语言缺口"
+换成"真实缺口"，且由两扇新门禁兜底，属于该放松的那一部分。
+
+**顺带发现并修复的第二个漏洞（门禁"空洞通过"）**：
+`release_check` 原用 `raw.get(field, 0)` 读三个新字段，于是磁盘上那份**旧**产物
+（`total=23`，不含新字段）三个字段全读成 0 → `exclusions_match` 比较 `0 == 0` → **绿灯**，
+`release_check --evidence-only` 照常 **exit 0**。这正是 ADR 0009 自己要防的
+"没有活消费端的豁免"，却复现在了本该防它的门禁里。改用 `-1` 作"未上报"哨兵后，
+旧产物被明确拒收并给出重跑指引。对应的旧测试**曾把这个 bug 断言成期望行为**，
+已重写。
+
+**边界（未做）**：
+- 跨语言**检索能力本身**仍未实现。两条 `cn-answerable-*` 用例仍红、登记在
+  `KNOWN_GAPS`。ADR 0009 只保证这个缺口**可见**，不假装它**消失**——那需要一项
+  新能力，属于另一个决策。
+- 中文路由契约现在**进了**门禁（这是本附录的成果），但中文的**结果补语**、
+  `我要投诉` 的 `human_required` 断言、中文 `scene` 词表三项边界维持附录 I 的划法不变。
+  （**后两项已被附录 K 与中文场景词表关闭**，此处保留原文以存档当时的判断。）
+
+---
+
+## 附录 K · 投诉转人工：L6 的闸门（2026-09-20）
+
+报告 §2.1 把质量投诉/赔付定在 **L6 争议归责（必须转人工）**，§2.3 对
+"板子短路了，我要索赔"标注 **"✅ 机制就绪"**，红线表写 **AI 绝不可做归责表态或赔付承诺**。
+
+**实测：这一条不成立，而且比"没接上"更糟。**
+
+### 1. 动手前的实测（不是记忆）
+
+```
+板子短路了，我要索赔                 scene=technical_support  route=knowledge_qa   → 被知识库回答
+开短路不良我要索赔                    scene=technical_support  route=knowledge_qa   → 被知识库回答
+这批货有虚焊                        scene=technical_support  route=knowledge_qa   → 被知识库回答
+这个不良品怎么理赔                    scene=technical_support  route=knowledge_qa   → 被知识库回答
+货期延误了，我要你们赔偿                scene=billing            route=knowledge_qa   → 被知识库回答
+I demand a refund for these...     scene=billing            route=knowledge_qa   → 被知识库回答
+我要投诉                           scene=complaint          route=business_write → 生成写提议
+I want to file a complaint         scene=complaint          route=business_write → 生成写提议
+```
+
+即：**索赔被知识库回答，投诉被当成写操作**。规划要的是"根本不去回答"。
+红线守卫挡不住它（它是 flag 门控、默认关闭、且扫的是**生成后的草稿**）——
+"已经决定回答之后才拦"不等于"这类消息不该回答"。
+
+### 2. 为什么**不**用 `Scene.COMPLAINT` 做判据（实测反例）
+
+最直观的写法是"scene 是 complaint 就转人工"。**实测否掉**：
+`_SCENE_PATTERNS` 的 COMPLAINT 词表含 `still not` / `third time`，于是
+
+```
+my order has still not arrived          scene=complaint  route=knowledge_qa
+The shipment still not updated, where is it?  scene=complaint  route=business_read
+```
+
+一道 scene 闸门会把**订单状态问题**送进人工队列，第二个还会抢在 `order.get_status`
+之前。反之，真正要拦的 `板子短路了，我要索赔` 的 scene 是 **technical_support**——
+**scene 闸门恰好漏掉报告自己举的那一条**。两边都错，故弃用。
+
+判据改为 **"这是不是一次索赔"**（`agent_runtime/complaint.py`），三条全中才算：
+
+1. 出现**救济词**（索赔/赔偿/赔付/退款/退货/投诉/起诉/找经理/refund/compensation/escalate…）；
+2. 且**客户在要它**（`我要`/`我要求`/`请给`/`给我`/`i want`/`i demand`/`refund me`/`let me speak to`…）；
+3. 且**不是在问流程**（`怎么`/`如何`/`什么`/`谁`/`吗`/`呢`/`政策`/`流程`/`规定`，或英文 wh- 词）。
+
+第 3 条是**与 L1 的分界**，不是保守：报告把 **赔付政策/退换货规则列在 L1（检索+引用，可直接回答）**，
+`全测板开短路不良怎么赔付？` 正是该回答的问题（`test_intent.py` 也把它钉为 TECHNICAL_SUPPORT）。
+**"怎么赔付"问的是规则，"我要索赔"是在规则下主张权利**——两者同一个词表，靠第 3 条分开。
+
+第 2 条是**被我自己写出来的回归逼出来的**（见第 4 节）：只有救济词、没有"要"的
+声明句（`Please escalate this defect to your engineering team`）根本不是索赔。
+
+### 3. 闸门位置与 flag
+
+放在 `orchestrator._run_pipeline` 的 **2b-complaint**：在 EQ 确认分支之后、
+澄清闸门之前、检索之前、写路径之前。
+
+- 在**澄清之前**，是因为让一个刚提出索赔的人"再说详细点"不是收集信息，是让他复述一遍不满；
+- **不挂 feature flag**（与 EQ 分支相反）：EQ 分支是"租户可选择的新行为"，
+  这一条是"撤掉一个被列为红线的回答"。红线挂在默认关闭的 flag 后面，正是这次漏掉的原因。
+
+### 4. 我自己制造的回归（写路径）
+
+第一版判定器把"声明句里出现救济词"也算索赔，于是
+`Please escalate this defect to your engineering team`（写路径的**标准请求**）
+被判成索赔 → 转人工 → `test_agent_write_path.py` 4 条失败。
+**"把缺陷升级给工程团队"不是索赔**，它是 `jira.create_issue` 的正当入口。
+
+修法是收紧到第 2 条（必须"要"），并把这句写进单测反向用例——
+它是我这次唯一一处回归，也是唯一靠全量测试才发现的（定向跑我的新测试全绿）。
+
+### 5. 变异验证 3/3（每条都真的红）
+
+| 变异 | 被谁捕获 |
+|---|---|
+| M1 去掉流程否决（`_is_procedure_question` 恒 False） | 集成 `test_the_policy_question_still_reaches_the_knowledge_path` + 单测 7 条 |
+| M2 闸门改用 `detection.scene is Scene.COMPLAINT` | `test_a_stalled_order_is_not_hijacked` **且** `test_a_compensation_claim_is_handed_off...`（报告那条又漏了） |
+| M3 判定器恒 False | 3 条转人工断言全红，日志回到 `QUESTION_TOO_SHORT`（即改动前的缺陷） |
+
+M1 第一次**没有**被捕获：当时唯一的那条反向用例以 `？` 结尾，被"结尾问号"兜住了，
+否决本身没被验证到。**已补一条不带问号的同义句**（`你们的赔付政策是什么`），才有今天的表。
+
+### 6. 边界（有意不做，不是疏漏）
+
+- **纯缺陷陈述**（`板子短路了` / `这批货有虚焊`）**不判为索赔**：报告把它们列在场景 D，
+  但它们什么都没要。要拦就得匹配裸缺陷词，而那正是工程师求助时用的词
+  （`为什么板子会短路`）。它们并非无人处理：不触发闸门 → 走知识路径 →
+  按证据不足弃权 → 同样转人工。**过宽的守卫比没有守卫更糟。**
+- **结构化证据收集**（报告要求 AI 做的第②件事：订单号、批次、不良数量、照片）
+  **未做**。转人工话术里请客户提供订单号与照片（人无论如何都收得到），
+  但没有结构化受理表单去解析入库——**只建平台侧不建消费端，是本项目最典型的缺陷形态**。
+- **话术仍为英文**：`safe_abstention_text` 全部分支都是英文，本地化是另一个决策，
+  不在本次改动里夹带。话术本身已确保**不认责、不承诺金额**（有断言）。
+
+### 7. 验证
+
+- 单测 38 条（正 16 / 反 20 / 边界 2），集成 7 条（含 2 条变异守卫）；
+- 全量 **1627 收集 / 0 失败 / 0 错误 / 0 跳过**（改动前 1582，+45）；
+- `ruff check` + `ruff format --check` + `mypy` 全绿（143 源文件）；
+- `release_check --evidence-only` **exit 0**，零容忍计数 15 / 4 / 3。
+
+---
+
+## 附录 L · 大客户分层：让 tier 到达转人工决策（2026-09-20）
+
+难点 5 要的是"**tier 驱动 SLA 与转人工优先级**"、"大客户命中 COMPLAINT 一律直转专属人工"。
+**SLA 那半早就有了**（`sla_policy_for_tier` 读 `Case.enterprise_account_id`）；
+**路由那半一直缺一个前提**：平台无从得知一次会话属于哪个 `EnterpriseAccount`，
+所以 tier 永远走不到转人工决策。本附录补的是这个前提 + 它的消费端。
+
+### 1. 关联建在 contact 上，不是 inbox 上（附实测）
+
+上一版交接建议"按 inbox 建关联"，理由是 `inbox_id` 在 webhook 最小化载荷里。
+**实测否掉了这个前提**，两轮：
+
+- **语义**：`docs/architecture.md:51` 把 inbox 与 channels/contacts 并列——
+  **inbox 是渠道，不是客户**。一个网站在线聊天 inbox 里是所有客户，
+  把它绑到某家大客户，等于把走进这个渠道的每个人都当成大客户。
+- **数据**：真实事件里 `inbox_id` **29/29 有键，但 27 条是字符串 `"None"`**
+  （`minimize.py` 的 `str(conversation.get("inbox_id"))` 在字段缺失时会写出 `"None"`）；
+  真正可用的只有 2 条。
+
+因此改按 **contact** 关联——**但 contact 同样不在载荷里**：
+
+```
+contact_id               0/29
+sender_id / sender_type  1/29
+inbox_id                29/29（其中 27 条是 "None"）
+conversation_id         29/29
+```
+
+所以 contact 只能**从 Chatwoot API 读**（`fetch_message_contact_id`，取消息对象里的
+`sender.id` 且 `sender.type == "contact"`）。这也顺带说明：
+`minimize.py` 的 contact 提取、以及 `_persist_memory` 里"按 contact 存长期事实"的逻辑，
+**在当前部署下从来没被喂过数据**——同一条外部事实卡住了两处。
+
+### 2. 一次做完关联 + 消费端
+
+- **写侧**：迁移 `0041` 建 `enterprise_account_contacts`（`UNIQUE (tenant_id, external_contact_id)`、
+  复合 FK `(enterprise_account_id, tenant_id)`、RLS `FORCE`），
+  管理台 `POST/GET/DELETE /v1/identity/accounts/{id}/contacts`（`TENANT_ADMIN` + 幂等键）。
+- **读侧（消费端）**：编排器在索赔闸门里用 contact 查出账户，
+  tier ∈ {strategic, enterprise} 且 `contract_status == active` 时，
+  理由码改 `STRATEGIC_ACCOUNT_REQUIRES_HUMAN`，私有便签带上 `account_id` 与 tier。
+
+**只建关联不建消费端是本项目反复出现的缺陷**——所以这两半是一次提交的。
+同理，若 contact 查不到，**降级为"未绑定"而不是失败**：tier 只是让一次**本来就会发生**的
+转人工更准确，不能让它变成"转人工丢了"。
+
+### 3. 变异验证 2/2
+
+| 变异 | 被谁捕获 |
+|---|---|
+| M1 忽略 tier（恒用通用理由码） | `test_a_bound_strategic_contact_hands_off_to_the_account_team` |
+| M2 忽略 `contract_status` | `test_a_churned_contract_does_not_get_the_dedicated_route` |
+
+另有两条反向断言防止"写死 strategic"：未绑定的 contact、无 contact 时都必须仍走通用转人工。
+
+### 4. 边界（有意不做）
+
+- **专属对接人本人**：报告说大客户有"专属对接人"，但 `EnterpriseAccount` **没有 owner 字段**。
+  现在能说出"是哪家客户"，不能路由到"哪个人"。**加这个字段是要先决定"对接人的权威来源在哪"的
+   schema 决策**，不在本次夹带。
+- **交期风险意图**的直转未做：需要先定义"交期风险"的判定面，属另一个决策。
+- **管理台三个端点的 HTTP 层测试未写**：本次测的是 service 层（真实库 + RLS）。
+  端点的权限/幂等/422 路径**尚未被测试覆盖**，这是明确的欠账，不是"已验证"。
+- **`inbox_id` 写出 `"None"` 的缺陷未修**（`minimize.py:42`）——它已无人读取，
+  但会误导任何按它做统计的人。留作单独一条。
+
+### 5. 验证
+
+- 迁移 `0041` 已应用至本地库，`EXPECTED_MIGRATIONS` 40 → 41；
+- 新增单测 3 条（contact 解析）+ 集成 6 条（含跨租户 RLS、churned、未绑定、两条变异守卫）；
+- 全量 **1636 收集 / 0 失败 / 0 错误 / 0 跳过**；`release_check` exit 0（15/4/3）；
+  ruff + mypy 全绿。

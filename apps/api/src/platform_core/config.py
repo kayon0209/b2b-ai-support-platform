@@ -24,9 +24,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://platform:platform@localhost:5435/platform"
     # Reserved. The durable work queue is a Postgres table (inbox_events /
     # outbox_events claimed with SKIP LOCKED), not Redis, so nothing reads this
-    # today. It is kept, and kept separate from Chatwoot's Redis (6381), so
-    # that a future cache/rate-limit feature does not have to invent a setting
-    # or accidentally share Chatwoot's instance.
+    # today. It is kept so a future cache or rate-limit feature does not have
+    # to invent a setting.
     redis_url: str = "redis://localhost:6380/0"
 
     # --- Authentication (docs/security.md) --------------------------------
@@ -48,10 +47,21 @@ class Settings(BaseSettings):
     # Webhook replay protection (docs/api-contracts.md)
     webhook_timestamp_tolerance_seconds: int = 300
 
-    # Chatwoot integration (ticket 4/8 will consume these)
-    chatwoot_base_url: str = "http://localhost:3000"
-    chatwoot_api_token: SecretStr | None = None
-    chatwoot_webhook_secret: SecretStr | None = None
+    # Outbound channel delivery (ADR 0014). An unset value means that channel is
+    # receive-only: the answer is still produced and persisted, but the run
+    # records `OUTBOUND_NOT_CONFIGURED` rather than pretending it was delivered.
+    # Deliberately separate from the inbound secret - the connector's
+    # `webhook_secret_ref` authenticates *their* traffic to us, and must never be
+    # reused to authenticate ours to them.
+    email_smtp_host: str | None = None
+    email_smtp_port: int = 587
+    email_smtp_username: str | None = None
+    email_smtp_password: SecretStr | None = None
+    # The envelope sender. Providers reject a From that is not the authenticated
+    # mailbox, so this is configuration rather than a per-tenant value today.
+    email_from_address: str | None = None
+    wechat_app_id: str | None = None
+    wechat_app_secret: SecretStr | None = None
 
     # LLM provider (Gitee AI / 模力方舟, OpenAI-compatible surface).
     # Credentials are resolved server-side and never reach the model or logs
@@ -59,6 +69,13 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://ai.gitee.com/v1"
     llm_api_key: SecretStr | None = None
     llm_model: str = "qwen3.8-flash"
+    # Feature list 11.2: per-task model routing. Classification and answer
+    # generation have different requirements - the first wants latency and
+    # cost, the second wants reasoning - so they may be different models.
+    # Unset means "use `llm_model`", not "disable": a deployment that never
+    # tunes this keeps working exactly as before, and turning routing on is a
+    # single variable rather than a code change.
+    llm_model_classify: str | None = None
     llm_embedding_model: str = "Qwen3-Embedding-8B"
     llm_rerank_model: str = "bge-reranker-v2-m3"
     # Matches the chunks.embedding vector(1536) column; the provider honors
@@ -160,12 +177,8 @@ class Settings(BaseSettings):
     # Consecutive clarification rounds before the run hands off instead of
     # asking again - an ask-loop is a dead conversation with extra steps.
     clarification_max_streak: int = 2
-    # Chatwoot history fetch (2.2). Failure degrades to single-turn; it never
-    # blocks the run.
-    history_fetch_limit: int = 20
-    history_fetch_timeout_seconds: float = 3.0
-    # Local redacted turns are pruned after N days (retention policy), and
-    # Chatwoot stays the system of record for raw content.
+    # Local redacted turns are pruned after N days (retention policy). They are
+    # the only record of the conversation the platform keeps.
     conversation_turn_days: int = 90
 
     # --- Cost, concurrency and fallback (iteration plan 5.1/5.3/5.5) ----------
@@ -184,26 +197,53 @@ class Settings(BaseSettings):
     # Inbox depth above which new runs are refused with 429 instead of
     # queueing - bounded backlog beats unbounded latency.
     queue_max_depth: int = 500
+    # How long an accepted-but-never-executed run may stay `queued` before the
+    # retention sweep closes it as `abandoned`. Generous on purpose: the sweep
+    # must not race a worker that is merely slow, and a wrong answer here makes
+    # the admission-counter (`usage_snapshot`) under-count what is pending.
+    # One hour is far beyond any observed queue latency.
+    run_abandon_after_seconds: int = 3600
     # Exponential-backoff jitter: without it every caller retries in the same
     # beat and the retry storm is synchronised. 0 disables.
     retry_jitter_ratio: float = 0.3
     # Estimated model pricing for the cost metric, cents per 1k tokens.
     cost_prompt_cents_per_1k: float = 0.15
     cost_completion_cents_per_1k: float = 0.60
-    # Evidence-carrying handoff notes (5.4): private Chatwoot note with the
-    # reason code and evidence references, readable by the receiving agent.
-    handoff_evidence_enabled: bool = False
-
     # --- Feature flags for new behaviour (constraint 4) -----------------------
     # Every behaviour change below defaults OFF and flips per tenant through
     # the flag service, following agent.rerank_enabled.
     flag_business_read_tools: str = "agent.business_read_enabled"
+    # The agent's write path (plan 3.5). Separate from the read flag on
+    # purpose: a tenant can let the AI answer "where is my order" long before
+    # it lets the AI propose a change to an external system, and rolling the
+    # two out together would make the safe half hostage to the risky one.
+    flag_business_write_tools: str = "agent.business_write_enabled"
     flag_citation_guard: str = "agent.citation_guard_enabled"
     flag_query_normalization: str = "agent.query_normalization_enabled"
     flag_metadata_filter: str = "retrieval.metadata_filter_enabled"
     flag_score_floor: str = "retrieval.score_floor_enabled"
     flag_priority_claim: str = "worker.priority_claim_enabled"
     flag_redline_guard: str = "agent.redline_guard_enabled"
+    # Shadow mode (9.2): run the whole pipeline, withhold the send. Per tenant
+    # and off by default, because it is a rollout control - it is switched on
+    # for the window where a newly-automated category is being watched, then
+    # off again.
+    flag_shadow_mode: str = "agent.shadow_mode_enabled"
+    # When a human is actually available (feature list 7.5), UTC hours.
+    # 0/0 means unconfigured, which reads as always open: a tenant that has
+    # not told us its hours must not gain a new way to refuse its customers.
+    support_open_hour: int = 0
+    support_close_hour: int = 0
+    # Which price table to quote from. "public-reference" uses published
+    # industry data with its provenance attached (see pricing/reference);
+    # "empty" declines every request so all quoting goes to a person, which is
+    # the right setting until a contracted price list exists.
+    pricing_ruleset: str = "public-reference"
+    # "http" is the real BusinessReadAdapter against the tenant's ERP. "demo"
+    # uses local sample data (see integrations/demo_erp) so the read path can
+    # run in a deployment that has no ERP to call; its records are marked
+    # `source: "demo"` so they are never mistaken for real ones.
+    business_api_adapter: str = "demo"
     # Priority claiming is a deployment-level decision (the claim query is
     # cross-tenant), so it is a plain switch rather than a tenant flag.
     priority_claim_enabled: bool = False
@@ -242,6 +282,24 @@ def _assert_auth_is_configured(settings: Settings) -> None:
             "and allow impersonation with a known slug + user id. It is only "
             f"permitted in local/test, not {settings.environment!r}. Configure "
             "APP_OIDC_ISSUER instead."
+        )
+
+    # `environment` defaults to "local", so a deployment that simply forgets to
+    # declare it is treated as a local machine - and if it also inherited
+    # `APP_ALLOW_BOOTSTRAP_TOKENS=true` from a copied .env, the check above
+    # passes and the impersonation path is live in production.
+    #
+    # `model_fields_set` distinguishes "declared" from "defaulted" (the .env
+    # file counts as declared; a default does not), so the guard is about
+    # intent rather than about the value. Opting into an unsigned token scheme
+    # now requires saying which environment you are in.
+    if settings.allow_bootstrap_tokens and "environment" not in settings.model_fields_set:
+        raise RuntimeError(
+            "APP_ALLOW_BOOTSTRAP_TOKENS is set but APP_ENVIRONMENT was never "
+            "declared, so this process cannot tell a laptop from production. "
+            "Bootstrap tokens are unsigned and impersonate a known slug + user "
+            "id, so declare APP_ENVIRONMENT explicitly (local/test) before "
+            "enabling them."
         )
 
     if settings.oidc_issuer is None and not settings.allow_bootstrap_tokens:

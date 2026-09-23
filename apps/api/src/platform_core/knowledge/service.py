@@ -310,7 +310,9 @@ def presign_for(key: str, *, expires_seconds: int, settings: Any | None = None) 
     """
     from platform_core.config import get_settings
 
-    url = _storage(settings or get_settings()).presign_get(key, expires_seconds=expires_seconds)
+    url = object_storage(settings or get_settings()).presign_get(
+        key, expires_seconds=expires_seconds
+    )
     return str(url)
 
 
@@ -321,7 +323,20 @@ def _secret(value: Any) -> str | None:
     return value.get_secret_value() if hasattr(value, "get_secret_value") else str(value)
 
 
-def _storage(settings: Any) -> Any:
+def object_storage(settings: Any) -> Any:
+    """Build the object-store client. **The one construction site.**
+
+    Public because the store is shared infrastructure that happens to live
+    under `knowledge`: a case attachment uploads to the same bucket with the
+    same credentials, and a second construction site with different settings is
+    how an object ends up written to an endpoint the presigner does not sign
+    for. The caller supplies its own content-type policy - see
+    `MinioStorage.put_object`.
+
+    (`knowledge/storage.py` mixes this infrastructure with `ObjectKey`, which
+    is a knowledge concept. Splitting them is a rename, not a redesign, and is
+    worth doing when a third caller appears.)
+    """
     from platform_core.knowledge.storage import MinioStorage
 
     return MinioStorage(
@@ -335,10 +350,17 @@ def _storage(settings: Any) -> Any:
 
 def upload_object(key: str, data: bytes, content_type: str) -> str:
     """Put the bytes. Separate from row creation so a storage failure can be
-    retried without re-registering the document."""
+    retried without re-registering the document.
+
+    The content-type check lives here rather than in the storage client, which
+    is shared with modules whose acceptable types are different (see
+    `MinioStorage.put_object`). Validating at this seam keeps the knowledge
+    guarantee where the knowledge rule is.
+    """
     from platform_core.config import get_settings
 
-    return str(_storage(get_settings()).put_object(key, data, content_type))
+    validate_content_type(content_type)
+    return str(object_storage(get_settings()).put_object(key, data, content_type))
 
 
 def get_object(key: str) -> bytes:
@@ -351,4 +373,4 @@ def get_object(key: str) -> bytes:
     """
     from platform_core.config import get_settings
 
-    return bytes(_storage(get_settings()).get_object(key))
+    return bytes(object_storage(get_settings()).get_object(key))

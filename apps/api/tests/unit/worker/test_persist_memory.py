@@ -2,7 +2,7 @@
 
 The bug this file was born from is fixed one layer up now. A platform-native
 conversation used to fail in `_dispatch` (`OUTBOUND_TARGET_MISSING`, because
-the event carries a `conversation_id` but no `chatwoot_account_id`), the run
+the event carries a `conversation_id` but names no external account), the run
 was marked FAILED, and the answer was never persisted - because the agent
 turn is only written for a COMPLETED run. `_dispatch` now reads a missing
 account id as "no external channel" and lets the run complete, so the answer
@@ -167,14 +167,16 @@ async def test_the_turn_source_names_where_the_question_came_from() -> None:
 
     RECORDED.clear()
     from_platform = _event()
-    from_platform.minimized_payload["chatwoot_account_id"] = "3"
+    # A payload that names an external account no longer changes the turn's
+    # source: every turn is written by this platform (ADR 0012).
+
     await _persist_memory(
         _SESSION,
         event=from_platform,
         question="What are your support hours?",
         outcome=_outcome(RunStatus.FAILED, answer_text="", reason="OUTBOUND_FAILED"),
     )
-    assert [(t[0], t[3]) for t in RECORDED] == [("customer", "chatwoot")]
+    assert [(t[0], t[3]) for t in RECORDED] == [("customer", "platform")]
 
 
 async def test_the_customer_turn_is_always_recorded() -> None:

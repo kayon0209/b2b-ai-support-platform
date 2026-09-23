@@ -1,350 +1,173 @@
 # Project Memory — B2B AI Customer Support Platform
 
-Durable rules only. Daily logs (`YYYY-MM-DD.md`) hold narrative + rationale.
-Ordered most-critical first — the tail is what gets lost on injection.
-Consolidated 2026-09-19 (v2, trimmed).
+**Index of rules that change behaviour often.** Narrative → `YYYY-MM-DD.md`;
+incidents, prose, folded originals → `REFERENCE.md` (**not** auto-injected).
+v13, 2026-09-23.
 
-## Environment
+## Orientation
 
-- **Dir**: `D:/360Downloads/360驱动大师目录/b2b-ai-support-plan/b2b-ai-support-plan`
-- **Python**: `.venv/Scripts/python.exe` (3.12). Managed 3.13 has **no pytest**.
-- **PYTHONPATH: absolute, `;`-joined** — else `No module named 'platform_core'`:
-  `$R/apps/api/src;$R/packages/contracts/src;$R/packages/policy/src;$R/packages/observability/src;$R/apps/worker/src`
-- **Ports**: ai-postgres 5435, chatwoot-postgres 5434, ai-redis 6380,
-  chatwoot-redis 6381, Chatwoot 3000, API 8000, Keycloak 8081, MinIO 9000/9001;
-  e2e `b2b-e2e-minio` 19000. Vite 5173, proxies `/api`→8000.
-- **DB roles**: `platform` (superuser, bypasses RLS — seeding/cleanup),
-  `platform_app` (NOBYPASSRLS — isolation assertions).
-- `packages/observability/src/observability.py` is top-level `observability`,
-  **not** `platform_core.observability`.
+**An AI control plane, not a chat product** — owns Tenant/Case/Knowledge/AgentRun/ToolExecution/Citation/
+Evaluation/AuditEvent, **not** conversation content. It **hosts its own customer channels**: Chatwoot was
+the kernel and **has been removed** (ADR 0012, all four stages; ADR 0013/0014 Accepted). `AGENTS.md`
+rules 1/2 were rewritten in the same change that made them true.
 
-## Verification
+**Four chat surfaces, only three of them the product:** `/support` = **the customer surface** (visitor
+session, ADR 0011, renders the structured data card); `Workbench` = the operator's; the ops console
+(`/quality`+`/gaps`+`/knowledge`) = the supervisor's; `/chat` = internal verification (operator token),
+**slated for removal**. The pilot's value is the **data card**. **An ADR from another session is not the
+user's decision: when one vetoes a request the user made, raise it — don't inherit it** (cost 2 sessions).
+
+**The product's open gap is the closed loop's last mile** — `docs/product-gap-analysis.md` (three surfaces
++ one loop, per-surface gaps, ranked next-builds); `docs/product-shape-and-last-mile.md` (§2.1 = the
+customer-surface UX spec, §3 = categories).
+
+## Run & verify
 
 ```bash
-./.venv/Scripts/python.exe -m pytest    # pyproject supplies pythonpath
+docker compose --env-file .env -f infra/compose/docker-compose.yml up -d
 ./.venv/Scripts/python.exe -m ruff check apps packages scripts tests pytest_plugins_release
 ./.venv/Scripts/python.exe -m ruff format --check apps packages scripts tests pytest_plugins_release
-./.venv/Scripts/python.exe -m mypy      # strict, 129 files, 0 errors
+./.venv/Scripts/python.exe -m mypy
+mv tests/artifacts/release_gate_evidence.json /tmp/evidence.bak 2>/dev/null   # sandbox guard
+./.venv/Scripts/python.exe -m pytest --junitxml=tests/artifacts/junit-final.xml
 ./.venv/Scripts/python.exe -m platform_core.evaluation.release_check --evidence-only
-./.venv/Scripts/python.exe tests/e2e/e2e_ingestion_minio.py
 ```
 
-pytest's summary goes to **stderr**; `EXIT=$?` after a pipe reports the last
-command — use `${PIPESTATUS[0]}` or no pipe. CI's `release-evidence` job runs the
-**full** suite then `release_check --evidence-only`.
-
-**Stop the `ai-*` services before running the suite.** `ai-worker-interactive`
-relays the outbox every second, so a test that commits an outbox row then
-asserts on its own relay sees `claimed=0`.
-
-**The suite flakes order-dependently here — a red run is not evidence by
-itself.** Six consecutive full runs on identical code produced 3 / 0 / 2 / 0 /
-10 / 2 failures, each time in different files, and every one passed in
-isolation. Two known amplifiers: a failed run leaves fixture rows behind and
-the *next* run's setup cascades `IntegrityError` on
-`chunks_document_version_id_fkey`; and pytest's tmp-dir GC can trip the
-safe-delete guard (54 items > 50) and truncate the summary. **Before touching
-code, re-run the failing test alone.** Use `--junitxml` when the summary gets
-cut off.
-
-**A truncated grep manufactures false conclusions.** `grep ... | head -40`
-once hid an existing registration and produced a report claiming a tool was
-missing. Grep by the exact name, separately, before asserting absence.
-
-## Errors must be real 4xx, never 200-with-error-body
-
-FastAPI renders a returned **dict** as HTTP 200. Three routers built
-`{"error": ...}` by hand and returned the dict, so every domain refusal
-(duplicate flag key, promote blocked by the evaluation gate, rollback with
-nothing active) arrived as 200 and the admin UI's `unwrap()` — which only
-treats `!res.ok` as failure — reported success. Promote showed a green
-"Promoted" for a promotion that never happened.
-
-**Always return `error_response()`/`domain_error_response()` (a
-`JSONResponse`), never a bare dict.** `DOMAIN_ERROR_STATUS` in `api.py`
-maps codes to statuses; unknown codes fall back to 400, never 200.
-
-Related, now fixed: `main.py` has a `RequestValidationError` handler
-(422 → documented envelope, and it does **not** echo `input`, which can be
-a token or a prompt) and an `Exception` handler (500 → envelope + trace_id,
-details only in the log).
-
-**Symptom to trust:** the UI says "done" but nothing changed. `curl -i` the
-endpoint and compare the status with what the UI showed.
-
-## The recurring defect: a capability with no consumer
-
-Every audit round finds the same shape — a value, column or function that
-exists and is tested but that no production path reads or writes. Found:
-`AgentRun.started_at`, `AgentRun.token_usage`, `sweep_expired_data`,
-`credential_ref`, priority-queue admission, `_is_identity_dependent`,
-`health_check`, `NEEDS_REAUTH`, `SyncCursor`, `DeadLetterItem`,
-`flag_service.evaluate`, the reranker (before 2026-09-18),
-`cases.enterprise_account_id`, `release_check`'s CI caller,
-`eval_report.json`'s producer, `drain_outbox_once` + `_now`,
-`claim_contradiction_candidates` (metric, never a guard).
-
-**For any field a reader depends on, grep its writers/callers.** A test calling
-a function directly will not reveal a missing production caller.
-
-## RLS
-
-**Bootstrap pattern (8 instances).** A tenant-owned table read *before* a
-binding exists needs a narrow `SECURITY DEFINER` function: pinned
-`SET search_path = pg_catalog, public`, `REVOKE ALL FROM PUBLIC` and from
-`platform`, `GRANT EXECUTE` to `platform_app` only, `RETURNS TABLE (...)`
-(0015, 0016, 0018, 0019, 0026, 0027, 0030 ×2).
-
-Never loosen a policy to `USING (app.tenant_id IS NULL OR ...)` — that grants
-table-wide read and `test_cross_tenant_leak_surfaces.py` fails.
-
-**RLS fails silently on writes.** Unbound `SELECT` → zero rows; unbound
-`UPDATE`/`DELETE` → `rowcount 0`, **no error**. Assert `rowcount` on any
-app-role write. `FOR UPDATE` requires the function be `VOLATILE`.
-
-**Cross-tenant queue scans are global by design** (`claim_pending`,
-`claim_ingestion_versions`, `reclaim_stale_ingestions`), so a leftover claimable
-row anywhere enters the next suite's batch. **Never leave probe rows.**
-
-## Async and sessions
-
-- **`set_config('app.tenant_id', ..., true)` is transaction-scoped** — it does
-  not survive `COMMIT`. **`tenant_session` rebinds on `after_begin`**, so a
-  handler that commits mid-request keeps the binding. Every tenant-scoped
-  handler must use `tenant_session(ctx)`; 22 sites used to do it by hand.
-- **`db.app_role_url()` is the only place the app-role URL is computed.**
-- **A failed flush poisons the session.** `await session.rollback()` before
-  raising, or the router's `commit()` raises `PendingRollbackError` and a clean
-  409 becomes a 500 (`begin_nested()` does **not** help). Prefer `ON CONFLICT
-  DO NOTHING` to insert-then-catch: a rollback discards *the whole transaction*.
-- **The outbox relay's caller owns the transaction.** `run_once(session)` does
-  not commit; pass `commit=True` or a `session_scope()`, or it reports `sent=1`
-  while persisting nothing.
-
-## The worker needs the same Windows loop fix as the API
-
-`apps/worker/src/worker/runner.py` used bare `asyncio.run(...)`, which builds
-a ProactorEventLoop on Windows — psycopg async refuses it, so the worker
-could not start at all (first poll cycle dies with
-`RuntimeError: psycopg async cannot run on a ProactorEventLoop`). Fixed by
-routing all five call sites through a `run(coro)` helper that passes
-`loop_factory=asyncio.SelectorEventLoop` on `win32`.
-
-**Any new `asyncio.run` in a DB-touching path needs the same treatment.**
-When a background task "starts" then immediately floods
-`worker_cycle_failed` with `RuntimeError`, this is the cause.
-
-Start it with (default queue is `interactive`; override with
-`APP_WORKER_QUEUE=outbox|ingestion|retention|sla`):
-
-```bash
-PYTHONPATH="<worker/src>;<api/src>;<contracts/src>;<policy/src>;<observability/src>" \
-  APP_CHATWOOT_API_TOKEN=<chatwoot user token> \
-  ./.venv/Scripts/python.exe -m worker.runner
-```
-
-A running worker consumes the global inbox/outbox queues, so it makes
-`test_billing_ledger` / `test_inbox_reclaim` / `test_ingestion_worker` flaky
-with `claimed=0` **and the failing test differs each run**. Stop it before
-running the suite.
-
-## Windows: never launch the API with bare uvicorn
-
-**Always `python -m platform_core.main`.** uvicorn hardcodes
-`ProactorEventLoop` on Windows and builds its loop **before** importing the app;
-psycopg async refuses it → every DB request dies at connect, which
-`TenantContextMiddleware` rendered as a bare `401 AUTH_UNRESOLVED`.
-
-**Any DB-touching script needs**
-`asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)`. `uvicorn.run(loop=...)` takes a **string**, not a class.
-
-## Idempotency belongs in a constraint
-
-`UNIQUE` + `ON CONFLICT DO NOTHING` beats read-then-write wherever replicas
-race (ingestion claims, `uq_inbox_delivery`, `uq_case_escalation_once`,
-`uq_saml_assertion_once`, `uq_billing_entry_event`, `uq_citation_claim`). An
-RLS-scoped pre-check is worth having for the *message* only.
-
-## Schema and migrations
-
-- **`alembic_version` is a single-row head table** — use `walk_revisions()`.
-- **Non-ASCII repo path**: `script_location = %(here)s` fails under
-  `ConfigParser`; call `cfg.set_main_option("script_location", ...)`.
-- **`DROP`/`CREATE DATABASE` cannot run in a transaction** — set
-  `isolation_level="AUTOCOMMIT"` on the *engine*.
-- **`(metadata -> 'k')::text` keeps JSON quotes**; `->>` does not. **A fixture
-  that does not reproduce the production row is a coverage gap.**
-- **A NOT NULL column filled by a trigger still needs an ORM `server_default`**,
-  dialect-neutral (unit tests build on SQLite).
-- **Enum columns are `String` holding lowercase *values*.** ORM `Enum(...)`
-  needs `values_callable=_enum_values` or reads raise `LookupError`.
-- **Tenant tables have no FK on `tenant_id`.** Compose parent FKs as
-  `(parent_id, tenant_id) -> (id, tenant_id)`.
-- **A test passing against a long-lived DB is not evidence about the
-  migrations** — only `downgrade base && upgrade head` is. A missing `GRANT`
-  shipped twice that way (`users` 0021, `tenant_domains` 0027);
-  `test_schema_privileges.py` covers every table and `EXPECTED_MIGRATIONS` is a
-  gate to bump per revision.
-- **A guard that cannot be observed failing is not evidence.** `FOUND` is
-  **false** after `EXECUTE ... INTO` even when the SELECT returned a row.
-
-## Auth, middleware, types
-
-- **Token-only endpoints must be in `middleware.py::EXEMPT_PATHS`** (or
-  `EXEMPT_PREFIXES`, e.g. `/v1/webhooks/`). The middleware 401s non-exempt
-  paths *before* the handler. `TestClient(platform_core.main.app)` is the only
-  proof of reachability — a middleware-less `TestClient(fresh_app)` still passes.
-- **Auth failures are deliberately indistinguishable** — unknown slug,
-  suspended tenant, missing/inactive membership all raise `identity not found
-  or inactive`; splitting them makes login an enumeration oracle.
-- mypy "Duplicate module named `__main__`" = empty `src/__init__.py`; fix with
-  `explicit_package_bases = true`.
-- New domain code must be mypy-strict clean.
-
-## LLM provider
-
-Gitee AI (模力方舟), OpenAI-compatible, `https://ai.gitee.com/v1`:
-`qwen3.8-flash` (chat; thinking channel separated from the answer),
-`Qwen3-Embedding-8B` (honors `dimensions: 1536`, so `chunks.embedding
-vector(1536)` needs no migration), `bge-reranker-v2-m3`. Credentials in `.env`
-(gitignored); an unset key fails the model boundary closed.
-
-## A test double's scale leaks into production logic
-
-`_sources_compete` guarded "comparable ranking" with an **absolute** 0.05
-margin, but `hybrid_search` fuses with RRF (scores are `sum(1/(60+rank))`, max
-gap ~0.016) so the guard could never fire. The constant was calibrated against
-`tests/evals/harness.py`.
-
-Rules: a threshold comparing retrieval scores must be **relative**; a heuristic
-exercised only through a harness must be **tested at the production scale**.
-Validate a new heuristic against the whole eval dataset before wiring it in
-(`qa_path._is_action_request` was deferred three times on "false-positive risk";
-measuring over all 23 dataset questions settled it). **Test the caller, not just
-the function** — the read-tool gate's tests bound `app.tenant_id` in the helper,
-but the only real caller never did.
-
-`scripts/run_eval.py` is the only path that runs the real pipeline end to end.
-
-## Release gates
-
-Zero-tolerance counts are **derived, not typed**: a test declares
-`@pytest.mark.zero_tolerance("<invariant>")`, the
-`pytest_plugins_release.gate_evidence` plugin writes
-`tests/artifacts/release_gate_evidence.json`, and `evaluation/evidence.py` is
-the only reader. A partial run (<500 tests) is refused. The writer is a plugin,
-not a conftest, because the suite has two test roots.
-
-`release_check` exits **0** all gates pass, **1** a gate failed, **2** inputs
-unusable. `--evidence-only` is the CI check. **`scripts/run_eval.py` produces
-`tests/artifacts/eval_report.json`** from the real pipeline — never from the
-deterministic harness.
-
-## Browser-testing the UI on Windows
-
-`agent-browser` does not support Windows. What works: install
-`playwright-core` into the managed node workspace and drive the **system**
-Chrome via `executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe"`
-(no browser download needed). Scripts live in
-`.workbuddy-ai/acceptance/` (`journey.mjs`, `adversarial.mjs`, `vp.mjs`).
-
-- **Restart the API after any Python change** — Vite has HMR, the API does
-  not, so a stale server makes a fixed bug look unfixed. Preferred: start a
-  second instance on another port (`APP_API_PORT=8010`) and point Vite at it
-  with `VITE_API_TARGET`, rather than killing an existing process.
-- Long runs get SIGTERM when run in the foreground; redirect to a file.
-- Mobile checks must compare `window.innerWidth` against the emulated
-  width: if content overflows, Chrome widens the *layout viewport* and
-  `innerWidth` grows (was 594 on a 390px device). `scrollWidth` will look
-  fine, so it is not a usable signal on its own.
-
-## 起服务给用户试用的最短路径
-
-后端（**必须**用 `-m platform_core.main`，不可用裸 uvicorn —— 见上文 Windows 段）：
-
-```bash
-PYTHONPATH="<绝对路径>;拼接" APP_API_PORT=8010 \
-  ./.venv/Scripts/python.exe -m platform_core.main
-```
-
-前端 —— `VITE_API_TOKEN` 会被 `api.ts` 读（`localStorage` 优先），启动时带上
-就**不用在 Token 弹窗里手输**；`VITE_API_TARGET` 默认是 8000，改端口时一定一起改：
-
-```bash
-VITE_API_TARGET=http://localhost:8010 VITE_API_TOKEN=pt_admin-demo_<user_id> \
-  node node_modules/vite/bin/vite.js --port 5174 --strictPort
-```
-
-验证顺序：`/healthz` → 带 token 打一个业务接口 → 打不带 token 的看 401 →
-再开浏览器确认不是白屏。四步都过再交给用户。
-
-## Admin UI (`apps/admin-web`)
-
-- **`ApiError` must extend `Error`.** As a plain object it fell through to
-  `String(err)` → `[object Object]` in every error banner.
-- `ok_response` **spreads** its payload (adding `trace_id`), so responses are
-  `{usage: ...}` / `{billing: ...}`, not nested under `data`.
-- Use `useAction()` + `<ActionFeedback>` for writes — no `alert()`.
-  `useAsync` exposes `errorStatus`, so a page can tell a 403 (permission
-  boundary → a note) from a 500 (→ a banner).
-- `.env` needs `VITE_API_TOKEN`. Gates are only `tsc` + `vite build` —
-  **front-end defects are invisible to pytest.**
-- Pages: Cases, GapQueue, PromptRelease, QualityDashboard, Usage, Members,
-  Branding, FeatureFlags. Components: Layout, Prompt, TokenDialog, ui.
-
-## Tooling and conventions
-
-- `scripts/seed_admin_demo.py` seeds the `admin-demo` tenant and prints
-  `pt_admin-demo_<uuid>`. `scripts/backup_restore_drill.py` restores into a
-  scratch DB; its exit **2** means "source was not quiescent", not data loss.
-- Conventional-commit subject + a body explaining **why**; state the test count
-  delta and ruff/mypy status. Read `AGENTS.md` before changing module
-  boundaries.
-- SAML login issues **no session**; a first SAML login **never provisions a
-  role**; a SCIM **Group maps to a Department, never to a `MembershipRole`**;
-  `infra/kubernetes/` has **never been applied to a cluster**.
-
-## Standing conclusions from the 2026-09-18 audit (132 items)
-
-Full mapping: `docs/interview-checklist-audit.md`. Gaps since closed by new
-modules: multi-turn context/memory/compression → `agent_runtime/conversation.py`;
-intent taxonomy → `agent_runtime/intent.py`; contextual query rewrite →
-`conversation.rewrite_query`; retrieval-vs-generation attribution →
-`evaluation/runner.py`.
-
-Reuse, do not re-derive:
-- `docs/agent.md` documents 7 routing classes and 7 context layers; before the
-  audit only 2 routing classes and 1 context layer existed in code. **A doc that
-  describes unbuilt behaviour is a spec, not evidence** — grep the doc's nouns
-  against `apps/api/src` when auditing coverage.
-- `uq_citation_claim` is `(agent_run_id, claim_index)`, so a claim carries
-  **one** citation row though `docs/agent.md` says "one or more"; extra
-  supporting chunks live in `retrieval_config`.
-- Chunking had **no overlap** and `MAX_CHUNK_CHARS = 1200` hardcoded; `top_k=8`
-  hardcoded in the orchestrator. Both are now config-driven.
-- `retry_delays` had **no jitter** (thundering herd); now `jitter_ratio`.
-
-## Reference customer research
-
-`docs/research/huaqiu-research.md` — 深圳华秋智联 (huaqiu.com) as the benchmark
-customer: business lines (PCB/PCBA/商城/方案/DFM/EDA), stakeholder roles, B2B
-support scenarios, landing path. Public info only; unverified items tagged
-`[假设]`.
-
-## 项目定位（容易误解，务必先看）
-
-**这个 repo 不是终端聊天产品，是"AI 控制平面"**。`docs/architecture.md` 开头即写明
-"integrated with Chatwoot as an external bounded context"，上下文图是：
-`Customer → Web chat/Email → Chatwoot → 签名 webhook → Support Bridge → AI Control Plane`
-，回程 `AI --REST send message--> Chatwoot`。
-
-所以"客户去哪提问"的正确答案是 **Chatwoot**，不是本仓库。本仓库只有：
-企业侧管理后台（admin-web）+ `/v1/*` 管理 API + 一个 webhook 入口。
-
-**但客户自服务门户是被规划过的、目前缺失**：`identity/domain_router.py` 有
-`/v1/public/branding`，注释写着 "Unauthenticated by design: this is the
-tenant's public page"，按 Host 解析租户。前端没做。这是"看起来应该有聊天界面
-却没有"的真正原因，不是设计上就该去 Chatwoot。
-
-另注：`docs/handover-summary.md` 记录了 embedding 曾为 `embed_deterministic`
-哈希占位（RAG 质量本不可用），M1 才接真实 embedding —— 涉及检索效果时先确认现状。
+- **`--env-file .env` is mandatory** (compose substitutes `${...}` from the project dir, not `env_file`;
+  an empty explicit value *overrides* the good one). The customer loop needs a *host* API on 8010
+  (`python -m platform_core.main`), not compose's 8000. There is **no `chatwoot` profile any more**.
+- **The full suite must be the LAST pytest invocation** — the gate plugin writes evidence unconditionally,
+  so a targeted run overwrites it → `release_check` exit 2. **Do not "fix" that plugin; it is correct.**
+  **Pause the worker containers first** — a live worker races the tests for the same queue rows.
+- **The API/worker image bakes the source → a backend change needs `up -d --build`.** Restarting without
+  `--build` leaves old code: new routes 404 while migrations are already applied, which reads exactly like
+  "my change did not take". Rebuild ~2.5 min. **`-o addopts=""` to see the summary line.**
+- **A red full-suite run is not evidence** — re-run the failing test alone first. **Green tests ≠ working
+  UI** → `scripts/{ui_smoke,admin_render_check,support_card_smoke}.cjs`; `concurrency_probe.py` needs a
+  **real service**. **Stop every consumer before testing, host processes too** (killing your shell does not
+  kill your python child). **Never edit a page while a guard is driving it** (Vite HMR → hang).
+
+## Environment & Windows traps
+
+- `.venv/Scripts/python.exe` (3.12) — managed 3.13 has **no pytest**. Repo
+  `D:/360Downloads/360驱动大师目录/b2b-ai-support-plan/b2b-ai-support-plan`.
+- **pytest/mypy read `pyproject.toml`'s `pythonpath` → no env var.** For a bare `python -m`, set **one
+  quoted** path: `export PYTHONPATH="$R/apps/api/src"`. **A `;`-joined PYTHONPATH in Git Bash is silently
+  truncated** → `ModuleNotFoundError: platform_core`. Script source root:
+  `apps/api/src;apps/worker/src;packages/*/src;.` (`observability` = `packages/observability/src`).
+- Roles `platform` (bypasses RLS) vs `platform_app` (NOBYPASSRLS).
+- **`python -m platform_core.main`, never bare uvicorn**; **`curl --noproxy "*"`**; bodies with `-o`, not a
+  pipe. Vite needs `--host 127.0.0.1` or it only listens on IPv6.
+- **Port ghosts** (an old `127.0.0.1:PORT` beats a new `0.0.0.0:PORT`) → judge by `netstat -ano` bind + PID,
+  not by a 404/405. **`wmic` is blacklisted; the PowerShell tool drops stdout** → `tasklist` + `netstat`.
+  **Kill what you started before leaving.**
+- **`agent-browser` does not support Windows.** Use playwright-core in the managed node workspace driving the
+  **system** Chrome (`executablePath`); scripts `.cjs`/`.mjs` **run from that workspace tree** (ESM ignores
+  `NODE_PATH`); long runs in the background with output to a file.
+- **Two sessions share this working tree.** Never `reset --hard`, `checkout --`, `clean -fd`; don't `git add`
+  a file carrying the other session's uncommitted changes. **Do not delete `.workbuddy-ai/`.**
+- **The Bash tool sometimes executes a command twice** → write one-off scripts **idempotently**
+  (replace-if-present, never assert-on-count) or a second pass duplicates the edit.
+- **Memory lives in `.workbuddy-ai/memory/`** (`.gitignore:36` = the committed canonical store). Tooling
+  defaults to `.workbuddy/memory/` — **that is the wrong place**; a note there never travels with the repo.
+
+## Rules that keep being violated (each with a case in REFERENCE)
+
+- **The recurring defect is a capability with no consumer** — a value/column/function that is tested but
+  that no production path reads. **Grep a reader's writers/callers before trusting it**; a test calling a
+  function directly hides a missing caller. **Grep before adding an enum value.** Build the consumer with
+  the capability, or don't build it. **Measure the tracked set, not the disk** (`git ls-tree`, not `ls`).
+- **Removing a transport removes its consumers** — every value that only travelled on it becomes dead.
+  Grep for them *before* the delete and give each a surviving consumer.
+- **`is not None` is not a capability check** — ask the registry (`systems`), not the object.
+- **Errors must be real 4xx.** FastAPI renders a returned **dict** as 200 — return `error_response()` /
+  `domain_error_response()`. **Never swallow an exception: catch ⇒ log.**
+- **A guard you cannot observe failing is not evidence** → mutation-test every guard; **an over-broad guard
+  is worse than none**; give each guard a case **only it** decides; **state its failure mode when you add it**.
+- **Never gate behaviour on `Scene.*` without measuring the pattern list.** **A red line is not a feature flag.**
+- **Measure before and bidirectionally after changing a heuristic; check the object's actual shape, and
+  decide what "pass" means, before asserting.** A change that only makes a test green can be "green that lies".
+- **A test can pass for the wrong reason and still look like a guard** — assert the opposite case too.
+- **Teardown order is a systemic defect here** — delete children before parents, enumerated from
+  `pg_constraint`, never memory. Prefer **derived** tenant UUIDs (`uuid.uuid5`): a slug `ON CONFLICT` does
+  **not** absorb a PK collision.
+- **When "this is easier" argues against a documented design, the design wins.** Delete a design's dependent
+  parameters too. Record deliberate scope boundaries.
+
+## RLS · async · runs · conventions (full → REFERENCE)
+
+- **RLS fails silently on writes**: unbound `SELECT` → 0 rows; `UPDATE`/`DELETE` → rowcount 0 — **assert
+  `rowcount` on every app-role write**. **Never leave probe rows**; tear down children-first.
+- `set_config('app.tenant_id', …, true)` is **transaction-scoped**; **a failed flush poisons the session** →
+  `await session.rollback()` before raising. **The outbox relay's caller owns the transaction.**
+- **Worker claiming precedes any tenant and every queue table is FORCE-RLS** → the owner role, the ONE
+  allowed exception: `worker.wiring.queue_bookkeeping_session()`.
+- **Query an `AgentRun` by its exact `run_id`**, never `conversation_ref` (two creation sites, `router.py:159`).
+- `packages/observability`'s **field allowlist *is* the log schema** — an unlisted field is silently dropped.
+- **Audit `after=` is hashed and unreadable; `metadata=` is the readable exception.**
+- **An RLS policy must use `NULLIF(current_setting('app.tenant_id', true), '')::uuid`, never a bare `::uuid`.**
+- **`set_config(..., false)` leaks on pooled connections** — a "no tenant context" assertion must `RESET`.
+- **Adding a tenant-owned table needs five edits:** migration + `models_registry` import + *both*
+  `TENANT_TABLES` tuples + `EXPECTED_MIGRATIONS` + a seed row in `test_cross_tenant_negative`.
+- **Within one router, declare `/queue` before `/{x}`** (registration order; `queue` is a valid `{x}`).
+- **A partial update needs its own `update_*` function, not `upsert` + defaults.**
+- **`async def helper()` called synchronously returns a coroutine** → make the wrapper sync, `_run()` inside.
+- **Unique "optional" fields must be NULL, not `""`.** **`Mapped[dict | None]` fails mypy** — add type args.
+- **A fallback must *delegate* to the old function, not restate its arithmetic.**
+- **A test whose configured value equals the default cannot prove the wiring.**
+- **Two `create_engine`s exist and mixing them breaks** — admin URL sync, app-role URL async.
+- **The admin web has two gates: `tsc --noEmit` and `vite build`.** Run both after touching `admin-web`.
+- **A toggle that re-sends a whole object must re-send it verbatim.** **`x.get(k) or default` cannot express
+  "explicitly zero".**
+- Conventional-commit subject + body explaining **why**, with test-count delta + ruff/mypy. Bootstrap tokens
+  are **unsigned** → `APP_ENVIRONMENT` must be *explicitly* declared (S-1). **A test outside `testpaths`
+  never runs.** **Never issue parallel edits to one file.**
+
+## Built and verified — do NOT "re-fix"
+
+- **`/support`'s card works** (2026-09-22: `POST /v1/support/verify` + nav link; smoke 6/6).
+  **Chinese reaches the read path. `mypy` is GREEN.**
+- **The read-path ownership gate (2.2/2.5) is built and verified.** `verified_account` is **three-state, not
+  a boolean**: `None` = operator run (no gate), `""` = anonymous → gate 1 `IDENTITY_REQUIRED` *before any
+  connector call*, `"acme"` = verified → gate 2 refuses a mismatched receipt. **Omitting the key means
+  `None` = any message may read any order — a hole, not a default.**
+- **Chatwoot is gone and the gate is intact** — `release_check`: `cross_tenant_violations: 15`,
+  `unauthorized_writes: 4`, `duplicate_replies: 4` passing.
+- **No real send has ever been observed** — no SMTP server, no WeChat credentials here; only the outbound
+  decision logic is tested (fake transports).
+- **2026-09-23 customer-side walkthrough fixes** (Chinese tool selection + `_READ_PRIORITY`; handoff no
+  longer swallows the next question — **the notice must be written by the API layer**; polling baseline;
+  `npm run build` i18n/type errors). Detail → REFERENCE, `2026-09-23.md`.
+
+## Still open
+
+- **`external_resource_refs` has no production reader or writer** (was the Chatwoot account→tenant mapping).
+  Table + model kept; dropping a table is a contract migration. **The recurring defect shape — either
+  onboarding writes to it again or a migration removes it.**
+- **Deliberately NOT changed:** `conversation_ref`'s `chatwoot:conversation:` uuid5 prefix (changing it
+  orphans every existing ref) and `0002_bridge_mappings`'s `server_default="chatwoot"` (immutable; inert).
+- **Related-cases ranking must stay language-agnostic** (`similarity()` = 0.000 for short Chinese pairs).
+- **Receipt timestamps must be ISO 8601** — `redact_text` masks a 10-digit run to `[PHONE]`, breaking JSON.
+- **Cards are read-side only** (`tool_card.py` → `timeline[].card`) and **only `/support` renders them** —
+  the workbench shows looked-up data as text, and the legacy `DataCard.tsx` still runs on `/chat`. W1/W2.
+- **`pricing/capability.py`'s matrix and the price list default empty** → every quote escalates. The demo's
+  "加急费参考 ¥XX（依据：价目表 v3.2）" needs **data configured**, not code.
+- Known flake: `test_ingestion_worker.py` (different tests across runs, each green alone) — pre-existing.
+- **The closed loop's last mile is `evaluation/categories.py` + `issue_categories` (migration 0046).**
+  Categories derive from `agent_runs.model_config.intent` (`business_line|scene|primary_kind`), so stats
+  need no write path. "Automated" is strict: completed **and** no `abstain_reason` **and** no
+  same-category re-ask within 900s. `routing`/`policy` fix types are never proposable.
+
+## Conversation ref: one id, two meanings (open, needs authorization)
+
+`/v1/conversations/{conversation_ref}/*` re-derives the path segment as an **external** id
+(`conversation_ref_for(tenant, seg)`), while `/v1/conversations` **lists the already-derived**
+`conversation_ref_id`. Passing the platform's own id back therefore derives it a second time.
+
+- Live failure: the operator replay page. 4/4 sampled — the first returned **another conversation's
+  content** (silent wrong data), the rest `NOT_FOUND`. `router.py:217`, also `:155`,
+  `agent_reply_router.py:85`, `customer_router.py:65`. `/chat` avoids it only because it generates its own
+  external id. Next to break: `/replies` (the workbench reply box is the roadmap's next step).
+- Fix (recommended, **unauthorised**): drop `conversation_ref_for(...)` at those four sites so the segment
+  **is** the platform ref; move `/chat` onto `/v1/support/sessions`. All uncommitted, no external consumers.
+  `support_router.py`'s docstring already warned about exactly this.

@@ -39,8 +39,15 @@ async def test_drain_sweeps_every_active_tenant_and_aggregates(monkeypatch) -> N
             "inbox_events_pruned": 3,
         }
 
+    ttls: list[int] = []
+
+    async def fake_abandon(session, *, tenant_id, older_than_seconds, now, batch=500):
+        ttls.append(older_than_seconds)
+        return 4
+
     monkeypatch.setattr(retention_consumer, "_active_tenant_ids", fake_active)
     monkeypatch.setattr(retention_consumer, "sweep_expired_data", fake_sweep)
+    monkeypatch.setattr(retention_consumer, "abandon_stale_placeholders", fake_abandon)
     monkeypatch.setattr(retention_consumer, "session_scope_with_url", lambda url: _SessionCtx())
 
     async def fake_apply(session, ctx) -> None:
@@ -56,7 +63,14 @@ async def test_drain_sweeps_every_active_tenant_and_aggregates(monkeypatch) -> N
     assert stats.expired_versions == 2
     assert stats.pruned_dead_letters == 4
     assert stats.pruned_inbox_events == 6
-    assert stats.changed_rows == 12
+    # The queue-hygiene step runs per tenant too, and its count is part of the
+    # aggregate - otherwise "did the sweep do anything" reads false on a cycle
+    # that only closed abandoned runs.
+    assert stats.abandoned_runs == 8
+    assert stats.changed_rows == 20
+    # And the threshold comes from configuration. A hard-coded or missing TTL
+    # would silently abandon runs that were about to execute.
+    assert ttls == [retention_consumer.get_settings().run_abandon_after_seconds] * 2
 
 
 async def test_a_failing_tenant_does_not_stop_the_sweep(monkeypatch) -> None:
@@ -79,8 +93,12 @@ async def test_a_failing_tenant_does_not_stop_the_sweep(monkeypatch) -> None:
         swept.append(tenant_id)
         return {"document_versions_expired": 1, "dead_letters_pruned": 0, "inbox_events_pruned": 0}
 
+    async def fake_abandon(session, *, tenant_id, older_than_seconds, now, batch=500):
+        return 0
+
     monkeypatch.setattr(retention_consumer, "_active_tenant_ids", fake_active)
     monkeypatch.setattr(retention_consumer, "sweep_expired_data", fake_sweep)
+    monkeypatch.setattr(retention_consumer, "abandon_stale_placeholders", fake_abandon)
     monkeypatch.setattr(retention_consumer, "session_scope_with_url", lambda url: _SessionCtx())
 
     async def fake_apply(session, ctx) -> None:

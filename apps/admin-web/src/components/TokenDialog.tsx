@@ -27,6 +27,14 @@ export function TokenDialog({ open, onClose }: { open: boolean; onClose: () => v
 
   if (!open) return null;
 
+  function signOut() {
+    setToken("");
+    // A full reload drops every cached page and every in-flight request bound
+    // to the old token, so nothing keeps rendering under an identity that is
+    // no longer present.
+    window.location.reload();
+  }
+
   async function save() {
     const token = draft.trim();
     if (!token) {
@@ -91,6 +99,14 @@ export function TokenDialog({ open, onClose }: { open: boolean; onClose: () => v
         <button className="btn" onClick={onClose} disabled={busy}>
           {t("common.cancel")}
         </button>
+        {getToken() ? (
+          // Without this there was no way to end a session at all: the dialog
+          // refuses an empty token, and the token lives in localStorage with no
+          // expiry. On a shared workstation the next person inherited it.
+          <button className="btn btn-ghost" onClick={signOut} disabled={busy}>
+            {t("token.signOut")}
+          </button>
+        ) : null}
       </div>
     </div>
   );

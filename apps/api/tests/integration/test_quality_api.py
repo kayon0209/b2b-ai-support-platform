@@ -42,8 +42,8 @@ CONV = "0190a000-0000-7000-8000-0000000000c1"
 
 _RUN_INSERT = (
     "INSERT INTO agent_runs "
-    "(id, tenant_id, conversation_ref_id, route, status, latency_ms, started_at) "
-    "VALUES (:id, :t, :conv, :route, :status, :latency, :started)"
+    "(id, tenant_id, conversation_ref_id, route, status, latency_ms, started_at, input_hash) "
+    "VALUES (:id, :t, :conv, :route, :status, :latency, :started, :hash)"
 )
 
 
@@ -148,7 +148,12 @@ def _insert(*rows: dict) -> None:
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
         for row in rows:
-            conn.execute(text(_RUN_INSERT), row)
+            # Every row here models a run that executed, so it carries a
+            # question hash - the field the platform writes the moment
+            # execution begins, and the one that separates a real run from a
+            # queue placeholder. Seeding '' made these fixtures depend on
+            # placeholders being aggregated as if they had run.
+            conn.execute(text(_RUN_INSERT), {**row, "hash": uuid.uuid4().hex * 2})
     admin.dispose()
 
 

@@ -218,6 +218,15 @@ class PlatformMetrics:
             "Inbox rows returned to RECEIVED after a worker died mid-run.",
             registry=r,
         )
+        self.outbox_unhandled_total = Counter(
+            "platform_outbox_unhandled_total",
+            "Outbox rows published with no registered handler, by event type. "
+            "The row is still retired so the queue drains, so without this a "
+            "producer with no consumer is invisible: the event is marked sent "
+            "and nothing anywhere reports that it went nowhere.",
+            labelnames=("event_type",),
+            registry=r,
+        )
 
         # --- Multi-turn context (docs/agent.md context layers 4 and 7) ---
         # Per-run counts, so histograms not counters: the question a dashboard
