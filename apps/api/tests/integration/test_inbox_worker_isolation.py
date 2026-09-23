@@ -163,7 +163,9 @@ def _run_row() -> tuple[str, str, str | None] | None:
 # --- 1. The flag that decides the run is the run's OWN tenant's --------------
 
 
-def test_a_run_is_decided_by_its_own_flag_not_another_tenants(seeded: None) -> None:
+def test_a_run_is_decided_by_its_own_flag_not_another_tenants(
+    seeded: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Tenant A's run must take the read-tool branch, because A's flag is on.
 
     Tenant B's identical key is off. On the broken code the lookup returned B's
@@ -174,17 +176,42 @@ def test_a_run_is_decided_by_its_own_flag_not_another_tenants(seeded: None) -> N
     be produced by entering `_attempt_business_read` (which then finds no
     `business_api` connector seeded here) and handing off from inside it. The
     knowledge path abstains with a different reason code.
+
+    The wiring's configuration gate refuses to build without an LLM key, and
+    this run never reaches the model (the read-tool branch fails before
+    generation), so a placeholder satisfies the gate here. It cannot come from
+    the job environment: the retrieval endpoint reads the same key and would
+    then switch from the deterministic embedder to a provider with nowhere to
+    call.
+
+    Two process-wide caches have to be reset with it, not one. `get_settings`
+    is `lru_cache`d, and so is `get_model_bundle` - and the bundle is the thing
+    the gate actually consults. An earlier test in the batch has already cached
+    a `None` bundle, so clearing only the settings lets the stale `None` be
+    returned and this test fails in a batch while passing alone. Cleaned on
+    both sides, so the placeholder cannot outlive the test either.
     """
     import asyncio
 
+    from platform_core.config import get_settings
+    from platform_core.llm.factory import reset_model_bundle
     from worker.inbox_consumer import drain_once
     from worker.wiring import build_interactive_deps, queue_bookkeeping_session
 
-    async def drain() -> None:
-        async with queue_bookkeeping_session() as bookkeeping:
-            await drain_once(bookkeeping, deps=build_interactive_deps(), batch=5)
+    monkeypatch.setenv("APP_LLM_API_KEY", "test-only-key-not-a-credential")
+    get_settings.cache_clear()
+    reset_model_bundle()
+    try:
 
-    asyncio.run(drain())
+        async def drain() -> None:
+            deps = build_interactive_deps()
+            async with queue_bookkeeping_session() as bookkeeping:
+                await drain_once(bookkeeping, deps=deps, batch=5)
+
+        asyncio.run(drain())
+    finally:
+        reset_model_bundle()
+        get_settings.cache_clear()
 
     row = _run_row()
     assert row is not None, "the event produced no run at all"

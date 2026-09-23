@@ -182,7 +182,9 @@ jobs:
         # database acquires the grant out of band, which is exactly the
         # "passes locally, fails fresh" shape that suite exists to catch.
         run: |
-          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres             psql -U platform -d platform -c             "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            psql -U platform -d platform -c \
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
       - name: Run integration tests
         run: pytest apps/api/tests/integration -m integration
         env:
@@ -192,11 +194,21 @@ jobs:
           # Same reason as the unit job: no .env exists in the checkout.
           APP_ENVIRONMENT: local
           APP_ALLOW_BOOTSTRAP_TOKENS: "true"
-          # The worker-isolation suite builds the *real* worker wiring, whose
-          # configuration gate refuses to run without an LLM key. No test in
-          # this job makes a model call (they run fakes), so a placeholder
-          # satisfies the gate without spending anything.
-          APP_LLM_API_KEY: test-only-key-not-a-credential
+          # `APP_LLM_API_KEY` is deliberately NOT set for this job.
+          #
+          # It was, as a placeholder, to satisfy the configuration gate that the
+          # worker-isolation suite hits when it builds the *real* worker wiring.
+          # But the key is read by the retrieval path too, and a key present
+          # switches it from the deterministic embedder to a real provider - which
+          # the sandbox cannot reach, so `/v1/retrieval/query` answered 500 and two
+          # integration tests failed (CI #18, and reproduced locally with the same
+          # placeholder: `test_m2_http_api.py::test_retrieval_query_requires_knowledge_read`
+          # and `test_cross_tenant_leak_surfaces.py::test_retrieval_never_returns_another_tenants_evidence`).
+          #
+          # The two needs are incompatible at job scope, so the one test that needs
+          # a key sets it itself: `test_inbox_worker_isolation.py` monkeypatches it
+          # and clears `get_settings` before and after, so the placeholder cannot
+          # leak into the rest of the batch.
 
   concurrency-guard:
     # Enforces the F-9 invariant: N concurrent writers of one logical message
@@ -262,7 +274,9 @@ jobs:
         # database acquires the grant out of band, which is exactly the
         # "passes locally, fails fresh" shape that suite exists to catch.
         run: |
-          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres             psql -U platform -d platform -c             "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            psql -U platform -d platform -c \
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
       - name: Seed the demo tenant and capture its token
         run: |
           python scripts/seed_admin_demo.py 2>&1 | tee seed.log
@@ -358,14 +372,19 @@ jobs:
         # database acquires the grant out of band, which is exactly the
         # "passes locally, fails fresh" shape that suite exists to catch.
         run: |
-          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres             psql -U platform -d platform -c             "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            psql -U platform -d platform -c \
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
       - name: Run the full suite (produces the release-gate evidence)
         run: pytest
         env:
           APP_TEST_DATABASE_URL: postgresql+psycopg://platform_app:platform_app@localhost:5435/platform
           APP_ADMIN_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
-          APP_LLM_API_KEY: test-only-key-not-a-credential
+          # No `APP_LLM_API_KEY` here either, for the same reason the integration
+          # job omits it: a placeholder key switches the retrieval path off the
+          # deterministic embedder and the sandbox has nowhere to call. This job
+          # runs the whole suite, so it contains both sides of that conflict.
       - name: Verify the zero-tolerance evidence is complete
         run: python -m platform_core.evaluation.release_check --evidence-only
         env:
