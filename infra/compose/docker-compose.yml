@@ -3,7 +3,7 @@ name: b2b-ai-support
 services:
   # --- Custom AI platform (its own database, Redis and object storage) ---
   ai-postgres:
-    image: docker.1ms.run/pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: platform
       POSTGRES_PASSWORD: platform

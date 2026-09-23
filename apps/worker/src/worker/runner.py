@@ -31,7 +31,7 @@ import asyncio
 import os
 import signal
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
 
@@ -377,7 +377,7 @@ def resolve_queue(argv: list[str] | None = None) -> str:
     return raw
 
 
-def run(coro: "Awaitable[None]") -> None:
+def run(coro: "Coroutine[Any, Any, None]") -> None:
     """`asyncio.run` with a loop psycopg can actually use.
 
     On Windows `asyncio.run` builds a ProactorEventLoop, which psycopg's
@@ -385,9 +385,15 @@ def run(coro: "Awaitable[None]") -> None:
     already selects a selector loop; the worker did not, so it could not
     start at all on Windows and failed its first poll cycle with
     `RuntimeError: psycopg async cannot run on a ProactorEventLoop`.
+
+    The annotation is `Coroutine`, not `Awaitable`: `asyncio.run` requires a
+    coroutine, and mypy narrows `sys.platform` to the *host*, so this check
+    only ever flagged the Linux branch — invisible on a Windows laptop
+    (the else branch is unreachable there), red in CI. Every caller passes
+    the result of an `async def` call, so the narrower annotation is true.
     """
     if sys.platform == "win32":
-        asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)  # type: ignore[arg-type]
+        asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)
     else:
         asyncio.run(coro)
 
