@@ -30,7 +30,7 @@ BASE = "http://127.0.0.1:8000"
 # The seeded `admin-demo` owner. A real deployment resolves this from OIDC; the
 # probe borrows the bootstrap token for the same reason every other probe here
 # does.
-TOKEN = "pt_admin-demo_8c89893c-09ce-4252-b839-971ac15e9a07"
+TOKEN = "pt_admin-demo_8c89893c-09ce-4252-b839-971ac15e9a07"  # noqa: S105 - the seeded demo token, not a secret
 TIMEOUT = 30
 
 FAILED = 0
@@ -43,16 +43,18 @@ def check(label: str, ok: bool, detail: str = "") -> None:
     print(f"  {'PASS' if ok else 'FAIL'}  {label}" + (f"\n        {detail}" if detail else ""))
 
 
-def call(method: str, path: str, body: dict | None = None, token: str | None = None) -> tuple[int, dict]:
+def call(
+    method: str, path: str, body: dict | None = None, token: str | None = None
+) -> tuple[int, dict]:
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if method != "GET":
         headers["Idempotency-Key"] = str(uuid.uuid4())
-    req = urllib.request.Request(f"{BASE}{path}", data=data, headers=headers, method=method)
+    req = urllib.request.Request(f"{BASE}{path}", data=data, headers=headers, method=method)  # noqa: S310 - BASE is a hardcoded http://127.0.0.1 URL
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:  # noqa: S310 - BASE is a hardcoded http://127.0.0.1 URL
             return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read() or b"{}")
@@ -95,7 +97,10 @@ status, reply = call(
     {"text": "您好，我是人工同事，已经接手这条对话，正在为您核实。", "origin": "free"},
     token=TOKEN,
 )
-print(f"[4] 人工回复 POST → HTTP {status}" + (f"  {reply.get('error', {}).get('code', '')}" if status != 200 else ""))
+print(
+    f"[4] 人工回复 POST → HTTP {status}"
+    + (f"  {reply.get('error', {}).get('code', '')}" if status != 200 else "")
+)
 check("人工回复被接受", status == 200, json.dumps(reply, ensure_ascii=False)[:200])
 
 # 3. Read the customer's own timeline back.
@@ -119,7 +124,9 @@ check(
 # 4. And the customer surface must now say who has it, rather than waiting.
 print("\n[6] 客户面此时应显示「已有同事接手这条对话，他们会看到您发的消息。」")
 print("    —— 断言由浏览器探针承担；这里只确认驱动它的 owner 值正确。")
-check("前端据此渲染状态条所需的 owner 值已就位", owner_after in ("human", "queue"), str(owner_after))
+check(
+    "前端据此渲染状态条所需的 owner 值已就位", owner_after in ("human", "queue"), str(owner_after)
+)
 
 print()
 print("=" * 78)

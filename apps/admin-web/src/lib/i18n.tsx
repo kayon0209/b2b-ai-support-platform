@@ -171,6 +171,8 @@ const en = {
   "quality.latencyP95": "Latency P95",
   "quality.supportedResolution": "Supported resolution",
   "quality.wrongResolution": "Wrong resolution",
+  "quality.csat": "Satisfaction (1-5)",
+  "quality.csatRate": "Survey response rate",
   "quality.resolutionOutcomes": "Resolution outcomes",
   "quality.casesMeasured": "Cases measured",
   "quality.resolutionHeld": "Resolution held",
@@ -676,6 +678,7 @@ const en = {
   "notFound.title": "Page not found",
   "notFound.body": "There is no page at {path}. It may have been renamed or removed.",
   "notFound.home": "Go to the quality dashboard",
+  "notFound.customerWindow": "Looking for customer support? Open the support window",
 };
 
 // A missing Chinese key is a compile error, not a silent English leak.
@@ -825,6 +828,8 @@ const zh: Record<keyof typeof en, string> = {
   "quality.latencyP95": "延迟 P95",
   "quality.supportedResolution": "有效解决率",
   "quality.wrongResolution": "错误解决率",
+  "quality.csat": "即时满意度（1-5）",
+  "quality.csatRate": "评价回收率",
   "quality.resolutionOutcomes": "解决结果",
   "quality.casesMeasured": "统计工单数",
   "quality.resolutionHeld": "解决有效",
@@ -1317,6 +1322,7 @@ const zh: Record<keyof typeof en, string> = {
   "notFound.title": "页面不存在",
   "notFound.body": "{path} 没有对应的页面，可能已被重命名或移除。",
   "notFound.home": "返回质量看板",
+  "notFound.customerWindow": "想找在线客服？打开客服对话窗",
 };
 
 export type Dict = typeof en;

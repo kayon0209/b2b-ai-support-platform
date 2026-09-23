@@ -21,6 +21,15 @@
 export type ToolCardNode = {
   label: string;
   state?: string;
+  /**
+   * The customer-facing wording for `state`, when the platform sent one.
+   *
+   * Preferred over the local map below. The vocabulary belongs on the server,
+   * because the same record is described twice in one turn - the card here and
+   * the answer's prose - and two copies of it drifted: the card said 生产中
+   * while the sentence above it said `in_production` (measured 2026-09-23).
+   */
+  state_label?: string;
   at?: string;
 };
 
@@ -28,6 +37,8 @@ export type ToolCardData = {
   kind: string;
   title?: string | null;
   status?: string | null;
+  /** The customer-facing wording for `status`, when the platform sent one. */
+  status_label?: string | null;
   nodes?: ToolCardNode[] | null;
   eta?: string | null;
   quantity?: number | null;
@@ -120,7 +131,12 @@ export function ToolCard({
   const nodes = Array.isArray(card.nodes) ? card.nodes : [];
   const age = relative(card.fetched_at);
   const heading = card.kind === "shipment" ? t.shipment : t.orderStatus;
-  const status = card.status ? (STATUS_TEXT[card.status] ?? card.status) : null;
+  // Server label first, local map second. The map stays as the fallback for a
+  // turn published before the platform sent labels, and for a surface whose
+  // payload predates them - it is no longer the primary source.
+  const status = card.status
+    ? (card.status_label ?? STATUS_TEXT[card.status] ?? card.status)
+    : null;
   const eta = stamp(card.eta);
 
   return (

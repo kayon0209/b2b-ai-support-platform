@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { apiGet } from "../lib/api";
 import { useAsync } from "../lib/useAsync";
-import type { QualityMetrics, RouteDistribution } from "../lib/types";
+import type { CsatSummary, QualityMetrics, RouteDistribution } from "../lib/types";
 import { Card, EmptyState, PageHeader, Spinner, Stat, Badge } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { useLang } from "../lib/i18n";
@@ -29,6 +29,14 @@ export function QualityDashboard() {
   );
   const routes = useAsync<RouteDistribution>(
     () => apiGet<RouteDistribution>(`/v1/quality/routes?window_seconds=${window}`),
+    [window],
+  );
+  // The satisfaction numbers. They were collected by nothing at all until
+  // 2026-09-23 - `csat.py` had no production caller - so this is the first time
+  // the platform can answer "are customers happy", which is one of the two
+  // experience metrics the industry tracks (the other being first-time-fix).
+  const csat = useAsync<{ csat: CsatSummary }>(
+    () => apiGet<{ csat: CsatSummary }>(`/v1/quality/csat?window_seconds=${window}`),
     [window],
   );
 
@@ -128,6 +136,37 @@ export function QualityDashboard() {
                 label={t("quality.wrongResolution")}
                 value={pct(metrics.data.wrong_resolution_rate)}
                 tone={toneFor(metrics.data.wrong_resolution_rate, 0.05, 0.15)}
+              />
+            </Card>
+            <Card>
+              {/* An em dash, not 0 or "-": no responses yet is not a score of
+                  zero, and showing 0.00 would read as "everyone is furious". */}
+              <Stat
+                label={t("quality.csat")}
+                value={
+                  csat.data?.csat.average != null
+                    ? `${csat.data.csat.average.toFixed(2)} / 5`
+                    : "—"
+                }
+                tone={
+                  csat.data?.csat.average == null
+                    ? undefined
+                    : csat.data.csat.average >= 4
+                      ? ("good" as const)
+                      : csat.data.csat.average >= 3
+                        ? ("warn" as const)
+                        : ("bad" as const)
+                }
+              />
+            </Card>
+            <Card>
+              <Stat
+                label={t("quality.csatRate")}
+                value={
+                  csat.data?.csat.response_rate != null
+                    ? pct(csat.data.csat.response_rate)
+                    : "—"
+                }
               />
             </Card>
           </div>

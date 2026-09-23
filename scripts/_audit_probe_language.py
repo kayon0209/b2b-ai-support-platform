@@ -45,14 +45,26 @@ print()
 print("== (b) 话术语言：由提问的语言决定 ==")
 ZH, EN = "交期是多久？", "What is the launch date?"
 rows = [
-    ("澄清", safe_abstention_text(ABSTAIN_CLARIFICATION, ZH),
-     safe_abstention_text(ABSTAIN_CLARIFICATION, EN)),
-    ("身份闸门", safe_abstention_text("IDENTITY_REQUIRED", ZH),
-     safe_abstention_text("IDENTITY_REQUIRED", EN)),
-    ("身份不符", safe_abstention_text("IDENTITY_MISMATCH", ZH),
-     safe_abstention_text("IDENTITY_MISMATCH", EN)),
-    ("情绪升级", safe_abstention_text(ABSTAIN_EMOTION_ESCALATION, ZH),
-     safe_abstention_text(ABSTAIN_EMOTION_ESCALATION, EN)),
+    (
+        "澄清",
+        safe_abstention_text(ABSTAIN_CLARIFICATION, ZH),
+        safe_abstention_text(ABSTAIN_CLARIFICATION, EN),
+    ),
+    (
+        "身份闸门",
+        safe_abstention_text("IDENTITY_REQUIRED", ZH),
+        safe_abstention_text("IDENTITY_REQUIRED", EN),
+    ),
+    (
+        "身份不符",
+        safe_abstention_text("IDENTITY_MISMATCH", ZH),
+        safe_abstention_text("IDENTITY_MISMATCH", EN),
+    ),
+    (
+        "情绪升级",
+        safe_abstention_text(ABSTAIN_EMOTION_ESCALATION, ZH),
+        safe_abstention_text(ABSTAIN_EMOTION_ESCALATION, EN),
+    ),
     ("系统故障", system_outage_notice(ZH), system_outage_notice(EN)),
     ("未核实记录", unverified_read_notice(ZH), unverified_read_notice(EN)),
     ("非服务时间", offline_notice(question=ZH), offline_notice(question=EN)),

@@ -38,13 +38,48 @@ const OUT = process.env.RENDER_CHECK_OUT || os.tmpdir();
  * `expect` is a string that must appear in the rendered text - the cheapest
  * proof that real data arrived rather than an empty state or an error banner.
  */
+// Every page an operator can reach, not a sample of them.
+//
+// This list held six entries against a fourteen-item sidebar, so nine operator
+// pages were never rendered by the only guard that renders pages. That gap was
+// found on 2026-09-23 while restructuring the route table (the console became a
+// pathless layout route so `/` could host the customer landing page): the
+// change touches **every** operator URL, and the guard could not have told
+// anyone if it had broken one of the nine.
+//
+// `expect` is a Chinese string from `lib/i18n.tsx`, which is the console's
+// default language, and it is the page's own heading or a value it always
+// renders - so a page that mounts but fails to fetch is still caught. Pages
+// whose content depends on live data that may legitimately be empty use `null`
+// and are checked for errors only.
 const PAGES = [
-  { path: "/conversations", expect: "会话列表" },
-  { path: "/knowledge", expect: "文档" },
-  { path: "/usage", expect: "已用运行数" },
-  { path: "/quality", expect: null },
+  { path: "/admin/quality", expect: null },
+  { path: "/admin/gaps", expect: "知识缺口" },
+  { path: "/admin/knowledge", expect: "文档" },
+  { path: "/admin/conversations", expect: "会话列表" },
+  { path: "/admin/prompts", expect: null },
+  { path: "/admin/flags", expect: null },
+  { path: "/admin/channels", expect: null },
+  { path: "/admin/experiments", expect: null },
+  { path: "/admin/cases", expect: null },
+  { path: "/admin/workbench", expect: null },
+  { path: "/admin/approvals", expect: null },
+  { path: "/admin/members", expect: null },
+  { path: "/admin/usage", expect: "已用运行数" },
+  { path: "/admin/branding", expect: null },
+  // A legacy address still has to resolve, or every bookmark and every
+  // documented link breaks. One entry proves the redirect routes are wired; the
+  // pages themselves are covered above at their real address.
   { path: "/cases", expect: null },
-  { path: "/support", expect: null },
+  // The customer surfaces. `/support` is the product's customer window; `/` is
+  // its landing page; `/support/*` is the customer's own 404, which must not
+  // show the operator sidebar.
+  { path: "/support", expect: null, expectAbsent: ".sidebar" },
+  { path: "/", expect: "开始对话", expectAbsent: ".sidebar" },
+  { path: "/support/nope", expect: "这个页面不存在", expectAbsent: ".sidebar" },
+  // The case this whole prefix exists for: a customer who mistypes the
+  // support address must not land on the operator console.
+  { path: "/suport", expect: null, expectAbsent: ".sidebar" },
 ];
 
 async function main() {
@@ -70,7 +105,15 @@ async function main() {
 
     const body = await page.innerText("body").catch(() => "");
     const missing = target.expect ? !body.includes(target.expect) : false;
-    const clean = problems.length === 0 && !missing;
+    // `expectAbsent` is the other half of a customer-surface assertion: it is
+    // not enough that the page rendered, it must not have rendered the
+    // operator's shell. The sidebar was the actual defect on the mistyped-URL
+    // 404 (2026-09-23), so a check that only looked for the page's own text
+    // would have passed while the bug was live.
+    const leaked = target.expectAbsent
+      ? (await page.locator(target.expectAbsent).count()) > 0
+      : false;
+    const clean = problems.length === 0 && !missing && !leaked;
     if (!clean) failures += 1;
 
     const shot = path.join(OUT, `render${target.path.replace(/\//g, "_")}.png`);
@@ -78,7 +121,8 @@ async function main() {
 
     console.log(
       `${clean ? "OK   " : "FAIL "}${target.path}  errors=${problems.length}` +
-        `${missing ? ` missing=${JSON.stringify(target.expect)}` : ""}  shot=${shot}`,
+        `${missing ? ` missing=${JSON.stringify(target.expect)}` : ""}` +
+        `${leaked ? ` leaked=${target.expectAbsent}` : ""}  shot=${shot}`,
     );
     if (!clean) {
       console.log(`      head: ${body.replace(/\s+/g, " ").slice(0, 200)}`);

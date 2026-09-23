@@ -284,9 +284,10 @@ async function waitForVerify(page, timeoutMs, label) {
   navItems.forEach((x) => note(`    - ${x.replace(/\n/g, " ")}`));
 
   note("\n[B2] 逐个打开侧边导航页面，收集控制台/网络错误");
-  const routes = ["/quality", "/gaps", "/knowledge", "/conversations", "/prompts", "/flags",
-                  "/channels", "/experiments", "/cases", "/workbench", "/approvals",
-                  "/members", "/usage", "/branding"];
+  const routes = ["/admin/quality", "/admin/gaps", "/admin/knowledge", "/admin/conversations",
+                  "/admin/prompts", "/admin/flags", "/admin/channels", "/admin/experiments",
+                  "/admin/cases", "/admin/workbench", "/admin/approvals", "/admin/members",
+                  "/admin/usage", "/admin/branding"];
   for (const r of routes) {
     const before = errors.length;
     await b.goto(BASE + r, { waitUntil: "domcontentloaded" });
@@ -299,7 +300,7 @@ async function waitForVerify(page, timeoutMs, label) {
   }
 
   note("\n[B3] 工作台：能否选中一个会话并回复");
-  await b.goto(BASE + "/workbench", { waitUntil: "domcontentloaded" });
+  await b.goto(BASE + "/admin/workbench", { waitUntil: "domcontentloaded" });
   await sleep(4000);
   const wb = await bodyText(b);
   note(`  工作台文本（前 1200 字）：\n---\n${wb.slice(0, 1200)}\n---`);
@@ -316,7 +317,7 @@ async function waitForVerify(page, timeoutMs, label) {
   await shot(b, "B4-会话");
 
   note("\n[B5] 工单与 SLA");
-  await b.goto(BASE + "/cases", { waitUntil: "domcontentloaded" });
+  await b.goto(BASE + "/admin/cases", { waitUntil: "domcontentloaded" });
   await sleep(3000);
   note(`  工单页文本（前 600 字）：\n---\n${(await bodyText(b)).slice(0, 600)}\n---`);
   await shot(b, "B5-工单");

@@ -37,20 +37,20 @@ def _post(path: str, body: dict, token: str | None = None) -> tuple[int, dict]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     headers["Idempotency-Key"] = str(uuid.uuid4())
-    req = urllib.request.Request(f"{BASE}{path}", data=data, headers=headers, method="POST")
+    req = urllib.request.Request(f"{BASE}{path}", data=data, headers=headers, method="POST")  # noqa: S310 - BASE is a hardcoded http://127.0.0.1 URL
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:  # noqa: S310 - BASE is a hardcoded http://127.0.0.1 URL
             return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read() or b"{}")
 
 
 def _get(path: str, token: str) -> tuple[int, dict]:
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 - BASE is a hardcoded http://127.0.0.1 URL
         f"{BASE}{path}", headers={"Authorization": f"Bearer {token}"}, method="GET"
     )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:  # noqa: S310 - BASE is a hardcoded http://127.0.0.1 URL
             return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read() or b"{}")
@@ -71,9 +71,7 @@ def new_session(visitor: str) -> dict:
 
 
 def verify_identity(token: str) -> str:
-    status, body = _post(
-        "/v1/support/verify", {"order_id": "SO-9001", "phone_tail": "8888"}, token
-    )
+    status, body = _post("/v1/support/verify", {"order_id": "SO-9001", "phone_tail": "8888"}, token)
     assert status == 200, (status, body)
     return body["token"]
 
@@ -122,9 +120,21 @@ check(
 print("\n[P1-3] 时间线每次都返回品牌与服务时间（刷新路径也拿得到）")
 token = session["token"]
 _status, timeline = _get("/v1/support/timeline", token)
-check("timeline 带 branding", bool(timeline.get("branding", {}).get("display_name")), str(timeline.get("branding")))
-check("timeline 带 conversation.owner", "owner" in timeline.get("conversation", {}), str(timeline.get("conversation")))
-check("timeline 带 support_window", "open" in timeline.get("support_window", {}), str(timeline.get("support_window")))
+check(
+    "timeline 带 branding",
+    bool(timeline.get("branding", {}).get("display_name")),
+    str(timeline.get("branding")),
+)
+check(
+    "timeline 带 conversation.owner",
+    "owner" in timeline.get("conversation", {}),
+    str(timeline.get("conversation")),
+)
+check(
+    "timeline 带 support_window",
+    "open" in timeline.get("support_window", {}),
+    str(timeline.get("support_window")),
+)
 
 # ---------------------------------------------------------------- P1-1 短中文
 print("\n[P1-1] 中文短问句不再被判「太短」，且用中文回答")
@@ -152,7 +162,11 @@ reply = agent_text(items)
 cards = [t for t in items if t["role"] == "tool" and t.get("card")]
 check("出现了订单数据卡", bool(cards), f"roles={roles(items)}")
 if cards:
-    check("卡片是 SO-9001", cards[0]["card"].get("title") == "SO-9001", str(cards[0]["card"].get("title")))
+    check(
+        "卡片是 SO-9001",
+        cards[0]["card"].get("title") == "SO-9001",
+        str(cards[0]["card"].get("title")),
+    )
 check(
     "回答不再是「系统没有响应」",
     "not responding" not in reply and "没有响应" not in reply,
@@ -182,7 +196,9 @@ check(
 
 # Q2: a plain knowledge question the AI COULD answer - and used to answer into
 # the void after a handoff.
-status, posted_q2 = _post("/v1/support/messages", {"text": "常规交期和加急分别是几个工作日？"}, token)
+status, posted_q2 = _post(
+    "/v1/support/messages", {"text": "常规交期和加急分别是几个工作日？"}, token
+)
 check("Q2（知识问题）发送成功", status == 200, f"HTTP {status}")
 check(
     "Q2 不再排队给 AI（避免生成后丢弃）",

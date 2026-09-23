@@ -89,6 +89,16 @@ const ANSWER_TIMEOUT_MS = Number(process.env.APP_ANSWER_TIMEOUT_MS || 90000);
 const notes = [];
 const failures = [];
 const started = Date.now();
+/**
+ * Whether the run got past the scaffolding and actually asked for a card.
+ *
+ * Set after the composer is found and enabled. Its whole purpose is to make two
+ * different failures distinguishable in the output: "the guard is stale and
+ * never got started" versus "the page was driven correctly and the card did not
+ * appear". Without it, both print a timeout, and the reader has to guess which
+ * one they are looking at.
+ */
+let GUARD_REACHED_ASSERTION = false;
 const HARD_DEADLINE_MS = Number(
   process.env.APP_HARD_DEADLINE_MS || ANSWER_TIMEOUT_MS * 2 + 90_000,
 );
@@ -97,6 +107,14 @@ function report() {
   for (const note of notes) console.log(note);
   console.log("");
   for (const failure of failures) console.log("FAIL " + failure);
+  // Said explicitly, because the two cases need different people to look at
+  // them: a stale guard is a defect in this file, a missing card is a defect in
+  // the product.
+  console.log(
+    GUARD_REACHED_ASSERTION
+      ? "\nGUARD drove the page: the composer was found and enabled, so a failure below is about the card."
+      : "\nGUARD DID NOT START: the composer was never found, so this says nothing about the card. Fix this file first.",
+  );
   console.log(
     "\nSUMMARY " +
       (process.env.APP_VISITOR_TOKEN ? "[adopt] " : "[ask] ") +
@@ -160,20 +178,38 @@ async function main() {
       waitUntil: "domcontentloaded",
     });
 
-    const composer = page.locator(".support-composer input");
+    // `#support-composer-input`, not `.support-composer input`.
+    //
+    // The composer became a `<textarea>` on 2026-09-23 (so a customer can paste
+    // a newline), and this guard kept asking for `input`. It therefore matched
+    // nothing, timed out at 15s on the line below, and **never reached the card
+    // assertion** - which is how the card became unreachable on the customer
+    // surface without this file noticing. A guard that can never pass is worse
+    // than no guard: its red is ignored, and it reports a *timeout*, which reads
+    // as "the page is broken" rather than "the guard is broken".
+    //
+    // The id is the stable handle: it is what the `<label for>` points at, so it
+    // survives a tag change. Select by tag name and the next refactor breaks the
+    // guard silently again.
+    const COMPOSER = "#support-composer-input";
+    const composer = page.locator(COMPOSER);
     await composer.waitFor({ state: "visible" });
     // The input is disabled until a session is open, and a disabled input is
     // the symptom the visitor-token work was about: it means the page could
     // not authenticate at all.
     await page.waitForFunction(
-      () => {
-        const el = document.querySelector(".support-composer input");
+      (sel) => {
+        const el = document.querySelector(sel);
         return el && !el.disabled;
       },
-      null,
+      COMPOSER,
       { timeout: 20000 },
     );
     notes.push("ok   session accepted, composer enabled");
+    // Self-check: everything above is scaffolding, and if it silently stops
+    // matching, the failure below is reported as a card defect. Assert we are
+    // past the scaffolding so the two are distinguishable in the output.
+    GUARD_REACHED_ASSERTION = true;
 
     if (!ADOPT) {
       // The identity step is part of the flow now, not an optional extra: an
@@ -204,7 +240,10 @@ async function main() {
 
     if (!ADOPT) {
       await composer.fill(QUESTION);
-      await page.locator(".support-composer button").click();
+      // `.support-send` (the submit button), not `.support-composer button`:
+      // that matches the 转人工 button first, which asks for a human instead of
+      // asking the question this guard is about.
+      await page.locator(".support-send").click();
     }
 
     await page.locator(".tool-card").waitFor({ state: "visible", timeout: ANSWER_TIMEOUT_MS });

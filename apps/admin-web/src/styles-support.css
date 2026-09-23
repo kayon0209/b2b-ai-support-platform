@@ -140,6 +140,19 @@
   padding: 18px 0;
   overflow-y: auto;
   scroll-behavior: smooth;
+  /* Messages grow from the bottom, next to the composer.
+   *
+   * Top-aligned content in a thread that stretches to fill the window left a
+   * dead band between the last message and the composer - measured 2026-09-23
+   * at roughly 350px on a 950px viewport with four turns, and about 450px in
+   * the empty state. That band is where the customer's eye goes while waiting
+   * for a reply, and it made a two-line conversation look like a broken page.
+   *
+   * `flex-end` rather than centring: centring a scrollable flex column clips
+   * the first item once the content overflows. `.support-empty` keeps
+   * `margin: auto`, which absorbs the free space before this applies, so the
+   * empty state stays centred. */
+  justify-content: flex-end;
 }
 
 /* Centred in the thread, which puts the greeting and the suggestions near the
@@ -234,6 +247,20 @@
 
 .support-bubble.is-agent .support-time {
   text-align: left;
+}
+
+/* The customer's own bubble is the tenant accent (`--support-accent`), so the
+ * muted grey that works on the light surface does not work here: measured
+ * 2026-09-23 at **2.28:1** on the default accent `#1a393d`, against the 4.5:1
+ * WCAG 2.2 AA needs for text this size. The file's own header claims every
+ * foreground reaches 4.5:1 - it did not cover a light foreground on the accent
+ * surface, which is exactly the combination the customer's own messages use.
+ *
+ * `rgba(255,255,255,.6)` measures 5.54:1 on that accent. Alpha rather than a
+ * solid colour so a tenant that sets a lighter or darker brand colour keeps a
+ * legible timestamp instead of a fixed grey that was tuned for one value. */
+.support-bubble.is-customer .support-time {
+  color: rgb(255 255 255 / 60%);
 }
 
 .support-typing {
@@ -481,11 +508,22 @@
  * conversation and it is the only thing on the page that explains a silence.
  * Before this existed, a customer whose question had been handed to a person
  * watched a window do nothing at all, indefinitely. */
+/* The status area. Holds the identity pill and the ownership notice, in that
+ * order, so "what the platform knows" and "who will answer" read as one
+ * answer instead of two competing chips. See SupportChat's render branch. */
+.support-status-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+
 .support-handoff {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 0 0 10px;
+  margin: 0;
   padding: 9px 12px;
   border: 1px solid #cfd9e6;
   border-radius: 10px;
@@ -595,7 +633,7 @@
 
 .support-verified {
   align-self: flex-start;
-  margin: 0 0 10px;
+  margin: 0;
   padding: 4px 10px;
   border-radius: 999px;
   background: #e6f0ec;
@@ -693,3 +731,193 @@
   border: 0;
 }
 
+
+/* --- Customer landing page (`/`) -----------------------------------------
+ *
+ * Shares `.support-shell`, so it inherits the same surface, the same accent
+ * and the same type scale as the window it leads to - the entry point and the
+ * product should not look like two products. Only the middle section differs:
+ * a headline, one action, and a way in for staff.
+ *
+ * Foregrounds are the same two values the window uses (`--support-text` for
+ * the headline, `--support-muted` for body copy), both of which are measured
+ * at or above 4.5:1 on `--support-surface`.
+ */
+.support-landing-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px 4px;
+  text-align: center;
+}
+
+.support-landing-headline {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--support-text);
+}
+
+.support-landing-body {
+  margin: 0;
+  max-width: 30em;
+  font-size: 14.5px;
+  line-height: 1.7;
+  color: var(--support-muted);
+}
+
+/* The one action on the page, so it is the only filled control here. */
+.support-landing-cta {
+  margin-top: 10px;
+  padding: 12px 28px;
+  border-radius: 999px;
+  background: var(--support-accent);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.support-landing-cta:hover {
+  opacity: 0.92;
+}
+
+.support-landing-cta:focus-visible {
+  outline: 2px solid var(--support-accent);
+  outline-offset: 3px;
+}
+
+.support-landing-note {
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: var(--support-muted);
+}
+
+.support-landing-foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px 4px 4px;
+  border-top: 1px solid var(--support-line);
+  font-size: 13px;
+}
+
+/* A quiet text link, not a button: this is not the audience the page is for,
+   and a second filled control would compete with the customer's own action. */
+.support-landing-staff {
+  color: var(--support-muted);
+  text-decoration: underline;
+}
+
+.support-landing-staff-hint {
+  color: var(--support-muted);
+  font-size: 12.5px;
+}
+
+/* --- Satisfaction ask (feature 7.10) --------------------------------------
+ *
+ * Offered after a handoff, in the same stack as the ownership notice because it
+ * is the same kind of thing: something the platform is telling the customer
+ * about this conversation.
+ *
+ * Contrast: the ask and the thanks use `--support-muted` (#5f6b7a, 5.43:1 on the
+ * surface); the stars use `--support-accent` for a chosen score and
+ * `--support-muted` for an unchosen one, both measured against the panel, not
+ * against white.
+ */
+.support-rating {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--support-line);
+  border-radius: 10px;
+  background: #fff;
+  font-size: 13px;
+  color: var(--support-muted);
+}
+
+.support-rating.is-done {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.support-rating-ask {
+  font-weight: 500;
+  color: var(--support-text);
+}
+
+.support-rating-thanks {
+  color: var(--support-text);
+}
+
+.support-rating-low {
+  flex-basis: 100%;
+  color: var(--support-muted);
+}
+
+.support-rating-buttons {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 40x40 rather than a bare glyph: the tap target is what a customer actually
+   aims at, and a 14px star is a miss on a phone. */
+.support-rating-star {
+  width: 40px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--support-line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--support-muted);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.support-rating-star:hover:not(:disabled) {
+  border-color: var(--support-accent);
+  color: var(--support-accent);
+}
+
+.support-rating-star:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.support-rating-stars {
+  display: inline-flex;
+  gap: 2px;
+  color: var(--support-muted);
+  font-size: 15px;
+}
+
+.support-rating-stars .is-on {
+  color: var(--support-accent);
+}
+
+.support-rating-skip {
+  margin-left: 6px;
+  padding: 6px 8px;
+  border: 0;
+  background: none;
+  color: var(--support-muted);
+  font-size: 13px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.support-rating-skip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

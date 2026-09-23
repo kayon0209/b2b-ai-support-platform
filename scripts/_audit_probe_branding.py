@@ -63,9 +63,7 @@ with psycopg.connect(URL) as conn:
         same = py == sql
         if not same:
             mismatches += 1
-        print(
-            f"{sample!r:<44} {str(py)!r:<24} {str(sql)!r:<24} {'✓' if same else '✗ 不一致'}"
-        )
+        print(f"{sample!r:<44} {str(py)!r:<24} {str(sql)!r:<24} {'✓' if same else '✗ 不一致'}")
 
 print()
 print("不一致数量:", mismatches)

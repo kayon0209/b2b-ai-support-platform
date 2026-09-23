@@ -45,17 +45,17 @@ const CHROME_FALLBACK =
  * tell "the page ignored the data" from "the page has nothing to show".
  */
 const ROUTES = [
-  ["/cases", "工单", "/v1/cases", ".case-row"],
-  ["/workbench", "坐席工作台", "/v1/cases", ".workbench-item"],
-  ["/gaps", "知识缺口", "/v1/knowledge/gaps", "tbody tr"],
-  ["/prompts", "提示词发布", "/v1/prompts", "tbody tr"],
-  ["/flags", "功能开关", "/v1/flags", "tbody tr"],
-  ["/members", "成员", "/v1/identity/members", "tbody tr"],
-  ["/approvals", "写操作审批", "/v1/tool-proposals", ".case-row"],
+  ["/admin/cases", "工单", "/v1/cases", ".case-row"],
+  ["/admin/workbench", "坐席工作台", "/v1/cases", ".workbench-item"],
+  ["/admin/gaps", "知识缺口", "/v1/knowledge/gaps", "tbody tr"],
+  ["/admin/prompts", "提示词发布", "/v1/prompts", "tbody tr"],
+  ["/admin/flags", "功能开关", "/v1/flags", "tbody tr"],
+  ["/admin/members", "成员", "/v1/identity/members", "tbody tr"],
+  ["/admin/approvals", "写操作审批", "/v1/tool-proposals", ".case-row"],
   // Pages with no list to count: they must still load without a failed call.
-  ["/quality", "质量看板", "/v1/quality/metrics", null],
-  ["/usage", "用量", "/v1/tenant/usage", null],
-  ["/branding", "品牌", "/v1/tenant/branding", null],
+  ["/admin/quality", "质量看板", "/v1/quality/metrics", null],
+  ["/admin/usage", "用量", "/v1/tenant/usage", null],
+  ["/admin/branding", "品牌", "/v1/tenant/branding", null],
 ];
 
 async function main() {

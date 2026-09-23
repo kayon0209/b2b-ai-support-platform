@@ -522,3 +522,20 @@ export class ApiError extends Error {
     this.retryable = retryable;
   }
 }
+/**
+ * `GET /v1/quality/csat` — how satisfied customers said they were.
+ *
+ * `average` alone is the number that misleads, so the distribution travels with
+ * it: 3.0 from everyone and 3.0 from half fives and half ones are the same mean
+ * and completely different problems. `response_rate` is the denominator that
+ * stops a 4.8 from three responses reading as a healthy platform — `null` when
+ * nothing was asked, because a rate over no conversations is undefined rather
+ * than zero.
+ */
+export type CsatSummary = {
+  responses: number;
+  average: number | null;
+  distribution: Record<string, number>;
+  response_rate: number | null;
+  window_seconds: number;
+};

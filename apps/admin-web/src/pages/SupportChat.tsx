@@ -85,6 +85,18 @@ type Session = {
   expires_at: number;
   visitor_id: string;
   /**
+   * Which tenant this session belongs to.
+   *
+   * Stored, and checked against the URL before the session is reused, because
+   * a session is bound to exactly one (tenant, conversation) pair by its
+   * token. Without this the page reused any unexpired session it found and
+   * ignored `?tenant=`, so `/support?tenant=other` showed the *previous*
+   * tenant's conversation and branding with no error and no hint - measured
+   * 2026-09-23. Silently answering as the wrong tenant is the worst of the
+   * available outcomes, so a mismatch now opens a new session instead.
+   */
+  tenant: string;
+  /**
    * Absent/null means anonymous — and an anonymous session cannot read an
    * order at all, because the read path's ownership gate answers
    * `IDENTITY_REQUIRED` *before* it calls any connector. So the data card is
@@ -122,9 +134,35 @@ const COPY = {
   greeting: "有什么可以帮您？",
   greetingBody:
     "可以问订单、交期、发票或技术参数。回答会附上引用的来源；想找人工同事，随时点「转人工」。",
-  suggestions: ["我的订单到哪了？", "常规交期是多久？", "转人工"],
+  suggestions: ["我的订单到哪了？", "常规交期是多久？", "发票怎么开？"],
   placeholder: "输入您的问题…",
+  /**
+   * What the composer says once a person owns the thread.
+   *
+   * The composer stays usable on purpose - the handoff notice promises the
+   * customer's messages will be read, so taking the box away would break that
+   * promise. What changes is that the page stops implying the AI will answer:
+   * the placeholder says who will read it. Leaving "输入您的问题…" there told
+   * the customer they were still talking to something that had already stopped
+   * listening.
+   */
+  placeholderWaiting: "留言给人工同事…",
   hint: "Enter 发送 · Shift+Enter 换行",
+  hintWaiting: "消息会直接进入人工队列 · Enter 发送",
+  /**
+   * The satisfaction ask (feature 7.10).
+   *
+   * Offered once the conversation has been handed to a person - the one
+   * unambiguous "this interaction is over" signal this surface has, and where
+   * industry practice puts the ask. A conversation the customer abandoned
+   * mid-sentence is never asked about: a score from a non-interaction drags the
+   * average down for a reason nobody can act on, which is what `csat.py`'s own
+   * docstring says.
+   */
+  ratingAsk: "这次服务您还满意吗？",
+  ratingThanks: "谢谢您的评价",
+  ratingSkip: "不用了",
+  ratingLow: "很抱歉没能帮上忙，您的反馈会交给同事跟进。",
   send: "发送",
   sending: "发送中…",
   typing: "客服正在输入…",
@@ -150,6 +188,24 @@ const COPY = {
     timeout: "客服服务响应超时，请稍后重试。",
     server: "客服服务暂时不可用，请稍后重试。",
     session: "找不到这个客服入口，请确认链接是否正确。",
+    /**
+     * Capacity, not connectivity.
+     *
+     * A 429 here is the platform declining to start work - the tenant's monthly
+     * run budget is spent, or the queue is too deep - and it used to fall
+     * through to `network` because only 404 and >=500 were mapped. So a
+     * customer was told to check their own connection while the platform was
+     * the thing that had stopped, and "retry" could only fail again. Measured
+     * 2026-09-23: it made a whole walkthrough read as "the backend is down".
+     *
+     * It deliberately does not say whose budget: `QUOTA_EXCEEDED` is the
+     * tenant's, `QUEUE_BACKPRESSURE` is the platform's, and the customer can
+     * act on neither. What they can act on is waiting, so that is what this
+     * says.
+     */
+    busy: "现在咨询的人比较多，暂时无法立刻回答。请稍后再试，或直接点「转人工」。",
+    forbidden: "这条信息需要先核实身份才能查看。请先完成上面的身份核实。",
+    tooLong: "这条消息太长了，请精简后重新发送。",
   },
 } as const;
 
@@ -185,6 +241,21 @@ function clock(at: number): string {
 }
 
 /**
+ * The platform's own error codes, mapped to something a customer can act on.
+ *
+ * A code is a better key than a status: `429` covers both "your tenant's
+ * budget is spent" and "the queue is too deep", and 403 covers both "you have
+ * not verified" and "these details do not match an order". The status decides
+ * the *shape* of the problem, the code decides what to say.
+ */
+const BY_ERROR_CODE: Record<string, string> = {
+  QUOTA_EXCEEDED: "现在咨询的人比较多，暂时无法立刻回答。请稍后再试，或直接点「转人工」。",
+  QUEUE_BACKPRESSURE: "现在咨询的人比较多，暂时无法立刻回答。请稍后再试，或直接点「转人工」。",
+  IDENTITY_REQUIRED: "查询订单信息前需要先核实身份。请在上方填写订单号和手机尾号后重试。",
+  IDENTITY_MISMATCH: "这些信息和当前已验证的账户不一致，请检查后重试，或点「转人工」。",
+};
+
+/**
  * Turn any failure into something a customer can act on.
  *
  * Written here rather than inherited from `lib/api.ts`, which this page cannot
@@ -193,10 +264,20 @@ function clock(at: number): string {
  * browser API, not a situation, so it is never shown: anything unrecognised
  * gets the network copy, which is the most likely cause and the one that
  * carries an action.
+ *
+ * `code` is the API's own `error.code`, when the caller could read it. It is
+ * checked first because it is the only thing that distinguishes two different
+ * problems behind one status.
  */
-function describeFailure(err: unknown, status?: number): string {
+function describeFailure(err: unknown, status?: number, code?: string): string {
+  if (code && BY_ERROR_CODE[code]) return BY_ERROR_CODE[code];
   if (typeof status === "number") {
     if (status === 404) return COPY.problems.session;
+    // Capacity before server error: 429 is "not now", not "broken", and the
+    // two lead a customer to do different things.
+    if (status === 429) return COPY.problems.busy;
+    if (status === 403) return COPY.problems.forbidden;
+    if (status === 413) return COPY.problems.tooLong;
     if (status >= 500) return COPY.problems.server;
   }
   if (err instanceof DOMException && err.name === "AbortError") return COPY.problems.timeout;
@@ -206,6 +287,26 @@ function describeFailure(err: unknown, status?: number): string {
     return COPY.problems.network;
   }
   return text;
+}
+
+/**
+ * Read a failed response's error code, then describe it.
+ *
+ * The body has to be read here because it is the only place the code exists,
+ * and reading it consumes it - so this is called exactly once per failed
+ * response, and the callers below do not read the body themselves.
+ */
+async function describeResponse(resp: Response): Promise<string> {
+  let code = "";
+  try {
+    const body = await resp.json();
+    code = body?.error?.code ?? "";
+  } catch {
+    // A body that is not JSON carries no code. Not an error: the status is
+    // still enough to say something useful, which is the point of the
+    // fallback chain above.
+  }
+  return describeFailure(null, resp.status, code);
 }
 
 export function SupportChat() {
@@ -228,6 +329,27 @@ export function SupportChat() {
   const [orderId, setOrderId] = useState("");
   const [phoneTail, setPhoneTail] = useState("");
   const [verifying, setVerifying] = useState(false);
+  /**
+   * Which operation the current `problem` came from.
+   *
+   * The failure banner carries one button, so that button has to re-do the
+   * thing that failed. It previously always reloaded the timeline unless a
+   * *send* was pending, which meant a failed identity check offered "重试" that
+   * reloaded the thread and left the verification exactly as it was - a button
+   * whose label promises one action and whose code performs another.
+   */
+  const [problemKind, setProblemKind] = useState<"load" | "send" | "verify">("load");
+  /**
+   * The score this conversation already has, and whether the ask is dismissed.
+   *
+   * `rating` comes from `/timeline`, so a reload shows the score the customer
+   * gave rather than an empty survey they already answered. `ratingDismissed`
+   * is local and deliberately not persisted: "not now" should not silence the
+   * ask forever, but it must not re-appear on the next render either.
+   */
+  const [rating, setRating] = useState<number | null>(null);
+  const [ratingDismissed, setRatingDismissed] = useState(false);
+  const [ratingBusy, setRatingBusy] = useState(false);
   /**
    * The text of a send that failed, so "重试" re-sends the same question. Held
    * in a ref rather than state: nothing renders from it, and putting it in
@@ -275,7 +397,7 @@ export function SupportChat() {
       // from a suspended one, so the page cannot be used to enumerate tenants.
       // The *copy* is the customer's, though: `tenant_slug` is an internal
       // parameter name and a customer has never heard of it.
-      throw new Error(describeFailure(null, resp.status));
+      throw new Error(await describeResponse(resp));
     }
     const body = await resp.json();
     const opened: Session = {
@@ -283,6 +405,7 @@ export function SupportChat() {
       conversation_ref: body.conversation_ref,
       expires_at: body.expires_at,
       visitor_id: visitorId(),
+      tenant,
       // `/sessions` mints an anonymous credential; only `/verify` binds an
       // account. Re-opening after expiry therefore drops verification, which
       // is why the expiry path tells the customer to confirm again.
@@ -309,13 +432,17 @@ export function SupportChat() {
         headers: { Authorization: `Bearer ${active.token}` },
       });
       if (resp.status === 401) throw new Error("EXPIRED");
-      if (!resp.ok) throw new Error(describeFailure(null, resp.status));
+      if (!resp.ok) throw new Error(await describeResponse(resp));
       const body = await resp.json();
       const items: Turn[] = body.items ?? [];
       setTurns(items);
       if (body.conversation) setConversation(body.conversation as ConversationState);
       applyBranding(body.branding ?? null);
       applyWindow(body.support_window ?? null);
+      // Absent and null both mean "no score yet" - an older payload does not
+      // carry the field at all, and neither case should clear a score the
+      // customer just gave in this tab.
+      if (body.rating != null) setRating(Number(body.rating));
       return items;
     },
     [applyBranding, applyWindow],
@@ -329,10 +456,20 @@ export function SupportChat() {
   // hardcoded name on every reload (measured 2026-09-23, A9).
   useEffect(() => {
     let cancelled = false;
+    setProblemKind("load");
     void (async () => {
       const stored = readStored<Session>(STORAGE_KEY);
+      // `stored.tenant === tenant` is not a nicety. The token names one
+      // (tenant, conversation) pair, so reusing a session opened for another
+      // tenant shows that tenant's conversation under this tenant's URL -
+      // silently, because nothing fails. A stored session from before `tenant`
+      // was recorded has `undefined` here, which is also a mismatch, and
+      // opening a fresh session is the correct recovery for both.
       const usable = Boolean(
-        stored && stored.expires_at * 1000 > Date.now() && stored.visitor_id === visitorId(),
+        stored &&
+          stored.tenant === tenant &&
+          stored.expires_at * 1000 > Date.now() &&
+          stored.visitor_id === visitorId(),
       );
       try {
         // Paint the cached brand before the network answers, so a returning
@@ -406,12 +543,25 @@ export function SupportChat() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [turns, waiting]);
 
+  // The browser tab's title.
+  //
+  // Without this the page inherits `index.html`'s `B2B AI Support · Admin`,
+  // because `document.title` was only ever set by `Layout.tsx` - the operator
+  // shell, which this page is deliberately outside of. So a customer's tab,
+  // bookmark and history entry all read "Admin", and none of them said which
+  // company they were talking to or that this was a support window. Measured
+  // 2026-09-23.
+  useEffect(() => {
+    document.title = `${branding?.display_name || COPY.fallbackBrand} · ${COPY.pageKind}`;
+  }, [branding]);
+
   const send = useCallback(
     async (text: string) => {
       const body = text.trim();
       if (!body || !session || busy) return;
       setBusy(true);
       setProblem(null);
+      setProblemKind("send");
       setDraft("");
       // Optimistic bubble, so the customer sees the message leave immediately.
       setTurns((prev) => [
@@ -431,7 +581,7 @@ export function SupportChat() {
           body: JSON.stringify({ text: body }),
         });
         if (resp.status === 401) throw new Error("EXPIRED");
-        if (!resp.ok) throw new Error(describeFailure(null, resp.status));
+        if (!resp.ok) throw new Error(await describeResponse(resp));
         const result = await resp.json();
         if (result.conversation) setConversation(result.conversation as ConversationState);
         pendingRetry.current = "";
@@ -474,25 +624,6 @@ export function SupportChat() {
     [session, busy, loadTimeline, openSession],
   );
 
-  /** Re-run whatever failed: the send if there was one, otherwise the load. */
-  const retry = useCallback(() => {
-    const text = pendingRetry.current;
-    setProblem(null);
-    if (text) {
-      void send(text);
-      return;
-    }
-    void (async () => {
-      try {
-        const active = session ?? (await openSession());
-        setSession(active);
-        await loadTimeline(active);
-      } catch (err) {
-        setProblem(describeFailure(err));
-      }
-    })();
-  }, [session, openSession, loadTimeline, send]);
-
   /**
    * Bind this session to the account that owns an order (feature 2.2/2.5).
    *
@@ -508,6 +639,7 @@ export function SupportChat() {
     if (!order || tail.length < 4 || !session || verifying) return;
     setVerifying(true);
     setProblem(null);
+    setProblemKind("verify");
     try {
       const resp = await fetch(`${API}/v1/support/verify`, {
         method: "POST",
@@ -525,7 +657,7 @@ export function SupportChat() {
         throw new Error(
           resp.status === 403
             ? "无法用这些信息核实该订单，请检查订单号与手机尾号后重试。"
-            : describeFailure(null, resp.status),
+            : await describeResponse(resp),
         );
       }
       const body = await resp.json();
@@ -546,6 +678,75 @@ export function SupportChat() {
     }
   }, [orderId, phoneTail, session, verifying]);
 
+  /**
+   * Re-run whatever failed: the verification, the send, or the load.
+   *
+   * Declared after `verify` and `send` because it depends on both - a
+   * `useCallback` dependency array is evaluated during render, so referencing
+   * a `const` declared further down would throw before the component ever
+   * mounted.
+   */
+  const retry = useCallback(() => {
+    setProblem(null);
+    if (problemKind === "verify") {
+      // `verify()` reads the order number and phone tail from state, and the
+      // customer has not cleared them, so this repeats the same attempt rather
+      // than asking them to type it in again.
+      void verify();
+      return;
+    }
+    const text = pendingRetry.current;
+    if (text) {
+      void send(text);
+      return;
+    }
+    void (async () => {
+      try {
+        const active = session ?? (await openSession());
+        setSession(active);
+        await loadTimeline(active);
+      } catch (err) {
+        setProblem(describeFailure(err));
+      }
+    })();
+  }, [problemKind, session, openSession, loadTimeline, send, verify]);
+
+  /**
+   * Send the satisfaction score (feature 7.10).
+   *
+   * The score is kept locally only after the server has accepted it: showing
+   * the stars as filled before the write lands would tell the customer their
+   * opinion was recorded when it may not have been, and this is the one control
+   * on the page whose whole value is that the answer is kept.
+   */
+  const rate = useCallback(
+    async (score: number) => {
+      if (!session || ratingBusy) return;
+      setRatingBusy(true);
+      setProblem(null);
+      try {
+        const resp = await fetch(`${API}/v1/support/rating`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${session.token}`,
+          },
+          body: JSON.stringify({ score }),
+        });
+        if (resp.status === 401) throw new Error("EXPIRED");
+        if (!resp.ok) throw new Error(await describeResponse(resp));
+        const body = await resp.json();
+        setRating(Number(body.score));
+      } catch (err) {
+        setProblemKind("send");
+        setProblem(describeFailure(err));
+      } finally {
+        setRatingBusy(false);
+      }
+    },
+    [session, ratingBusy],
+  );
+
   const brandName = branding?.display_name || COPY.fallbackBrand;
 
   return (
@@ -562,7 +763,14 @@ export function SupportChat() {
             the page was for.
           */}
           <h1 className="support-title">
-            <span className="support-title-brand">{brandName}</span>
+            {/* The brand span is dropped when it would repeat the kind.
+                `fallbackBrand` and `pageKind` are both 在线客服, so an unknown
+                tenant rendered the heading as "在线客服 在线客服" - measured
+                2026-09-23 on `?tenant=nope-nope`. The kind always renders, so
+                the heading still names the page for a screen reader. */}
+            {brandName !== COPY.pageKind ? (
+              <span className="support-title-brand">{brandName}</span>
+            ) : null}
             <span className="support-title-kind">{COPY.pageKind}</span>
           </h1>
           <p className={`support-status${closed ? " off" : ""}`}>
@@ -658,8 +866,15 @@ export function SupportChat() {
       {/* The identity step, and the reason it is on this page at all: until an
           account is bound, an order question can only be answered with "I
           could not verify", and the data card never appears. Shown only while
-          the session is anonymous, so a verified customer is never nagged. */}
-      {session && !session.verified_account ? (
+          the session is anonymous, so a verified customer is never nagged.
+
+          Hidden once a person owns the thread. Verifying then does nothing:
+          the AI will not answer in this conversation again, so the form would
+          accept the customer's order number, report "已通过身份核实", and
+          deliver nothing - a control that looks like it works. Measured
+          2026-09-23, and it is worse than no form: the green success state is
+          a promise the page cannot keep. */}
+      {session && !session.verified_account && !handedOff ? (
         <form
           className="support-verify"
           onSubmit={(event) => {
@@ -717,30 +932,99 @@ export function SupportChat() {
       ) : null}
 
       {/*
-        The receipt's account is the ERP's own slug ("acme"), which means nothing
-        to the customer whose order it is. What they need to know is that the
-        gate is satisfied.
+        One status area, not two stacked chips.
+        
+        "已通过身份核实" and "已转人工…" used to render as two independent blocks
+        with a gap each, so a customer read them as unrelated and had to work
+        out for themselves which one answered "is anyone going to reply?".
+        They answer different questions - what the platform knows about you, and
+        who owns the conversation - so they belong in one place, in that order,
+        with the ownership line given the emphasis because it is the one that
+        explains a silence.
       */}
-      {session?.verified_account ? (
-        <p className="support-verified" role="status">
-          {COPY.verified}
-        </p>
-      ) : null}
+      <div className="support-status-stack">
+        {/*
+          The receipt's account is the ERP's own slug ("acme"), which means
+          nothing to the customer whose order it is. What they need to know is
+          that the gate is satisfied.
+        */}
+        {session?.verified_account ? (
+          <p className="support-verified" role="status">
+            {COPY.verified}
+          </p>
+        ) : null}
 
-      {/*
-        Who will answer. Persistent rather than a one-off message, because it
-        stays true for the rest of the conversation and it is the only thing on
-        this page that explains a silence.
-      */}
-      {handedOff ? (
-        <p className="support-handoff" role="status">
-          {conversation.owner === "expired"
-            ? COPY.handoffExpired
-            : conversation.owner === "human"
-              ? COPY.handoffHuman
-              : COPY.handoffQueue}
-        </p>
-      ) : null}
+        {/*
+          Who will answer. Persistent rather than a one-off message, because it
+          stays true for the rest of the conversation and it is the only thing
+          on this page that explains a silence.
+        */}
+        {handedOff ? (
+          <p className="support-handoff" role="status">
+            {conversation.owner === "expired"
+              ? COPY.handoffExpired
+              : conversation.owner === "human"
+                ? COPY.handoffHuman
+                : COPY.handoffQueue}
+          </p>
+        ) : null}
+
+        {/*
+          The satisfaction ask, after the ownership notice.
+
+          It sits here rather than in a floating toast because it is about the
+          conversation, and it is offered only once a person owns the thread -
+          the interaction is over, which is when the question is answerable.
+          Once answered it stays visible as a receipt: the customer can see the
+          platform kept their score, and a re-tap replaces it rather than
+          adding a second opinion.
+        */}
+        {handedOff && rating !== null ? (
+          <p className="support-rating is-done" role="status">
+            <span className="support-rating-thanks">{COPY.ratingThanks}</span>
+            <span className="support-rating-stars" aria-label={`${rating} / 5`}>
+              {[1, 2, 3, 4, 5].map((n) => (
+                <span key={n} aria-hidden className={n <= rating ? "is-on" : ""}>
+                  ★
+                </span>
+              ))}
+            </span>
+            {rating <= 2 ? <span className="support-rating-low">{COPY.ratingLow}</span> : null}
+          </p>
+        ) : null}
+
+        {handedOff && rating === null && !ratingDismissed ? (
+          <div className="support-rating" role="group" aria-label={COPY.ratingAsk}>
+            <span className="support-rating-ask">{COPY.ratingAsk}</span>
+            <div className="support-rating-buttons">
+              {[1, 2, 3, 4, 5].map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  className="support-rating-star"
+                  // The accessible name is the score, not the glyph: a screen
+                  // reader announcing five identical "★" buttons tells the
+                  // customer nothing about which is which.
+                  aria-label={`${n} 分`}
+                  disabled={ratingBusy}
+                  onClick={() => void rate(n)}
+                >
+                  <span aria-hidden>★</span>
+                  <span className="visually-hidden">{n}</span>
+                </button>
+              ))}
+              <button
+                type="button"
+                className="support-rating-skip"
+                disabled={ratingBusy}
+                onClick={() => setRatingDismissed(true)}
+              >
+                {COPY.ratingSkip}
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </div>
 
       {problem ? (
         <p className="support-problem" role="alert">
@@ -778,7 +1062,7 @@ export function SupportChat() {
           className="support-input"
           rows={1}
           value={draft}
-          placeholder={COPY.placeholder}
+          placeholder={handedOff ? COPY.placeholderWaiting : COPY.placeholder}
           maxLength={4000}
           disabled={!session || busy}
           onChange={(event) => {
@@ -804,15 +1088,20 @@ export function SupportChat() {
           panel does the opposite - its button appends "you are in the queue" and
           never calls the API - and copying that would have shipped a promise
           nothing keeps.
+
+          Hidden once the conversation is already with a person: the transfer is
+          one-way, so a second request is a button that cannot change anything.
         */}
-        <button
-          type="button"
-          className="support-human"
-          onClick={() => void send(COPY.human)}
-          disabled={!session || busy}
-        >
-          {COPY.human}
-        </button>
+        {!handedOff ? (
+          <button
+            type="button"
+            className="support-human"
+            onClick={() => void send(COPY.human)}
+            disabled={!session || busy}
+          >
+            {COPY.human}
+          </button>
+        ) : null}
         <button
           type="submit"
           className="support-send"
@@ -821,7 +1110,7 @@ export function SupportChat() {
           {busy ? COPY.sending : COPY.send}
         </button>
       </form>
-      <p className="support-foot-note">{COPY.hint}</p>
+      <p className="support-foot-note">{handedOff ? COPY.hintWaiting : COPY.hint}</p>
     </div>
   );
 }
