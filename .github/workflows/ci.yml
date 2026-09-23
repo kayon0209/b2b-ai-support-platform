@@ -381,6 +381,12 @@ jobs:
           APP_TEST_DATABASE_URL: postgresql+psycopg://platform_app:platform_app@localhost:5435/platform
           APP_ADMIN_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
+          # Same reasoning as the unit and integration jobs: this checkout has
+          # no .env, and the auth guard refuses to resolve any settings without
+          # an explicit decision. Left out of this step for the whole run of
+          # rounds before this one, which cost 417 failures from one gap.
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
           # No `APP_LLM_API_KEY` here either, for the same reason the integration
           # job omits it: a placeholder key switches the retrieval path off the
           # deterministic embedder and the sandbox has nowhere to call. This job
