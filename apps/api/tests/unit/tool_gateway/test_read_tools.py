@@ -3,6 +3,7 @@ argument extraction (iteration plan 3.1/3.2)."""
 
 from __future__ import annotations
 
+from platform_core.agent_runtime.identifiers import names_a_record
 from platform_core.agent_runtime.intent import classify
 from platform_core.tool_gateway.selector import select_read_tools
 
@@ -157,13 +158,83 @@ def test_chinese_order_question_beats_the_invoice_tool_on_a_tie() -> None:
     `shipment.track`, so this question ties at 1.40 and only the tie-break
     decides. It must resolve to the order, because the order record is what
     carries the shipping node and the ETA.
+
+    The fixture carries **no record id**, and that is load-bearing. It used to
+    be `"SO-9001 什么时候发货"`, which tied only because nothing scored an
+    identifier. Once `SO-9001` became evidence for `order.get_status` the
+    question stopped being a tie, and this test failed on its own guard
+    (`expected a genuine tie`) rather than passing for the wrong reason - which
+    is what that guard is for. A tie-break test needs a question that ties.
     """
-    question = "SO-9001 什么时候发货"
+    question = "什么时候发货"
     candidates = select_read_tools(classify(question), question)
     tied = [c for c in candidates if c.score == candidates[0].score]
     assert len(tied) > 1, "expected a genuine tie, so the tie-break is what is under test"
     assert candidates[0].tool_name == "order.get_status"
     assert "billing.get_invoice" not in [c.tool_name for c in tied[:1]]
+
+
+def test_the_tie_break_holds_when_four_tools_tie() -> None:
+    """The widest tie the read vocabulary can produce.
+
+    No noun matches, so every tool with an affinity for the scene scores the
+    scene weight alone and all four tie at 0.40 - including
+    `billing.get_invoice`, which is the tool the alphabetical tie-break used to
+    hand every tied question to. Four candidates is where "the tie-break is a
+    policy, not a formality" is actually under load.
+    """
+    question = "货什么时候发出"
+    candidates = select_read_tools(classify(question), question)
+    tied = [c for c in candidates if c.score == candidates[0].score]
+    assert len(tied) > 1, "expected a genuine tie, so the tie-break is what is under test"
+    assert candidates[0].tool_name == "order.get_status"
+    assert "billing.get_invoice" not in [c.tool_name for c in tied[:1]]
+
+
+def test_a_record_id_selects_its_tool_without_a_noun() -> None:
+    """A bare record id is a business-read question, and it names its tool.
+
+    Measured on the customer surface 2026-09-23. The platform asked a customer
+    for their order number; they replied `SO-9001`; the reply contains no noun
+    from any vocabulary and no interrogative, so it routed to the knowledge
+    path and the order tool was never selected. The order card was therefore
+    unreachable by the route the product itself had recommended.
+
+    Both halves are asserted here because either alone leaves the defect: the
+    **route** must be `business_read` (or `select_read_tools` returns nothing by
+    construction), and the **tool** must be the order lookup.
+    """
+    for question, expected in (
+        ("SO-9001", "order.get_status"),
+        ("SO-9001 到哪了？", "order.get_status"),
+        ("SH-7001 到哪了？", "shipment.track"),
+        ("INV-9001 状态", "billing.get_invoice"),
+    ):
+        detection = classify(question)
+        assert detection.route.value == "business_read", (
+            f"{question!r} routed to {detection.route.value}; the selector never runs "
+            "on a non-business-read route, so the tool could not be selected at all"
+        )
+        candidates = select_read_tools(detection, question)
+        assert candidates, f"no read candidate for {question!r}"
+        assert candidates[0].tool_name == expected, (
+            f"{question!r} selected {candidates[0].tool_name}, expected {expected}"
+        )
+
+
+def test_a_quantity_is_not_a_record_id() -> None:
+    """Digits alone must not select an order lookup.
+
+    The identifier patterns are anchored on a prefix (`SO-`, `SH-`, `INV-`,
+    `CASE-`) precisely so that a quantity, a date or a phone tail cannot send
+    an unrelated question down the tool path. Asserted as its own case because
+    the failure mode is silent: the tool would run, fail to find a record
+    called "500", and abstain - which looks like a provider problem.
+    """
+    for question in ("500 件什么时候能到", "2026-09-26 发货吗"):
+        assert not names_a_record(question), (
+            f"{question!r} was read as naming a record; a bare number is not an id"
+        )
 
 
 def test_chinese_invoice_question_still_selects_the_invoice_tool() -> None:

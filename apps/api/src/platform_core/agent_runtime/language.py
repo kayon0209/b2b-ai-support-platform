@@ -23,6 +23,7 @@ the tenant. "Answer in the language the question was written in" needs neither.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 
 # Kana, CJK ideographs (extensions A and unified) and Hangul. Deliberately
 # wider than Han characters alone - a Japanese or Korean customer is not
@@ -36,4 +37,27 @@ def answers_in_chinese(question: str | None) -> bool:
     return _CJK.search(question or "") is not None
 
 
-__all__ = ["answers_in_chinese"]
+def conversation_is_chinese(texts: Iterable[str | None]) -> bool:
+    """Whether a conversation is being held in Chinese, from all its messages.
+
+    Not the same question as `answers_in_chinese`, and the difference was a
+    customer-visible defect. That function asks about **one message**, so a
+    message carrying no script signal at all - a bare identifier, a number, an
+    English part code - is read as English.
+
+    Measured 2026-09-23: a Chinese-speaking customer asked 我的订单到哪了？, was
+    asked for the order number, and replied `SO-9001`. That reply contains no
+    CJK character, so the system notice that followed was written in English,
+    inside an otherwise entirely Chinese conversation - and the platform had
+    *asked* for exactly that message. The rule "answer in the language the
+    question was written in" is right; the mistake was applying it to the
+    message that happens to be last rather than to the conversation.
+
+    Any Chinese message makes the conversation Chinese: a customer who has
+    written Chinese once is writing Chinese, and a later identifier does not
+    change that.
+    """
+    return any(answers_in_chinese(text) for text in texts)
+
+
+__all__ = ["answers_in_chinese", "conversation_is_chinese"]

@@ -38,7 +38,7 @@ from platform_core.agent_runtime.conversation import (
     rewrite_query,
 )
 from platform_core.agent_runtime.emotion import detect_emotion
-from platform_core.agent_runtime.generator import LlmAnswerGenerator
+from platform_core.agent_runtime.generator import MAX_EXCERPT_CHARS, LlmAnswerGenerator
 from platform_core.agent_runtime.hours import is_open, offline_notice
 from platform_core.agent_runtime.intent import (
     NON_ANSWERABLE_ROUTES,
@@ -83,6 +83,7 @@ from platform_core.agent_runtime.qa_path import (
 )
 from platform_core.agent_runtime.queue_status import queue_notice, queue_status
 from platform_core.agent_runtime.routing import routing_note, team_for
+from platform_core.agent_runtime.tool_card import glossary_for
 from platform_core.audit import service as audit_service
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
@@ -529,6 +530,11 @@ class AgentOrchestrator:
         self._top_k = deps.top_k
         self._target_team: str | None = None
         self._attachment_types: list[str] = []
+        # Earlier conversation turns, for the customer-visible notices: a
+        # notice's language must follow the conversation, not the last message
+        # (a bare `SO-9001` carries no script). Set per run in `_run_pipeline`;
+        # see `language.conversation_is_chinese` for the measured failure.
+        self._history_texts: tuple[str, ...] = ()
         # Which channel this run answers on (ADR 0014), stored rather than
         # threaded for the same reason `_target_team` is: there is one value per
         # run, and *three* places dispatch - the answer, the abstention notice
@@ -729,6 +735,11 @@ class AgentOrchestrator:
         # One place, set from the caller: the minimiser already decided what is
         # safe to keep, so this only carries it.
         self._attachment_types = list(attachment_types or [])
+        # Conversation texts for the notice language, set once here because
+        # `_finish_abstain` and `_finish_clarify` are reached from many call
+        # sites and threading a parameter through all of them is how one gets
+        # missed; every one of them is downstream of this line.
+        self._history_texts = tuple(t.text for t in (history or []) if t.text)
         # Feature 2.5 ownership gate - three states, see the parameter.
         self._verified_account = verified_account
 
@@ -1103,6 +1114,7 @@ class AgentOrchestrator:
                     conversation_ref_id=conversation_ref_id,
                     expected_lease_version=expected_lease_version,
                     channel_conversation_key=channel_conversation_key,
+                    history=history,
                 )
                 if isinstance(read_result, RunOutcome):
                     return read_result
@@ -1437,13 +1449,28 @@ class AgentOrchestrator:
                 channel_conversation_key=channel_conversation_key,
             )
         if not validation.ok:
+            # A validation failure on a **tool receipt** keeps the conversation.
+            #
+            # The receipt is the provider's own verified answer to the question
+            # - that is why the abstention gate above is bypassed for it. So a
+            # draft the validator rejects means the platform fetched the data
+            # and the model failed to use it, which is our defect, not a reason
+            # to take the conversation away from the customer and hand it to a
+            # queue. Releasing the lease here is what made a successful order
+            # lookup end the AI's involvement in the conversation.
+            #
+            # A validation failure on *document* evidence is unchanged: there
+            # the answer may genuinely not be supported, and a person is the
+            # right next step.
             return await self._finish_abstain(
                 run=run,
                 tenant_id=tenant_id,
                 conversation_ref_id=conversation_ref_id,
                 expected_lease_version=expected_lease_version,
                 decision=AbstentionDecision(
-                    abstain=True, reason_code=validation.reason_code, handoff=True
+                    abstain=True,
+                    reason_code=validation.reason_code,
+                    handoff=not tool_evidence,
                 ),
                 ctx=ctx,
                 started=started,
@@ -1707,6 +1734,7 @@ class AgentOrchestrator:
         conversation_ref_id: uuid.UUID,
         expected_lease_version: int,
         channel_conversation_key: str | None,
+        history: list[Turn] | None = None,
     ) -> RunOutcome | list[RetrievedChunk]:
         """Attempt the read-tool path for a BUSINESS_READ run (plan 3.2/3.4).
 
@@ -1714,6 +1742,10 @@ class AgentOrchestrator:
         that hands off - the two outcomes, never a fallback that pretends the
         knowledge corpus holds live data (ADR 0006). Every decision point is
         audited: selection, proposal, execution.
+
+        `history` is the loaded conversation, used only to count consecutive
+        clarifications so an incomplete question escalates instead of being
+        asked forever - see `_clarify_or_escalate_read`.
         """
         import json as _json
 
@@ -1730,7 +1762,22 @@ class AgentOrchestrator:
         # exactly what unblocks it (2.2), which is the difference between a
         # gate and a dead end.
         if self._verified_account == "":
-            return await self._handoff_for_tool(
+            # Asks, and keeps the conversation.
+            #
+            # This used to `_handoff_for_tool`, which releases the lease to the
+            # human queue - and the release is one-way (`lease_service` only
+            # ever sets `owner_type="ai"` when it creates the lease). So an
+            # anonymous visitor asking the most natural first question there is
+            # ("where is my order?") was transferred to a person *before* they
+            # had any chance to prove who they were, and every later question
+            # in that conversation went unanswered, including the knowledge
+            # questions the platform can answer.
+            #
+            # The message already names the one thing that unblocks it (2.2),
+            # so it is a request for information, not a failure: the customer
+            # can still act on it. Asking keeps the lease with the AI, which is
+            # what makes acting on it worth anything.
+            return await self._clarify_or_escalate_read(
                 run=run,
                 tenant_id=tenant_id,
                 conversation_ref_id=conversation_ref_id,
@@ -1740,6 +1787,7 @@ class AgentOrchestrator:
                 started=started,
                 question=question,
                 channel_conversation_key=channel_conversation_key,
+                history=history,
             )
 
         candidates = select_read_tools(detection, question)
@@ -1785,7 +1833,13 @@ class AgentOrchestrator:
         chosen = usable[0]
         arguments = _extract_tool_args(chosen.tool_name, question)
         if arguments is None:
-            return await self._handoff_for_tool(
+            # Same reasoning as IDENTITY_REQUIRED above: the tool was found and
+            # the question simply does not name the record yet, so the platform
+            # asks for it and stays. Handing off here meant the customer
+            # answered the platform's own question ("please give me the order
+            # number") into a conversation that could no longer be answered by
+            # anything - measured as 62s of silence, 2026-09-23.
+            return await self._clarify_or_escalate_read(
                 run=run,
                 tenant_id=tenant_id,
                 conversation_ref_id=conversation_ref_id,
@@ -1795,6 +1849,7 @@ class AgentOrchestrator:
                 started=started,
                 question=question,
                 channel_conversation_key=channel_conversation_key,
+                history=history,
             )
 
         # The AI acts as the integration service for READS: TOOL_READ is the
@@ -1919,12 +1974,49 @@ class AgentOrchestrator:
         receipt_json = _json.dumps(output, sort_keys=True, ensure_ascii=False, default=str)
         ref_value = next(iter(arguments.values()), "")
         receipt_id = uuid.uuid5(tenant_id, f"receipt:{chosen.tool_name}:{idempotency_key}")
+        # The excerpt is what the *model* grounds on; the card gets the whole
+        # payload separately (see `published` below). These were two different
+        # documents, and the difference was the defect.
+        #
+        # This used to be `receipt_json[:280]`. A receipt for an order with four
+        # stages is ~380 characters, so the model was handed a JSON document cut
+        # off mid-object - it ended mid-key, with unbalanced braces. The prompt
+        # tells the model to answer only from the evidence and to say it cannot
+        # verify when the evidence does not support the question, so the model
+        # did exactly that: `{"claims": []}`. That became NO_CLAIMS, which
+        # became an abstention and a handoff.
+        #
+        # Measured 2026-09-23: `tool_read_executed order.get_status` followed by
+        # `run_abstained NO_CLAIMS`, while the card - built from the untruncated
+        # payload - rendered all four stages correctly. The customer saw the data
+        # and a sentence saying the platform could not verify it.
+        #
+        # The whole receipt goes to the model now. It is one record, not a
+        # document, so `MAX_EXCERPT_CHARS` is the real bound - imported rather
+        # than restated, so the check and the generator cannot drift apart.
+        if len(receipt_json) > MAX_EXCERPT_CHARS:
+            # Not truncated silently: a receipt too large to ground on is a
+            # configuration problem (an adapter returning a whole table), and
+            # the log is where that shows up instead of as an abstention.
+            logger.warning(
+                "receipt_exceeds_model_budget",
+                ctx,
+                tool_name=chosen.tool_name,
+                reason_code="RECEIPT_TOO_LARGE",
+                tenant_id=str(tenant_id),
+            )
         receipt = RetrievedChunk(
             chunk_id=receipt_id,
             document_version_id=None,
             title=f"tool://{chosen.tool_name}",
             section_path=[],
-            excerpt=receipt_json[:280],
+            # The receipt, plus the label mapping for the state codes it
+            # contains. Without the glossary the model reads `in_production` and
+            # writes it back, while the card drawn from the same receipt says
+            # 生产中 - the same record described in two vocabularies in one
+            # turn. The mapping comes from `tool_card`, which is also what the
+            # card renders, so the two cannot drift.
+            excerpt=receipt_json + glossary_for(receipt_json),
             source_uri=f"tool://{chosen.tool_name}/{ref_value}",
             score=1.0,
             ranking={"tool": 1.0},
@@ -2386,14 +2478,19 @@ class AgentOrchestrator:
         # this one: an ambiguous or absent record is not the third party's
         # outage, and reporting it as one sends the operator to look for a
         # failure that never happened (see `UNVERIFIED_READ_REASONS`).
+        # The notices below follow the conversation's language, not the last
+        # message's script: a bare `SO-9001` carries none, and a Chinese
+        # customer must not be switched to English mid-conversation (see
+        # `language.conversation_is_chinese` for the measured failure).
+        prior = self._history_texts
         if decision.reason_code in SYSTEM_OUTAGE_REASONS:
-            notice = system_outage_notice(question)
+            notice = system_outage_notice(question, prior_texts=prior)
         elif decision.reason_code in UNVERIFIED_READ_REASONS:
-            notice = unverified_read_notice(question)
+            notice = unverified_read_notice(question, prior_texts=prior)
             # The same queue/out-of-hours enrichment applies: this notice also
             # promises a person, so it must not promise one who is not there.
             if decision.handoff and not is_open():
-                notice = f"{notice} {offline_notice(question=question)}"
+                notice = f"{notice} {offline_notice(question=question, prior_texts=prior)}"
             elif decision.handoff:
                 try:
                     position_notice = queue_notice(
@@ -2403,13 +2500,14 @@ class AgentOrchestrator:
                             conversation_ref_id=conversation_ref_id,
                         ),
                         question,
+                        prior_texts=prior,
                     )
                 except Exception:  # noqa: BLE001 - enrichment, not a dependency
                     position_notice = None
                 if position_notice:
                     notice = f"{notice} {position_notice}"
         else:
-            notice = safe_abstention_text(decision.reason_code, question)
+            notice = safe_abstention_text(decision.reason_code, question, prior_texts=prior)
             # 7.5: never promise a person who is not there. The reason code
             # still says why the run stopped - that is for the receiving agent
             # and the audit log - but the customer is told the truth about when
@@ -2585,6 +2683,76 @@ class AgentOrchestrator:
         )
         get_metrics().run_cost_cents.observe(max(0.0, cost))
 
+    async def _clarify_or_escalate_read(
+        self,
+        *,
+        run: AgentRun,
+        tenant_id: uuid.UUID,
+        conversation_ref_id: uuid.UUID,
+        expected_lease_version: int,
+        reason_code: str,
+        ctx: TraceContext,
+        started: float,
+        question: str,
+        channel_conversation_key: str | None,
+        history: list[Turn] | None,
+    ) -> RunOutcome:
+        """Ask for the missing detail - unless asking has stopped working.
+
+        A read that cannot proceed because the question is incomplete is a
+        request for information, and it keeps the conversation (see
+        `_finish_clarify`). But an ask that never escalates is a loop: a customer
+        who does not supply the order number - because they do not have it, or
+        because they are asking about something else entirely - would be asked
+        forever.
+
+        So the same limit the knowledge and write paths already apply is applied
+        here: `clarification_max_streak` (2), counted from the `clarify:` refs
+        the inbox consumer writes. Those two paths checked it; this one did not,
+        because until 2026-09-23 this path handed off immediately and there was
+        no loop to guard. Routing it to a clarification introduced the loop, so
+        it needs the guard the other two already had.
+
+        Measured before adding it: three consecutive 「我的订单到哪了？」 with no
+        order number produced three identical clarifications and no escalation,
+        against a threshold of 2. (The first reading of this said the `clarify:`
+        marker was never written at all - it is, by
+        `worker.inbox_consumer`, and the stored refs show it. The guard was
+        simply not consulted on this path.)
+        """
+        if _clarify_streak(history or []) >= self._settings().clarification_max_streak:
+            logger.info(
+                "read_clarify_limit_reached",
+                ctx,
+                route=run.route,
+                reason_code="CLARIFICATION_LIMIT",
+            )
+            return await self._finish_abstain(
+                run=run,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                expected_lease_version=expected_lease_version,
+                decision=AbstentionDecision(
+                    abstain=True, reason_code="CLARIFICATION_LIMIT", handoff=True
+                ),
+                ctx=ctx,
+                started=started,
+                question=question,
+                channel_conversation_key=channel_conversation_key,
+            )
+        return await self._finish_clarify(
+            run=run,
+            tenant_id=tenant_id,
+            conversation_ref_id=conversation_ref_id,
+            expected_lease_version=expected_lease_version,
+            reason_code=reason_code,
+            notice_source=reason_code,
+            ctx=ctx,
+            started=started,
+            question=question,
+            channel_conversation_key=channel_conversation_key,
+        )
+
     async def _finish_clarify(
         self,
         *,
@@ -2597,6 +2765,7 @@ class AgentOrchestrator:
         started: float,
         question: str,
         channel_conversation_key: str | None,
+        notice_source: str = ABSTAIN_CLARIFICATION,
     ) -> RunOutcome:
         """Ask the customer for the missing detail; keep the conversation.
 
@@ -2610,13 +2779,27 @@ class AgentOrchestrator:
         It still goes through the pre-send lease re-check: a human may have
         taken over between arrival and here, and a clarification sent after a
         human already replied is the duplicate the lease exists to stop.
+
+        `notice_source` picks which customer-facing sentence to send, and it is
+        separate from `reason_code` on purpose: `reason_code` is the specific
+        cause recorded on the audit row and in the log, while the sentence is
+        whichever one names what actually unblocks the customer. The default
+        reproduces the generic clarification text exactly, so the existing
+        callers are unchanged.
+
+        It exists because "the question is incomplete" and "the customer must
+        prove who they are" are both *asks*, not failures, and both used to
+        hand the conversation to a human instead of asking. Measured
+        2026-09-23: clicking the page's own first suggestion produced a request
+        for the order number **and** a one-way handoff, so the customer
+        answered the platform's question and heard nothing ever again.
         """
         run.status = RunStatus.ABSTAINED.value
         run.abstain_reason = ABSTAIN_CLARIFICATION[:127]
         run.latency_ms = int((time.monotonic() - started) * 1000)
         await self._session.flush()
 
-        notice = safe_abstention_text(ABSTAIN_CLARIFICATION, question)
+        notice = safe_abstention_text(notice_source, question, prior_texts=self._history_texts)
 
         send_error = ""
         try:

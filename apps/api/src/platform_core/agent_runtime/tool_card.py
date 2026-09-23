@@ -60,6 +60,71 @@ _TOOL_KINDS: dict[str, str] = {
     "shipments": "shipment",
 }
 
+# Provider state -> the words a customer reads. The single source for both
+# surfaces that describe a record: the card renders these labels, and the model
+# is handed the same mapping as a glossary so its prose agrees with the card.
+#
+# It was two sources, and they disagreed in front of the customer. Measured
+# 2026-09-23: the card said 生产中 and the sentence directly above it said
+# `in_production`, because the labels lived only in the web client and the
+# model was given the raw receipt. Same record, same turn, two vocabularies.
+#
+# An unlisted state is deliberately absent rather than defaulted: the card shows
+# the provider's own wording for a state this platform does not know, which is
+# honest, and the glossary simply omits it.
+STATUS_LABELS: dict[str, str] = {
+    "in_production": "生产中",
+    "shipped": "已发货",
+    "in_transit": "运输中",
+    "delivered": "已签收",
+    "pending": "待处理",
+    "cancelled": "已取消",
+}
+
+# Fulfilment-stage state -> the words a customer reads, on the same terms.
+NODE_STATE_LABELS: dict[str, str] = {
+    "done": "已完成",
+    "active": "进行中",
+    "pending": "待执行",
+}
+
+
+def glossary_for(payload: str) -> str:
+    """The label mapping for the states this receipt actually contains.
+
+    Returned as text for the model's evidence block. Only the values present
+    are listed: a glossary of every state the platform knows is noise, and it
+    would invite the model to mention a state the record does not have.
+
+    Returns "" when nothing needs translating, so the caller can append it
+    unconditionally.
+    """
+    try:
+        parsed = json.loads(payload)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    record = _record(parsed)
+
+    wanted: list[tuple[str, str]] = []
+    status = _text(record.get("status"))
+    if status and status in STATUS_LABELS:
+        wanted.append((status, STATUS_LABELS[status]))
+    for node in _nodes(record.get("nodes")):
+        state = node.get("state")
+        if state and state in NODE_STATE_LABELS:
+            pair = (state, NODE_STATE_LABELS[state])
+            if pair not in wanted:
+                wanted.append(pair)
+    if not wanted:
+        return ""
+    pairs = ", ".join(f"{raw}={label}" for raw, label in wanted)
+    return (
+        "\nThe record uses these provider state codes. When you answer, use the "
+        f"customer-facing wording: {pairs}."
+    )
+
 
 def _text(value: Any, *, limit: int = _MAX_TEXT) -> str | None:
     """A non-empty trimmed string, or None. Never coerces arbitrary objects."""
@@ -162,12 +227,23 @@ def build_card(receipt_text: str) -> dict[str, Any] | None:
             # The stages ARE the card. An order card without them is a title
             # and a status chip, which the answer's prose already says.
             return None
+        for node in nodes:
+            # The label the customer should read, sent with the card so the
+            # client does not have to keep its own copy of the vocabulary. The
+            # raw `state` stays for a client that has its own mapping and for
+            # anything reading the payload rather than rendering it.
+            state_label = NODE_STATE_LABELS.get(node.get("state", ""))
+            if state_label:
+                node["state_label"] = state_label
         card: dict[str, Any] = {
             "kind": kind,
             "title": _text(record.get("order_id")),
             "status": _text(record.get("status")),
             "nodes": nodes,
         }
+        status_label = STATUS_LABELS.get(card["status"] or "")
+        if status_label:
+            card["status_label"] = status_label
         eta = _instant(record.get("eta"))
         if eta is not None:
             card["eta"] = datetime.fromtimestamp(eta, tz=UTC).isoformat()
@@ -180,6 +256,9 @@ def build_card(receipt_text: str) -> dict[str, Any] | None:
             "title": _text(record.get("shipment_id")),
             "status": _text(record.get("status")),
         }
+        status_label = STATUS_LABELS.get(card["status"] or "")
+        if status_label:
+            card["status_label"] = status_label
         carrier = _text(record.get("carrier"))
         if carrier is not None:
             card["carrier"] = carrier

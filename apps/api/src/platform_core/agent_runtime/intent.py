@@ -68,6 +68,7 @@ from enum import StrEnum
 from typing import Any
 
 from platform_core.agent_runtime.homophones import corrections_in, normalize_for_matching
+from platform_core.agent_runtime.identifiers import names_a_record
 from platform_core.agent_runtime.qa_path import _content_terms, _stem
 
 # --- Reused vocabulary -----------------------------------------------------
@@ -654,6 +655,21 @@ def _detect_kinds(question: str) -> tuple[list[IntentKind], float, list[IntentSi
     if _CASE_RECORD.search(question):
         kinds.append(IntentKind.BUSINESS_QUERY)
         signals.append(IntentSignal("kind", IntentKind.BUSINESS_QUERY.value, "case reference"))
+    elif names_a_record(question):
+        # An order, shipment or invoice id. Evaluated with the case reference
+        # above because it is the same evidence: naming a record the platform
+        # holds is a live-data question whatever else the sentence does not
+        # say.
+        #
+        # Added 2026-09-23 for a measured failure on the customer surface. The
+        # platform asked a customer for their order number, they replied
+        # `SO-9001`, and this function saw no noun, no interrogative and no
+        # case reference - so the reply routed to the knowledge path, the order
+        # tool was never selected, and the answer the platform had just asked
+        # for became an abstention. A record id is the sharpest signal there
+        # is; it must not need a noun beside it.
+        kinds.append(IntentKind.BUSINESS_QUERY)
+        signals.append(IntentSignal("kind", IntentKind.BUSINESS_QUERY.value, "record reference"))
     elif _LIVE_DATA.search(question):
         kinds.append(IntentKind.BUSINESS_QUERY)
         signals.append(IntentSignal("kind", IntentKind.BUSINESS_QUERY.value, "live data requested"))

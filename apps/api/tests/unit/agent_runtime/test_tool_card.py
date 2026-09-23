@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from platform_core.agent_runtime.tool_card import build_card
+from platform_core.agent_runtime.tool_card import NODE_STATE_LABELS, build_card
 
 DEMO_RECEIPT = {
     "order_id": "SO-9001",
@@ -99,6 +99,14 @@ def test_only_named_fields_reach_the_customer() -> None:
         "kind",
         "title",
         "status",
+        # `status_label` / the per-node `state_label` are named fields, not a
+        # bypass: they are the customer-facing wording for a provider state code,
+        # and they are produced by `STATUS_LABELS` / `NODE_STATE_LABELS` in
+        # `tool_card` - never copied from the payload. Added 2026-09-23 so the
+        # card and the answer's prose describe a record in the same vocabulary;
+        # before that the card said 生产中 while the sentence above it said
+        # `in_production`.
+        "status_label",
         "nodes",
         "eta",
         "quantity",
@@ -108,6 +116,12 @@ def test_only_named_fields_reach_the_customer() -> None:
         "provenance",
     }
     assert set(card) <= allowed
+    # The labels are ours, so they cannot carry provider text: a state code the
+    # platform does not know must not become a label.
+    for node in card["nodes"]:
+        assert set(node) <= {"label", "state", "state_label", "at"}
+        if "state_label" in node:
+            assert node["state_label"] in NODE_STATE_LABELS.values()
     flattened = json.dumps(card, ensure_ascii=False)
     assert "cost_price" not in flattened
     assert "internal_notes" not in flattened
@@ -184,7 +198,10 @@ def test_a_stage_without_a_label_is_dropped() -> None:
         }
     )
     assert card is not None
-    assert card["nodes"] == [{"label": "生产", "state": "active"}]
+    # The surviving stage keeps its own label and state, plus the platform's
+    # wording for the state (`state_label`). A stage whose *label* is blank is
+    # still dropped: the label is the row's whole content.
+    assert card["nodes"] == [{"label": "生产", "state": "active", "state_label": "进行中"}]
 
 
 def test_stage_times_accept_both_encodings() -> None:

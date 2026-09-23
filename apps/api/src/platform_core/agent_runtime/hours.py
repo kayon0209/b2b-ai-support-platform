@@ -17,9 +17,10 @@ refusal.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
-from platform_core.agent_runtime.language import answers_in_chinese
+from platform_core.agent_runtime.language import conversation_is_chinese
 
 # Inclusive start, exclusive end, in hours. A window where start == end means
 # "no window configured", which is treated as always open rather than as
@@ -95,7 +96,11 @@ def opening_hour() -> int:
     return int(cfg_open)
 
 
-def offline_notice(open_hour: int | None = None, question: str = "") -> str:
+def offline_notice(
+    open_hour: int | None = None,
+    question: str = "",
+    prior_texts: Iterable[str | None] = (),
+) -> str:
     """What to say instead of "a colleague will help".
 
     States that no one is there, that the message is kept, and when someone
@@ -103,14 +108,15 @@ def offline_notice(open_hour: int | None = None, question: str = "") -> str:
     not cause and does not promise a reply time it cannot bound, because the
     queue depth at opening is not something this platform knows.
 
-    `question` decides the language (see `language.answers_in_chinese`); this
-    notice sits in the same customer-visible cluster as the abstention copy, so
-    it has to follow the same rule or a Chinese customer is told the team is
-    offline in English.
+    The language follows the conversation (`prior_texts` + `question`, see
+    `language.conversation_is_chinese`); this notice sits in the same
+    customer-visible cluster as the abstention copy, so it has to follow the
+    same rule - deciding from `question` alone told a Chinese customer whose
+    last message was a bare id that the team is offline, in English.
     """
     cfg_open, _cfg_close = _window()
     shown = cfg_open if open_hour is None else open_hour
-    if answers_in_chinese(question):
+    if conversation_is_chinese((question, *prior_texts)):
         return (
             "我们的人工团队目前不在线，所以现在没有人能接起这条对话。"
             f"您的消息已经记录在这条对话里，会有同事在 {shown:02d}:00 之后跟进。"

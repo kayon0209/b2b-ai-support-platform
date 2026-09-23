@@ -12,10 +12,11 @@ Safety contract (docs/agent.md):
 import hashlib
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
-from platform_core.agent_runtime.language import answers_in_chinese
+from platform_core.agent_runtime.language import conversation_is_chinese
 from platform_core.retrieval.hybrid import RetrievedChunk
 
 if TYPE_CHECKING:
@@ -1167,12 +1168,9 @@ def decide_abstention(
 # They are entries here now, so the language is decided once.
 _ABSTENTION_ZH: dict[str, str] = {
     ABSTAIN_RESTRICTED: "这条信息我无法提供。我会请人工同事来协助您。",
-    ABSTAIN_ACTION_REQUEST: (
-        "我无法直接修改您账户上的内容。我会把这件事转给可以操作的人工同事。"
-    ),
+    ABSTAIN_ACTION_REQUEST: ("我无法直接修改您账户上的内容。我会把这件事转给可以操作的人工同事。"),
     ABSTAIN_AMBIGUOUS_IDENTITY: (
-        "这取决于您的合同条款，而我看不出哪一条适用于您。"
-        "我会请人工同事为您确认具体的条款。"
+        "这取决于您的合同条款，而我看不出哪一条适用于您。我会请人工同事为您确认具体的条款。"
     ),
     ABSTAIN_CLARIFICATION: "能否再多说一点？我想确认自己回答的是您真正要问的问题。",
     "IDENTITY_REQUIRED": (
@@ -1184,8 +1182,7 @@ _ABSTENTION_ZH: dict[str, str] = {
         "订单，请完成对应验证，或由人工同事为您处理。"
     ),
     ABSTAIN_EMOTION_ESCALATION: (
-        "很抱歉给您带来了不好的体验。我已把这条对话连同上下文转给人工同事，"
-        "由他们来为您跟进处理。"
+        "很抱歉给您带来了不好的体验。我已把这条对话连同上下文转给人工同事，由他们来为您跟进处理。"
     ),
     # Deliberately identical for both sensitive codes: see the English branch
     # for why naming the reason is what must not happen here.
@@ -1215,16 +1212,14 @@ _ABSTENTION_ZH: dict[str, str] = {
         "您可以换个说法再问，或者由人工同事为您确认。"
     ),
     ABSTAIN_CONFLICT: (
-        "我查到的几份资料说法互相不一致，我不愿意替您从中挑一份。"
-        "我会请人工同事来确认适用哪一条。"
+        "我查到的几份资料说法互相不一致，我不愿意替您从中挑一份。我会请人工同事来确认适用哪一条。"
     ),
     "NO_CLAIMS": (
         "我没能组织出一个有依据的答案，所以不打算凭猜测回答您。"
         "这次提问已经记在这条对话里，可以转人工同事为您处理。"
     ),
     "UNSUPPORTED_CLAIM": (
-        "我能给出的说法没有可靠依据支撑，所以不打算这样回答您。"
-        "我会请人工同事来为您确认。"
+        "我能给出的说法没有可靠依据支撑，所以不打算这样回答您。我会请人工同事来为您确认。"
     ),
     # A read path that could not even find the tool, or could not build its
     # arguments, is not an outage (`TOOL_NO_CANDIDATE` is deliberately outside
@@ -1255,16 +1250,23 @@ _ABSTENTION_ZH_FALLBACK = (
 )
 
 
-def safe_abstention_text(reason_code: str, question: str = "") -> str:
+def safe_abstention_text(
+    reason_code: str, question: str = "", prior_texts: Iterable[str | None] = ()
+) -> str:
     """Customer-safe abstention reply: state what cannot be verified,
     offer handoff, never invent an explanation (docs/agent.md).
 
-    `question` is what decides the language. It is optional so a caller with
-    no question - a test, a run being reported on after the fact - still gets a
-    usable string; without it the English text is returned, which is what this
-    function returned before the language was resolved at all.
+    The language follows the **conversation**, not the last message alone:
+    `prior_texts` carries the earlier turns, and any Chinese among them makes
+    the reply Chinese. Deciding from `question` alone was the original rule and
+    it failed on exactly the reply the platform asks for - a bare `SO-9001`
+    carries no script, so a Chinese customer was answered in English in the
+    middle of an otherwise Chinese conversation (see
+    `language.conversation_is_chinese`, added for that measured failure).
+    `question` stays optional so a caller with no question - a test, a run
+    being reported on after the fact - still gets a usable string.
     """
-    if answers_in_chinese(question):
+    if conversation_is_chinese((question, *prior_texts)):
         return _ABSTENTION_ZH.get(reason_code) or _ABSTENTION_ZH_FALLBACK
     if reason_code == ABSTAIN_RESTRICTED:
         return (
@@ -1476,16 +1478,18 @@ SYSTEM_OUTAGE_REASONS = frozenset({"TOOL_UNAVAILABLE", "TOOL_EXECUTION_FAILED"})
 UNVERIFIED_READ_REASONS = frozenset({"TOOL_EXECUTION_UNVERIFIED"})
 
 
-def system_outage_notice(question: str = "") -> str:
+def system_outage_notice(question: str = "", prior_texts: Iterable[str | None] = ()) -> str:
     """What to say when an external system is down (10.2).
 
+    The language follows the conversation, like every customer-visible notice
+    (`prior_texts`; see `safe_abstention_text` for the measured failure).
     Names the actual cause, says the request is kept, and says someone will
     follow up. It does not promise a time - how long an outage lasts is not
     something this platform knows - and it does not claim a ticket exists,
     because this path does not file one. Both omissions are deliberate: an
     outage is exactly when a customer needs the truth and not a reassurance.
     """
-    if answers_in_chinese(question):
+    if conversation_is_chinese((question, *prior_texts)):
         return (
             "我们对接的订单与物流系统目前没有响应，所以这次查询我无法完成。"
             "这次请求已经记录在这条对话里，系统恢复后会有同事跟进。"
@@ -1498,15 +1502,17 @@ def system_outage_notice(question: str = "") -> str:
     )
 
 
-def unverified_read_notice(question: str = "") -> str:
+def unverified_read_notice(question: str = "", prior_texts: Iterable[str | None] = ()) -> str:
     """What to say when a read ran but its result could not be confirmed.
 
+    The language follows the conversation, like every customer-visible notice
+    (`prior_texts`; see `safe_abstention_text` for the measured failure).
     Owns up to the platform's side of it rather than blaming a system we do not
     own, and does not report a figure it cannot stand behind - the same
     discipline as `abstain` itself. It says what happens next, which is the one
     thing the customer can act on.
     """
-    if answers_in_chinese(question):
+    if conversation_is_chinese((question, *prior_texts)):
         return (
             "我没能核实到这条记录，所以无法把结果给您。"
             "这次查询已经记在这条对话里，会由人工同事为您查证。"

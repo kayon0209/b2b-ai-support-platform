@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime.hours import is_open
-from platform_core.agent_runtime.language import answers_in_chinese
+from platform_core.agent_runtime.language import conversation_is_chinese
 from platform_core.identity.control_lease import ConversationControlLease
 
 # Set by an operator from their own figures (queue service, historical
@@ -115,7 +116,11 @@ async def queue_status(
     )
 
 
-def queue_notice(status: QueueStatus, question: str = "") -> str | None:
+def queue_notice(
+    status: QueueStatus,
+    question: str = "",
+    prior_texts: Iterable[str | None] = (),
+) -> str | None:
     """What to append to a handoff notice, or None when there is nothing true
     to add.
 
@@ -124,13 +129,16 @@ def queue_notice(status: QueueStatus, question: str = "") -> str | None:
     to someone whose conversation went straight to a person is a small lie
     that costs trust and buys nothing.
 
-    `question` decides the language, as it does for the notice this one is
-    appended to - the two are concatenated into a single message, so a language
-    mismatch would show up mid-sentence.
+    `question` + `prior_texts` decide the language, as they do for the notice
+    this one is appended to - the two are concatenated into a single message, so
+    a language mismatch would show up mid-sentence. Following the conversation
+    rather than the last message is the same rule the other notices use: a
+    Chinese customer whose latest turn is a bare id must not be switched to
+    English here (see `language.conversation_is_chinese`).
     """
     if not status.queued:
         return None
-    if answers_in_chinese(question):
+    if conversation_is_chinese((question, *prior_texts)):
         if status.ahead <= 0:
             return "正在为您接入人工同事。"
         text = f"您已进入人工队列，前面还有 {status.ahead} 位。"

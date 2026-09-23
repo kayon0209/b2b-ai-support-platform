@@ -22,8 +22,10 @@ candidate may only be proposed - the gateway's risk class and a second
 party's confirmation decide whether it ever runs.
 """
 
+import re
 from dataclasses import dataclass
 
+from platform_core.agent_runtime.identifiers import READ_IDENTIFIERS
 from platform_core.agent_runtime.intent import IntentDetection, Scene
 
 
@@ -180,6 +182,27 @@ _WRITE_PRIORITY: dict[str, int] = {
 SCENE_WEIGHT = 0.4
 SUBJECT_WEIGHT = 1.0
 
+# Identifiers a tool's own records carry, as a pattern per tool.
+#
+# The subject-noun table above answers "which tool is this question about?" and
+# it needs a *word* to do it. A customer who replies to "please give me the
+# order number" with `SO-9001` has named the record exactly and named no noun
+# at all, so the noun table scored nothing, no candidate was returned, and the
+# run abstained `TOOL_NO_CANDIDATE`. Measured 2026-09-23, on the reply the
+# platform had just asked for.
+#
+# An identifier is the strongest subject evidence there is - it is the record's
+# primary key, not a word about it - so it scores `SUBJECT_WEIGHT`, the same as
+# a noun hit. The noun and the identifier both hitting is not double-counted
+# into a different answer: the tool is the same either way, and `_READ_PRIORITY`
+# still decides between tools that tie.
+#
+# The table itself lives in `agent_runtime.identifiers` because `intent` needs
+# the same patterns to choose the *route*: a selector that finds a candidate
+# for an utterance the router sent to the knowledge path is a selector whose
+# work is thrown away. One table, two callers, no drift.
+_READ_IDENTIFIERS = READ_IDENTIFIERS
+
 
 _CJK_RANGES = ((0x3040, 0x30FF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7AF))
 
@@ -197,6 +220,7 @@ def _rank(
     question: str,
     available: set[str] | None,
     priority: dict[str, int],
+    identifiers: dict[str, str] | None = None,
 ) -> list[ToolCandidate]:
     """Score and order the tools in one vocabulary.
 
@@ -206,6 +230,11 @@ def _rank(
     `priority` breaks score ties. It is a parameter rather than a constant
     because the two vocabularies need different orders, and because the order
     has to be read alongside the vocabulary it belongs to.
+
+    `identifiers` is the same idea as `nouns` one level down: a pattern per tool
+    matching the ids that tool's own records carry. Optional, so the write
+    vocabulary is untouched - see `_READ_IDENTIFIERS` for why a read needs it
+    and a write does not.
     """
     lowered = question.lower()
     tokens = lowered.replace("-", " ").split()
@@ -231,6 +260,10 @@ def _rank(
         if noun_hits:
             score += SUBJECT_WEIGHT
             reasons.append("subject:" + ",".join(sorted(noun_hits)[:2]))
+        pattern = (identifiers or {}).get(tool_name)
+        if pattern and re.search(pattern, lowered):
+            score += SUBJECT_WEIGHT
+            reasons.append("identifier")
         if score > 0:
             candidates.append(
                 ToolCandidate(tool_name=tool_name, score=score, reason=";".join(reasons))
@@ -255,7 +288,13 @@ def select_read_tools(
     if detection.route.value != "business_read":
         return []
     return _rank(
-        _READ_SCENE_AFFINITY, _READ_SUBJECT_NOUNS, detection, question, available, _READ_PRIORITY
+        _READ_SCENE_AFFINITY,
+        _READ_SUBJECT_NOUNS,
+        detection,
+        question,
+        available,
+        _READ_PRIORITY,
+        _READ_IDENTIFIERS,
     )
 
 
