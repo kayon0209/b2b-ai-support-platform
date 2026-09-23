@@ -168,6 +168,13 @@ jobs:
         env:
           APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src
+          # env.py resolves the URL through get_settings(), which refuses to
+          # start without an auth decision - and this job has no .env to read
+          # (measured: "RuntimeError: no authentication configured" from
+          # config.py:306 via migrations/env.py). Same two variables the test
+          # steps declare.
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
       - name: Run integration tests
         run: pytest apps/api/tests/integration -m integration
         env:
@@ -228,6 +235,13 @@ jobs:
         env:
           APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src
+          # env.py resolves the URL through get_settings(), which refuses to
+          # start without an auth decision - and this job has no .env to read
+          # (measured: "RuntimeError: no authentication configured" from
+          # config.py:306 via migrations/env.py). Same two variables the test
+          # steps declare.
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
       - name: Seed the demo tenant and capture its token
         run: |
           python scripts/seed_admin_demo.py 2>&1 | tee seed.log
@@ -309,6 +323,13 @@ jobs:
         env:
           APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src
+          # env.py resolves the URL through get_settings(), which refuses to
+          # start without an auth decision - and this job has no .env to read
+          # (measured: "RuntimeError: no authentication configured" from
+          # config.py:306 via migrations/env.py). Same two variables the test
+          # steps declare.
+          APP_ENVIRONMENT: local
+          APP_ALLOW_BOOTSTRAP_TOKENS: "true"
       - name: Run the full suite (produces the release-gate evidence)
         run: pytest
         env:
