@@ -1,0 +1,187 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1080" viewBox="0 0 1600 1080" role="img" aria-labelledby="title desc">
+  <title id="title">企业级 AI 客服平台服务闭环</title>
+  <desc id="desc">从客户渠道接入开始，经过租户身份与事件边界、Agent Runtime 与知识检索，再分流到客户回复、人工坐席工作台或经授权的业务工具。底部展示 PostgreSQL RLS、事件队列、Redis、对象存储、审计和评估基础。</desc>
+  <defs>
+    <linearGradient id="header" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f3f8ff"/>
+      <stop offset="1" stop-color="#f7fbfa"/>
+    </linearGradient>
+    <linearGradient id="ai" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#eff6ff"/>
+      <stop offset="1" stop-color="#f1fbfa"/>
+    </linearGradient>
+    <filter id="shadow" x="-15%" y="-15%" width="130%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#203554" flood-opacity=".08"/>
+    </filter>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#3478d4"/>
+    </marker>
+    <marker id="arrow-teal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#078b83"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#c47b19"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #14243a; }
+      .eyebrow { font-size: 15px; font-weight: 700; letter-spacing: 2px; fill: #4474a7; }
+      .headline { font-size: 34px; font-weight: 750; letter-spacing: .2px; }
+      .subtitle { font-size: 17px; fill: #52657d; }
+      .step { font-size: 14px; font-weight: 700; letter-spacing: 1px; fill: #52708f; }
+      .card-title { font-size: 22px; font-weight: 700; }
+      .body { font-size: 16px; fill: #44566d; }
+      .small { font-size: 14px; fill: #68798e; }
+      .tag { font-size: 14px; font-weight: 650; }
+      .foundation-title { font-size: 17px; font-weight: 700; }
+      .foundation-body { font-size: 13px; fill: #607188; }
+      .line-blue { fill: none; stroke: #3478d4; stroke-width: 3; marker-end: url(#arrow-blue); }
+      .line-teal { fill: none; stroke: #078b83; stroke-width: 3; marker-end: url(#arrow-teal); }
+      .line-amber { fill: none; stroke: #c47b19; stroke-width: 3; marker-end: url(#arrow-amber); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1080" rx="28" fill="#f8fafc"/>
+  <rect x="0" y="0" width="1600" height="160" rx="28" fill="url(#header)"/>
+  <path d="M0 158H1600" stroke="#e1e8f0"/>
+  <text x="54" y="48" class="eyebrow">B2B AI SUPPORT PLATFORM · SERVICE FLOW</text>
+  <text x="54" y="96" class="headline">从客户问题，到有依据、可接管、可追溯的服务结果</text>
+  <text x="54" y="132" class="subtitle">同一条控制链：验证租户与事件 → 检索证据 → 按策略回答、转人工或执行已授权工具。</text>
+
+  <!-- Intake and reasoning row -->
+  <g filter="url(#shadow)">
+    <rect x="48" y="205" width="258" height="278" rx="18" fill="#ffffff" stroke="#d8e2ee"/>
+    <rect x="330" y="205" width="308" height="278" rx="18" fill="#ffffff" stroke="#d8e2ee"/>
+    <rect x="662" y="205" width="466" height="278" rx="18" fill="url(#ai)" stroke="#b9d6ee"/>
+  </g>
+
+  <text x="72" y="242" class="step">01 · ENTRY</text>
+  <text x="72" y="278" class="card-title">客户渠道</text>
+  <g>
+    <rect x="72" y="300" width="210" height="44" rx="10" fill="#f2f7fd"/>
+    <circle cx="95" cy="322" r="8" fill="#3478d4"/>
+    <text x="114" y="328" class="body">Web 客服窗口</text>
+    <rect x="72" y="354" width="210" height="44" rx="10" fill="#f2f7fd"/>
+    <path d="M87 367h17v14H87zM87 367l8.5 7 8.5-7" fill="none" stroke="#3478d4" stroke-width="2" stroke-linejoin="round"/>
+    <text x="114" y="382" class="body">Email 适配器</text>
+    <rect x="72" y="408" width="210" height="44" rx="10" fill="#f2f7fd"/>
+    <path d="M87 421h17v14H87zM91 426h9M91 430h9" fill="none" stroke="#3478d4" stroke-width="2" stroke-linecap="round"/>
+    <text x="114" y="436" class="body">WeChat 适配器</text>
+  </g>
+  <text x="72" y="468" class="small">外部渠道通过适配器接入</text>
+
+  <text x="354" y="242" class="step">02 · TRUST BOUNDARY</text>
+  <text x="354" y="278" class="card-title">身份与事件边界</text>
+  <circle cx="364" cy="313" r="4" fill="#078b83"/>
+  <text x="380" y="319" class="body">Webhook 验签 / 访客令牌</text>
+  <circle cx="364" cy="352" r="4" fill="#078b83"/>
+  <text x="380" y="358" class="body">服务端解析租户与操作者</text>
+  <circle cx="364" cy="391" r="4" fill="#078b83"/>
+  <text x="380" y="397" class="body">最小化与敏感信息脱敏</text>
+  <circle cx="364" cy="430" r="4" fill="#078b83"/>
+  <text x="380" y="436" class="body">Inbox 幂等入库后再排队</text>
+  <rect x="354" y="450" width="258" height="22" rx="11" fill="#e9f7f5"/>
+  <text x="367" y="466" class="tag" fill="#087c75">客户端租户字段不作为授权依据</text>
+
+  <text x="686" y="242" class="step">03 · AGENT CONTROL PLANE</text>
+  <text x="686" y="278" class="card-title">Agent Runtime</text>
+  <g>
+    <rect x="686" y="298" width="196" height="62" rx="12" fill="#ffffff" stroke="#d4e2f2"/>
+    <text x="702" y="323" class="tag" fill="#285da7">意图与风险路由</text>
+    <text x="702" y="346" class="small">判断任务、权限和风险</text>
+    <rect x="896" y="298" width="208" height="62" rx="12" fill="#ffffff" stroke="#d4e2f2"/>
+    <text x="912" y="323" class="tag" fill="#285da7">知识检索 + ACL</text>
+    <text x="912" y="346" class="small">租户过滤、引用证据</text>
+    <rect x="686" y="374" width="196" height="62" rx="12" fill="#ffffff" stroke="#d4e2f2"/>
+    <text x="702" y="399" class="tag" fill="#285da7">生成与响应校验</text>
+    <text x="702" y="422" class="small">引用支持 / 澄清 / 拒答</text>
+    <rect x="896" y="374" width="208" height="62" rx="12" fill="#ffffff" stroke="#d4e2f2"/>
+    <text x="912" y="399" class="tag" fill="#285da7">Conversation Lease</text>
+    <text x="912" y="422" class="small">AI / 队列 / 人工所有权</text>
+  </g>
+  <text x="686" y="466" class="small">AI 不是权限边界：租户、策略和发送权均由服务端复核</text>
+
+  <path d="M307 344H324" class="line-blue"/>
+  <path d="M639 344H656" class="line-blue"/>
+  <rect x="287" y="315" width="62" height="22" rx="11" fill="#f8fafc"/>
+  <text x="296" y="331" class="small">接入</text>
+  <rect x="616" y="315" width="70" height="22" rx="11" fill="#f8fafc"/>
+  <text x="625" y="331" class="small">可信上下文</text>
+
+  <!-- Decision and outcome paths -->
+  <rect x="600" y="515" width="400" height="36" rx="18" fill="#eaf1fa"/>
+  <text x="800" y="539" text-anchor="middle" class="tag" fill="#315f98">04 · 按证据和策略分流</text>
+  <path d="M895 483V511" fill="none" stroke="#3478d4" stroke-width="3"/>
+  <path d="M895 551V562H272V568" class="line-blue"/>
+  <path d="M895 551V568" class="line-teal"/>
+  <path d="M895 562H1327V568" class="line-amber"/>
+
+  <g filter="url(#shadow)">
+    <rect x="48" y="578" width="450" height="244" rx="18" fill="#ffffff" stroke="#b8e3dd"/>
+    <rect x="575" y="578" width="450" height="244" rx="18" fill="#ffffff" stroke="#b9d6ee"/>
+    <rect x="1102" y="578" width="450" height="244" rx="18" fill="#ffffff" stroke="#ead4af"/>
+  </g>
+
+  <rect x="72" y="602" width="34" height="26" rx="8" fill="#e5f5f2"/>
+  <text x="89" y="621" text-anchor="middle" class="tag" fill="#087c75">A</text>
+  <text x="118" y="622" class="card-title">客户回复</text>
+  <text x="72" y="663" class="body">有证据：附引用回答</text>
+  <text x="72" y="693" class="body">证据不足：澄清、拒答或转人工</text>
+  <rect x="72" y="714" width="399" height="48" rx="10" fill="#eef8f6"/>
+  <text x="90" y="735" class="tag" fill="#087c75">发送前再检查控制租约版本</text>
+  <text x="90" y="754" class="small">网页时间线或已配置的渠道适配器</text>
+  <text x="72" y="794" class="small">API 接收 ≠ 外部渠道已送达</text>
+
+  <rect x="599" y="602" width="34" height="26" rx="8" fill="#eaf2fb"/>
+  <text x="616" y="621" text-anchor="middle" class="tag" fill="#285da7">B</text>
+  <text x="645" y="622" class="card-title">人工接管 · 坐席工作台</text>
+  <text x="599" y="663" class="body">待认领 → 我的会话 → 等待客户</text>
+  <text x="599" y="693" class="body">CAS 租约防止双人同时接管</text>
+  <text x="599" y="723" class="body">上下文：时间线、客户资料、工单与 SLA</text>
+  <rect x="599" y="744" width="399" height="44" rx="10" fill="#f0f5fc"/>
+  <text x="617" y="772" class="tag" fill="#285da7">坐席回复 → 客户出站 → 审计留痕</text>
+
+  <rect x="1126" y="602" width="34" height="26" rx="8" fill="#fff3df"/>
+  <text x="1143" y="621" text-anchor="middle" class="tag" fill="#9a6110">C</text>
+  <text x="1172" y="622" class="card-title">Tool Gateway · 业务动作</text>
+  <text x="1126" y="663" class="body">策略校验 → 按需人工确认</text>
+  <text x="1126" y="693" class="body">幂等执行 → 后置状态验证</text>
+  <rect x="1126" y="714" width="399" height="48" rx="10" fill="#fff7eb"/>
+  <text x="1144" y="735" class="tag" fill="#9a6110">ERP / CRM 仅经授权 API 连接</text>
+  <text x="1144" y="754" class="small">动作与结果写入审计记录</text>
+  <text x="1126" y="794" class="small">模型可提议，服务端决定是否执行</text>
+
+  <!-- Human response returns to the customer path -->
+  <path d="M575 790H540Q523 790 523 773V710Q523 694 506 694H499" class="line-teal"/>
+  <rect x="488" y="732" width="92" height="22" rx="11" fill="#f8fafc"/>
+  <text x="534" y="748" text-anchor="middle" class="small">坐席回复</text>
+
+  <!-- Shared data and governance foundation -->
+  <path d="M272 822V856M800 822V856M1327 822V856" fill="none" stroke="#a9bacd" stroke-width="2" stroke-dasharray="5 6"/>
+  <rect x="48" y="858" width="1504" height="176" rx="20" fill="#edf2f7" stroke="#d6e0eb"/>
+  <text x="74" y="893" class="step">SHARED FOUNDATIONS</text>
+  <text x="286" y="894" class="small">每条路径共享租户边界、可靠事件、审计与评估</text>
+
+  <g>
+    <rect x="72" y="914" width="278" height="90" rx="12" fill="#ffffff" stroke="#d7e1ec"/>
+    <text x="90" y="946" class="foundation-title">PostgreSQL · RLS · pgvector</text>
+    <text x="90" y="975" class="foundation-body">租户数据、会话与知识检索</text>
+
+    <rect x="366" y="914" width="278" height="90" rx="12" fill="#ffffff" stroke="#d7e1ec"/>
+    <text x="384" y="946" class="foundation-title">Inbox / Outbox · Workers</text>
+    <text x="384" y="975" class="foundation-body">持久化事件、异步执行与重试</text>
+
+    <rect x="660" y="914" width="278" height="90" rx="12" fill="#ffffff" stroke="#d7e1ec"/>
+    <text x="678" y="946" class="foundation-title">Redis · S3 / MinIO</text>
+    <text x="678" y="975" class="foundation-body">限流与对象存储，部署时配置</text>
+
+    <rect x="954" y="914" width="278" height="90" rx="12" fill="#ffffff" stroke="#d7e1ec"/>
+    <text x="972" y="946" class="foundation-title">Audit · Metrics · Traces</text>
+    <text x="972" y="975" class="foundation-body">记录动作脉络，限制敏感数据</text>
+
+    <rect x="1248" y="914" width="278" height="90" rx="12" fill="#ffffff" stroke="#d7e1ec"/>
+    <text x="1266" y="946" class="foundation-title">Evaluation · Release Gates</text>
+    <text x="1266" y="975" class="foundation-body">引用、拒答、安全与发布证据</text>
+  </g>
+
+  <text x="48" y="1062" class="small">外部身份源、ERP、渠道送达与对象存储需部署方接入；此图表达系统责任边界，不表示这些外部服务已配置。</text>
+</svg>
