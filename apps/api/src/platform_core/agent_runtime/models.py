@@ -31,6 +31,14 @@ class RunStatus(enum.StrEnum):
     # counter and the replay list have to guess which. See
     # `agent_runtime/abandoned.py`.
     ABANDONED = "abandoned"
+    # Accepted, never executed, and nobody is on it. Distinct from
+    # HANDED_OFF, which is a claim about a *person*: the conversation left the
+    # AI and went to the human queue, so until somebody claims it, no one has
+    # it. Recording these as HANDED_OFF made eighteen unanswered questions look
+    # like eighteen answered-by-a-colleague ones in every list, replay and
+    # metric that reads the status. Measured on a live stack: 20 messages in,
+    # 3 replies out, 18 runs reported as handed to a human.
+    SUPERSEDED = "superseded"
 
 
 class Route(enum.StrEnum):

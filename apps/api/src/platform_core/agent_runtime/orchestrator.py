@@ -39,6 +39,7 @@ from platform_core.agent_runtime.conversation import (
 )
 from platform_core.agent_runtime.emotion import detect_emotion
 from platform_core.agent_runtime.generator import MAX_EXCERPT_CHARS, LlmAnswerGenerator
+from platform_core.agent_runtime.handoff import hand_off_to_human_queue
 from platform_core.agent_runtime.hours import is_open, offline_notice
 from platform_core.agent_runtime.intent import (
     NON_ANSWERABLE_ROUTES,
@@ -914,7 +915,16 @@ class AgentOrchestrator:
         # `test_orchestrator_lease_race.py`).
         if str(lease.owner_type) == "queue":
             run.route = route
-            run.status = RunStatus.HANDED_OFF.value
+            # SUPERSEDED, not HANDED_OFF. This run was accepted, never
+            # executed, and the conversation is parked in a queue that no human
+            # has claimed. `handed_off` asserts a person is on it, and every
+            # list, replay and metric that reads the status then reports an
+            # unanswered question as answered-by-a-colleague. Where the lease
+            # moved while this run sat in the queue,
+            # `chat_service.supersede_queued_runs` has usually already set
+            # this status; arriving here means the run was claimed before the
+            # move and is only now reaching the guard.
+            run.status = RunStatus.SUPERSEDED.value
             run.latency_ms = int((time.monotonic() - started) * 1000)
             await self._session.flush()
             logger.info(
@@ -923,14 +933,14 @@ class AgentOrchestrator:
                 reason_code=f"owner is {lease.owner_type}",
             )
             get_metrics().observe_run(
-                outcome="handed_off",
+                outcome="superseded",
                 route=route,
                 latency_seconds=run.latency_ms / 1000.0,
                 citation_count=0,
             )
             return RunOutcome(
                 run_id=run.id,
-                status=RunStatus.HANDED_OFF,
+                status=RunStatus.SUPERSEDED,
                 route=route,
                 answer_text="",
                 send_blocked_reason=f"AI_NOT_OWNER: owner is {lease.owner_type}",
@@ -2602,7 +2612,11 @@ class AgentOrchestrator:
                 logger.warning("gap_record_failed", ctx, reason_code=decision.reason_code)
 
         if decision.handoff:
-            await lease_service.release_to_queue(
+            # Moves the lease, closes out the runs this conversation was still
+            # holding, and tells the customer once if anything was closed. See
+            # `agent_runtime.handoff` for why that is one operation and not
+            # three: the count is only knowable at the moment ownership moves.
+            await hand_off_to_human_queue(
                 self._session,
                 tenant_id=tenant_id,
                 conversation_ref_id=conversation_ref_id,
@@ -3000,6 +3014,15 @@ class AgentOrchestrator:
         came from a path that does not execute -- stays `queued`, which is now an
         honest state meaning "accepted, never executed" rather than a duplicate
         of a run that did happen.
+
+        A `superseded` placeholder is adopted too, and returned untouched. It
+        was already settled by `hand_off_to_human_queue` when the conversation
+        left the AI, so there is nothing to execute and nothing to overwrite -
+        but its inbox event is still in the queue and still arriving here. If
+        adoption only looked for `queued`, that event would find no placeholder
+        and create a *second* run for a question that already has one, so a
+        twenty-message burst produced 39 run rows for 20 turns. Returning the
+        row as-is is what keeps one logical run to one row.
         """
         placeholder = (
             await self._session.execute(
@@ -3007,7 +3030,7 @@ class AgentOrchestrator:
                 .where(
                     AgentRun.tenant_id == tenant_id,
                     AgentRun.conversation_ref_id == conversation_ref_id,
-                    AgentRun.status == RunStatus.QUEUED.value,
+                    AgentRun.status.in_((RunStatus.QUEUED.value, RunStatus.SUPERSEDED.value)),
                     AgentRun.input_hash == "",
                 )
                 .order_by(AgentRun.started_at.asc())
@@ -3015,6 +3038,11 @@ class AgentOrchestrator:
                 .with_for_update(skip_locked=True)
             )
         ).scalar_one_or_none()
+
+        if placeholder is not None and placeholder.status == RunStatus.SUPERSEDED.value:
+            # Already has its outcome. Overwriting `status` would resurrect it,
+            # and writing `started_at` would report a run that never began.
+            return placeholder
 
         # What the *enqueue* path recorded about this run's purpose, read before
         # the overwrite below destroys it.

@@ -28,19 +28,6 @@ put it here, because a backlog entry without one is a wish.
 
 ## P1 — correctness, resilience, isolation
 
-- [ ] **A lease change silently discards the rest of the conversation's
-      queue.** Measured: 20 messages in one conversation → the third trips the
-      clarification limit, the lease moves to `queue`, and the remaining 18
-      runs are skipped (`run_skipped_not_owner`) while being recorded as
-      `handed_off` — which reads downstream as "a human has it". Every message
-      needs an explicit outcome, and "never answered" must not share a status
-      with "handed to a human".
-- [ ] **Stale-claim recovery keys off enqueue time, not claim time.**
-      `inbox_consumer.py` reclaims `PROCESSING` rows whose `received_at` is old
-      and never records a claim timestamp, so after a ten-minute backlog an
-      in-flight task is handed straight back to the queue. Reproduced: a row
-      enqueued 11 minutes ago and claimed a moment ago was reclaimed on the
-      next poll. Needs `claimed_at` + heartbeat.
 - [ ] **Visitor tokens cannot be revoked.** No `jti`, no revocation table, no
       endpoint; a 12-hour TTL is the only limit, and re-opening a session with
       the same `visitor_id` returns the same token. A conversation cannot be
@@ -61,9 +48,8 @@ put it here, because a backlog entry without one is a wish.
       `knowledge_aliases`, `knowledge_drafts`, `knowledge_gaps`,
       `membership_invitations`, `prompt_versions`, `saml_connections`,
       `saml_consumed_assertions`, `scim_tokens`, `sync_cursors`,
-      `tenant_domains`, `tool_proposals`' own parent rows. Add a test that
-      fails when a new tenant-owned table is not named, so the gap cannot
-      reopen silently.
+      `tenant_domains`. Add a test that fails when a new tenant-owned table is
+      not named, so the gap cannot reopen silently.
 
 ## P2 — experience and scale
 

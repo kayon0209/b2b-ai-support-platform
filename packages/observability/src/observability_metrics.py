@@ -43,7 +43,18 @@ from prometheus_client import CollectorRegistry, Counter, Histogram
 # already persisted on AgentRun, so a metric and an audit event can be
 # correlated without a translation table.
 
-RUN_OUTCOMES = ("completed", "abstained", "handed_off", "failed", "running")
+RUN_OUTCOMES = (
+    "completed",
+    "abstained",
+    "handed_off",
+    # Accepted, never executed, and nobody is on it - distinct from
+    # `handed_off`, which claims a person is. Without it in the vocabulary the
+    # closed-set check would reject the label and the run would fail to record
+    # an outcome at all.
+    "superseded",
+    "failed",
+    "running",
+)
 # All seven routing classes from `agent_runtime.intent.Route`. A route outside
 # this set is a programming error, so `observe_run` refuses to invent a label
 # for it. `test_every_route_is_a_valid_metric_label` asserts the two stay in

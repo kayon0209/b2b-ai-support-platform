@@ -70,6 +70,13 @@ class InboxEvent(Base, PkMixin, TenantMixin):
         String(31), nullable=False, default=InboxEventStatus.RECEIVED.value
     )
     received_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Claim bookkeeping. `received_at` is when the row arrived and is the FIFO
+    # key; these three are when a worker took it and when it last proved it was
+    # still alive. Reclaiming on `received_at` instead of these turns a backlog
+    # into duplicate work - see migration 0056.
+    claimed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    heartbeat_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     processed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     conversation_ref_id: Mapped[uuid.UUID | None] = mapped_column(

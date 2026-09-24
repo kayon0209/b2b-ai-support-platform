@@ -125,10 +125,10 @@ TENANT_TABLES = (
 # "how many revisions are registered", and a stray untracked file on one
 # machine must not be able to satisfy it.
 #
-# 53 as of 2026-09-24. `0054_workbench_queue_indexes` is the newest registered
+# 55 as of 2026-09-24. `0056_inbox_claim_heartbeat` is the newest registered
 # revision; keep this synchronized with the tracked revision set, excluding
 # `.gitkeep` and any local-only migration files.
-EXPECTED_MIGRATIONS = 54
+EXPECTED_MIGRATIONS = 55
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

@@ -377,8 +377,14 @@ def test_a_conversation_parked_in_the_queue_skips_generation() -> None:
     # The whole point: no model call, no retrieval, no draft to throw away.
     assert generator.calls == 0, "a queued conversation must not spend a generation"
     assert sender.calls == [], "no outbound send may happen for a queued conversation"
-    assert outcome.status.value == "handed_off"
-    assert status == "handed_off"
+    # `superseded`, not `handed_off`. The run was accepted, never executed, and
+    # the conversation is parked in a queue that no human has claimed. It used
+    # to be recorded as `handed_off`, which asserts a person is on it - and
+    # that is what made eighteen unanswered questions read as eighteen answered
+    # ones on a live stack. The two properties this test actually guards (no
+    # generation, no send) are unchanged by the rename.
+    assert outcome.status.value == "superseded"
+    assert status == "superseded"
     assert outcome.answer_text == ""
     assert "AI_NOT_OWNER" in outcome.send_blocked_reason
 
