@@ -67,6 +67,12 @@ class VisitorClaim:
     # payload at queue time, and the expiry of the proof is the expiry of the
     # token - one lifetime to reason about, not two.
     account: str | None = None
+    # Identifies *this* credential, so it can be withdrawn without touching the
+    # conversation. Absent on tokens minted before revocation existed, which
+    # `verify` reports as None and the revocation check treats as "cannot be
+    # withdrawn" - the same state those tokens were already in, so the deploy
+    # that introduces revocation does not log every open window out at once.
+    token_jti: uuid.UUID | None = None
 
 
 def _b64e(raw: bytes) -> str:
@@ -104,6 +110,10 @@ def issue(
     """
     issued = int(time.time() if now is None else now)
     expires_at = issued + int(ttl_seconds)
+    # A fresh uuid per token, not per conversation: the customer page re-issues
+    # silently (after an ownership check, for instance) and each of those is a
+    # separate credential that can be withdrawn on its own.
+    token_jti = uuid.uuid4()
     payload = _b64e(
         json.dumps(
             {
@@ -111,6 +121,7 @@ def issue(
                 "c": str(conversation_ref),
                 "x": external_ref,
                 "e": expires_at,
+                "j": str(token_jti),
                 # Omitted entirely when absent, so an unverified token stays
                 # short and a verified one differs visibly in the payload.
                 **({"a": account} if account else {}),
@@ -144,6 +155,12 @@ def verify(token: str, *, now: int | None = None) -> VisitorClaim:
         external_ref = str(claims["x"])
         expires_at = int(claims["e"])
         account = claims.get("a")
+        # Optional: a token minted before revocation existed has no `j`, and
+        # refusing to parse it would log out every open customer window the
+        # moment this ships. It stays valid and stays un-withdrawable, which is
+        # where it already was.
+        raw_jti = claims.get("j")
+        token_jti = uuid.UUID(str(raw_jti)) if raw_jti else None
     except Exception as exc:  # noqa: BLE001 - any parse failure is a bad token
         raise VisitorTokenError("payload is unreadable") from exc
 
@@ -155,4 +172,5 @@ def verify(token: str, *, now: int | None = None) -> VisitorClaim:
         conversation_ref=conversation_ref,
         external_ref=external_ref,
         account=str(account) if account else None,
+        token_jti=token_jti,
     )

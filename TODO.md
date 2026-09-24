@@ -43,10 +43,6 @@ put it here, because a backlog entry without one is a wish.
 
 ## P1 — correctness, resilience, isolation
 
-- [ ] **Visitor tokens cannot be revoked.** No `jti`, no revocation table, no
-      endpoint; a 12-hour TTL is the only limit, and re-opening a session with
-      the same `visitor_id` returns the same token. A conversation cannot be
-      closed in a way that actually locks the holder out.
 - [ ] **Object storage has no lifecycle and no scheduled backup.** Retention
       purges rows and leaves the bytes; nothing creates the bucket, configures
       versioning or expires prefixes; `backup_restore_drill.py` is manual and
