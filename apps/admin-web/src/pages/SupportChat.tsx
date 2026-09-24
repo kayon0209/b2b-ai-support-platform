@@ -16,10 +16,9 @@
  * session (`POST /v1/support/sessions`), which returns a signed token bound to
  * one (tenant, conversation) pair, and carries that token itself.
  *
- * The visitor id is an opaque handle in localStorage, not an identity: it only
- * lets a returning browser resume the same conversation. Authorization comes
- * from the token, and the token names no role, so this page cannot reach any
- * operator endpoint even if a route were mis-wired.
+ * The visitor id and token live in sessionStorage. A reload of this tab keeps
+ * the conversation; closing the browser session does not leave a durable
+ * handle to a customer's transcript on a shared workstation.
  *
  * Why it carries its own error copy
  * ---------------------------------
@@ -72,7 +71,7 @@ type Branding = {
  * platform's pre-send lease gate refuses one — and without knowing that, this
  * window sat on "客服正在输入…" while nothing was ever going to arrive.
  */
-type Owner = "ai" | "human" | "queue" | "expired";
+type Owner = "ai" | "human" | "queue" | "expired" | "closed";
 
 type ConversationState = { owner: Owner; mode: string };
 
@@ -163,6 +162,8 @@ const COPY = {
   ratingThanks: "谢谢您的评价",
   ratingSkip: "不用了",
   ratingLow: "很抱歉没能帮上忙，您的反馈会交给同事跟进。",
+  conversationClosed: "本次服务已结束。需要继续咨询时，请开启新会话。",
+  newConversation: "开启新会话",
   send: "发送",
   sending: "发送中…",
   typing: "客服正在输入…",
@@ -218,7 +219,7 @@ function offlineBanner(hour: number): string {
 
 function readStored<T>(key: string): T | null {
   try {
-    const raw = window.localStorage.getItem(key);
+    const raw = window.sessionStorage.getItem(key);
     return raw ? (JSON.parse(raw) as T) : null;
   } catch {
     return null;
@@ -229,7 +230,7 @@ function visitorId(): string {
   const existing = readStored<string>(VISITOR_KEY);
   if (typeof existing === "string" && existing) return existing;
   const minted = crypto.randomUUID();
-  window.localStorage.setItem(VISITOR_KEY, JSON.stringify(minted));
+  window.sessionStorage.setItem(VISITOR_KEY, JSON.stringify(minted));
   return minted;
 }
 
@@ -253,6 +254,7 @@ const BY_ERROR_CODE: Record<string, string> = {
   QUEUE_BACKPRESSURE: "现在咨询的人比较多，暂时无法立刻回答。请稍后再试，或直接点「转人工」。",
   IDENTITY_REQUIRED: "查询订单信息前需要先核实身份。请在上方填写订单号和手机尾号后重试。",
   IDENTITY_MISMATCH: "这些信息和当前已验证的账户不一致，请检查后重试，或点「转人工」。",
+  CONVERSATION_CLOSED: "本次服务已结束，请开启新会话继续咨询。",
 };
 
 /**
@@ -311,7 +313,8 @@ async function describeResponse(resp: Response): Promise<string> {
 
 export function SupportChat() {
   const tenant = useRef(
-    new URLSearchParams(window.location.search).get("tenant") ?? "admin-demo",
+    new URLSearchParams(window.location.search).get("tenant") ??
+      (import.meta.env.DEV ? "admin-demo" : ""),
   ).current;
 
   const [session, setSession] = useState<Session | null>(null);
@@ -350,6 +353,7 @@ export function SupportChat() {
   const [rating, setRating] = useState<number | null>(null);
   const [ratingDismissed, setRatingDismissed] = useState(false);
   const [ratingBusy, setRatingBusy] = useState(false);
+  const [ratingEligible, setRatingEligible] = useState(false);
   /**
    * The text of a send that failed, so "重试" re-sends the same question. Held
    * in a ref rather than state: nothing renders from it, and putting it in
@@ -372,7 +376,8 @@ export function SupportChat() {
   const waitDeadline = useRef(0);
   const threadRef = useRef<HTMLElement | null>(null);
 
-  const handedOff = conversation.owner !== "ai";
+  const finished = conversation.owner === "closed";
+  const handedOff = conversation.owner !== "ai" && !finished;
   const closed = Boolean(supportWindow && !supportWindow.open);
   const accent = branding?.primary_color ?? "#1a393d";
 
@@ -412,7 +417,7 @@ export function SupportChat() {
       verified_account: null,
       branding: body.branding ?? null,
     };
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(opened));
+    window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(opened));
     applyBranding(opened.branding ?? null);
     applyWindow(body.support_window ?? null);
     return opened;
@@ -443,6 +448,7 @@ export function SupportChat() {
       // carry the field at all, and neither case should clear a score the
       // customer just gave in this tab.
       if (body.rating != null) setRating(Number(body.rating));
+      setRatingEligible(Boolean(body.rating_eligible));
       return items;
     },
     [applyBranding, applyWindow],
@@ -457,6 +463,10 @@ export function SupportChat() {
   useEffect(() => {
     let cancelled = false;
     setProblemKind("load");
+    if (!tenant) {
+      setProblem("客服链接缺少企业标识，请从企业提供的客服入口进入。");
+      return () => { cancelled = true; };
+    }
     void (async () => {
       const stored = readStored<Session>(STORAGE_KEY);
       // `stored.tenant === tenant` is not a nicety. The token names one
@@ -503,13 +513,16 @@ export function SupportChat() {
     };
   }, [openSession, loadTimeline, applyBranding]);
 
-  // Poll while the agent is working. The platform answers asynchronously (the
-  // run is queued and a worker picks it up), so the reply arrives as a new
-  // turn rather than as the send response.
+  // AI answers asynchronously; human replies also arrive after the original
+  // send. Keep the customer window current while either party owns it, with a
+  // slower human cadence and a visibility guard so background tabs do no work.
   useEffect(() => {
-    if (!waiting || !session) return;
+    if (!session || finished || (!waiting && !handedOff)) return;
     let failures = 0;
+    let inFlight = false;
     const timer = window.setInterval(() => {
+      if (document.hidden || inFlight) return;
+      inFlight = true;
       void (async () => {
         try {
           const items = await loadTimeline(session);
@@ -518,9 +531,10 @@ export function SupportChat() {
           // count either - a card arrives *before* the answer, and a handoff
           // notice is the platform saying somebody else will answer.
           const answers = items.filter((t) => t.role === "agent").length;
-          if (answers > answeredBaseline.current || Date.now() > waitDeadline.current) {
+          if (waiting && (answers > answeredBaseline.current || Date.now() > waitDeadline.current)) {
             setWaiting(false);
           }
+          failures = 0;
         } catch (err) {
           failures += 1;
           // Not silent any more. Giving up on the first blip meant a single
@@ -531,11 +545,17 @@ export function SupportChat() {
             setWaiting(false);
             setProblem(describeFailure(err));
           }
+        } finally {
+          inFlight = false;
         }
       })();
-    }, 2000);
+    }, waiting ? 2000 : 5000);
     return () => window.clearInterval(timer);
-  }, [waiting, session, loadTimeline]);
+  }, [waiting, session, loadTimeline, handedOff, finished]);
+
+  useEffect(() => {
+    if (handedOff && waiting) setWaiting(false);
+  }, [handedOff, waiting]);
 
   // Keep the newest turn in view without stealing focus from the composer.
   useEffect(() => {
@@ -558,7 +578,7 @@ export function SupportChat() {
   const send = useCallback(
     async (text: string) => {
       const body = text.trim();
-      if (!body || !session || busy) return;
+      if (!body || !session || busy || finished) return;
       setBusy(true);
       setProblem(null);
       setProblemKind("send");
@@ -621,7 +641,7 @@ export function SupportChat() {
         setBusy(false);
       }
     },
-    [session, busy, loadTimeline, openSession],
+    [session, busy, finished, loadTimeline, openSession],
   );
 
   /**
@@ -667,7 +687,7 @@ export function SupportChat() {
         expires_at: body.expires_at,
         verified_account: body.verified_account ?? null,
       };
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(renewed));
+      window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(renewed));
       setSession(renewed);
       setOrderId("");
       setPhoneTail("");
@@ -730,6 +750,7 @@ export function SupportChat() {
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${session.token}`,
+            "Idempotency-Key": crypto.randomUUID(),
           },
           body: JSON.stringify({ score }),
         });
@@ -746,6 +767,26 @@ export function SupportChat() {
     },
     [session, ratingBusy],
   );
+
+  const startNewConversation = useCallback(async () => {
+    window.sessionStorage.removeItem(STORAGE_KEY);
+    window.sessionStorage.removeItem(VISITOR_KEY);
+    setSession(null);
+    setTurns([]);
+    setRating(null);
+    setRatingEligible(false);
+    setRatingDismissed(false);
+    setConversation({ owner: "ai", mode: "AI_ACTIVE" });
+    setDraft("");
+    setProblem(null);
+    try {
+      const active = await openSession();
+      setSession(active);
+      await loadTimeline(active);
+    } catch (err) {
+      setProblem(describeFailure(err));
+    }
+  }, [openSession, loadTimeline]);
 
   const brandName = branding?.display_name || COPY.fallbackBrand;
 
@@ -773,9 +814,9 @@ export function SupportChat() {
             ) : null}
             <span className="support-title-kind">{COPY.pageKind}</span>
           </h1>
-          <p className={`support-status${closed ? " off" : ""}`}>
+          <p className={`support-status${closed || (!session && problem) ? " off" : ""}`}>
             <span className="support-dot" aria-hidden="true" />
-            {closed ? COPY.offline : COPY.online}
+            {!session && problem ? "暂不可用" : !session ? "连接中" : closed ? COPY.offline : COPY.online}
           </p>
         </div>
       </header>
@@ -874,7 +915,7 @@ export function SupportChat() {
           deliver nothing - a control that looks like it works. Measured
           2026-09-23, and it is worse than no form: the green success state is
           a promise the page cannot keep. */}
-      {session && !session.verified_account && !handedOff ? (
+      {session && !session.verified_account && !handedOff && !finished ? (
         <form
           className="support-verify"
           onSubmit={(event) => {
@@ -969,6 +1010,13 @@ export function SupportChat() {
           </p>
         ) : null}
 
+        {finished ? (
+          <div className="support-ended" role="status">
+            <span>{COPY.conversationClosed}</span>
+            <button type="button" onClick={() => void startNewConversation()}>{COPY.newConversation}</button>
+          </div>
+        ) : null}
+
         {/*
           The satisfaction ask, after the ownership notice.
 
@@ -979,7 +1027,7 @@ export function SupportChat() {
           platform kept their score, and a re-tap replaces it rather than
           adding a second opinion.
         */}
-        {handedOff && rating !== null ? (
+        {finished && ratingEligible && rating !== null ? (
           <p className="support-rating is-done" role="status">
             <span className="support-rating-thanks">{COPY.ratingThanks}</span>
             <span className="support-rating-stars" aria-label={`${rating} / 5`}>
@@ -993,7 +1041,7 @@ export function SupportChat() {
           </p>
         ) : null}
 
-        {handedOff && rating === null && !ratingDismissed ? (
+        {finished && ratingEligible && rating === null && !ratingDismissed ? (
           <div className="support-rating" role="group" aria-label={COPY.ratingAsk}>
             <span className="support-rating-ask">{COPY.ratingAsk}</span>
             <div className="support-rating-buttons">
@@ -1040,7 +1088,7 @@ export function SupportChat() {
         </p>
       ) : null}
 
-      <form
+      {!finished ? <form
         className="support-composer"
         onSubmit={(event) => {
           event.preventDefault();
@@ -1109,8 +1157,8 @@ export function SupportChat() {
         >
           {busy ? COPY.sending : COPY.send}
         </button>
-      </form>
-      <p className="support-foot-note">{handedOff ? COPY.hintWaiting : COPY.hint}</p>
+      </form> : null}
+      {!finished ? <p className="support-foot-note">{handedOff ? COPY.hintWaiting : COPY.hint}</p> : null}
     </div>
   );
 }

@@ -40,6 +40,10 @@ ADMIN_URL = os.environ.get(
 )
 
 APP_ROLE = "platform_app"
+# Alembic owns its schema version table. The request-serving app role should
+# not need migration bookkeeping privileges; migrations run with a separate
+# elevated deployment credential.
+MIGRATION_TABLES = frozenset({"alembic_version"})
 
 # Tables the application role must not be able to modify, with the reason.
 # A new entry here is a deliberate decision, not a way to silence the test.
@@ -134,6 +138,8 @@ def test_the_application_role_can_use_every_table() -> None:
 
     missing: list[str] = []
     for table, privileges in grants.items():
+        if table in MIGRATION_TABLES:
+            continue
         withheld, _reason = RESTRICTED_BY_DESIGN.get(table, (frozenset(), ""))
         # SELECT and INSERT are required everywhere: a table the app cannot
         # read is dead weight, and one it cannot write is a write path that

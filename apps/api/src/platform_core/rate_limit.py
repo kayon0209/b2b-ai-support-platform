@@ -32,7 +32,9 @@ Three decisions worth stating
 
 Keys are tenant when a tenant is resolved, and the client address otherwise.
 A tenant key is what stops one noisy tenant from consuming another's budget;
-the address key covers the paths reachable without a token (webhooks).
+the address key covers paths reachable without a token. Authenticated
+workbench GETs use a separate tenant bucket from general interactive APIs, so
+agent polling does not consume the budget reserved for business writes.
 """
 
 from __future__ import annotations
@@ -57,6 +59,7 @@ UNLIMITED_PATHS = frozenset({"/healthz", "/metrics", "/openapi.json", "/docs", "
 # would turn the platform's own protection into data loss. It gets its own,
 # more generous budget rather than sharing the API's.
 WEBHOOK_PREFIX = "/v1/webhooks/"
+WORKBENCH_READ_PREFIX = "/v1/workbench/"
 
 BUCKET_KEY_PREFIX = "ratelimit"
 
@@ -265,7 +268,12 @@ def bucket_key(request: Request, *, tenant_id: str | None) -> str:
     in one bucket, which is correct for `/v1/webhooks/` (there is no tenant
     yet) and harmless elsewhere because nothing else is reachable unauthenticated.
     """
-    scope = "webhook" if request.url.path.startswith(WEBHOOK_PREFIX) else "api"
+    if request.url.path.startswith(WEBHOOK_PREFIX):
+        scope = "webhook"
+    elif request.method.upper() == "GET" and request.url.path.startswith(WORKBENCH_READ_PREFIX):
+        scope = "workbench"
+    else:
+        scope = "api"
     if tenant_id:
         return f"{BUCKET_KEY_PREFIX}:{scope}:tenant:{tenant_id}"
     return f"{BUCKET_KEY_PREFIX}:{scope}:addr:{client_address(request)}"
@@ -299,15 +307,18 @@ def build_limiter(*, redis_url: str | None) -> HybridRateLimiter:
 
 
 def policies_from_settings(settings: Any) -> dict[str, RateLimitPolicy]:
-    """Build the three policies from configuration.
+    """Build the audience-specific policies from configuration.
 
-    Three because the audiences differ: interactive API traffic, traffic that
-    arrives with no tenant yet, and webhook deliveries that arrive in provider
-    -paced bursts.
+    Workbench reads get an explicit higher tenant budget because each active
+    tab polls both its queue and selected conversation every five seconds.
+    Writes still use the general interactive budget.
     """
     window = float(settings.rate_limit_window_seconds)
     return {
         "api": RateLimitPolicy(capacity=int(settings.rate_limit_requests), window_seconds=window),
+        "workbench": RateLimitPolicy(
+            capacity=int(settings.rate_limit_workbench_requests), window_seconds=window
+        ),
         "anonymous": RateLimitPolicy(
             capacity=int(settings.rate_limit_anonymous_requests), window_seconds=window
         ),
@@ -326,6 +337,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         *,
         limiter: RateLimiter,
         api_policy: RateLimitPolicy,
+        workbench_policy: RateLimitPolicy,
         anonymous_policy: RateLimitPolicy,
         webhook_policy: RateLimitPolicy,
         unlimited_paths: frozenset[str] = UNLIMITED_PATHS,
@@ -333,15 +345,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         super().__init__(app)  # type: ignore[arg-type]
         self._limiter = limiter
         self._api_policy = api_policy
+        self._workbench_policy = workbench_policy
         self._anonymous_policy = anonymous_policy
         self._webhook_policy = webhook_policy
         self._unlimited_paths = unlimited_paths
 
-    def _policy_for(self, path: str, *, tenant_id: str | None) -> RateLimitPolicy | None:
+    def _policy_for(
+        self, path: str, *, method: str, tenant_id: str | None
+    ) -> RateLimitPolicy | None:
         if path in self._unlimited_paths:
             return None
         if path.startswith(WEBHOOK_PREFIX):
             return self._webhook_policy
+        if method.upper() == "GET" and path.startswith(WORKBENCH_READ_PREFIX):
+            return self._workbench_policy
         return self._api_policy if tenant_id else self._anonymous_policy
 
     async def dispatch(
@@ -350,7 +367,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         ctx = getattr(request.state, "tenant_context", None)
         tenant_id = str(ctx.tenant_id) if ctx is not None else None
 
-        policy = self._policy_for(request.url.path, tenant_id=tenant_id)
+        policy = self._policy_for(
+            request.url.path,
+            method=request.method,
+            tenant_id=tenant_id,
+        )
         if policy is None:
             return await call_next(request)
 

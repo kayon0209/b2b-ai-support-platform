@@ -232,10 +232,32 @@ async def contact_for_conversation(
     ).scalar_one_or_none()
 
 
+async def conversation_channels(
+    session: AsyncSession, *, tenant_id: uuid.UUID, refs: list[uuid.UUID]
+) -> dict[uuid.UUID, dict[str, str | None]]:
+    """Minimal contact/channel projection for the agent inbox."""
+    if not refs:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                ConversationContact.conversation_ref_id,
+                ConversationContact.external_contact_id,
+                ConversationContact.channel,
+            ).where(
+                ConversationContact.tenant_id == tenant_id,
+                ConversationContact.conversation_ref_id.in_(refs),
+            )
+        )
+    ).all()
+    return {ref: {"contact_ref": contact, "channel": channel} for ref, contact, channel in rows}
+
+
 __all__ = [
     "DEFAULT_PRIOR_LIMIT",
     "PriorConversation",
     "contact_for_conversation",
+    "conversation_channels",
     "link_conversation",
     "prior_conversations",
 ]

@@ -10,11 +10,11 @@ The decision is made here, as data, in one place. That is the 6.5 rule applied
 to routing: a rule living in a prompt is a rule nobody can audit, change or
 test, and it changes silently whenever the model or its wording does.
 
-**This does not assign anyone.** Chatwoot owns assignment (docs/adr/0001), and
-the platform naming a team is a recommendation attached to the handoff, not a
-claim that someone is now responsible. Saying otherwise would be reporting an
-outcome the platform cannot observe - the same class of lie as a tool reporting
-success because its transport call returned.
+**This does not assign anyone.** The conversation lease and agent directory
+own person-level assignment. The platform naming a team is a recommendation
+attached to the handoff, not a claim that someone is now responsible. Claiming
+otherwise would report an outcome the platform cannot observe, like a tool
+reporting success before verifying its result.
 
 An unmapped scene yields None, meaning the general queue. Guessing a team for
 an unfamiliar scene would send work somewhere specific on the strength of a

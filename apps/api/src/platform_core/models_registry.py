@@ -44,10 +44,13 @@ from platform_core.identity import control_lease as _control_lease  # noqa: F401
 from platform_core.identity import models as _identity_models  # noqa: F401
 from platform_core.integrations import models as _integrations_models  # noqa: F401
 from platform_core.knowledge import acl as _knowledge_acl  # noqa: F401
+from platform_core.knowledge import correction_models as _correction_models  # noqa: F401
 from platform_core.knowledge import flag_models as _flag_models  # noqa: F401
 from platform_core.knowledge import gap_models as _gap_models  # noqa: F401
 from platform_core.knowledge import models as _knowledge_models  # noqa: F401
 from platform_core.outbox import OutboxEvent as _OutboxEvent  # noqa: F401
+from platform_core.support_bridge import continuity_models as _continuity_models  # noqa: F401
+from platform_core.support_bridge import csat_models as _csat_models  # noqa: F401
 from platform_core.support_bridge import models as _support_bridge_models  # noqa: F401
 from platform_core.tool_gateway import models as _tool_gateway_models  # noqa: F401
 

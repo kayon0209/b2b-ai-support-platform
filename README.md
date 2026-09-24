@@ -33,6 +33,9 @@ Chatwoot was the original customer-service kernel. It was removed — see
 | [docs/deployment-and-operations.md](docs/deployment-and-operations.md) | Environments, deployment, observability, backup, and runbooks |
 | [docs/integrations.md](docs/integrations.md) | CRM, IM, SSO, issue-tracker, and enterprise connector design |
 | [docs/product-gap-analysis.md](docs/product-gap-analysis.md) | Target experience (three surfaces + one loop) vs. what is built |
+| [docs/workbench-redesign-spec.md](docs/workbench-redesign-spec.md) | Current conversation-first workbench requirements and visual blueprint |
+| [docs/workbench-redesign-acceptance.md](docs/workbench-redesign-acceptance.md) | UI, UX, security and production acceptance gates |
+| [docs/workbench-redesign-implementation.md](docs/workbench-redesign-implementation.md) | Implementation map, operating conditions and remaining work |
 | [docs/adr/](docs/adr/) | Architecture decision records, newest first |
 
 ## MVP scope

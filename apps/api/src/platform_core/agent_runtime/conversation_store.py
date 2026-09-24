@@ -1,8 +1,8 @@
 """Redacted conversation turns: the memory store (iteration plan 2.1).
 
-The raw message lives only in Chatwoot. This store keeps what memory needs
-to work - the redacted words, in order - plus an integrity hash over the
-original bytes, and nothing else. Every write goes through
+The source channel remains the system of record for its raw message. This
+store keeps what memory needs - the redacted words, in order - plus an
+integrity hash over the original bytes, and nothing else. Every write goes through
 `evaluation.pii.redact_text` before it reaches the row, which is the
 enforcement point for "customer PII does not gain a second copy at rest".
 """
@@ -71,6 +71,7 @@ async def append_authored_turn(
     origin: str = "",
     canned_reply_id: uuid.UUID | None = None,
     author_ref: str | None = None,
+    turn_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Persist a turn the **platform authored**, verbatim. Returns the row id.
 
@@ -91,7 +92,7 @@ async def append_authored_turn(
     defaulted boolean can be flipped at a call site by someone who has not read
     the reason, and this is not a behaviour anyone should change by accident.
     """
-    row_id = uuid.uuid4()
+    row_id = turn_id or uuid.uuid4()
     session.add(
         ConversationTurn(
             tenant_id=tenant_id,
@@ -224,8 +225,11 @@ async def load_facts(
 
 
 def contact_ref_from_external(tenant_id: uuid.UUID, external_contact_id: str) -> uuid.UUID:
-    """Stable per-tenant ref for a Chatwoot contact, same derivation as the
-    conversation ref: no schema change needed to map external ids."""
+    """Stable per-tenant ref for a channel contact.
+
+    The legacy namespace is frozen: changing it would split existing
+    conversations when an external contact id is mapped again.
+    """
     return uuid.uuid5(tenant_id, f"chatwoot:contact:{external_contact_id}")
 
 
@@ -263,6 +267,7 @@ async def latest_suggestion(
                 ConversationTurn.tenant_id == tenant_id,
                 ConversationTurn.conversation_ref_id == conversation_ref_id,
                 ConversationTurn.role == _role_value(TurnRole.AGENT),
+                ConversationTurn.source != "agent",
             )
             .order_by(ConversationTurn.ts.desc())
             .limit(1)

@@ -69,6 +69,12 @@ async def post_claim_case(request: Request, case_id: uuid.UUID, body: ClaimIn) -
     missing_idem = require_write_idempotency(request, Action.CASE_UPDATE)
     if missing_idem is not None:
         return missing_idem
+    # Claim is a volunteer action. Supervisors use the explicit assign command
+    # when placing work with someone else; a client cannot volunteer a peer.
+    if ctx.actor_id is None or body.user_ref != str(ctx.actor_id):
+        return error_response(
+            "CASE_CLAIM_ACTOR_MISMATCH", "claim must name the authenticated agent", status_code=403
+        )
 
     try:
         async with tenant_session(ctx) as session:

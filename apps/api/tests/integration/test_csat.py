@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 
 import pytest
@@ -64,6 +65,10 @@ def _clear() -> None:
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
         conn.execute(text("DELETE FROM csat_responses WHERE tenant_id = :t"), {"t": TENANT})
+        conn.execute(text("DELETE FROM conversation_turns WHERE tenant_id = :t"), {"t": TENANT})
+        conn.execute(
+            text("DELETE FROM conversation_control_leases WHERE tenant_id = :t"), {"t": TENANT}
+        )
         conn.execute(text("DELETE FROM agent_runs WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(text("DELETE FROM tenants WHERE slug = :slug"), {"slug": SLUG})
     admin.dispose()
@@ -103,7 +108,42 @@ def tenant() -> None:
 
 
 def _conversation() -> uuid.UUID:
-    return uuid.uuid4()
+    conversation_ref = uuid.uuid4()
+    now = int(time.time())
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO conversation_control_leases "
+                "(id, tenant_id, conversation_ref_id, owner_type, owner_ref, mode, "
+                "lease_version, changed_reason, updated_at) "
+                "VALUES (:id, :tenant, :conversation, 'closed', 'agent-test', 'RESOLVED', "
+                "2, 'csat-test', :now)"
+            ),
+            {
+                "id": uuid.uuid4(),
+                "tenant": TENANT,
+                "conversation": conversation_ref,
+                "now": now,
+            },
+        )
+        conn.execute(
+            text(
+                "INSERT INTO conversation_turns "
+                "(id, tenant_id, conversation_ref_id, role, text_redacted, text_hash, ts, "
+                "ref, source, origin, author_ref, created_at) "
+                "VALUES (:id, :tenant, :conversation, 'agent', 'Test reply', 'test-hash', "
+                ":now, '', 'agent', 'free', 'agent-test', :now)"
+            ),
+            {
+                "id": uuid.uuid4(),
+                "tenant": TENANT,
+                "conversation": conversation_ref,
+                "now": now,
+            },
+        )
+    admin.dispose()
+    return conversation_ref
 
 
 def test_a_score_is_recorded_and_read_back() -> None:

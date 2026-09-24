@@ -65,8 +65,19 @@ def ensure_async_db_loop() -> None:
 
 def create_engine(database_url: str | None = None) -> AsyncEngine:
     ensure_async_db_loop()
-    url = database_url or get_settings().database_url
-    return create_async_engine(url, pool_pre_ping=True, pool_size=10, max_overflow=10)
+    settings = get_settings()
+    url = database_url or settings.database_url
+    is_app_role = settings.app_database_url is not None and url == settings.app_database_url
+    pool_size = settings.app_database_pool_size if is_app_role else settings.database_pool_size
+    max_overflow = (
+        settings.app_database_max_overflow if is_app_role else settings.database_max_overflow
+    )
+    return create_async_engine(
+        url,
+        pool_pre_ping=True,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+    )
 
 
 # Engines are cached per URL and reused across requests: a pool that is built
@@ -144,4 +155,7 @@ def app_role_url() -> str:
     owner. It lives here rather than in each caller because a second copy is how
     one of them ends up pointing at the owner.
     """
-    return get_settings().database_url.replace("platform:platform@", "platform_app:platform_app@")
+    settings = get_settings()
+    if settings.app_database_url:
+        return settings.app_database_url
+    return settings.database_url.replace("platform:platform@", "platform_app:platform_app@")

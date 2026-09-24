@@ -168,7 +168,7 @@ KNOWN_ORIGINS: frozenset[str] = frozenset(
 class ConversationTurn(Base, PkMixin, TenantMixin):
     """One redacted turn of one conversation (iteration plan 2.1).
 
-    The raw message lives only in Chatwoot (docs/security.md). What is
+    The raw message remains with its source channel (docs/security.md). What is
     persisted here is the REDACTED text: memory must be able to read the
     words ("my plan is annual") to resolve anaphora, so a hash alone will
     not do - but storing the unredacted sentence would create a second
@@ -188,8 +188,8 @@ class ConversationTurn(Base, PkMixin, TenantMixin):
     # Correlation marker: "clarify:<reason>" for clarification notices, tool
     # references for tool turns. Read by the clarify-streak guard.
     ref: Mapped[str] = mapped_column(String(127), nullable=False, default="")
-    # Source of the turn: "chatwoot" (fetched live) or "platform" (our own
-    # reply). Local rows win when merging with a live fetch.
+    # Source of the turn: "agent" for a human reply or "platform" for a
+    # platform-authored turn. Older external-source values remain readable.
     source: Mapped[str] = mapped_column(String(15), nullable=False, default="platform")
     # How the text was composed. Empty means *unknown*, not *free-typed* - see
     # migration 0051 for why that distinction is kept rather than resolved.

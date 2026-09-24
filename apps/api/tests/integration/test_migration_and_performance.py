@@ -125,12 +125,10 @@ TENANT_TABLES = (
 # "how many revisions are registered", and a stray untracked file on one
 # machine must not be able to satisfy it.
 #
-# 52 as of 2026-09-23. `0053_brand_display_name_cleanup` was added and committed
-# without this moving, so the gate was red on a clean checkout - which is the
-# same drift the paragraph above describes, happening again. Re-measured with
-# `git ls-tree --name-only HEAD apps/api/migrations/versions/ | grep -c '\.py$'`
-# (53 entries, one of which is `.gitkeep`).
-EXPECTED_MIGRATIONS = 52
+# 53 as of 2026-09-24. `0054_workbench_queue_indexes` is the newest registered
+# revision; keep this synchronized with the tracked revision set, excluding
+# `.gitkeep` and any local-only migration files.
+EXPECTED_MIGRATIONS = 53
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

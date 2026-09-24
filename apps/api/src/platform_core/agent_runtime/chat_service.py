@@ -20,7 +20,7 @@ import uuid
 from typing import Any
 
 from sqlalchemy import func as sa_func
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,26 +39,53 @@ from platform_core.support_bridge.models import InboxEvent, InboxEventStatus
 async def read_timeline(
     session: AsyncSession, *, ref_id: uuid.UUID, limit: int
 ) -> list[dict[str, Any]]:
-    """The redacted exchange for one conversation, oldest first.
+    """The latest redacted exchange for one conversation, oldest first.
 
     Tenant scoping is RLS, not a filter: callers run this inside
     `tenant_session`, so a conversation belonging to another tenant returns
     nothing rather than leaking.
     """
+    items, _older = await read_timeline_page(session, ref_id=ref_id, limit=limit)
+    return items
+
+
+async def read_timeline_page(
+    session: AsyncSession,
+    *,
+    ref_id: uuid.UUID,
+    limit: int,
+    before_id: uuid.UUID | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Page backwards without dropping recent replies from a long thread."""
+    stmt = select(ConversationTurn).where(ConversationTurn.conversation_ref_id == ref_id)
+    if before_id is not None:
+        anchor = (
+            await session.execute(
+                select(ConversationTurn.ts, ConversationTurn.id).where(
+                    ConversationTurn.conversation_ref_id == ref_id,
+                    ConversationTurn.id == before_id,
+                )
+            )
+        ).one_or_none()
+        if anchor is None:
+            return [], None
+        stmt = stmt.where(tuple_(ConversationTurn.ts, ConversationTurn.id) < tuple_(*anchor))
     rows = (
         (
             await session.execute(
-                select(ConversationTurn)
-                .where(ConversationTurn.conversation_ref_id == ref_id)
-                .order_by(ConversationTurn.ts.asc(), ConversationTurn.id.asc())
-                .limit(limit)
+                stmt.order_by(ConversationTurn.ts.desc(), ConversationTurn.id.desc()).limit(
+                    limit + 1
+                )
             )
         )
         .scalars()
         .all()
     )
-    return [
+    has_older = len(rows) > limit
+    rows = list(reversed(rows[:limit]))
+    items = [
         {
+            "turn_id": str(r.id),
             "role": r.role,
             "text": r.text_redacted,
             "at": r.ts,
@@ -73,6 +100,128 @@ async def read_timeline(
         }
         for r in rows
     ]
+    return items, str(rows[0].id) if has_older and rows else None
+
+
+async def latest_previews(
+    session: AsyncSession, *, tenant_id: uuid.UUID, refs: list[uuid.UUID]
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """One latest turn per visible conversation; never return a tool JSON blob."""
+    if not refs:
+        return {}
+    rows = (
+        (
+            await session.execute(
+                select(ConversationTurn)
+                .where(
+                    ConversationTurn.tenant_id == tenant_id,
+                    ConversationTurn.conversation_ref_id.in_(refs),
+                )
+                .distinct(ConversationTurn.conversation_ref_id)
+                .order_by(
+                    ConversationTurn.conversation_ref_id,
+                    ConversationTurn.ts.desc(),
+                    ConversationTurn.id.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    customer_rows = (
+        (
+            await session.execute(
+                select(ConversationTurn)
+                .where(
+                    ConversationTurn.tenant_id == tenant_id,
+                    ConversationTurn.conversation_ref_id.in_(refs),
+                    ConversationTurn.role == "customer",
+                )
+                .distinct(ConversationTurn.conversation_ref_id)
+                .order_by(
+                    ConversationTurn.conversation_ref_id,
+                    ConversationTurn.ts.desc(),
+                    ConversationTurn.id.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    customer_text = {row.conversation_ref_id: row.text_redacted[:160] for row in customer_rows}
+    return {
+        row.conversation_ref_id: {
+            "text": "已查询业务数据" if row.role == "tool" else row.text_redacted[:160],
+            "role": row.role,
+            "at": int(row.ts),
+            "customer_text": customer_text.get(row.conversation_ref_id, ""),
+        }
+        for row in rows
+    }
+
+
+async def search_conversation_refs(
+    session: AsyncSession, *, tenant_id: uuid.UUID, term: str
+) -> set[uuid.UUID]:
+    """Search redacted conversation wording; tenant scope is explicit and RLS backed."""
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    rows = (
+        (
+            await session.execute(
+                select(ConversationTurn.conversation_ref_id)
+                .where(
+                    ConversationTurn.tenant_id == tenant_id,
+                    ConversationTurn.text_redacted.ilike(f"%{escaped}%", escape="\\"),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return set(rows)
+
+
+async def has_human_reply(
+    session: AsyncSession, *, tenant_id: uuid.UUID, ref_id: uuid.UUID
+) -> bool:
+    row = (
+        await session.execute(
+            select(ConversationTurn.id)
+            .where(
+                ConversationTurn.tenant_id == tenant_id,
+                ConversationTurn.conversation_ref_id == ref_id,
+                ConversationTurn.role == "agent",
+                ConversationTurn.source == "agent",
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return row is not None
+
+
+async def human_replied_refs(
+    session: AsyncSession, *, tenant_id: uuid.UUID, refs: set[uuid.UUID]
+) -> set[uuid.UUID]:
+    if not refs:
+        return set()
+    rows = (
+        (
+            await session.execute(
+                select(ConversationTurn.conversation_ref_id)
+                .where(
+                    ConversationTurn.tenant_id == tenant_id,
+                    ConversationTurn.conversation_ref_id.in_(refs),
+                    ConversationTurn.role == "agent",
+                    ConversationTurn.source == "agent",
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return set(rows)
 
 
 async def append_customer_turn(

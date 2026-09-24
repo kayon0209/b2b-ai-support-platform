@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { apiGet, getToken, setToken } from "../lib/api";
+import { beginOperatorLogin, logoutOperator, oidcConfigured } from "../lib/operatorAuth";
 import { useLang } from "../lib/i18n";
 
 /**
- * Bearer-token entry for the control plane.
+ * Operator authentication entry. Production uses OIDC; local development may
+ * paste a bootstrap token for a disposable test tenant.
  *
  * Every API call carries a bearer token the operator was issued (an OIDC
  * access token in production). This dialog is the one place a token is
@@ -26,6 +28,32 @@ export function TokenDialog({ open, onClose }: { open: boolean; onClose: () => v
   }, [open]);
 
   if (!open) return null;
+
+  if (import.meta.env.PROD) {
+    return <div className="prompt" role="dialog" aria-label="企业身份验证" aria-modal="false">
+      <div className="prompt-head"><strong>企业身份验证</strong></div>
+      <p className="muted">坐席控制台通过企业单点登录访问。</p>
+      {!oidcConfigured() ? <p className="prompt-error" role="alert">尚未配置 OIDC 登录。请联系部署管理员。</p> : null}
+      {error ? <p className="prompt-error" role="alert">{error}</p> : null}
+      <div className="prompt-actions">
+        <button className="btn btn-primary" type="button" disabled={!oidcConfigured() || busy} onClick={() => {
+          setBusy(true);
+          void beginOperatorLogin().catch((reason: unknown) => {
+            setError(reason instanceof Error ? reason.message : String(reason));
+            setBusy(false);
+          });
+        }}>企业单点登录</button>
+        {getToken() ? <button className="btn" type="button" disabled={busy} onClick={() => {
+          setBusy(true);
+          void logoutOperator().catch((reason: unknown) => {
+            setError(reason instanceof Error ? reason.message : String(reason));
+            setBusy(false);
+          });
+        }}>退出登录</button> : null}
+        <button className="btn btn-ghost" type="button" onClick={onClose}>关闭</button>
+      </div>
+    </div>;
+  }
 
   function signOut() {
     setToken("");

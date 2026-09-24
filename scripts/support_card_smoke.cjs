@@ -154,8 +154,8 @@ async function main() {
       await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded" });
       await page.evaluate(
         ({ visitorId, session }) => {
-          window.localStorage.setItem("support.visitor.v1", JSON.stringify(visitorId));
-          window.localStorage.setItem("support.session.v1", JSON.stringify(session));
+          window.sessionStorage.setItem("support.visitor.v1", JSON.stringify(visitorId));
+          window.sessionStorage.setItem("support.session.v1", JSON.stringify(session));
         },
         {
           visitorId: VISITOR_ID,
@@ -253,7 +253,7 @@ async function main() {
     // page itself holds, so this is the customer's own view of the data.
     const token = await page.evaluate(() => {
       try {
-        const raw = window.localStorage.getItem("support.session.v1");
+        const raw = window.sessionStorage.getItem("support.session.v1");
         return raw ? JSON.parse(raw).token : null;
       } catch {
         return null;

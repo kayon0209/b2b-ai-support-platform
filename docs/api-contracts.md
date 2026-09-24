@@ -5,7 +5,7 @@
 - JSON over HTTPS.
 - OpenAPI 3.1 is the API source of truth.
 - IDs are UUID strings internally; external IDs remain opaque strings.
-- Times are RFC 3339 UTC.
+- Stored times are UTC; existing list/timeline APIs return epoch seconds, while event envelopes use RFC 3339.
 - All commands accept `Idempotency-Key`.
 - All responses expose `trace_id`.
 - Errors use stable machine-readable codes.
@@ -15,7 +15,7 @@
 
 - Human API: OIDC access token issued by Keycloak/enterprise IdP.
 - Service API: short-lived client credentials with audience restrictions.
-- Chatwoot webhook: HMAC signature, timestamp and replay window.
+- Channel and connector webhooks: provider signature, timestamp and replay window.
 - Connector webhook: provider-specific signature verification.
 
 The API resolves `tenant_id` from authenticated membership, connector configuration or trusted resource mapping. It must not trust a client-provided tenant ID.
@@ -36,10 +36,10 @@ The API resolves `tenant_id` from authenticated membership, connector configurat
 
 Never expose stack traces, prompts, credentials or raw provider responses.
 
-## Signed Chatwoot webhook endpoint
+## Signed channel/connector webhooks
 
 ```text
-POST /v1/webhooks/chatwoot
+POST /v1/webhooks/channels/{connector_id}
 Headers:
   X-Signature
   X-Timestamp
@@ -63,7 +63,7 @@ Processing rules:
   "event_type": "conversation.message.created",
   "event_version": 1,
   "tenant_id": "019...",
-  "source": "chatwoot",
+  "source": "web",
   "occurred_at": "2026-09-15T17:30:00Z",
   "resource": {
     "type": "message",
@@ -86,7 +86,7 @@ Request:
 
 ```json
 {
-  "trigger_message_ref": "chatwoot:98765",
+  "trigger_message_ref": "channel-message-reference",
   "mode": "customer_reply",
   "expected_control_version": 12
 }
@@ -184,6 +184,24 @@ without it is not reachable that way.
 
 ## Case workbench
 
+The current operator entry point is the **conversation-first** workbench:
+
+```text
+GET  /v1/workbench/conversations?tab=queue|mine|waiting&q=&limit=&offset=
+GET  /v1/workbench/conversations/{conversation_ref}
+GET  /v1/workbench/conversations/{conversation_ref}/timeline?before={turn_id}
+POST /v1/workbench/conversations/{conversation_ref}/actions
+```
+
+The action body contains `operation` (`claim|release|transfer|close`),
+`expected_version` and an optional `target_ref`. It requires `CASE_UPDATE`
+and `Idempotency-Key`. The actor is derived from the authenticated context;
+version or ownership conflicts return HTTP 409. Queue items may have `case: null`.
+The customer-visible reply still uses `POST /v1/conversations/{ref}/replies`,
+which is idempotent for the same `(tenant, ref, key)`.
+
+The older case-specific context endpoint remains for bookmarked cases:
+
 ```text
 GET /v1/cases/{case_id}/workbench
 ```
@@ -191,20 +209,20 @@ GET /v1/cases/{case_id}/workbench
 Everything an agent needs to take over without asking the customer to repeat
 themselves: the case, the conversation, the AI's last proposal with its
 sources, related cases, the account's tier, and every contact bound to the
-account (one company reaches us through several channels, and each is a
-different Chatwoot contact).
+account (one company may reach us through several channel contacts).
 
 ```json
 {
   "case": {},
+  "conversation_ref": "019...",
   "account_tier": "enterprise",
   "account_contacts": [
     {"external_contact_id": "email-contact", "channel": "email"},
     {"external_contact_id": "wechat-contact", "channel": "wechat"}
   ],
-  "conversation": {"items": []},
-  "ai_suggestion": {"text": null, "citations": [], "abstain_reason": null},
-  "related_cases": {"items": [], "basis": "same_category"}
+  "conversation": [],
+  "ai_suggestion": {"text": "...", "sources": []},
+  "related_cases": {"items": [], "basis": "subject_terms_or_category"}
 }
 ```
 
@@ -503,7 +521,7 @@ event — so a client that retried after a timeout cannot credit an account
 twice. An empty adjustment (both deltas zero) is refused with
 `400 ADJUSTMENT_EMPTY`.
 
-## Outbound Chatwoot command
+## Outbound channel command
 
 The internal command includes:
 
@@ -511,17 +529,17 @@ The internal command includes:
 {
   "command_id": "019...",
   "tenant_id": "019...",
-  "conversation_external_id": "12345",
+  "conversation_ref": "019...",
   "expected_control_version": 12,
   "message": {
     "content": "...",
-    "private": false,
+    "visibility": "customer",
     "citations": []
   }
 }
 ```
 
-Before API dispatch, the worker performs a compare-and-set control check. `command_id` is the idempotency key and is stored with the returned external message ID.
+Before dispatch, the worker performs a compare-and-set control check. The channel adapter supplies the provider conversation key, and `command_id` is the idempotency key for delivery.
 
 ## Connector interface
 

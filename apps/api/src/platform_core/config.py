@@ -22,6 +22,21 @@ class Settings(BaseSettings):
     # Local default matches infra/compose/docker-compose.yml (ai-postgres is
     # published on 5435 to avoid colliding with a host PostgreSQL on 5432).
     database_url: str = "postgresql+psycopg://platform:platform@localhost:5435/platform"
+    # Tenant-scoped requests use a dedicated non-owner, non-BYPASSRLS role.
+    # Production supplies this URL as a secret rather than inheriting a local
+    # development password by string substitution.
+    app_database_url: str | None = Field(default=None, validation_alias="APP_DATABASE_APP_URL")
+    # Pool limits are per process and per database URL (owner and RLS app role
+    # have separate pools). Deployments must budget them across API replicas
+    # and all workers against PostgreSQL max_connections.
+    database_pool_size: int = Field(default=10, ge=1, le=100)
+    database_max_overflow: int = Field(default=10, ge=0, le=100)
+    app_database_pool_size: int = Field(
+        default=10, ge=1, le=100, validation_alias="APP_DATABASE_APP_POOL_SIZE"
+    )
+    app_database_max_overflow: int = Field(
+        default=10, ge=0, le=100, validation_alias="APP_DATABASE_APP_MAX_OVERFLOW"
+    )
     # Reserved. The durable work queue is a Postgres table (inbox_events /
     # outbox_events claimed with SKIP LOCKED), not Redis, so nothing reads this
     # today. It is kept so a future cache or rate-limit feature does not have
@@ -118,6 +133,11 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
     # Interactive API traffic, per tenant.
     rate_limit_requests: int = 600
+    # Two workbench read polls (queue + selected detail) every five seconds
+    # for 1000 active tabs require about 24000 requests/minute per tenant.
+    # This larger budget applies only to authenticated GETs under /v1/workbench;
+    # writes and all other APIs keep the smaller general limit.
+    rate_limit_workbench_requests: int = 24_000
     rate_limit_window_seconds: int = 60
     # Traffic with no tenant yet, keyed by client address.
     rate_limit_anonymous_requests: int = 300
@@ -254,6 +274,16 @@ def get_settings() -> Settings:
     settings = Settings()
     if settings.environment in ("staging", "production") and settings.secret_key is None:
         raise RuntimeError("APP_SECRET_KEY is required in staging/production")
+    if settings.environment == "production" and settings.business_api_adapter == "demo":
+        raise RuntimeError(
+            "production cannot serve sample ERP data: configure APP_BUSINESS_API_ADAPTER"
+        )
+    if settings.environment == "production" and settings.pricing_ruleset == "public-reference":
+        raise RuntimeError(
+            "production cannot quote public reference prices: configure APP_PRICING_RULESET"
+        )
+    if settings.environment in ("staging", "production") and not settings.app_database_url:
+        raise RuntimeError("APP_DATABASE_APP_URL is required in staging/production")
     _assert_auth_is_configured(settings)
     return settings
 

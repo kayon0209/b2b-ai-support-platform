@@ -26,6 +26,7 @@
  * to a tenant this page guessed.
  */
 
+import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
 import "../styles-support.css";
@@ -38,14 +39,17 @@ const COPY = {
   verifyHint: "要查订单或物流，进对话后先核实一下身份即可。",
   staff: "我是客服人员",
   staffHint: "进入运营控制台",
+  tenantLabel: "企业识别码",
+  tenantHint: "请使用企业提供的客服链接，或输入企业识别码。",
 } as const;
 
 export function Landing() {
   const [params] = useSearchParams();
   // Passed through verbatim. Absent means the API's own default, not a guess
   // made here.
-  const tenant = params.get("tenant");
-  const supportHref = tenant ? `/support?tenant=${encodeURIComponent(tenant)}` : "/support";
+  const linkedTenant = params.get("tenant")?.trim() ?? "";
+  const [tenant, setTenant] = useState(linkedTenant || (import.meta.env.DEV ? "admin-demo" : ""));
+  const supportHref = tenant.trim() ? `/support?tenant=${encodeURIComponent(tenant.trim())}` : "#";
 
   return (
     <div className="support-shell support-landing">
@@ -61,7 +65,12 @@ export function Landing() {
         <h2 className="support-landing-headline">{COPY.headline}</h2>
         <p className="support-landing-body">{COPY.body}</p>
 
-        <Link className="support-landing-cta" to={supportHref}>
+        {!linkedTenant ? <label className="support-landing-tenant">{COPY.tenantLabel}
+          <input value={tenant} onChange={(event) => setTenant(event.target.value)} maxLength={63} placeholder="如 acme" />
+          <span>{COPY.tenantHint}</span>
+        </label> : null}
+
+        <Link className={`support-landing-cta${!tenant.trim() ? " is-disabled" : ""}`} to={supportHref} aria-disabled={!tenant.trim()} onClick={(event) => { if (!tenant.trim()) event.preventDefault(); }}>
           {COPY.start}
         </Link>
         <p className="support-landing-note">{COPY.verifyHint}</p>

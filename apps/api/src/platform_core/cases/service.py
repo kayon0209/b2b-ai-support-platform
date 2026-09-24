@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import String, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.cases.models import (
@@ -59,6 +59,120 @@ async def cases_for_conversation(
         .scalars()
         .all()
     )
+
+
+async def workbench_cases_for_conversations(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_refs: list[uuid.UUID],
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """A narrow case projection for the conversation-first workbench.
+
+    A handoff does not necessarily create a Case. Returning an empty mapping
+    for such a conversation keeps it visible in the inbox without inventing a
+    ticket or letting agent_runtime import this module's ORM classes.
+    """
+    if not conversation_refs:
+        return {}
+    rows = (
+        await session.execute(
+            select(CaseConversation.conversation_ref_id, Case)
+            .join(Case, Case.id == CaseConversation.case_id)
+            .where(
+                CaseConversation.tenant_id == tenant_id,
+                Case.tenant_id == tenant_id,
+                CaseConversation.conversation_ref_id.in_(conversation_refs),
+            )
+            .order_by(Case.opened_at.desc(), Case.id.desc())
+        )
+    ).all()
+    result: dict[uuid.UUID, dict[str, Any]] = {}
+    for ref, case in rows:
+        if ref in result:
+            continue
+        result[ref] = {
+            "case_id": str(case.id),
+            "subject": case.subject,
+            "status": case.status,
+            "priority": case.priority,
+            "category": case.category,
+            "assignee_ref": case.assignee_ref,
+            "team_ref": case.team_ref,
+            "enterprise_account_id": (
+                str(case.enterprise_account_id) if case.enterprise_account_id else None
+            ),
+            "version": int(case.version),
+            "first_response_due_at": case.first_response_due_at,
+            "first_responded_at": case.first_responded_at,
+            "resolution_due_at": case.resolution_due_at,
+            "opened_at": case.opened_at,
+        }
+    return result
+
+
+async def search_case_conversation_refs(
+    session: AsyncSession, *, tenant_id: uuid.UUID, term: str
+) -> set[uuid.UUID]:
+    """Find case-linked conversations by title or case ID within this tenant."""
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    rows = (
+        (
+            await session.execute(
+                select(CaseConversation.conversation_ref_id)
+                .join(Case, Case.id == CaseConversation.case_id)
+                .where(
+                    CaseConversation.tenant_id == tenant_id,
+                    Case.tenant_id == tenant_id,
+                    (Case.subject.ilike(f"%{escaped}%", escape="\\"))
+                    | (Case.id.cast(String).ilike(f"%{escaped}%", escape="\\")),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return set(rows)
+
+
+async def set_workbench_case_owner(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_ref_id: uuid.UUID,
+    owner_ref: str | None,
+) -> list[tuple[uuid.UUID, int]]:
+    """Keep linked open Cases aligned with the conversation's human owner."""
+    rows = (
+        (
+            await session.execute(
+                select(Case)
+                .join(CaseConversation, CaseConversation.case_id == Case.id)
+                .where(
+                    Case.tenant_id == tenant_id,
+                    CaseConversation.tenant_id == tenant_id,
+                    CaseConversation.conversation_ref_id == conversation_ref_id,
+                    Case.status.not_in((CaseStatus.RESOLVED.value, CaseStatus.CLOSED.value)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    service = CaseService(session)
+    changed: list[tuple[uuid.UUID, int]] = []
+    for row in rows:
+        if row.assignee_ref == owner_ref:
+            continue
+        updated = await service.apply_command(
+            tenant_id=tenant_id,
+            case_id=row.id,
+            command="assign",
+            parameters={"assignee_ref": owner_ref, "team_ref": row.team_ref},
+        )
+        changed.append((updated.id, int(updated.version)))
+    return changed
 
 
 class CaseService:

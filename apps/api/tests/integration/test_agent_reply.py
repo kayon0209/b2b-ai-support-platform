@@ -209,7 +209,7 @@ def test_replying_takes_the_lease_from_the_ai() -> None:
     admin.dispose()
     assert row[0] == "human"
     assert row[1] == "agent-7"
-    assert row[2] == "HUMAN_ACTIVE"
+    assert row[2] == "HUMAN_WAITING_CUSTOMER"
     assert result.lease_version >= 1
 
 

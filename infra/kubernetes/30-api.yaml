@@ -70,11 +70,24 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
-            - name: APP_DATABASE_PASSWORD
+            - name: APP_DATABASE_POOL_SIZE
+              value: "2"
+            - name: APP_DATABASE_MAX_OVERFLOW
+              value: "0"
+            - name: APP_DATABASE_APP_POOL_SIZE
+              value: "16"
+            - name: APP_DATABASE_APP_MAX_OVERFLOW
+              value: "0"
+            - name: APP_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: platform-secrets
-                  key: APP_DATABASE_PASSWORD
+                  key: APP_DATABASE_URL
+            - name: APP_DATABASE_APP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_APP_URL
             - name: APP_SECRET_KEY
               valueFrom:
                 secretKeyRef:

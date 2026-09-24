@@ -1,5 +1,7 @@
 # 最终外形与最后一公里（设计决策）
 
+> 本文保留早期产品形态决策。当前坐席工作台的执行规格、参考图与状态请以 [工作台改版规格](workbench-redesign-spec.md) 为准。
+
 > 依据：已上线产品的实测做法（Intercom Fin、Zendesk AI agents、Dynamics 365 Copilot、Decagon/Sierra，
 > 以及国内合力亿捷的 62%→19% 改造实录）+ 本仓库现状（`docs/product-gap-analysis.md`）。
 > 结论性文档：§2 定外形，§3 定最后一公里。**§4 起是可直接施工的设计。**
