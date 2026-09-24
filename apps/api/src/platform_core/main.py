@@ -92,6 +92,7 @@ from platform_core.rate_limit import (
     RateLimitMiddleware,
     build_limiter,
     policies_from_settings,
+    trusted_proxies_from_settings,
 )
 from platform_core.retrieval.router import router as retrieval_router
 from platform_core.support_bridge.csat_router import router as csat_router
@@ -275,6 +276,8 @@ if get_settings().rate_limit_enabled:
         workbench_policy=_policies["workbench"],
         anonymous_policy=_policies["anonymous"],
         webhook_policy=_policies["webhook"],
+        visitor_policy=_policies["visitor"],
+        trusted_proxies=trusted_proxies_from_settings(get_settings()),
     )
 app.add_middleware(TenantContextMiddleware, resolver=build_resolver())
 app.add_middleware(HttpMetricsMiddleware)

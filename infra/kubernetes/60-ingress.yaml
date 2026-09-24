@@ -26,9 +26,20 @@ metadata:
     # A webhook body is a bounded JSON payload; 1 MB is generous and refuses a
     # document upload aimed at the webhook path.
     nginx.ingress.kubernetes.io/proxy-body-size: "1m"
-    # Rate limiting is enforced in the application, per tenant, in
-    # `rate_limit.py` - where the tenant is known. A second limit here would be
-    # per-IP and would punish a tenant whose agents share a NAT address.
+    # Rate limiting is enforced in the application, in `rate_limit.py`. A second
+    # limit here would be per-IP, and a per-IP limit is exactly the wrong shape
+    # for a B2B customer surface: every visitor behind one corporate NAT would
+    # share it.
+    #
+    # Note what the application cannot do on its own. It keys per tenant when
+    # one is resolved, and per visitor credential on `/v1/support/*`, but the
+    # address it can see behind this controller is *this pod's* address - so
+    # without `APP_RATE_LIMIT_TRUSTED_PROXIES` the entire customer surface
+    # collapses into a single bucket. Measured before that setting existed:
+    # one key in Redis, and 39 rejections out of 200 concurrent visitors.
+    #
+    # Keep the real client address flowing (the default) so the application can
+    # use it once the trusted-proxy list names this controller's network.
     nginx.ingress.kubernetes.io/enable-access-log: "true"
 spec:
   ingressClassName: nginx

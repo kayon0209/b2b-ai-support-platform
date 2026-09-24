@@ -5,15 +5,14 @@ put it here, because a backlog entry without one is a wish.
 
 ## P0 — blocks a real deployment
 
-- [ ] **Customer-side rate limiting collapses to one global bucket behind the
-      ingress.** `rate_limit.py` keys on the peer address when no tenant is
-      resolved, and `/v1/support/*` never resolves one — the visitor token is
-      verified inside the handler, after the middleware has keyed the bucket.
-      `client_address` refuses `X-Forwarded-For` by design. Measured: 200
-      concurrent visitors → 19.5% rejected, and Redis held exactly one key
-      (`ratelimit:api:addr:<peer>`). Behind `60-ingress.yaml` every tenant
-      shares one 300-request-per-minute budget. Needs a trusted-proxy list plus
-      a per-visitor or per-tenant key, and a load test run *after* the ingress.
+- [ ] **Set `APP_RATE_LIMIT_TRUSTED_PROXIES` in the deployment.** The code
+      side is fixed — a trusted-proxy list plus a per-visitor bucket, verified
+      by A/B load test (200 concurrent visitors: 14.4% rejected with one global
+      bucket, 0% rejected and 340 split buckets with the proxy trusted) — but
+      the ConfigMap ships the value empty, because the correct CIDR belongs to
+      the cluster. A deployment that leaves it empty behind an ingress keeps the
+      original defect. Fill it from the actual Ingress/load-balancer network
+      and re-run the probe; `docs/deployment-and-operations.md` now says so.
 - [ ] **The frontend has no deployment path.** The API mounts no static
       assets, neither the K8s manifests nor the Compose file carry a frontend
       workload, and `GET /support` answers 401. The product cannot ship its own

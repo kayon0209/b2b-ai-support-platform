@@ -144,6 +144,20 @@ class Settings(BaseSettings):
     # Provider deliveries are burstier and must not be throttled into data
     # loss, so they get their own, more generous budget.
     rate_limit_webhook_requests: int = 1200
+    # Per-visitor budget on the customer surface, charged in addition to the
+    # address bucket. The address bucket answers "is this source abusive"; it
+    # cannot answer "is this one customer being unfair", because every visitor
+    # behind a corporate NAT shares it - so a single chatty customer would
+    # spend everyone's allowance. Sized for a person, not a script: opening a
+    # session, asking, refreshing the timeline.
+    rate_limit_visitor_requests: int = 60
+    # Peers whose `X-Forwarded-For` may be believed, as CIDRs or bare
+    # addresses. Empty means believe none, which is the previous behaviour and
+    # the right default: an unvalidated header lets any caller pick its own
+    # bucket. Measured, this is what the deployment needs - behind the ingress
+    # every request presented the ingress pod's address, so one bucket covered
+    # the entire customer surface (200 concurrent visitors, 39 rejections).
+    rate_limit_trusted_proxies: str = ""
 
     # --- Chunking and ingestion (iteration plan 1.1/1.6/4.6) ------------------
     # Defaults recorded in each document version's metadata together with the
