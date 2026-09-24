@@ -42,6 +42,27 @@ TENANT_TABLES = (
     "agent_profiles",
     "sla_policies",
     "ab_experiments",
+    # The conversation and tool-execution surface. These were missing while
+    # the table above already looked comprehensive, which is the failure mode
+    # worth naming: a hand-maintained list reads as exhaustive and is not.
+    # `conversation_turns` is what a customer actually sees, `tool_executions`
+    # records what the platform did on their behalf, and both sat outside the
+    # zero-tolerance sweep. `tool_definitions` / `tool_proposals` /
+    # `case_conversations` are here because the rows below are unreachable
+    # without them, not because they are interesting on their own.
+    #
+    # Coverage is still partial: 51 tables carry `tenant_id` and this list
+    # names 28. The remainder (billing, SSO/SCIM, connectors, sync cursors,
+    # feature flags, drafts and gaps) is tracked in TODO.md under
+    # "cross-tenant sweep coverage" rather than left implicit here.
+    "case_conversations",
+    "conversation_turns",
+    "csat_responses",
+    "case_attachments",
+    "tool_definitions",
+    "tool_proposals",
+    "tool_executions",
+    "action_confirmations",
 )
 
 _seed_ids: dict[str, str] = {}
@@ -82,7 +103,10 @@ def seed_all_tables() -> None:
         ver = str(uuid.uuid4())
         run_id = str(uuid.uuid4())
         case_id = str(uuid.uuid4())
-        _seed_ids.update(space=space, doc=doc, ver=ver, run_id=run_id, case_id=case_id)
+        tool_def = str(uuid.uuid4())
+        _seed_ids.update(
+            space=space, doc=doc, ver=ver, run_id=run_id, case_id=case_id, tool_def=tool_def
+        )
         stmts = [
             (
                 "memberships",
@@ -199,6 +223,55 @@ def seed_all_tables() -> None:
                 "updated_at) VALUES (:i, :t, 'neg.exp', "
                 'CAST(\'[{"name": "a", "weight": 1}]\' AS jsonb), 1000, 1000)',
             ),
+            (
+                "case_conversations",
+                "INSERT INTO case_conversations (id, tenant_id, case_id, conversation_ref_id) "
+                "VALUES (:i, :t, :cid, gen_random_uuid())",
+            ),
+            (
+                "conversation_turns",
+                "INSERT INTO conversation_turns (id, tenant_id, conversation_ref_id, role, "
+                "text_redacted, text_hash) SELECT :i, :t, cc.conversation_ref_id, 'customer', "
+                "'neg turn', 'th' FROM case_conversations cc WHERE cc.tenant_id = CAST(:t AS uuid) "
+                "ORDER BY cc.id LIMIT 1",
+            ),
+            (
+                "csat_responses",
+                "INSERT INTO csat_responses (id, tenant_id, conversation_ref_id, score, "
+                "created_at) SELECT :i, :t, cc.conversation_ref_id, 5, 1000 "
+                "FROM case_conversations cc WHERE cc.tenant_id = CAST(:t AS uuid) "
+                "ORDER BY cc.id LIMIT 1",
+            ),
+            (
+                "case_attachments",
+                "INSERT INTO case_attachments (id, tenant_id, case_id, object_key, filename, "
+                "content_type, size_bytes, created_at) "
+                "VALUES (:i, :t, :cid, 'neg/attach.txt', 'attach.txt', 'text/plain', 4, 1000)",
+            ),
+            (
+                "tool_definitions",
+                "INSERT INTO tool_definitions (id, tenant_id, name) "
+                "VALUES (:tooldef, :t, 'neg.tool')",
+            ),
+            (
+                "tool_proposals",
+                "INSERT INTO tool_proposals (id, tenant_id, tool_definition_id, action_hash, "
+                "actor_id, idempotency_key) "
+                "VALUES (:i, :t, :tooldef, 'ah', gen_random_uuid(), 'neg-idem')",
+            ),
+            (
+                "tool_executions",
+                "INSERT INTO tool_executions (id, tenant_id, actor_id, tool_definition_id, "
+                "idempotency_key) VALUES (:i, :t, gen_random_uuid(), :tooldef, 'neg-idem-exec')",
+            ),
+            (
+                "action_confirmations",
+                "INSERT INTO action_confirmations (id, tenant_id, proposal_id, actor_id, "
+                "action_hash, expires_at) "
+                "SELECT :i, :t, tp.id, gen_random_uuid(), tp.action_hash, 9999 "
+                "FROM tool_proposals tp WHERE tp.tenant_id = CAST(:t AS uuid) "
+                "ORDER BY tp.id LIMIT 1",
+            ),
         ]
         for _table, stmt in stmts:
             if stmt is None:
@@ -213,6 +286,7 @@ def seed_all_tables() -> None:
                     "vid": ver,
                     "rid": run_id,
                     "cid": case_id,
+                    "tooldef": tool_def,
                 },
             )
     yield

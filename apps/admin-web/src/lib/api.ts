@@ -1,3 +1,4 @@
+import { fetchWithTimeout, HttpTimeoutError, REQUEST_TIMEOUT_MS } from "./http";
 import { ApiError } from "./types";
 import { operatorAccessToken } from "./operatorAuth";
 
@@ -57,24 +58,27 @@ function authHeader(): Record<string, string> {
 /**
  * Nothing in the console ever hung up on the server before: `fetch` has no
  * default timeout, so a request that never answered left the page spinning
- * indefinitely with no error and no way to cancel. Every call now aborts
- * after `REQUEST_TIMEOUT_MS` and reports something actionable.
+ * indefinitely with no error and no way to cancel. The deadline and the
+ * cancellation policy now live in `lib/http.ts`, shared with the customer
+ * surface - they were implemented here first, which is how that surface ended
+ * up with none.
  */
-const REQUEST_TIMEOUT_MS = 20_000;
+const REQUEST_TIMEOUT_MS_VALUE = REQUEST_TIMEOUT_MS;
 
 async function send(path: string, init: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  // The timeout and cancellation policy lives in lib/http.ts, shared with the
+  // customer surface. It was implemented here first, which is how the customer
+  // chat surface ended up without one; a second copy is how that happens again.
   try {
-    return await fetch(`${BASE}${path}`, { ...init, signal: controller.signal });
+    return await fetchWithTimeout(`${BASE}${path}`, init);
   } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") {
+    if (err instanceof HttpTimeoutError) {
       throw new ApiError(
         0,
         "TIMEOUT",
         isChinese()
           ? "服务响应超时，请稍后重试。"
-          : `The control plane did not respond within ${REQUEST_TIMEOUT_MS / 1000}s. Check that the API is running, then retry.`,
+          : `The control plane did not respond within ${REQUEST_TIMEOUT_MS_VALUE / 1000}s. Check that the API is running, then retry.`,
         true,
       );
     }
@@ -91,8 +95,6 @@ async function send(path: string, init: RequestInit): Promise<Response> {
       );
     }
     throw err;
-  } finally {
-    window.clearTimeout(timer);
   }
 }
 

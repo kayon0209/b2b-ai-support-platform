@@ -128,7 +128,7 @@ TENANT_TABLES = (
 # 53 as of 2026-09-24. `0054_workbench_queue_indexes` is the newest registered
 # revision; keep this synchronized with the tracked revision set, excluding
 # `.gitkeep` and any local-only migration files.
-EXPECTED_MIGRATIONS = 53
+EXPECTED_MIGRATIONS = 54
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

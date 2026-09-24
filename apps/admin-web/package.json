@@ -9,7 +9,8 @@
     "build": "tsc -b && vite build",
     "build:release": "node scripts/check-release-env.mjs && npm run build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:runtime": "node --experimental-strip-types scripts/check-runtime-guards.mjs"
   },
   "dependencies": {
     "lucide-react": "^1.47.0",

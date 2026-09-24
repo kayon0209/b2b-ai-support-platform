@@ -39,6 +39,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ToolCard, type ToolCardData } from "../components/ToolCard";
+import { newIdempotencyKey, randomId } from "../lib/idempotency";
+import {
+  fetchWithTimeout,
+  HttpCancelledError,
+  HttpTimeoutError,
+} from "../lib/http";
 import "../styles-support.css";
 
 const STORAGE_KEY = "support.session.v1";
@@ -229,7 +235,11 @@ function readStored<T>(key: string): T | null {
 function visitorId(): string {
   const existing = readStored<string>(VISITOR_KEY);
   if (typeof existing === "string" && existing) return existing;
-  const minted = crypto.randomUUID();
+  // `randomId`, not `crypto.randomUUID()`: the conversation ref is derived from
+  // this value, so a throw here is not a degraded page but a customer with no
+  // conversation at all - and it is exactly what a plain-http internal
+  // deployment produced before. See lib/idempotency.ts.
+  const minted = randomId("visitor");
   window.sessionStorage.setItem(VISITOR_KEY, JSON.stringify(minted));
   return minted;
 }
@@ -282,6 +292,13 @@ function describeFailure(err: unknown, status?: number, code?: string): string {
     if (status === 413) return COPY.problems.tooLong;
     if (status >= 500) return COPY.problems.server;
   }
+  // Two distinct cancellations reach here, and only one is a customer problem:
+  // the deadline in `fetchWithTimeout`, and the caller's own signal when the
+  // component is being torn down. The `AbortError` branch is kept because a
+  // raw fetch elsewhere could still surface it; `HttpCancelledError` is not
+  // mapped to anything visible, because nothing went wrong.
+  if (err instanceof HttpTimeoutError) return COPY.problems.timeout;
+  if (err instanceof HttpCancelledError) return "";
   if (err instanceof DOMException && err.name === "AbortError") return COPY.problems.timeout;
   if (err instanceof TypeError) return COPY.problems.network;
   const text = err instanceof Error ? err.message : "";
@@ -375,6 +392,19 @@ export function SupportChat() {
   const answeredBaseline = useRef(0);
   const waitDeadline = useRef(0);
   const threadRef = useRef<HTMLElement | null>(null);
+  /**
+   * Cancellation for work the polling effect owns, and the ordering token that
+   * decides which timeline response is allowed to write state.
+   *
+   * The counter is the part that is easy to miss. Aborting stops the *next*
+   * request; it cannot un-write a response that is already in flight. So a
+   * poll started for the old conversation could still resolve after the
+   * customer pressed "开启新会话" and paint the previous thread into the new
+   * one. The workbench solves the same race with a request sequence
+   * (`Workbench.tsx`), and this is the same mechanism on the customer side.
+   */
+  const pollAbort = useRef<AbortController | null>(null);
+  const timelineSeq = useRef(0);
 
   const finished = conversation.owner === "closed";
   const handedOff = conversation.owner !== "ai" && !finished;
@@ -392,7 +422,7 @@ export function SupportChat() {
   }, []);
 
   const openSession = useCallback(async (): Promise<Session> => {
-    const resp = await fetch(`${API}/v1/support/sessions`, {
+    const resp = await fetchWithTimeout(`${API}/v1/support/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ tenant_slug: tenant, visitor_id: visitorId() }),
@@ -432,14 +462,21 @@ export function SupportChat() {
    * and render a state that was never true.
    */
   const loadTimeline = useCallback(
-    async (active: Session): Promise<Turn[]> => {
-      const resp = await fetch(`${API}/v1/support/timeline`, {
-        headers: { Authorization: `Bearer ${active.token}` },
-      });
+    async (active: Session, signal?: AbortSignal): Promise<Turn[]> => {
+      const seq = ++timelineSeq.current;
+      const resp = await fetchWithTimeout(
+        `${API}/v1/support/timeline`,
+        { headers: { Authorization: `Bearer ${active.token}` } },
+        { signal },
+      );
       if (resp.status === 401) throw new Error("EXPIRED");
       if (!resp.ok) throw new Error(await describeResponse(resp));
       const body = await resp.json();
       const items: Turn[] = body.items ?? [];
+      // A newer load has started: this response describes a state the customer
+      // has already moved past, so writing it would be a regression, not a
+      // late-but-valid update.
+      if (seq !== timelineSeq.current) return items;
       setTurns(items);
       if (body.conversation) setConversation(body.conversation as ConversationState);
       applyBranding(body.branding ?? null);
@@ -520,12 +557,18 @@ export function SupportChat() {
     if (!session || finished || (!waiting && !handedOff)) return;
     let failures = 0;
     let inFlight = false;
+    // One controller per poll cycle, aborted on cleanup. `clearInterval` alone
+    // stops the *next* poll; a request already sent kept running and could
+    // still resolve into a component that had already switched conversation or
+    // unmounted.
+    const controller = new AbortController();
+    pollAbort.current = controller;
     const timer = window.setInterval(() => {
       if (document.hidden || inFlight) return;
       inFlight = true;
       void (async () => {
         try {
-          const items = await loadTimeline(session);
+          const items = await loadTimeline(session, controller.signal);
           // Counted, not "is there one": an agent turn from an earlier question
           // is not an answer to this one. A `tool` or `system` turn does not
           // count either - a card arrives *before* the answer, and a handoff
@@ -536,6 +579,10 @@ export function SupportChat() {
           }
           failures = 0;
         } catch (err) {
+          // Our own teardown aborted this; it is not a poll failure and must
+          // not be counted toward the three-strikes threshold, or switching
+          // conversation would surface a spurious error on the new one.
+          if (err instanceof HttpCancelledError) return;
           failures += 1;
           // Not silent any more. Giving up on the first blip meant a single
           // failed poll ended the wait with no answer and no explanation, which
@@ -550,7 +597,11 @@ export function SupportChat() {
         }
       })();
     }, waiting ? 2000 : 5000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      controller.abort();
+      if (pollAbort.current === controller) pollAbort.current = null;
+    };
   }, [waiting, session, loadTimeline, handedOff, finished]);
 
   useEffect(() => {
@@ -589,14 +640,16 @@ export function SupportChat() {
         { role: "customer", text: body, at: Date.now() / 1000, source: "local" },
       ]);
       try {
-        const resp = await fetch(`${API}/v1/support/messages`, {
+        const resp = await fetchWithTimeout(
+      `${API}/v1/support/messages`,
+      {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${session.token}`,
             // Required by the API, and it is what makes a double-tap on send a
             // single question rather than two for an agent to answer.
-            "Idempotency-Key": crypto.randomUUID(),
+            "Idempotency-Key": newIdempotencyKey(),
           },
           body: JSON.stringify({ text: body }),
         });
@@ -661,7 +714,9 @@ export function SupportChat() {
     setProblem(null);
     setProblemKind("verify");
     try {
-      const resp = await fetch(`${API}/v1/support/verify`, {
+      const resp = await fetchWithTimeout(
+      `${API}/v1/support/verify`,
+      {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -745,12 +800,14 @@ export function SupportChat() {
       setRatingBusy(true);
       setProblem(null);
       try {
-        const resp = await fetch(`${API}/v1/support/rating`, {
+        const resp = await fetchWithTimeout(
+      `${API}/v1/support/rating`,
+      {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${session.token}`,
-            "Idempotency-Key": crypto.randomUUID(),
+            "Idempotency-Key": newIdempotencyKey(),
           },
           body: JSON.stringify({ score }),
         });

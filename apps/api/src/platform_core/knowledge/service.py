@@ -35,6 +35,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from platform_core.audit import service as audit_service
+from platform_core.identity.tenant_context import TenantContext
 from platform_core.knowledge import ingest
 from platform_core.knowledge.models import (
     Document,
@@ -98,6 +100,48 @@ def _validate_upload(content_type: str | None, data: bytes) -> str:
         return validate_content_type(content_type)
     except StorageValidationError as exc:
         raise KnowledgeError("UNSUPPORTED_CONTENT_TYPE", str(exc)) from exc
+
+
+async def create_space(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    name: str,
+    ctx: TenantContext | None = None,
+) -> KnowledgeSpace:
+    """Create the container a document is uploaded into.
+
+    This is the bootstrap step the knowledge base was missing. Uploading a
+    document requires a space id, the only listing of spaces was a GET, and no
+    other code path in the repository constructed a `KnowledgeSpace` - so a
+    freshly provisioned tenant had no supported way to create one and the
+    retrieval side stayed permanently empty. Measured on a live stack: 150 of
+    167 customer questions were answered by abstaining, with nowhere to put the
+    evidence.
+
+    Names are not unique per tenant. A duplicate name is a confusing listing,
+    not a correctness problem, and refusing it would push operators toward
+    generated names that are harder to read than the ones they chose.
+    """
+    if not name.strip():
+        raise KnowledgeError("INVALID_TITLE", "space name must not be blank")
+    if len(name) > 255:
+        raise KnowledgeError("INVALID_TITLE", "space name must be 255 characters or fewer")
+
+    space = KnowledgeSpace(tenant_id=tenant_id, name=name.strip(), status="active")
+    session.add(space)
+    await session.flush()
+
+    if ctx is not None:
+        await audit_service.record(
+            session,
+            ctx=ctx,
+            action="knowledge.space.created",
+            resource_type="knowledge_space",
+            resource_id=space.id,
+            after={"name": space.name},
+        )
+    return space
 
 
 async def _require_space(session: AsyncSession, tenant_id: uuid.UUID, space_id: uuid.UUID) -> None:
