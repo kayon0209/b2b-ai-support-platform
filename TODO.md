@@ -5,6 +5,15 @@ put it here, because a backlog entry without one is a wish.
 
 ## P0 — blocks a real deployment
 
+- [ ] **The pool benchmark needs connection headroom.**
+      `test_larger_pool_is_not_faster_under_concurrency` deliberately opens 50
+      connections at once. It cannot pass on a host where a long-running
+      Compose stack already holds most of `max_connections` — measured here:
+      62 of 100 in use, so the warm-up cannot complete. Its failure path also
+      used to leak every connection it had opened, which left the database
+      unusable for the rest of the session; that is fixed, but the test still
+      needs a database with room, or a skip when the budget is obviously too
+      small rather than a failure.
 - [ ] **Set `APP_RATE_LIMIT_TRUSTED_PROXIES` in the deployment.** The code
       side is fixed — a trusted-proxy list plus a per-visitor bucket, verified
       by A/B load test (200 concurrent visitors: 14.4% rejected with one global

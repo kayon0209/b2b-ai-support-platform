@@ -159,6 +159,17 @@ class Settings(BaseSettings):
     # the entire customer surface (200 concurrent visitors, 39 rejections).
     rate_limit_trusted_proxies: str = ""
 
+    # Built frontend to serve, when the API is also the static host. Empty
+    # falls back to the path `api.Dockerfile` produces. A checkout with no
+    # `npm run build` has none, and the API then serves the API and nothing
+    # else - which is the correct behaviour for a backend test run and a loud
+    # one to discover in production, because the startup log names the path.
+    #
+    # Named without the `app_` prefix the class fields all share, because the
+    # settings prefix is `APP_`: a field called `app_spa_dist` would be read
+    # from `APP_APP_SPA_DIST`, which is a trap for whoever configures it.
+    spa_dist: str = ""
+
     # --- Chunking and ingestion (iteration plan 1.1/1.6/4.6) ------------------
     # Defaults recorded in each document version's metadata together with the
     # pipeline version, so a chunk-set is always reproducible from its row.

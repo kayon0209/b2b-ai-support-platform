@@ -24,6 +24,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from platform_core.api import AUTH_UNRESOLVED, error_response, new_trace_id
 from platform_core.identity import tenant_context
 from platform_core.identity.tenant_context import TenantContext
+from platform_core.spa import is_spa_route
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +85,21 @@ EXEMPT_PREFIXES = (
 )
 
 
-def is_exempt(path: str) -> bool:
-    """Whether a path skips bearer-token resolution."""
-    return path in EXEMPT_PATHS or path.startswith(EXEMPT_PREFIXES)
+def is_exempt(path: str, *, spa_enabled: bool = False) -> bool:
+    """Whether a path skips bearer-token resolution.
+
+    `spa_enabled` covers the browser router's own paths (`/support`,
+    `/admin/*`, `/auth/callback`). Those are static shells: the browser must
+    fetch the bundle before it has any credential, and every datum they show
+    comes from an authenticated `/v1/*` call, so nothing is granted by serving
+    them. It is passed in rather than detected here because the exemption is
+    only correct while something is actually serving those paths - with no
+    built frontend they must keep failing exactly as before, so a checkout
+    without `npm run build` does not quietly return a blank page.
+    """
+    if path in EXEMPT_PATHS or path.startswith(EXEMPT_PREFIXES):
+        return True
+    return spa_enabled and is_spa_route(path)
 
 
 class TenantContextMiddleware(BaseHTTPMiddleware):
@@ -94,15 +107,20 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
     resolved. Fail closed per docs/security.md objective 5."""
 
     def __init__(
-        self, app: object, resolver: Callable[[Request], Awaitable[TenantContext]]
+        self,
+        app: object,
+        resolver: Callable[[Request], Awaitable[TenantContext]],
+        *,
+        spa_enabled: bool = False,
     ) -> None:
         super().__init__(app)  # type: ignore[arg-type]
         self._resolver = resolver
+        self._spa_enabled = spa_enabled
 
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        if is_exempt(request.url.path):
+        if is_exempt(request.url.path, spa_enabled=self._spa_enabled):
             tenant_context.clear_tenant_context()
             return await call_next(request)
 

@@ -18,7 +18,9 @@
 - **入口网关的网段必须填入 `APP_RATE_LIMIT_TRUSTED_PROXIES`**，否则客户侧限流退化。应用按地址分桶时看到的是网关 Pod 的地址，于是整条客户面共用一个桶（实测：200 并发访客被拒 14.4%，Redis 里只有一个键）。填入网关控制器所在网段后，同一压测拒绝率降为 0%，桶按客户端地址与访客凭据分裂。留空是安全默认（不轻信任何转发头），但**部署到入口网关后面就必须显式填写**，取值以集群实际的 Ingress/负载均衡器网段为准，例如 `10.244.0.0/16,10.96.0.0/16`。
 - 客户面另有每访客预算 `APP_RATE_LIMIT_VISITOR_REQUESTS`（默认 60 次/分钟），与地址桶叠加：地址桶挡来源滥用，访客桶挡单个客户在企业 NAT 后面耗尽所有人的额度。两者都通过才放行。
 - MinIO/S3 私有桶、短时签名 URL、备份和恢复演练必须验证。
-- 前端通过 HTTPS 提供；设置 CSP、HSTS、X-Content-Type-Options、Referrer-Policy 与路由 fallback。生产构建关闭公开 sourcemap。
+- **前端由 API 镜像自身提供**：`api.Dockerfile` 是多阶段构建，先用 Node 构建 `apps/admin-web`，只把 `dist/` 复制进运行镜像；`platform_core.spa` 在 `/assets` 提供带哈希名的静态文件，并把浏览器路由的路径（`/`、`/support/*`、`/admin/*`、`/auth/*`）回退到 `index.html`，因此深链刷新可用。不需要额外的静态托管组件、证书或跨域策略。若改用独立前端部署，必须同时移除该镜像层与 `APP_SPA_DIST`，并自行承担 SPA fallback。
+- 没有前端构建产物时（例如只跑后端测试），API 不挂载任何东西，`/support` 保持与改动前一致的 401，启动日志会打印缺失目录路径——这是刻意的：一个没有构建产物的检出不该变成一个看起来正常、实则空白的页面。
+- 前端通过 HTTPS 提供；设置 CSP、HSTS、X-Content-Type-Options、Referrer-Policy。生产构建关闭公开 sourcemap。`/assets` 下的文件名带内容哈希，可长缓存；`index.html` 不可长缓存。
 - 配置 `VITE_OIDC_ISSUER`、`VITE_OIDC_CLIENT_ID` 和 IdP 注册的 `${origin}/auth/callback`。`npm run build:release` 会拒绝缺少 HTTPS issuer/client id 或嵌入 API token 的构建。
 
 ## 健康与发布

@@ -1,3 +1,26 @@
+# The built frontend, produced in its own stage.
+#
+# It is a separate stage rather than an `apt install nodejs` in the runtime
+# image for two reasons: the final image carries no Node toolchain to patch,
+# and the build cache for `npm ci` is keyed on `package-lock.json` alone, so
+# editing Python source does not re-run it.
+#
+# The output lands where `platform_core.spa` looks by default
+# (`/app/apps/admin-web/dist`), which is what makes the product shippable from
+# one image: before this, `GET /support` answered 401 and nothing in the
+# repository described how the interface was deployed at all.
+FROM node:22-slim AS frontend
+
+WORKDIR /web
+# Manifests first, so `npm ci` is cached until a dependency actually changes.
+COPY apps/admin-web/package.json apps/admin-web/package-lock.json ./
+RUN npm ci
+COPY apps/admin-web/ ./
+# `build` runs `tsc -b && vite build`, so a type error fails the image rather
+# than shipping a bundle the browser cannot execute.
+RUN npm run build
+
+
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -23,6 +46,11 @@ COPY apps/api/migrations ./apps/api/migrations
 # and is allowed to fail (`|| true`) - PYTHONPATH below is what actually puts
 # the sources on the path.
 RUN pip install --no-cache-dir -e . --no-deps 2>/dev/null || true
+
+# The only thing the API needs from the frontend is the built directory. The
+# source is not copied: it is not served, not indexed, and shipping it would
+# put the whole React tree in the image for nothing.
+COPY --from=frontend /web/dist ./apps/admin-web/dist
 
 ENV PYTHONPATH=/app/apps/api/src:/app/apps/worker/src:/app/packages/contracts/src:/app/packages/policy/src:/app/packages/observability/src
 

@@ -95,6 +95,7 @@ from platform_core.rate_limit import (
     trusted_proxies_from_settings,
 )
 from platform_core.retrieval.router import router as retrieval_router
+from platform_core.spa import mount_spa, register_spa_fallback
 from platform_core.support_bridge.csat_router import router as csat_router
 from platform_core.tool_gateway.router import (
     catalog_router as tool_catalog_router,
@@ -279,7 +280,16 @@ if get_settings().rate_limit_enabled:
         visitor_policy=_policies["visitor"],
         trusted_proxies=trusted_proxies_from_settings(get_settings()),
     )
-app.add_middleware(TenantContextMiddleware, resolver=build_resolver())
+# The built frontend, when this image carries one. Its presence is what makes
+# the browser-router paths exempt from bearer resolution - see `spa.py` for why
+# that grants nothing, and why a checkout with no build keeps answering exactly
+# as it did before. The catch-all route is registered at the very bottom of
+# this module, after every real route.
+_SPA_DIST = mount_spa(app, get_settings().spa_dist)
+
+app.add_middleware(
+    TenantContextMiddleware, resolver=build_resolver(), spa_enabled=_SPA_DIST is not None
+)
 app.add_middleware(HttpMetricsMiddleware)
 
 
@@ -287,6 +297,12 @@ app.add_middleware(HttpMetricsMiddleware)
 def healthz() -> dict[str, str]:
     settings: Settings = get_settings()
     return {"status": "ok", "environment": settings.environment}
+
+
+# Last route registered wins last match, so the browser-router fallback goes
+# here: after `/healthz`, after every router, after everything. Anything
+# defined below this line would be shadowed by the shell.
+register_spa_fallback(app, _SPA_DIST)
 
 
 def run() -> None:

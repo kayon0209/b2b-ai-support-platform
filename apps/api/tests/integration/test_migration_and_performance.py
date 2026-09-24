@@ -25,6 +25,7 @@ exercises the real ingest code path and sets the tenant RLS context per call.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -643,6 +644,7 @@ def test_larger_pool_is_not_faster_under_concurrency() -> None:
 
     async def p50_for(pool_size: int, tasks: int = 60) -> float:
         eng = create_async_engine(ADMIN_URL, pool_size=pool_size, max_overflow=0)
+        warm: list = []
 
         async def one() -> float:
             t0 = time.perf_counter()
@@ -650,16 +652,33 @@ def test_larger_pool_is_not_faster_under_concurrency() -> None:
                 await conn.execute(text("SELECT 1"))
             return (time.perf_counter() - t0) * 1000.0
 
-        # Warm every pooled connection before timing.
-        warm = [await eng.connect() for _ in range(pool_size)]
-        for c in warm:
-            await c.execute(text("SELECT 1"))
-        for c in warm:
-            await c.close()
+        try:
+            # Warm every pooled connection before timing.
+            for _ in range(pool_size):
+                warm.append(await eng.connect())
+            for c in warm:
+                await c.execute(text("SELECT 1"))
+            for c in warm:
+                await c.close()
+            warm = []
 
-        res = sorted(await asyncio.gather(*(one() for _ in range(tasks))))
-        await eng.dispose()
-        return res[len(res) // 2]
+            res = sorted(await asyncio.gather(*(one() for _ in range(tasks))))
+            return res[len(res) // 2]
+        finally:
+            # Every exit closes the engine, including the failure path.
+            #
+            # This benchmark opens up to 50 connections at once, which is most
+            # of what the server will hand out on a busy host. When the warm-up
+            # could not get them all, the exception skipped both the explicit
+            # closes and `dispose`, and every already-open connection stayed
+            # checked out for the rest of the session. That is how one run of
+            # this test could leave the database unable to serve anything -
+            # including tests that never touch it - for every run afterwards.
+            for c in warm:
+                with contextlib.suppress(Exception):
+                    await c.close()
+            with contextlib.suppress(Exception):
+                await eng.dispose()
 
     async def run() -> tuple[float, float]:
         small = await p50_for(5)
