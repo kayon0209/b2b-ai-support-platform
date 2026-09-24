@@ -5,6 +5,13 @@ put it here, because a backlog entry without one is a wish.
 
 ## P0 — blocks a real deployment
 
+- [ ] **Prometheus Operator is not part of this repository.** `70-alerts.yaml`
+      and `71-servicemonitor.yaml` are Operator CRDs; applying them to a
+      cluster without the Operator and its CRDs fails with `no matches for
+      kind`. That is the intended behaviour — a cluster with the Operator but
+      no rules looks exactly like a healthy deployment. Install the Operator,
+      set `OTEL_EXPORTER_OTLP_ENDPOINT` in the ConfigMap for tracing to leave
+      the process, and confirm the alerts reach a real receiver.
 - [ ] **The pool benchmark needs connection headroom.**
       `test_larger_pool_is_not_faster_under_concurrency` deliberately opens 50
       connections at once. It cannot pass on a host where a long-running

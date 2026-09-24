@@ -70,6 +70,12 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
+            # Spans are stamped with this in the collector. `build_tracer`
+            # reads OTEL_SERVICE_NAME and falls back to "platform", which is
+            # also what every worker would report - so a trace that crosses
+            # the API and a worker could not be attributed to either.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-api"
             - name: APP_DATABASE_POOL_SIZE
               value: "2"
             - name: APP_DATABASE_MAX_OVERFLOW

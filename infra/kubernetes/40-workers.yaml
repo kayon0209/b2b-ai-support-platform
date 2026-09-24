@@ -62,6 +62,12 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
+            # Stamped on every span this pod emits. The five roles share
+            # one image and one process entrypoint, so without a per-role
+            # name the collector cannot tell an interactive answer from an
+            # ingestion retry.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-worker-interactive"
             - name: APP_WORKER_QUEUE
               value: "interactive"
             - name: APP_DATABASE_URL
@@ -168,6 +174,12 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
+            # Stamped on every span this pod emits. The five roles share
+            # one image and one process entrypoint, so without a per-role
+            # name the collector cannot tell an interactive answer from an
+            # ingestion retry.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-worker-ingestion"
             - name: APP_WORKER_QUEUE
               value: "ingestion"
             - name: APP_DATABASE_URL
@@ -263,6 +275,12 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
+            # Stamped on every span this pod emits. The five roles share
+            # one image and one process entrypoint, so without a per-role
+            # name the collector cannot tell an interactive answer from an
+            # ingestion retry.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-worker-outbox"
             - name: APP_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -335,6 +353,12 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
+            # Stamped on every span this pod emits. The five roles share
+            # one image and one process entrypoint, so without a per-role
+            # name the collector cannot tell an interactive answer from an
+            # ingestion retry.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-worker-retention"
             - name: APP_WORKER_QUEUE
               value: "retention"
             - name: APP_DATABASE_URL
@@ -411,6 +435,12 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
+            # Stamped on every span this pod emits. The five roles share
+            # one image and one process entrypoint, so without a per-role
+            # name the collector cannot tell an interactive answer from an
+            # ingestion retry.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-worker-sla"
             - name: APP_WORKER_QUEUE
               value: "sla"
             - name: APP_DATABASE_URL

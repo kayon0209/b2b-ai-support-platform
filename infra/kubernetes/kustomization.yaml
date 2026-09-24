@@ -18,6 +18,15 @@ resources:
   - 40-workers.yaml
   - 50-networkpolicy.yaml
   - 60-ingress.yaml
+  # `70`/`71` are the Prometheus Operator CRDs. They need the operator's CRDs
+  # installed, which this repository does not own - so they are listed, and
+  # `test_kubernetes_manifests.py` asserts that, but applying them to a cluster
+  # without the operator fails with "no matches for kind". That failure is
+  # correct and better than the alternative: an operator installed without
+  # rules looks exactly like a healthy deployment, because nothing is watching
+  # the metrics.
+  - 70-alerts.yaml
+  - 71-servicemonitor.yaml
 # `11-secret.example.yaml` is intentionally absent: it holds placeholders, and
 # applying it would create a Secret whose values look configured. Create the
 # real Secret from your secret manager first.
