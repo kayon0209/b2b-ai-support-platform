@@ -30,12 +30,14 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import select, text
 
 from platform_core.agent_runtime.agent_reply import (
     MAX_REPLY_CHARS,
     AgentReplyError,
     send_agent_reply,
 )
+from platform_core.agent_runtime.models import ConversationTurn
 from platform_core.api import (
     AUTH_UNRESOLVED,
     VALIDATION_FAILED,
@@ -46,6 +48,8 @@ from platform_core.api import (
     tenant_session,
 )
 from platform_core.audit import service as audit_service
+from platform_core.cases.assignment import list_agents
+from platform_core.identity import lease_service
 from platform_core.support_bridge.conversation_ref import parse_conversation_ref
 from platform_policy import Action
 
@@ -78,6 +82,7 @@ async def post_agent_reply(request: Request, conversation_ref: str, body: AgentR
     missing_idem = require_write_idempotency(request, Action.CASE_UPDATE)
     if missing_idem is not None:
         return missing_idem
+    idem = request.headers["Idempotency-Key"]
 
     # Server-derived attribution - see the module docstring. An actor-less
     # context is a service token, and a service token has no business signing a
@@ -95,8 +100,54 @@ async def post_agent_reply(request: Request, conversation_ref: str, body: AgentR
     except ValueError as exc:
         return error_response(VALIDATION_FAILED, str(exc), status_code=400)
 
+    # The same logical send resolves to the same turn. An advisory lock makes
+    # concurrent retries wait for the first transaction to commit; a second
+    # delivery is never enqueued for the same key.
+    turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"agent-reply:{ctx.tenant_id}:{ref_id}:{idem}")
     try:
         async with tenant_session(ctx) as session:
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"agent-reply:{ctx.tenant_id}:{ref_id}:{idem}"},
+            )
+            existing = (
+                await session.execute(
+                    select(ConversationTurn).where(
+                        ConversationTurn.tenant_id == ctx.tenant_id,
+                        ConversationTurn.id == turn_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                if (
+                    existing.text_redacted != body.text.strip()
+                    or existing.author_ref != agent_ref
+                    or existing.origin != body.origin
+                    or existing.canned_reply_id != body.canned_reply_id
+                ):
+                    return error_response(
+                        "IDEMPOTENCY_CONFLICT",
+                        "key was used for a different reply",
+                        status_code=409,
+                    )
+                return {
+                    "conversation_ref": str(ref_id),
+                    "turn_id": str(turn_id),
+                    "delivery": "already_accepted",
+                    "queued_event_id": None,
+                }
+            agents = await list_agents(session, tenant_id=ctx.tenant_id)
+            if not any(agent.user_ref == agent_ref for agent in agents):
+                return error_response(
+                    "AGENT_UNAVAILABLE", "agent is not active in this tenant", status_code=403
+                )
+            lease = await lease_service.lease_snapshot(
+                session, tenant_id=ctx.tenant_id, conversation_ref_id=ref_id, for_update=True
+            )
+            if lease is None or lease.owner_type != "human" or lease.owner_ref != agent_ref:
+                return error_response(
+                    "LEASE_CONFLICT", "claim this conversation before replying", status_code=409
+                )
             result = await send_agent_reply(
                 session,
                 tenant_id=ctx.tenant_id,
@@ -106,6 +157,7 @@ async def post_agent_reply(request: Request, conversation_ref: str, body: AgentR
                 trace_id=getattr(request.state, "trace_id", None),
                 origin=body.origin,
                 canned_reply_id=body.canned_reply_id,
+                turn_id=turn_id,
             )
             await audit_service.record(
                 session,

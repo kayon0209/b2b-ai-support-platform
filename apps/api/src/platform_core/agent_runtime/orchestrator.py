@@ -4,7 +4,7 @@ Assembles the documented request pipeline into one deterministic flow:
 
   resolve lease -> minimize -> classify -> route -> retrieve authorized
   evidence -> generate draft -> validate citations -> RECHECK LEASE
-  -> send via Chatwoot -> persist run/citations/audit/metrics
+  -> send through channel adapter or persist web turn -> record audit/metrics
 
 Design rules:
 - Deterministic code owns every gate. The model proposes; this module

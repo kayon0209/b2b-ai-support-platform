@@ -1,7 +1,22 @@
 import { ApiError } from "./types";
+import { operatorAccessToken } from "./operatorAuth";
 
 const BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 const TOKEN_KEY = "b2b_token";
+
+const ZH_ERRORS: Record<string, string> = {
+  AUTH_UNRESOLVED: "登录状态已失效，请重新登录。",
+  LEASE_CONFLICT: "会话状态已变化，请刷新后重试。",
+  AGENT_UNAVAILABLE: "坐席未在当前企业启用。",
+  AGENT_AT_CAPACITY: "目标坐席已达到接待上限。",
+  CASE_CLAIM_ACTOR_MISMATCH: "只能认领给当前登录的坐席。",
+  CONVERSATION_CLOSED: "会话已结束，请开始新会话。",
+  IDEMPOTENCY_CONFLICT: "这次提交的标识已用于其他内容，请重新操作。",
+};
+
+function isChinese(): boolean {
+  return document.documentElement.lang.startsWith("zh");
+}
 
 let unauthorizedHandler: (() => void) | null = null;
 
@@ -15,12 +30,11 @@ export function setUnauthorizedHandler(fn: (() => void) | null): void {
 }
 
 export function getToken(): string {
+  if (import.meta.env.PROD) return operatorAccessToken();
   const stored = localStorage.getItem(TOKEN_KEY);
   if (stored) return stored;
-  // A build-time token is compiled into the bundle and served to every
-  // visitor - including the customer-facing chat, which is the same bundle.
-  // So it is honoured only in a dev build; a production bundle always starts
-  // signed out and asks for a token.
+  // A build-time token would be sent to every visitor, including customers.
+  // Only a local dev build may use one; production reads the OIDC session.
   return import.meta.env.DEV ? import.meta.env.VITE_API_TOKEN || "" : "";
 }
 
@@ -30,6 +44,7 @@ export function usingBuildToken(): boolean {
 }
 
 export function setToken(token: string): void {
+  if (import.meta.env.PROD) throw new Error("生产环境只能使用企业单点登录");
   if (token) localStorage.setItem(TOKEN_KEY, token);
   else localStorage.removeItem(TOKEN_KEY);
 }
@@ -57,9 +72,9 @@ async function send(path: string, init: RequestInit): Promise<Response> {
       throw new ApiError(
         0,
         "TIMEOUT",
-        `The control plane did not respond within ${
-          REQUEST_TIMEOUT_MS / 1000
-        }s. Check that the API is running, then retry.`,
+        isChinese()
+          ? "服务响应超时，请稍后重试。"
+          : `The control plane did not respond within ${REQUEST_TIMEOUT_MS / 1000}s. Check that the API is running, then retry.`,
         true,
       );
     }
@@ -69,7 +84,9 @@ async function send(path: string, init: RequestInit): Promise<Response> {
       throw new ApiError(
         0,
         "NETWORK",
-        "Could not reach the control plane. Check the network or the API host, then retry.",
+        isChinese()
+          ? "无法连接客服服务，请检查网络后重试。"
+          : "Could not reach the control plane. Check the network or the API host, then retry.",
         true,
       );
     }
@@ -125,6 +142,21 @@ export async function apiPut<T>(
   return unwrap<T>(res);
 }
 
+export async function apiPatch<T>(
+  path: string,
+  body: unknown,
+  idempotencyKey?: string,
+): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    ...authHeader(),
+  };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  const res = await send(`${path}`, { method: "PATCH", headers, body: JSON.stringify(body) });
+  return unwrap<T>(res);
+}
+
 /**
  * POST a multipart body, for endpoints that take a file.
  *
@@ -135,11 +167,15 @@ export async function apiPut<T>(
  * server parse nothing and reject the upload as malformed, which is a
  * confusing failure for a mistake that looks like a detail.
  */
-export async function apiUpload<T>(path: string, form: FormData): Promise<T> {
+export async function apiUpload<T>(path: string, form: FormData, idempotencyKey?: string): Promise<T> {
   const res = await send(`${path}`, {
     method: "POST",
     // No Content-Type - the browser sets it, boundary included.
-    headers: { Accept: "application/json", ...authHeader() },
+    headers: {
+      Accept: "application/json",
+      ...authHeader(),
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+    },
     body: form,
   });
   return unwrap<T>(res);
@@ -178,7 +214,9 @@ async function unwrap<T>(res: Response): Promise<T> {
         res.status,
         "NON_JSON_RESPONSE",
         down
-          ? `The control plane answered HTTP ${res.status} without a JSON body, so it is most likely down or restarting. Retry in a moment.`
+          ? isChinese()
+            ? `服务暂时不可用（HTTP ${res.status}），请稍后重试。`
+            : `The control plane answered HTTP ${res.status} without a JSON body, so it is most likely down or restarting. Retry in a moment.`
           : `HTTP ${res.status}`,
         down,
       );
@@ -214,7 +252,8 @@ function toApiError(status: number, data: unknown): ApiError {
   // the operator was simply shown "HTTP 500", which reads like a bug in the
   // control plane rather than like its absence.
   const message =
-    stated ||
+    (isChinese() ? ZH_ERRORS[errorBlock.code] : "") ||
+    (isChinese() && status >= 500 ? `服务暂时不可用（HTTP ${status}），请稍后重试。` : stated) ||
     (status >= 500
       ? `The control plane answered HTTP ${status} with no explanation, so it is most likely down or restarting. Retry in a moment.`
       : `HTTP ${status}`);

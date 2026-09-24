@@ -147,9 +147,55 @@ def test_the_application_connects_as_the_non_bypass_role() -> None:
     """The migration owner is a superuser and bypasses row-level security. If
     the API's URL used it, every isolation guarantee at the application layer
     would be the only one left."""
+    secret_doc = next(
+        yaml.safe_load_all((K8S / "11-secret.example.yaml").read_text(encoding="utf-8"))
+    )
+    secret = secret_doc["stringData"]
+    assert "platform_app:" in secret["APP_DATABASE_URL"]
+    assert secret["APP_DATABASE_URL"] == secret["APP_DATABASE_APP_URL"]
     config = _by_kind("ConfigMap")[0]["data"]
-    assert "platform_app:" in config["APP_DATABASE_URL"]
+    assert "APP_DATABASE_URL" not in config
     assert "app.tenant_id" not in config  # nothing pins a tenant cluster-wide
+
+
+def test_every_api_worker_receives_both_app_database_url_settings_from_secret() -> None:
+    for name, spec in _all_pod_specs():
+        if name.endswith("/platform-migrate"):
+            continue
+        containers = _app_containers(spec)
+        if not containers:
+            continue
+        env = {entry["name"]: entry for entry in containers[0].get("env", [])}
+        for variable in ("APP_DATABASE_URL", "APP_DATABASE_APP_URL"):
+            assert env[variable]["valueFrom"]["secretKeyRef"]["name"] == "platform-secrets", (
+                name,
+                variable,
+            )
+
+
+def test_kubernetes_connection_pools_leave_postgres_admin_headroom() -> None:
+    """Three API replicas plus every worker must stay below the DB budget."""
+    config = _by_kind("ConfigMap")[0]["data"]
+    api = _named("Deployment", "platform-api")
+    api_container = _app_containers(api["spec"]["template"]["spec"])[0]
+    api_env = {entry["name"]: entry.get("value") for entry in api_container.get("env", [])}
+    api_pool_per_pod = int(api_env["APP_DATABASE_POOL_SIZE"]) + int(
+        api_env["APP_DATABASE_APP_POOL_SIZE"]
+    )
+    worker_pool_per_pod = int(config["APP_DATABASE_POOL_SIZE"]) + int(
+        config["APP_DATABASE_APP_POOL_SIZE"]
+    )
+    worker_replicas = sum(
+        int(deployment["spec"].get("replicas", 1)) for deployment in _worker_deployments().values()
+    )
+    max_connections = 100  # PostgreSQL's default; production must substitute its actual cap.
+    planned = (
+        int(api["spec"]["replicas"]) * api_pool_per_pod + worker_replicas * worker_pool_per_pod
+    )
+    assert planned <= max_connections - 10, (
+        f"planned connection cap {planned} leaves fewer than 10 of {max_connections} "
+        "PostgreSQL connections for migrations and administration"
+    )
 
 
 def test_bootstrap_tokens_are_not_enabled_anywhere() -> None:

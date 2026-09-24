@@ -13,12 +13,12 @@ different conversation's transcript. See
 `support_bridge.conversation_ref` for the one rule.
 
 Contract notes:
-- docs/api-contracts.md requires the webhook path to respond within 300 ms
-  and to never call an LLM synchronously. The same rule governs this
-  endpoint: it persists the work and returns `status: "queued"`. Generation
-  happens in the worker, where the pre-send lease re-check lives.
+- The channel adapter persists the inbound event before queueing this work.
+  This endpoint records the run request and returns `status: "queued"`;
+  generation and delivery happen in the worker, where the pre-send lease
+  re-check lives.
 - The endpoint therefore enqueues through the same transactional inbox the
-  Chatwoot webhook uses. That reuses the proven claim/ack/idempotency path
+  signed channel adapters use. That reuses the claim/ack/idempotency path
   instead of introducing a second queue with its own semantics.
 - `expected_control_version` is recorded for audit. The authoritative
   compare-and-set still happens in the orchestrator immediately before

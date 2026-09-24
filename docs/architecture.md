@@ -1,179 +1,32 @@
-# Architecture
+# 当前平台架构
 
-## Architectural style
+状态：现行架构。历史决策保留在 `docs/adr/`；渠道自建决定见 ADR 0012，坐席租约收件箱见 ADR 0015。
 
-The first production shape is a **modular monolith plus asynchronous workers**, integrated with Chatwoot as an external bounded context. This minimizes distributed-systems overhead while preserving module boundaries that can later be extracted.
+## 系统边界
 
-## Context diagram
-
-```mermaid
-flowchart LR
-  Customer[Enterprise customer] --> Channels[Web chat / Email]
-  Agent[Human support agent] --> CW[Chatwoot]
-  Channels --> CW
-  CW -->|Signed webhook| Bridge[Support Bridge]
-  Bridge --> AI[AI Control Plane]
-  AI --> Knowledge[Knowledge Service]
-  AI --> Tools[Tool Gateway]
-  AI --> Cases[Case & SLA]
-  AI --> Policy[Identity & Policy]
-  Tools --> CRM[CRM]
-  Tools --> Issues[Jira / Linear]
-  Tools --> ERP[ERP / Internal APIs]
-  Policy --> IdP[Keycloak / Enterprise IdP]
-  AI -->|REST send message| CW
-  AI --> Obs[Audit / Metrics / Traces]
-```
-
-## Deployment units for MVP
+平台自己承载 `/support` 客户页面与 `/admin/workbench` 坐席页面。FastAPI 模块化单体拥有租户、会话投影、工单/SLA、知识、AgentRun、工具执行、引用、评估和审计。渠道 provider 只通过版本化适配器、签名 webhook 和出站接口连接；不读写外部系统数据库。
 
 ```text
-chatwoot-web
-chatwoot-sidekiq
-ai-platform-api
-ai-platform-worker
-admin-web
-postgres-chatwoot
-postgres-ai
-redis-chatwoot
-redis-ai
-minio
-keycloak
-observability stack
+客户 /support ─┐                         ┌─ 管理台 /admin/*
+渠道 Webhook ──┴─> FastAPI 控制平面 ─────┴─> PostgreSQL + RLS
+                     │       │                    │
+                     │       └─ Tool Gateway       └─ pgvector
+                     ├─ Outbox / Inbox ─> Worker
+                     ├─ Redis（限流/短期协调）
+                     └─ MinIO/S3（原始文件）
 ```
 
-The custom API contains modules, not network microservices. Extraction candidates are Knowledge Worker, Integration Hub and Evaluation Runner after measured need.
+## 会话与工单
 
-## Bounded contexts
+- `ConversationTurn` 保存最小化、脱敏的对话副本；外部渠道的原始消息仍由其来源系统持有。
+- `ConversationControlLease` 决定 AI、人工、队列或已结束状态。客户可见的 AI 发送必须在派发前比较租约版本。
+- 坐席收件箱以人工队列租约为主，不依赖 Case 存在。Case 可关联一个或多个会话，Case 仍单独管理状态和 SLA。
+- 出站回复由渠道适配器按幂等键投递；网页渠道从会话时间线读取。API 返回接收不等于渠道送达，通道结果必须分别记录。
 
-### Chatwoot support kernel
+## 安全边界
 
-Owns inboxes, channels, contacts, conversations, messages, human agents, teams, assignments, labels, basic automation and CSAT.
+每个租户业务行带 `tenant_id`，生产数据库使用非 BYPASSRLS 的应用角色。请求中的租户由认证成员或已签名访客令牌解析。原始客户内容、完整文件和凭据不得进模型外日志；检索在模型前执行租户与知识 ACL 过滤。
 
-### Identity and policy
+## 当前扩展原则
 
-Owns tenant, enterprise account, department, membership, role, policy, external identity and authorization decisions. It resolves tenant context server-side.
-
-### Case and SLA
-
-Owns enterprise support cases, priority, assignment, escalation, SLA clocks, pause conditions, resolution and reopening. A Case may link multiple Chatwoot conversations.
-
-### Knowledge
-
-Owns source connectors, documents, immutable versions, parsing artifacts, chunks, embeddings, ACLs, publication, expiry and conflict metadata.
-
-### Agent runtime
-
-Owns routing, context construction, retrieval requests, prompt/model versions, generation, validation, abstention and customer response proposals.
-
-### Tool Gateway
-
-Owns tool definitions, credentials references, authorization, action preview, confirmation, idempotency, execution, postcondition verification and audit.
-
-### Integration Hub
-
-Owns connector configurations, external resource mappings, webhook subscriptions, sync cursors, retries and dead-letter recovery.
-
-### Evaluation and observability
-
-Owns evaluation datasets, release gates, production traces, quality metrics, cost, latency and knowledge-gap classification.
-
-## Critical data flow: inbound customer message
-
-1. Chatwoot receives and persists the message.
-2. Chatwoot sends a signed webhook.
-3. Support Bridge verifies signature, timestamp and replay window.
-4. The raw payload is encrypted or minimized and stored with an InboxEvent row.
-5. The transaction commits before the job is enqueued.
-6. Worker resolves tenant and external mappings.
-7. Runtime acquires an AI control lease for the conversation.
-8. Runtime routes the request and performs retrieval or a deterministic flow.
-9. Before sending, the runtime verifies that the lease version is unchanged.
-10. The response is sent through the Chatwoot API with an idempotency key.
-11. Run, citations, audit events and metrics are persisted.
-
-## Data storage
-
-### PostgreSQL AI database
-
-- Authoritative store for custom domain entities.
-- RLS on tenant-owned tables.
-- pgvector for the initial vector index.
-- PostgreSQL FTS for initial lexical retrieval.
-- Transactional Inbox and Outbox tables.
-
-### Object storage
-
-- Immutable original documents.
-- Parsed artifacts and large evaluation fixtures.
-- Tenant-prefixed object keys.
-- Server-side encryption and retention policies.
-
-### Redis AI
-
-- Celery broker/result coordination where necessary.
-- Bounded caches and distributed control leases.
-- No authoritative business state.
-- Separate instance or cluster from Chatwoot.
-
-## Search architecture
-
-MVP retrieval:
-
-```text
-ACL/tenant pre-filter
-  → PostgreSQL FTS candidates
-  + pgvector candidates
-  → rank fusion
-  → reranker with deadline
-  → citation construction
-```
-
-Upgrade triggers:
-
-- Add OpenSearch when lexical search, aggregations or corpus scale exceed PostgreSQL benchmarks.
-- Add Milvus only when vector volume/concurrency is demonstrated to be the bottleneck.
-- Do not operate PostgreSQL, OpenSearch and Milvus simultaneously without clear ownership and reconciliation rules.
-
-## Consistency model
-
-- Chatwoot and the custom platform are eventually consistent.
-- External mappings carry source version and last synchronization time.
-- Business commands are idempotent.
-- Inbound events are at-least-once; consumers deduplicate by event ID.
-- The source system remains authoritative for its owned resources.
-- Cross-system workflows use explicit states and compensating actions, not distributed transactions.
-
-## Availability and degradation
-
-| Dependency failure | Required behavior |
-|---|---|
-| LLM unavailable | Queue or hand off; never fabricate |
-| Retrieval unavailable | Do not answer enterprise facts; offer human handoff |
-| CRM unavailable | State that live data cannot be verified; do not use stale values silently |
-| Reranker unavailable | Fall back to fused retrieval only if evaluation allows |
-| Chatwoot API unavailable | Retain outbound command and retry idempotently |
-| Redis unavailable | Reject new AI ownership safely; human support remains available |
-| Worker backlog | Display delayed state and scale workers; protect interactive priority queue |
-
-## Performance targets
-
-- Webhook acknowledgement P95: < 300 ms
-- Human handoff control event P95: < 1 s
-- First token P95 for knowledge answers: < 2.5 s
-- Completed normal answer P95: < 8 s
-- Read-tool P95 excluding third-party latency: < 3 s
-- No duplicate customer-visible replies under at-least-once delivery
-- Tenant authorization decision P95: < 50 ms cached, < 150 ms uncached
-
-## Evolution strategy
-
-Extract a module only when one or more are true:
-
-- independent scaling is required;
-- failure isolation materially improves reliability;
-- a separate team owns it;
-- release cadence conflicts are measurable;
-- compliance requires independent deployment.
-
-Every extraction requires an ADR, contract tests, migration plan, observability and rollback.
+先测量查询、队列与模型路径，再决定是否拆服务或加组件。新渠道必须实现现有渠道接口和契约测试；不得复制一套对话主流程。PG RLS、幂等 outbox、租约 CAS、审计和可回滚开关属于所有写路径的组成部分。

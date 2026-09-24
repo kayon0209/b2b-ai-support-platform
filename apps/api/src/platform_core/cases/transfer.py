@@ -20,9 +20,9 @@ Three properties it has to have, and where each one comes from:
   change nobody can review later; 6.6 exists so that reason has somewhere to
   live.
 
-Deliberately not here: assignment to a *person*. `assignee_ref` belongs to
-Chatwoot (ADR 0001) and the platform naming an individual would be reporting a
-responsibility it cannot observe.
+Person-level assignment belongs to the agent directory and conversation lease.
+Team escalation remains a separate Case command, so each work object has one
+source of truth for its owner.
 """
 
 from __future__ import annotations

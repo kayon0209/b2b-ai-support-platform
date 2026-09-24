@@ -1,7 +1,7 @@
 [project]
 name = "b2b-ai-support"
 version = "0.1.0"
-description = "Enterprise AI customer support platform (Chatwoot kernel + FastAPI control plane)"
+description = "Enterprise AI customer support platform with owned customer channels and a FastAPI control plane"
 requires-python = ">=3.12"
 
 [dependency-groups]

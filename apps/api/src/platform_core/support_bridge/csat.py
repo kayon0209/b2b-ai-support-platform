@@ -143,11 +143,15 @@ async def csat_summary(
     are the same number and completely different problems.
     """
     cutoff = int(time.time()) - window_seconds
+    eligible = await _eligible_conversations(session, tenant_id=tenant_id, since=cutoff)
+    if not eligible:
+        return CsatSummary(responses=0, average=None, distribution={})
     rows = (
         await session.execute(
             select(CsatResponse.score).where(
                 CsatResponse.tenant_id == tenant_id,
                 CsatResponse.created_at >= cutoff,
+                CsatResponse.conversation_ref_id.in_(eligible),
             )
         )
     ).scalars()
@@ -172,28 +176,40 @@ async def response_rate(
     conversations is not zero - it is undefined, and reporting it as 0.0 would
     look like every customer ignored the survey.
     """
-    from platform_core.agent_runtime.models import AgentRun
-
     cutoff = int(time.time()) - window_seconds
-    asked = int(
-        (
-            await session.execute(
-                select(func.count(func.distinct(AgentRun.conversation_ref_id))).where(
-                    AgentRun.tenant_id == tenant_id,
-                    AgentRun.started_at.is_not(None),
-                    AgentRun.started_at >= cutoff,
-                )
-            )
-        ).scalar_one()
-    )
+    eligible = await _eligible_conversations(session, tenant_id=tenant_id, since=cutoff)
+    asked = len(eligible)
     if asked == 0:
         return None
     # No `: Any` here on purpose. Annotating the summary as `Any` is what let
     # this return an untyped value from a function declared `float | None`, so
     # the arithmetic below was never actually checked. `csat_summary` returns
     # `CsatSummary`, and letting mypy infer it is the point of the annotation.
-    summary = await csat_summary(session, tenant_id=tenant_id, window_seconds=window_seconds)
-    return round(summary.responses / asked, 3)
+    responses = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(CsatResponse)
+                .where(
+                    CsatResponse.tenant_id == tenant_id,
+                    CsatResponse.conversation_ref_id.in_(eligible),
+                    CsatResponse.created_at >= cutoff,
+                )
+            )
+        ).scalar_one()
+    )
+    return round(responses / asked, 3)
+
+
+async def _eligible_conversations(
+    session: AsyncSession, *, tenant_id: uuid.UUID, since: int
+) -> set[uuid.UUID]:
+    """Only finished conversations with a human response are survey eligible."""
+    from platform_core.agent_runtime.chat_service import human_replied_refs
+    from platform_core.identity.lease_service import recently_closed_refs
+
+    closed = await recently_closed_refs(session, tenant_id=tenant_id, since=since)
+    return await human_replied_refs(session, tenant_id=tenant_id, refs=closed)
 
 
 __all__ = [

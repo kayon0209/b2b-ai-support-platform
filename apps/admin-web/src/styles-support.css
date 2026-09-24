@@ -641,6 +641,58 @@
   font-size: 12.5px;
 }
 
+.support-ended {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: #eaf5f2;
+  color: #245b50;
+  font-size: 13px;
+}
+
+.support-ended button {
+  flex: none;
+  border: 1px solid #85bdb1;
+  border-radius: 6px;
+  background: #fff;
+  color: #176f61;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+
+.support-landing-tenant {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: min(320px, 100%);
+  margin: 18px auto 12px;
+  text-align: left;
+  font-size: 13px;
+  color: #425260;
+}
+
+.support-landing-tenant input {
+  height: 42px;
+  border: 1px solid #cdd7dc;
+  border-radius: 8px;
+  background: #fff;
+  padding: 0 12px;
+  font: inherit;
+}
+
+.support-landing-tenant span {
+  color: #61717c;
+  font-size: 12px;
+}
+
+.support-landing-cta.is-disabled {
+  opacity: .48;
+  cursor: not-allowed;
+}
+
 /* --- Composer -------------------------------------------------------------
  *
  * A textarea, not an input: an `<input>` cannot hold a newline, so a customer

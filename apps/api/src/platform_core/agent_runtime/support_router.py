@@ -203,6 +203,9 @@ async def timeline(
         )
         branding = await _branding_for(session, claim.tenant_id)
         rating = await _rating_for(session, claim)
+        rating_eligible = owner == "closed" and await chat_service.has_human_reply(
+            session, tenant_id=claim.tenant_id, ref_id=claim.conversation_ref
+        )
     return ok_response(
         {
             "items": items,
@@ -223,6 +226,7 @@ async def timeline(
             # rating the customer gave rather than an empty survey they have
             # already answered.
             "rating": rating,
+            "rating_eligible": rating_eligible,
         },
         trace_id=new_trace_id(),
     )
@@ -407,11 +411,9 @@ async def rate_conversation(request: Request, body: RatingIn) -> object:
     number the operations dashboard needs did not exist. Measured 2026-09-23 by
     grepping for production callers; there were none.
 
-    Where the ask belongs is settled by industry practice and by this module's
-    own docstring: at the end of an interaction, and only for one that happened.
-    The only unambiguous "this interaction is over" signal this product has is a
-    handoff, so that is where the surface offers it - and a conversation the
-    customer abandoned mid-sentence is never asked about.
+    A handoff starts human service; it does not finish it. A score is accepted
+    only after the assigned human closes the conversation, and only when that
+    person actually replied. The same eligibility is returned by /timeline.
 
     A second score replaces the first rather than adding a row, so a re-tap is
     not a second opinion (`record_response` says the same thing, and 0044's
@@ -423,8 +425,25 @@ async def rate_conversation(request: Request, body: RatingIn) -> object:
 
     from platform_core.support_bridge import csat
 
+    idem = require_idempotency_key(request)
+    if not idem:
+        return error_response(
+            IDEMPOTENCY_KEY_REQUIRED,
+            "rating requires an Idempotency-Key header",
+            status_code=400,
+        )
+
     try:
         async with tenant_session(_ctx_for(claim)) as session:
+            owner, _mode = await lease_service.current_owner(
+                session, tenant_id=claim.tenant_id, conversation_ref_id=claim.conversation_ref
+            )
+            if owner != "closed" or not await chat_service.has_human_reply(
+                session, tenant_id=claim.tenant_id, ref_id=claim.conversation_ref
+            ):
+                return error_response(
+                    "CSAT_NOT_READY", "the interaction has not finished", status_code=409
+                )
             row = await csat.record_response(
                 session,
                 tenant_id=claim.tenant_id,
@@ -490,12 +509,25 @@ async def post_message(request: Request, body: MessageIn) -> object:
             text=body.text,
         )
 
-        owner, mode = await lease_service.current_owner(
+        owner, mode = await lease_service.locked_owner(
             session,
             tenant_id=ctx.tenant_id,
             conversation_ref_id=claim.conversation_ref,
         )
+        if owner == "closed":
+            await session.rollback()
+            return error_response(
+                "CONVERSATION_CLOSED",
+                "this conversation has ended; start a new session",
+                status_code=409,
+                trace_id=trace_id,
+            )
         if owner != "ai":
+            if owner == "human":
+                await lease_service.mark_customer_replied(
+                    session, tenant_id=ctx.tenant_id, conversation_ref_id=claim.conversation_ref
+                )
+                mode = "HUMAN_ACTIVE"
             # The question is kept either way, so declining to answer the AI's
             # way is not data loss - a person will read it. `append_system_turn`
             # dedupes, so two messages in a row do not produce two copies of the

@@ -2,7 +2,7 @@
 
 ## Ownership rule
 
-The source system owns its resources. The custom platform references Chatwoot entities through external mappings and never duplicates them as authoritative records.
+The platform owns customer conversations and cases. Channel adapters retain external contact/thread references for delivery, while tenant identity and business state remain owned here.
 
 ## Identity and tenancy
 
@@ -23,7 +23,7 @@ Tenant
 
 ### EnterpriseAccount
 
-Represents the tenant's own customer/account hierarchy. Do not confuse it with a Chatwoot Account.
+Represents the tenant's own customer/account hierarchy. Provider-side accounts remain external references only.
 
 ```text
 EnterpriseAccount
@@ -70,7 +70,7 @@ UNIQUE(tenant_id, system, resource_type, external_id)
 
 ## Support and Case
 
-Chatwoot owns Conversation and Message. The custom platform owns Case.
+The platform owns ConversationTurn, ConversationControlLease and Case. A Case may link to a conversation, but an AI-to-human handoff can exist without a Case.
 
 ```text
 Case
@@ -133,7 +133,7 @@ flow needs, and it is already a legal transition, so no edge was added for it.
 ConversationControlLease
 - tenant_id
 - conversation_ref_id
-- owner_type: ai|human|queue
+- owner_type: ai|human|queue|closed
 - owner_ref?
 - mode
 - lease_version
@@ -143,6 +143,8 @@ ConversationControlLease
 ```
 
 A customer-visible AI send requires compare-and-set on `lease_version` immediately before dispatch.
+`closed` is the completed conversation state; it does not imply the linked Case
+is resolved. A customer starting a new issue receives a new conversation ref.
 
 ## Knowledge
 

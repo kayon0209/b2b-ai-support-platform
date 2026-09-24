@@ -97,6 +97,7 @@ async def send_agent_reply(
     trace_id: str | None = None,
     origin: str = ORIGIN_UNKNOWN,
     canned_reply_id: uuid.UUID | None = None,
+    turn_id: uuid.UUID | None = None,
 ) -> AgentReplyResult:
     """Record a human's reply and arrange for it to reach the customer.
 
@@ -124,6 +125,13 @@ async def send_agent_reply(
     await lease_service.acquire_or_get(
         session, tenant_id=tenant_id, conversation_ref_id=conversation_ref_id
     )
+    current = await lease_service.lease_snapshot(
+        session, tenant_id=tenant_id, conversation_ref_id=conversation_ref_id, for_update=True
+    )
+    if current is not None and current.owner_type == "closed":
+        raise AgentReplyError("this conversation has ended")
+    if current is not None and current.owner_type == "human" and current.owner_ref != owner:
+        raise AgentReplyError("another agent owns this conversation")
     lease_version = await lease_service.transfer_to_human(
         session,
         tenant_id=tenant_id,
@@ -143,6 +151,10 @@ async def send_agent_reply(
         origin=origin,
         canned_reply_id=canned_reply_id,
         author_ref=owner,
+        turn_id=turn_id,
+    )
+    await lease_service.mark_waiting_for_customer(
+        session, tenant_id=tenant_id, conversation_ref_id=conversation_ref_id, actor_ref=owner
     )
 
     # 2b. The human answered, so the first-response clock is satisfied. Through

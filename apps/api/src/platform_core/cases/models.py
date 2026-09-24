@@ -262,7 +262,7 @@ class Case(Base, PkMixin, TenantMixin):
 
 
 class CaseConversation(Base, PkMixin, TenantMixin):
-    """A Case may link multiple Chatwoot conversations (external refs)."""
+    """A Case may link multiple platform conversations."""
 
     __tablename__ = "case_conversations"
     __table_args__ = (

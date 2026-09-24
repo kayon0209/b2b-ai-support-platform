@@ -39,6 +39,7 @@ from platform_core.agent_runtime.customer_router import router as customer_route
 from platform_core.agent_runtime.prompt_router import router as prompt_router
 from platform_core.agent_runtime.router import router as agent_runtime_router
 from platform_core.agent_runtime.support_router import router as support_router
+from platform_core.agent_runtime.workbench_router import router as workbench_router
 from platform_core.api import (
     INTERNAL_ERROR,
     VALIDATION_FAILED,
@@ -222,6 +223,7 @@ app.include_router(retrieval_router)
 app.include_router(agent_runtime_router)
 app.include_router(customer_router)
 app.include_router(agent_reply_router)
+app.include_router(workbench_router)
 app.include_router(support_router)
 app.include_router(tool_gateway_router)
 app.include_router(tool_catalog_router)
@@ -270,6 +272,7 @@ if get_settings().rate_limit_enabled:
         RateLimitMiddleware,
         limiter=build_limiter(redis_url=get_settings().redis_url),
         api_policy=_policies["api"],
+        workbench_policy=_policies["workbench"],
         anonymous_policy=_policies["anonymous"],
         webhook_policy=_policies["webhook"],
     )

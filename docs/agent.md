@@ -23,7 +23,7 @@ Human ownership always takes precedence. A lease with version and expiry prevent
 
 ```text
 Message received
-  → verify webhook and persist inbox event
+  → verify signed channel event and persist inbox event (or accept a visitor message)
   → resolve tenant, actor, contact, conversation and control lease
   → redact/minimize sensitive data
   → classify intent and risk
@@ -33,7 +33,7 @@ Message received
   → generate draft
   → validate citations, policy and output schema
   → re-check control lease
-  → send through Chatwoot API
+  → send through the selected channel adapter or persist a web turn
   → persist run, citations, outcome and metrics
 ```
 
@@ -118,18 +118,17 @@ the form would be a capability with no consumer.
 Two identical complaints are not the same event if one of them is a key
 account's. When the conversation's contact is bound to an `EnterpriseAccount`
 whose tier is `strategic`/`enterprise` **and** whose contract is `active`, the
-handoff reason becomes `STRATEGIC_ACCOUNT_REQUIRES_HUMAN` and the private note
-names the account and tier, so the receiving team knows whose contract this is.
+handoff reason becomes `STRATEGIC_ACCOUNT_REQUIRES_HUMAN` and the receiving
+agent sees the account tier and gathered context in the workbench.
 The act is the same either way - a person takes over - because the red line
 does not depend on tier.
 
-The binding (`enterprise_account_contacts`) is keyed on the **Chatwoot
-contact**, not on the inbox: an inbox is a channel shared by everyone who walks
-in through it, so binding an inbox would make every customer in that channel a
-key account. The contact id is **not in the webhook payload** - measured over
-every stored event: `contact_id` 0/29, `sender_id` 1/29 - so it is read from the
-message via the Chatwoot API. An unresolvable contact degrades to "unbound",
-never to a failed run: the tier sharpens a handoff that happens regardless.
+The binding (`enterprise_account_contacts`) is keyed on the channel contact,
+not on the channel itself: a channel is shared by everyone who arrives through
+it, so binding a channel would make every customer there a key account. The
+adapter supplies a contact reference when the provider has one. An unresolved
+contact degrades to "unbound", never to a failed run: the tier sharpens a
+handoff that happens regardless.
 
 `contract_status` is checked alongside tier, the same rule `sla_policy_for_tier`
 applies to the SLA clock - a contract that ended no longer buys the dedicated

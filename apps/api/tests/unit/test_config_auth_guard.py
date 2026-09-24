@@ -1,5 +1,7 @@
 """The bootstrap-token guard must fail closed on an undeclared environment."""
 
+from pathlib import Path
+
 import pytest
 
 
@@ -56,3 +58,72 @@ def test_a_deployed_environment_still_refuses_bootstrap_tokens() -> None:
     )
     with pytest.raises(RuntimeError, match="only permitted in local/test"):
         _assert_auth_is_configured(settings)
+
+
+def test_production_refuses_demo_business_data_and_reference_prices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from platform_core.config import get_settings
+
+    monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("APP_SECRET_KEY", "local-test-secret")
+    monkeypatch.setenv("APP_OIDC_ISSUER", "https://idp.example.test/realms/platform")
+    monkeypatch.setenv("APP_ALLOW_BOOTSTRAP_TOKENS", "false")
+    monkeypatch.setenv("APP_PRICING_RULESET", "empty")
+    monkeypatch.setenv("APP_BUSINESS_API_ADAPTER", "demo")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="sample ERP data"):
+            get_settings()
+        monkeypatch.setenv("APP_BUSINESS_API_ADAPTER", "http")
+        monkeypatch.setenv("APP_PRICING_RULESET", "public-reference")
+        get_settings.cache_clear()
+        with pytest.raises(RuntimeError, match="reference prices"):
+            get_settings()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_deployed_environment_requires_dedicated_app_database_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from platform_core.config import get_settings
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("APP_ENVIRONMENT", "staging")
+    monkeypatch.setenv("APP_SECRET_KEY", "local-test-secret")
+    monkeypatch.setenv("APP_OIDC_ISSUER", "https://idp.example.test/realms/platform")
+    monkeypatch.setenv("APP_ALLOW_BOOTSTRAP_TOKENS", "false")
+    monkeypatch.delenv("APP_DATABASE_APP_URL", raising=False)
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="APP_DATABASE_APP_URL is required"):
+            get_settings()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_app_role_url_and_pool_limits_read_the_documented_environment_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from platform_core.config import get_settings
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("APP_ENVIRONMENT", "local")
+    monkeypatch.setenv("APP_ALLOW_BOOTSTRAP_TOKENS", "true")
+    monkeypatch.setenv(
+        "APP_DATABASE_APP_URL",
+        "postgresql+psycopg://platform_app:app-test@localhost:5435/platform",
+    )
+    monkeypatch.setenv("APP_DATABASE_APP_POOL_SIZE", "37")
+    monkeypatch.setenv("APP_DATABASE_APP_MAX_OVERFLOW", "0")
+    get_settings.cache_clear()
+    try:
+        settings = get_settings()
+        assert settings.app_database_url == (
+            "postgresql+psycopg://platform_app:app-test@localhost:5435/platform"
+        )
+        assert settings.app_database_pool_size == 37
+        assert settings.app_database_max_overflow == 0
+    finally:
+        get_settings.cache_clear()

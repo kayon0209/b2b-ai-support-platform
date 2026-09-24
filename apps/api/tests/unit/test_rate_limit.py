@@ -37,6 +37,24 @@ def test_refill_rate_is_capacity_over_window() -> None:
     assert RateLimitPolicy(capacity=60, window_seconds=60).refill_per_second == 1.0
 
 
+def test_workbench_read_budget_is_configurable_and_independent_of_api_writes() -> None:
+    from types import SimpleNamespace
+
+    from platform_core.rate_limit import policies_from_settings
+
+    policies = policies_from_settings(
+        SimpleNamespace(
+            rate_limit_window_seconds=60,
+            rate_limit_requests=600,
+            rate_limit_workbench_requests=24000,
+            rate_limit_anonymous_requests=300,
+            rate_limit_webhook_requests=1200,
+        )
+    )
+    assert policies["api"].capacity == 600
+    assert policies["workbench"].capacity == 24000
+
+
 # --- token bucket ---------------------------------------------------------
 
 
@@ -156,9 +174,9 @@ def test_the_bucket_map_is_bounded() -> None:
 # --- key derivation -------------------------------------------------------
 
 
-def _request(path: str, host: str | None = "10.0.0.9") -> Request:
+def _request(path: str, host: str | None = "10.0.0.9", *, method: str = "GET") -> Request:
     client = (host, 12345) if host else None
-    scope = {"type": "http", "path": path, "headers": [], "client": client, "method": "GET"}
+    scope = {"type": "http", "path": path, "headers": [], "client": client, "method": method}
     return Request(scope)
 
 
@@ -179,6 +197,18 @@ def test_webhook_traffic_gets_its_own_scope() -> None:
     assert key == "ratelimit:webhook:addr:10.0.0.9"
 
 
+def test_workbench_read_traffic_gets_a_separate_tenant_scope() -> None:
+    key = bucket_key(_request("/v1/workbench/conversations"), tenant_id="t-1")
+    assert key == "ratelimit:workbench:tenant:t-1"
+
+
+def test_workbench_writes_stay_in_the_general_api_scope() -> None:
+    key = bucket_key(
+        _request("/v1/workbench/conversations/id/actions", method="POST"), tenant_id="t-1"
+    )
+    assert key == "ratelimit:api:tenant:t-1"
+
+
 def test_a_missing_client_address_is_handled() -> None:
     """`request.client` is None under some ASGI transports; a crash here would
     be a 500 on every request."""
@@ -189,7 +219,11 @@ def test_a_missing_client_address_is_handled() -> None:
 
 
 def _app(
-    *, capacity: int, window: int = 60, unlimited: frozenset[str] = UNLIMITED_PATHS
+    *,
+    capacity: int,
+    workbench_capacity: int | None = None,
+    window: int = 60,
+    unlimited: frozenset[str] = UNLIMITED_PATHS,
 ) -> FastAPI:
     app = FastAPI()
 
@@ -201,10 +235,22 @@ def _app(
     def healthz() -> dict:
         return {"ok": True}
 
+    @app.get("/v1/workbench/conversations")
+    def workbench_read() -> dict:
+        return {"ok": True}
+
+    @app.post("/v1/workbench/conversations/id/actions")
+    def workbench_write() -> dict:
+        return {"ok": True}
+
     app.add_middleware(
         RateLimitMiddleware,
         limiter=InMemoryRateLimiter(),
         api_policy=RateLimitPolicy(capacity=capacity, window_seconds=window),
+        workbench_policy=RateLimitPolicy(
+            capacity=workbench_capacity if workbench_capacity is not None else capacity,
+            window_seconds=window,
+        ),
         anonymous_policy=RateLimitPolicy(capacity=capacity, window_seconds=window),
         webhook_policy=RateLimitPolicy(capacity=capacity * 2, window_seconds=window),
         unlimited_paths=unlimited,
@@ -265,6 +311,17 @@ def test_a_larger_policy_is_honoured_for_webhooks() -> None:
     assert client.get("/thing").status_code == 429
     # Twice the API capacity, and a separate bucket.
     assert client.get("/v1/webhooks/connectors/abc").status_code == 200
+
+
+def test_workbench_reads_have_a_separate_budget_and_writes_keep_the_api_budget() -> None:
+    client = TestClient(_app(capacity=1, workbench_capacity=2), raise_server_exceptions=False)
+
+    assert client.get("/thing").status_code == 200
+    assert client.get("/thing").status_code == 429
+    assert client.get("/v1/workbench/conversations").status_code == 200
+    assert client.get("/v1/workbench/conversations").status_code == 200
+    assert client.get("/v1/workbench/conversations").status_code == 429
+    assert client.post("/v1/workbench/conversations/id/actions").status_code == 429
 
 
 # --- wiring on the real app ----------------------------------------------

@@ -320,7 +320,7 @@ async def case_workbench(request: Request, case_id: str) -> Any:
             if facts is not None:
                 tier = facts[0]
             # Feature list 2.1: one company reaches us through several
-            # channels, and each channel is a different Chatwoot contact. The
+            # channels, and each channel may use a distinct contact reference. The
             # binding already says they are the same account; showing them is
             # what stops an agent treating the email from last week and the
             # WeChat message from this morning as two different customers.
@@ -335,6 +335,7 @@ async def case_workbench(request: Request, case_id: str) -> Any:
     return ok_response(
         {
             "case": _serialize(case),
+            "conversation_ref": str(link) if link is not None else None,
             "account_tier": tier,
             "account_contacts": contacts,
             "conversation": conversation,

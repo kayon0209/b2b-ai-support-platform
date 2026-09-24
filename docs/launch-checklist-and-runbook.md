@@ -19,7 +19,7 @@
 | RLS FORCE | 全部租户表 | `test_tenant_owned_tables_force_row_level_security` |
 | append-only 表不可改 | audit/billing | `test_schema_privileges` |
 | bootstrap token | 生产环境禁用 | `config._assert_auth_is_configured` 启动即拒 |
-| 前端 sourcemap 不外发 | 对外可取的 `*.map` = 0 | 构建用 `sourcemap: "hidden"`（bundle 不含 `sourceMappingURL`，浏览器不会去取）；**部署时排除 `*.map`**——本条是部署期检查，没有自动化门禁 |
+| 前端 sourcemap 不外发 | 对外可取的 `*.map` = 0 | Vite 生产构建关闭 sourcemap；部署仍须确认静态站点未暴露历史 `.map` 文件 |
 
 ### 1.2 质量（固定语料，`scripts/run_eval.py`）
 
