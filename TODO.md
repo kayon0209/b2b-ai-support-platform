@@ -52,17 +52,19 @@ put it here, because a backlog entry without one is a wish.
 
 - [x] **Uploads are not scanned.** **Done (T4.2).** Magic-byte type validation, a scan state machine, and an enforcement that an unscanned upload cannot enter retrieval.
 
-- [ ] **Cross-tenant sweep coverage.** 51 tables carry `tenant_id`;
-      `test_cross_tenant_negative.py` now names 28. Still unswept:
-      `answer_corrections`, `billing_entries`, `case_escalations`,
-      `connectors`, `contact_facts`, `dead_letter_items`, `departments`,
-      `enterprise_accounts`, `enterprise_account_contacts`,
-      `external_identities`, `feature_flags`, `feature_flag_targets`,
-      `knowledge_aliases`, `knowledge_drafts`, `knowledge_gaps`,
-      `membership_invitations`, `prompt_versions`, `saml_connections`,
-      `saml_consumed_assertions`, `scim_tokens`, `sync_cursors`,
-      `tenant_domains`. Add a test that fails when a new tenant-owned table is
-      not named, so the gap cannot reopen silently.
+- [x] **Cross-tenant sweep coverage.** 52 tables carry `tenant_id` and the
+      sweep now names all 52 — measured against `information_schema`, not
+      maintained by hand. The 24 added here are billing, customer records,
+      connectors and cursors, feature flags, the knowledge authoring surface,
+      identity, SSO/SCIM and visitor-token revocation.
+      All 24 already had RLS policies and phase one's
+      `0055_rls_empty_binding_guard` had already hardened them, so this batch
+      added verification rather than protection — a smaller and different claim
+      than the original gap implied.
+      `test_the_table_list_matches_the_database` now fails when a table gains a
+      `tenant_id` column, so the list cannot drift again silently. The sweep
+      itself was checked by breaking `billing_entries` to `USING (true)`: it
+      fails with `tenant B must see zero rows` and passes again once restored.
 
 ## P2 — experience and scale
 
