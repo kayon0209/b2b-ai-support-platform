@@ -651,6 +651,40 @@ def test_larger_pool_is_not_faster_under_concurrency() -> None:
 
     from sqlalchemy.ext.asyncio import create_async_engine
 
+    async def available_connections() -> int:
+        """How many more connections the server will actually hand out.
+
+        Asked *before* the benchmark opens anything, because the alternative -
+        catching the failure - cannot tell "this host is full" from "the code is
+        broken", and reporting the second as the first is how a sizing test ends
+        up permanently red and eventually deleted.
+        """
+        eng = create_async_engine(ADMIN_URL, pool_size=1, max_overflow=0)
+        try:
+            async with eng.connect() as conn:
+                limit = await conn.scalar(text("SHOW max_connections"))
+                used = await conn.scalar(text("SELECT count(*) FROM pg_stat_activity"))
+            return int(limit) - int(used)
+        finally:
+            await eng.dispose()
+
+    # The warm-up below needs `pool_size` connections at once, and the measured
+    # run keeps `tasks` competing for them. Reserve a margin for whatever else
+    # the suite is doing at this moment: a benchmark that consumes the last
+    # connection on the server makes every *other* test fail, which is the
+    # worst possible outcome for a test whose only job is to report a number.
+    NEEDED = 50
+    MARGIN = 15
+
+    budget = asyncio.run(available_connections(), loop_factory=asyncio.SelectorEventLoop)
+    if budget < NEEDED + MARGIN:
+        pytest.skip(
+            f"needs about {NEEDED + MARGIN} free connections to warm a 50-connection "
+            f"pool, and the server has {budget}. Raise max_connections, or run "
+            "this module on its own where the rest of the suite is not also "
+            "holding connections open."
+        )
+
     async def p50_for(pool_size: int, tasks: int = 60) -> float:
         eng = create_async_engine(ADMIN_URL, pool_size=pool_size, max_overflow=0)
         warm: list = []

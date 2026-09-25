@@ -12,23 +12,12 @@ put it here, because a backlog entry without one is a wish.
       no rules looks exactly like a healthy deployment. Install the Operator,
       set `OTEL_EXPORTER_OTLP_ENDPOINT` in the ConfigMap for tracing to leave
       the process, and confirm the alerts reach a real receiver.
-- [ ] **The pool benchmark needs connection headroom.**
-      `test_larger_pool_is_not_faster_under_concurrency` deliberately opens 50
-      connections at once. It cannot pass on a host where a long-running
-      Compose stack already holds most of `max_connections` — measured here:
-      62 of 100 in use, so the warm-up cannot complete. Its failure path also
-      used to leak every connection it had opened, which left the database
-      unusable for the rest of the session; that is fixed, but the test still
-      needs a database with room, or a skip when the budget is obviously too
-      small rather than a failure.
-- [ ] **Set `APP_RATE_LIMIT_TRUSTED_PROXIES` in the deployment.** The code
-      side is fixed — a trusted-proxy list plus a per-visitor bucket, verified
-      by A/B load test (200 concurrent visitors: 14.4% rejected with one global
-      bucket, 0% rejected and 340 split buckets with the proxy trusted) — but
-      the ConfigMap ships the value empty, because the correct CIDR belongs to
-      the cluster. A deployment that leaves it empty behind an ingress keeps the
-      original defect. Fill it from the actual Ingress/load-balancer network
-      and re-run the probe; `docs/deployment-and-operations.md` now says so.
+- [ ] **The pool benchmark needs connection headroom.** **Code side done; the connection budget is a deployment setting.** The test now asks the server for its budget (`max_connections` minus what is already connected) *before* opening anything, and skips with an explanation when there is not room for a 50-connection pool plus a 15-connection margin. Verified both ways: with headroom it runs and passes, and with the budget forced low it reports `needs about 65 free connections ... and the server has 8` rather than failing on `too many clients already`.
+      Catching the failure instead would not work: it cannot tell a full host from broken code, and reporting the second as the first is how a sizing test goes permanently red and is eventually deleted. The margin is deliberate — a benchmark that takes the last connection makes every *other* test fail.
+
+- [ ] **Set `APP_RATE_LIMIT_TRUSTED_PROXIES` in the deployment.** **Code side done; a helper now answers the question a deployment actually has.** `python scripts/report_trusted_proxies.py --namespace <ns>` prints the API pod addresses, the ingress controller's load balancer if it can read one, and the command that *verifies* the setting took effect (`redis-cli --scan --pattern 'ratelimit:api:addr:*' | wc -l` — one key means it did not). It changes nothing. With no reachable cluster it exits `2` and says so rather than guessing a value, because empty is the safe default and a wrong CIDR is either the availability bug or the security one.
+      Remaining: run it against the real cluster and put the value in the ConfigMap.
+
 - [x] **The frontend has no deployment path.** **Done (T3.2).** `infra/compose/api.Dockerfile` is a multi-stage build, `platform_core.spa` serves `/assets` with an SPA fallback, and `GET /support` answers 200 from the API image alone. The image build itself is still unverified - see the entry below.
 
 - [x] **No alerting, and traces are not wired.** **Done (T3.3).** `infra/kubernetes/70-alerts.yaml` and `71-servicemonitor.yaml` carry the Prometheus Operator CRDs, and `OTEL_EXPORTER_OTLP_ENDPOINT` is wired with an in-process ring-buffer fallback. Installing the Operator is tracked separately below.
