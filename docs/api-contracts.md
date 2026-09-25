@@ -36,6 +36,20 @@ The API resolves `tenant_id` from authenticated membership, connector configurat
 
 Never expose stack traces, prompts, credentials or raw provider responses.
 
+Two codes are worth naming here because they separate conditions that used to
+share one answer:
+
+- `DATABASE_SATURATED` (503, `retryable: true`) - the connection pool is
+  exhausted. The endpoint is fine and the service is busy; the pool drains on
+  its own and the same request succeeds shortly after.
+- `INTERNAL_ERROR` (500, `retryable: true`) - a genuine fault. Retrying
+  reproduces it, and the `trace_id` is what support needs.
+
+Both are retryable, because refusing the second would turn a bug into an
+outage for clients that honour the flag. They are distinct codes so that a load
+balancer, a backoff policy and an operator can tell a capacity problem from a
+bug - a page of identical 500s cannot.
+
 ## Signed channel/connector webhooks
 
 ```text
@@ -264,8 +278,9 @@ stays its own reviewed act.
 ## Quality metrics
 
 ```text
-GET /v1/quality/metrics?window_seconds=86400
-GET /v1/quality/routes?window_seconds=86400
+GET  /v1/quality/metrics?window_seconds=86400
+GET  /v1/quality/routes?window_seconds=86400
+POST /v1/quality/categories/state
 ```
 
 Returns the dashboard numbers, plus the leak analysis:
@@ -277,6 +292,15 @@ Returns the dashboard numbers, plus the leak analysis:
   rather than automation. Each carries `sample_questions` taken from the gap
   queue, so the list is a work queue and not a histogram with opinions.
 - `pending_corrections` - agent corrections awaiting review (see above).
+
+`POST /categories/state` is the only write here, and it is the one that records
+that something was *decided* about a category - which is why it demands an
+`Idempotency-Key`. It is authorized under `AUDIT_READ` because reading the
+dashboard and recording a decision on it are the same operator's job, but the
+state machine it advances is deliberate: a first decision may not skip the work
+(`observed` before `automated`), and two illegal transitions are refused with
+`CATEGORY_STATE_INVALID` rather than normalised. A client that timed out and
+retried would move that machine twice, so the retry needs the key.
 
 ## Case evidence attachments
 
