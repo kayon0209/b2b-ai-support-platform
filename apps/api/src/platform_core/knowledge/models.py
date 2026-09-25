@@ -118,6 +118,21 @@ class DocumentVersion(Base, PkMixin, TenantMixin):
     status: Mapped[str] = mapped_column(String(31), nullable=False, default="draft")
     # MinIO object URI with tenant prefix (docs/security.md object storage)
     object_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    # Epoch seconds at which the object bytes were confirmed absent from storage
+    # (migration 0058). NULL means "not known to be gone" - see the erasure pass
+    # for why that is a different question from whether the status is `expired`.
+    #
+    # Deliberately not a status value. A status says what we decided; this says
+    # what happened to the bytes, and only one of those survives a worker that
+    # dies between marking a row expired and reaching the endpoint.
+    bytes_deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Whether the bytes have been examined by a scanner (migration 0059):
+    # pending|clean|infected|error. Retrieval requires `clean`, so the default
+    # is deliberately not searchable - see `knowledge/scanning.py` for why
+    # `error` is not a pass either.
+    scan_status: Mapped[str] = mapped_column(
+        String(31), nullable=False, default="pending", server_default="pending"
+    )
     parser_version: Mapped[str] = mapped_column(String(63), nullable=False, default="v1")
     ingestion_status: Mapped[str] = mapped_column(String(31), nullable=False, default="uploaded")
     # Both timestamps are bigint epoch seconds and are owned by the database

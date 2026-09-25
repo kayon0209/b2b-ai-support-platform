@@ -22,6 +22,7 @@ const NAV = [
   { to: "/admin/gaps", key: "nav.gaps" },
   { to: "/admin/conversations", key: "nav.conversations" },
   { to: "/admin/approvals", key: "nav.approvals" },
+  { to: "/admin/agents", key: "nav.agents" },
   { to: "/admin/channels", key: "nav.channels" },
   { to: "/admin/experiments", key: "nav.experiments" },
   { to: "/admin/prompts", key: "nav.prompts" },

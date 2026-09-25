@@ -25,7 +25,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_core.api import error_response, tenant_session
+from platform_core.api import (
+    IDEMPOTENCY_KEY_REQUIRED,
+    error_response,
+    require_idempotency_key,
+    tenant_session,
+)
 from platform_core.evaluation.categories import category_report
 from platform_core.evaluation.category_service import CategoryStateError, set_category_state
 from platform_core.evaluation.channels import aggregate_channel_distribution
@@ -365,6 +370,25 @@ async def post_category_state(request: Request, body: CategoryStateIn) -> Any:
     gate = PolicyEngine().check(_principal_from_ctx(ctx), Action.AUDIT_READ)
     if gate.decision != Decision.ALLOW.value:
         return _denied(gate.reason_code)
+
+    # This is a write wearing a read's authorization action, and the two roles
+    # cannot be shared. `require_write_idempotency` decides read-versus-write by
+    # looking at the *authorization* action, and `AUDIT_READ` is in the read set,
+    # so passing it here exempts the endpoint - the first version of this did
+    # exactly that and a request with no `Idempotency-Key` was accepted with a
+    # 200. Authorization answers "may this actor?", idempotency answers "is this
+    # the same command?", and an endpoint that mutates needs the second asked
+    # explicitly rather than inferred from the first.
+    #
+    # The category state machine is why it matters: a client that timed out and
+    # retried would advance a deliberate decision twice, and the report would
+    # carry a claim with no work behind it.
+    if not require_idempotency_key(request):
+        return error_response(
+            IDEMPOTENCY_KEY_REQUIRED,
+            "recording a category state requires an Idempotency-Key header",
+            status_code=400,
+        )
 
     try:
         async with tenant_session(ctx) as session:

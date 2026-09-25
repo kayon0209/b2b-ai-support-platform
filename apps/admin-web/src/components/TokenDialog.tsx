@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { apiGet, getToken, setToken } from "../lib/api";
 import { beginOperatorLogin, logoutOperator, oidcConfigured } from "../lib/operatorAuth";
 import { useLang } from "../lib/i18n";
+import { Dialog } from "./ui";
 
 /**
  * Operator authentication entry. Production uses OIDC; local development may
@@ -18,7 +19,6 @@ export function TokenDialog({ open, onClose }: { open: boolean; onClose: () => v
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const dialogRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   // Focus the field on open: this dialog can appear over a page full of
@@ -30,7 +30,11 @@ export function TokenDialog({ open, onClose }: { open: boolean; onClose: () => v
   if (!open) return null;
 
   if (import.meta.env.PROD) {
-    return <div className="prompt" role="dialog" aria-label="企业身份验证" aria-modal="false">
+    // This declared `aria-modal="false"` on a dialog that covers the page,
+    // which told assistive technology the rest of the console was still live
+    // behind it. <Dialog> also traps Tab, closes on Escape, and restores focus
+    // to the control that opened it.
+    return <Dialog open={open} onClose={onClose} label="企业身份验证" className="prompt">
       <div className="prompt-head"><strong>企业身份验证</strong></div>
       <p className="muted">坐席控制台通过企业单点登录访问。</p>
       {!oidcConfigured() ? <p className="prompt-error" role="alert">尚未配置 OIDC 登录。请联系部署管理员。</p> : null}
@@ -52,7 +56,7 @@ export function TokenDialog({ open, onClose }: { open: boolean; onClose: () => v
         }}>退出登录</button> : null}
         <button className="btn btn-ghost" type="button" onClick={onClose}>关闭</button>
       </div>
-    </div>;
+    </Dialog>;
   }
 
   function signOut() {
@@ -88,15 +92,13 @@ export function TokenDialog({ open, onClose }: { open: boolean; onClose: () => v
   }
 
   return (
-    <div
+    <Dialog
+      open={open}
+      // Guarded: a token check is in flight, and closing here would leave the
+      // operator unable to tell whether the credential was accepted.
+      onClose={() => { if (!busy) onClose(); }}
+      label={t("token.title")}
       className="prompt"
-      role="dialog"
-      aria-modal="false"
-      aria-label={t("token.title")}
-      ref={dialogRef}
-      onKeyDown={(e) => {
-        if (e.key === "Escape" && !busy) onClose();
-      }}
     >
       <div className="prompt-head">
         <strong>{t("token.title")}</strong>
@@ -136,6 +138,6 @@ export function TokenDialog({ open, onClose }: { open: boolean; onClose: () => v
           </button>
         ) : null}
       </div>
-    </div>
+    </Dialog>
   );
 }

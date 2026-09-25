@@ -25,6 +25,7 @@ exercises the real ingest code path and sets the tenant RLS context per call.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -125,10 +126,10 @@ TENANT_TABLES = (
 # "how many revisions are registered", and a stray untracked file on one
 # machine must not be able to satisfy it.
 #
-# 53 as of 2026-09-24. `0054_workbench_queue_indexes` is the newest registered
+# 61 as of 2026-09-25. `0062_draft_conversation_ref` is the newest registered
 # revision; keep this synchronized with the tracked revision set, excluding
 # `.gitkeep` and any local-only migration files.
-EXPECTED_MIGRATIONS = 53
+EXPECTED_MIGRATIONS = 61
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection
@@ -137,9 +138,18 @@ EXPECTED_MIGRATIONS = 53
 POOL_SIZE = 10
 
 
-def _write_artifact(name: str, payload: dict[str, Any]) -> None:
+# One run id shared by every artifact this session writes, so a reviewer can
+# ask "were these two produced by the same run?" - the question a migration
+# report and a performance report from different runs cannot answer.
+_ARTIFACT_RUN_ID = f"{os.getpid()}-{int(time.time())}"
+
+
+def _write_artifact(name: str, payload: dict[str, Any], **stamp_kwargs: Any) -> None:
+    from platform_core.evaluation.artifacts import stamp
+
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    (ARTIFACT_DIR / name).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    document = stamp(name.removesuffix(".json"), payload, run_id=_ARTIFACT_RUN_ID, **stamp_kwargs)
+    (ARTIFACT_DIR / name).write_text(json.dumps(document, indent=2), encoding="utf-8")
 
 
 # --- 1. Migration testing ----------------------------------------------------
@@ -550,7 +560,7 @@ def test_100_concurrent_ingest_p95(perf_tenant: str) -> None:
         "persisted_rows": persisted,
         "duplicate_replay_detected": duplicate,
     }
-    _write_artifact("performance_report.json", report)
+    _write_artifact("performance_report.json", report, derived_from=("release_gate_evidence",))
 
     assert persisted == n, f"expected {n} rows, got {persisted}"
     assert duplicate, "replayed delivery id was not detected as a duplicate"
@@ -641,8 +651,43 @@ def test_larger_pool_is_not_faster_under_concurrency() -> None:
 
     from sqlalchemy.ext.asyncio import create_async_engine
 
+    async def available_connections() -> int:
+        """How many more connections the server will actually hand out.
+
+        Asked *before* the benchmark opens anything, because the alternative -
+        catching the failure - cannot tell "this host is full" from "the code is
+        broken", and reporting the second as the first is how a sizing test ends
+        up permanently red and eventually deleted.
+        """
+        eng = create_async_engine(ADMIN_URL, pool_size=1, max_overflow=0)
+        try:
+            async with eng.connect() as conn:
+                limit = await conn.scalar(text("SHOW max_connections"))
+                used = await conn.scalar(text("SELECT count(*) FROM pg_stat_activity"))
+            return int(limit) - int(used)
+        finally:
+            await eng.dispose()
+
+    # The warm-up below needs `pool_size` connections at once, and the measured
+    # run keeps `tasks` competing for them. Reserve a margin for whatever else
+    # the suite is doing at this moment: a benchmark that consumes the last
+    # connection on the server makes every *other* test fail, which is the
+    # worst possible outcome for a test whose only job is to report a number.
+    NEEDED = 50
+    MARGIN = 15
+
+    budget = asyncio.run(available_connections(), loop_factory=asyncio.SelectorEventLoop)
+    if budget < NEEDED + MARGIN:
+        pytest.skip(
+            f"needs about {NEEDED + MARGIN} free connections to warm a 50-connection "
+            f"pool, and the server has {budget}. Raise max_connections, or run "
+            "this module on its own where the rest of the suite is not also "
+            "holding connections open."
+        )
+
     async def p50_for(pool_size: int, tasks: int = 60) -> float:
         eng = create_async_engine(ADMIN_URL, pool_size=pool_size, max_overflow=0)
+        warm: list = []
 
         async def one() -> float:
             t0 = time.perf_counter()
@@ -650,16 +695,33 @@ def test_larger_pool_is_not_faster_under_concurrency() -> None:
                 await conn.execute(text("SELECT 1"))
             return (time.perf_counter() - t0) * 1000.0
 
-        # Warm every pooled connection before timing.
-        warm = [await eng.connect() for _ in range(pool_size)]
-        for c in warm:
-            await c.execute(text("SELECT 1"))
-        for c in warm:
-            await c.close()
+        try:
+            # Warm every pooled connection before timing.
+            for _ in range(pool_size):
+                warm.append(await eng.connect())
+            for c in warm:
+                await c.execute(text("SELECT 1"))
+            for c in warm:
+                await c.close()
+            warm = []
 
-        res = sorted(await asyncio.gather(*(one() for _ in range(tasks))))
-        await eng.dispose()
-        return res[len(res) // 2]
+            res = sorted(await asyncio.gather(*(one() for _ in range(tasks))))
+            return res[len(res) // 2]
+        finally:
+            # Every exit closes the engine, including the failure path.
+            #
+            # This benchmark opens up to 50 connections at once, which is most
+            # of what the server will hand out on a busy host. When the warm-up
+            # could not get them all, the exception skipped both the explicit
+            # closes and `dispose`, and every already-open connection stayed
+            # checked out for the rest of the session. That is how one run of
+            # this test could leave the database unable to serve anything -
+            # including tests that never touch it - for every run afterwards.
+            for c in warm:
+                with contextlib.suppress(Exception):
+                    await c.close()
+            with contextlib.suppress(Exception):
+                await eng.dispose()
 
     async def run() -> tuple[float, float]:
         small = await p50_for(5)

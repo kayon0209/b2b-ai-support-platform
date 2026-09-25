@@ -35,12 +35,21 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from platform_core.audit import service as audit_service
+from platform_core.identity.tenant_context import TenantContext
 from platform_core.knowledge import ingest
 from platform_core.knowledge.models import (
     Document,
     DocumentVersion,
     IngestionStatus,
     KnowledgeSpace,
+)
+from platform_core.knowledge.scanning import (
+    ContentScanner,
+    ContentTypeMismatch,
+    ScanVerdict,
+    run_scan,
+    verify_declared_type,
 )
 from platform_core.knowledge.storage import (
     ObjectKey,
@@ -95,9 +104,61 @@ def _validate_upload(content_type: str | None, data: bytes) -> str:
             f"upload exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB",
         )
     try:
-        return validate_content_type(content_type)
+        media = validate_content_type(content_type)
     except StorageValidationError as exc:
         raise KnowledgeError("UNSUPPORTED_CONTENT_TYPE", str(exc)) from exc
+
+    # The allowlist above answers "is this type acceptable"; this answers "are
+    # these bytes that type". Before this, a file labelled PDF carrying an
+    # executable passed the whole upload path and was retrieved as ordinary
+    # knowledge.
+    try:
+        verify_declared_type(media, data)
+    except ContentTypeMismatch as exc:
+        raise KnowledgeError("CONTENT_TYPE_MISMATCH", str(exc)) from exc
+    return media
+
+
+async def create_space(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    name: str,
+    ctx: TenantContext | None = None,
+) -> KnowledgeSpace:
+    """Create the container a document is uploaded into.
+
+    This is the bootstrap step the knowledge base was missing. Uploading a
+    document requires a space id, the only listing of spaces was a GET, and no
+    other code path in the repository constructed a `KnowledgeSpace` - so a
+    freshly provisioned tenant had no supported way to create one and the
+    retrieval side stayed permanently empty. Measured on a live stack: 150 of
+    167 customer questions were answered by abstaining, with nowhere to put the
+    evidence.
+
+    Names are not unique per tenant. A duplicate name is a confusing listing,
+    not a correctness problem, and refusing it would push operators toward
+    generated names that are harder to read than the ones they chose.
+    """
+    if not name.strip():
+        raise KnowledgeError("INVALID_TITLE", "space name must not be blank")
+    if len(name) > 255:
+        raise KnowledgeError("INVALID_TITLE", "space name must be 255 characters or fewer")
+
+    space = KnowledgeSpace(tenant_id=tenant_id, name=name.strip(), status="active")
+    session.add(space)
+    await session.flush()
+
+    if ctx is not None:
+        await audit_service.record(
+            session,
+            ctx=ctx,
+            action="knowledge.space.created",
+            resource_type="knowledge_space",
+            resource_id=space.id,
+            after={"name": space.name},
+        )
+    return space
 
 
 async def _require_space(session: AsyncSession, tenant_id: uuid.UUID, space_id: uuid.UUID) -> None:
@@ -165,10 +226,27 @@ async def create_document(
     session.add(document)
     await session.flush()
 
+    # The scanner runs on the bytes already in hand, before the object is
+    # uploaded, so a rejected file never occupies storage. A scanner outage is
+    # recorded as `error` rather than treated as a pass: the version is stored
+    # and stays invisible to retrieval until a scan succeeds.
+    verdict = run_scan(
+        ContentScanner(),
+        key="",
+        data=data,
+        declared_type=media_type,
+    )
+    if verdict is ScanVerdict.INFECTED:
+        raise KnowledgeError(
+            "UPLOAD_REJECTED",
+            "the file's contents do not match its declared type",
+        )
+
     version = DocumentVersion(
         tenant_id=tenant_id,
         document_id=document.id,
         version_label=version_label,
+        scan_status=verdict.as_status().value,
         content_hash=content_hash(data),
         status="processing",
         object_uri="",  # filled in below, once the key is derived
@@ -323,7 +401,7 @@ def _secret(value: Any) -> str | None:
     return value.get_secret_value() if hasattr(value, "get_secret_value") else str(value)
 
 
-def object_storage(settings: Any) -> Any:
+def object_storage(settings: Any, *, bucket: str | None = None) -> Any:
     """Build the object-store client. **The one construction site.**
 
     Public because the store is shared infrastructure that happens to live
@@ -332,6 +410,14 @@ def object_storage(settings: Any) -> Any:
     how an object ends up written to an endpoint the presigner does not sign
     for. The caller supplies its own content-type policy - see
     `MinioStorage.put_object`.
+
+    `bucket` overrides only the bucket, never the endpoint or the credentials.
+    That is what the backup job needs: it writes to a *different* bucket - the
+    one where versioning is safe, because the live documents bucket must stay
+    unversioned for erasure to mean anything - over the same connection. An
+    override that could also redirect the endpoint would be a way for a caller
+    to silently ship data somewhere else, which is the exact failure this
+    function exists to prevent.
 
     (`knowledge/storage.py` mixes this infrastructure with `ObjectKey`, which
     is a knowledge concept. Splitting them is a rename, not a redesign, and is
@@ -343,7 +429,7 @@ def object_storage(settings: Any) -> Any:
         endpoint=settings.object_storage_endpoint,
         access_key=_secret(settings.object_storage_access_key),
         secret_key=_secret(settings.object_storage_secret_key),
-        bucket=settings.object_storage_bucket,
+        bucket=bucket or settings.object_storage_bucket,
         secure=settings.object_storage_secure,
     )
 

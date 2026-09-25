@@ -314,3 +314,50 @@ def test_window_above_the_ceiling_is_rejected() -> None:
     )
 
     assert resp.status_code == 422
+
+
+def test_recording_a_category_state_requires_an_idempotency_key() -> None:
+    """The one write in the quality API, and the header it now demands.
+
+    `/v1/quality/categories/state` is a write wearing `AUDIT_READ`: the
+    authorization action is what the dashboard needs, so it is not the thing to
+    change, but the handler advances a deliberate state machine. A client that
+    timed out and retried would move it twice, and the second move is a claim
+    the report will carry with no work behind it.
+
+    Asserted as behaviour rather than by reading the source, because the
+    contract test already reads the source and this is the part that proves the
+    two agree.
+    """
+    # `observed`, not `automated`: the state machine refuses a first decision
+    # that skips the work, and that 409 would arrive before the idempotency
+    # check - so `automated` here would test the wrong refusal.
+    payload = {"category_key": "eq_confirmation", "state": "observed"}
+
+    refused = _client(TENANT_A, "auditor").post(
+        "/v1/quality/categories/state", json=payload, headers=_headers()
+    )
+
+    assert refused.status_code == 400
+    assert refused.json()["error"]["code"] == "IDEMPOTENCY_KEY_REQUIRED"
+
+
+def test_the_same_request_with_a_key_is_not_refused_for_that_reason() -> None:
+    """The guard has to be narrow.
+
+    A 400 from the idempotency check and a 400 from the state machine are both
+    "the request failed", so asserting only the first would pass against a
+    handler that refuses everything. This distinguishes them by the code.
+    """
+    # `observed`, not `automated`: the state machine refuses a first decision
+    # that skips the work, and that 409 would arrive before the idempotency
+    # check - so `automated` here would test the wrong refusal.
+    payload = {"category_key": "eq_confirmation", "state": "observed"}
+
+    resp = _client(TENANT_A, "auditor").post(
+        "/v1/quality/categories/state",
+        json=payload,
+        headers={**_headers(), "Idempotency-Key": "quality-category-state-1"},
+    )
+
+    assert resp.json().get("error", {}).get("code") != "IDEMPOTENCY_KEY_REQUIRED"

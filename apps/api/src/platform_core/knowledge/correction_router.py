@@ -30,6 +30,7 @@ from platform_core.api import (
     new_trace_id,
     ok_response,
     require_policy,
+    require_write_idempotency,
     tenant_session,
 )
 from platform_core.knowledge import corrections as service
@@ -78,6 +79,9 @@ async def create_correction(request: Request, body: CorrectionIn) -> object:
     denied = require_policy(ctx, Action.CASE_UPDATE)
     if denied is not None:
         return denied
+    missing_idem = require_write_idempotency(request, Action.CASE_UPDATE)
+    if missing_idem is not None:
+        return missing_idem
 
     async with tenant_session(ctx) as session:
         try:
@@ -121,6 +125,9 @@ async def review_correction(request: Request, correction_id: uuid.UUID, body: Re
     denied = require_policy(ctx, Action.KNOWLEDGE_PUBLISH)
     if denied is not None:
         return denied
+    missing_idem = require_write_idempotency(request, Action.KNOWLEDGE_PUBLISH)
+    if missing_idem is not None:
+        return missing_idem
 
     async with tenant_session(ctx) as session:
         try:

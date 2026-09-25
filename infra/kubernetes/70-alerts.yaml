@@ -1,0 +1,266 @@
+# PrometheusRule: the thresholds in docs/launch-checklist-and-runbook.md,
+# turned into things that page someone.
+#
+# Why this file exists
+# --------------------
+# `docs/launch-checklist-and-runbook.md` states the rule it had not met: "清单里的
+# 每一条阈值都必须有一个对应的门禁或指标——写在这里却没有门禁的项，视为未实现".
+# The application exported 39 metric families and nothing consumed them: a
+# threshold in a runbook that nobody watches is a wish. Every expression below
+# is checked against the live registry by
+# `apps/api/tests/unit/test_alert_rules.py`, because a rule naming a metric this
+# service does not export is accepted by Prometheus and then silently evaluates
+# to nothing forever - indistinguishable from a healthy system.
+#
+# Two conventions worth knowing before editing
+# ---------------------------------------------
+# 1. **Every rule has a runbook anchor.** `annotations.runbook` names a section of
+#    `docs/launch-checklist-and-runbook.md`. An alert that does not say what to do
+#    is a page with no first step, and the anchor is what stops the runbook and
+#    the rule from drifting apart.
+# 2. **Rates are windowed, and the window is stated.** A bare `rate(...[5m]) > 0`
+#    pages on a single blip. Each threshold below is one an operator would accept
+#    being woken for; the ones that are not (`PlatformCitationValidationUnsupported`,
+#    `PlatformModelErrorsHigh`) use sustained windows on purpose, because their
+#    signal is a trend and a trend needs a baseline to be a trend.
+#
+# `for:` is the minimum time a condition must hold before firing. It is not
+# decoration: it is what separates "spike" from "incident". Counters reset on
+# restart, and `rate()` handles that, so a rollout does not manufacture a fire.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: platform-alerts
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: observability
+spec:
+  groups:
+    # ---------------------------------------------------------------------
+    # Availability. If this group is quiet, nothing else matters.
+    # ---------------------------------------------------------------------
+    - name: platform-availability
+      interval: 30s
+      rules:
+        - alert: PlatformApiDown
+          # `up` is 1 while a scrape succeeds. The `job` label is whatever the
+          # ServiceMonitor names its endpoint - here `job_name`, which the test
+          # suite asserts against this expression. A mismatch would leave this
+          # alert permanently silent, which is the worst failure mode an
+          # availability alert can have: it looks configured and never fires.
+          expr: max by (job) (up{job="platform-api-metrics"} == 0) > 0
+          for: 2m
+          labels:
+            severity: critical
+            component: api
+          annotations:
+            summary: The customer-facing API is not responding to scrapes
+            description: >-
+              Prometheus has failed to scrape the API for 2 minutes. Customers
+              cannot open sessions, send messages, or load their timeline. Check
+              pod readiness and the ingress before anything else.
+            runbook: docs/launch-checklist-and-runbook.md#incident-runbook
+
+        - alert: PlatformErrorRateHigh
+          # The failure share of all traffic, expressed as "everything that is
+          # not `ok`" rather than as a list of the bad values.
+          #
+          # The list would have been wrong. The middleware records three
+          # distinct non-ok outcomes from three different places - `error`
+          # (status >= 400), `exception` (no response at all) and `throttled`
+          # (rate limited) - and the first draft of this rule named only
+          # `error`, so a run of unhandled exceptions and every rate-limited
+          # request would have been invisible to it. `!= "ok"` cannot be
+          # defeated by a fourth value being added later.
+          expr: >-
+            sum(rate(platform_http_requests_total{outcome!="ok"}[5m]))
+              /
+            clamp_min(sum(rate(platform_http_requests_total[5m])), 0.001)
+            > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            component: api
+          annotations:
+            summary: More than 5% of requests are not succeeding
+            description: >-
+              Over 10 minutes, more than 5% of requests recorded a non-`ok`
+              outcome: a 4xx/5xx status, an unhandled exception, or a rate-limit
+              refusal. Break it down by `outcome` and `route` before assuming
+              the cause is uniform - the three mean very different things, and
+              a customer being throttled is not a server fault.
+            runbook: docs/launch-checklist-and-runbook.md#incident-runbook
+
+    # ---------------------------------------------------------------------
+    # The run depends on the queue draining. Queue age is a separate signal
+    # from run latency on purpose: a backed-up queue produces fast runs and
+    # waiting customers at the same time.
+    # ---------------------------------------------------------------------
+    - name: platform-queue
+      interval: 30s
+      rules:
+        - alert: PlatformInboxQueueAgeHigh
+          # p99 of time-from-received-to-run-start. The launch checklist sets
+          # the run-latency budget, not a queue budget, so this threshold is
+          # derived from what a person will wait for an answer rather than
+          # copied from a document that never mentioned it - stated here
+          # because an unexplained number in an alert is a number nobody trusts.
+          expr: histogram_quantile(0.99, sum by (le) (rate(platform_inbox_claim_age_seconds_bucket[15m]))) > 120
+          for: 15m
+          labels:
+            severity: warning
+            component: worker
+          annotations:
+            summary: Customer questions are waiting over two minutes for a worker
+            description: >-
+              p99 time from an inbound message being accepted to its run starting
+              has exceeded 120s for 15 minutes. The runs themselves may be fast;
+              the queue is not draining. Check the interactive worker replicas
+              and whether they are alive but wedged.
+            runbook: docs/launch-checklist-and-runbook.md#incident-runbook
+
+        - alert: PlatformStaleClaimsReclaiming
+          # A reclaimed claim is a worker that died mid-run: the customer
+          # message was processed twice, or not at all. One is routine - a
+          # deploy kills a worker - so this fires on a rate, not on the event.
+          expr: increase(platform_stale_claims_reclaimed_total[15m]) > 2
+          for: 5m
+          labels:
+            severity: warning
+            component: worker
+          annotations:
+            summary: Workers are repeatedly dying mid-run
+            description: >-
+              More than two inbox rows were returned to the queue in 15 minutes.
+              Each one was being processed when its worker stopped, so the
+              customer's message may have been answered twice or not at all.
+              Check for OOM kills and for a rollout that exceeded its grace
+              period.
+            runbook: docs/launch-checklist-and-runbook.md#incident-runbook
+
+        - alert: PlatformOutboxUnhandledEvents
+          # The outbox row is retired even when nothing handles it, so this is
+          # the only evidence a business event went nowhere. It is emitted
+          # from one place, which means a firing alert is precise by
+          # construction.
+          expr: increase(platform_outbox_unhandled_total[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            component: worker
+          annotations:
+            summary: A business event was published with no consumer
+            description: >-
+              An outbox event was marked sent with no registered handler, so
+              nothing anywhere performed the work it described. The `event_type`
+              label says which. This is a wiring gap, not a transient failure:
+              the same event type will keep going nowhere.
+            runbook: docs/launch-checklist-and-runbook.md#incident-runbook
+
+    # ---------------------------------------------------------------------
+    # Answer quality. These are the runbook's wrong-answer signals, and they
+    # are on longer windows because a single bad run is not a trend.
+    # ---------------------------------------------------------------------
+    - name: platform-answer-quality
+      interval: 60s
+      rules:
+        - alert: PlatformCitationValidationUnsupported
+          # The runbook names this as the primary wrong-answer trigger.
+          # Sustained over 30 minutes: one unsupported draft in a thousand is
+          # normal, a rising share is a retrieval or prompt regression.
+          expr: >-
+            sum(rate(platform_agent_citation_validation_total{status="unsupported"}[30m]))
+              >
+            0.1 * clamp_min(sum(rate(platform_agent_citation_validation_total[30m])), 0.001)
+          for: 30m
+          labels:
+            severity: critical
+            component: agent
+          annotations:
+            summary: More than 10% of generated citations are unsupported
+            description: >-
+              The citation validator is rejecting drafts at a sustained rate
+              above 10%. Answers are being composed from evidence that does not
+              support them, which is the wrong-answer incident the runbook's
+              first section covers: start with the feature flags, then the
+              prompt rollback.
+            runbook: docs/launch-checklist-and-runbook.md#错误回答激增
+
+        - alert: PlatformModelErrorsHigh
+          # Failure of the primary model means every answer is coming from the
+          # fallback chain, or from an abstention. Both change what a customer
+          # experiences, and neither is visible in the run outcome alone.
+          expr: >-
+            sum(rate(platform_model_errors_total[10m]))
+              >
+            0.2 * clamp_min(sum(rate(platform_model_errors_total[10m])) + sum(rate(platform_agent_runs_total[10m])), 0.001)
+          for: 10m
+          labels:
+            severity: critical
+            component: model
+          annotations:
+            summary: The model is failing on a fifth of calls
+            description: >-
+              Model errors exceed 20% of model calls over 10 minutes. Answers
+              are being served by the fallback chain or abstained entirely.
+              Check `error_code` for the failure class and the fallback
+              configuration before a restart.
+            runbook: docs/launch-checklist-and-runbook.md#incident-runbook
+
+        - alert: PlatformRetrievalDegraded
+          # Rerank or hybrid-search degradation. The platform answers from
+          # retrieval, so a degraded retriever is a quieter version of the
+          # wrong-answer incident.
+          expr: increase(platform_retrieval_degraded_total[30m]) > 5
+          for: 15m
+          labels:
+            severity: warning
+            component: retrieval
+          annotations:
+            summary: Retrieval is running in its degraded mode
+            description: >-
+              The retriever has fallen back more than five times in 30 minutes.
+              Results are being returned without reranking, so citation
+              support will degrade even though answers still look normal.
+            runbook: docs/launch-checklist-and-runbook.md#incident-runbook
+
+    # ---------------------------------------------------------------------
+    # Cost and latency: the two thresholds the launch checklist sets
+    # explicitly (p95 cost <= 5 cents, p95 latency < 8s).
+    # ---------------------------------------------------------------------
+    - name: platform-budget
+      interval: 60s
+      rules:
+        - alert: PlatformRunCostP95High
+          # docs/launch-checklist-and-runbook.md §1.3: p95 <= 5 cents.
+          # The threshold is the document's, verbatim, so this rule and the
+          # checklist cannot disagree about what "too expensive" means.
+          expr: histogram_quantile(0.95, sum by (le) (rate(platform_run_cost_cents_bucket[30m]))) > 5
+          for: 30m
+          labels:
+            severity: warning
+            component: cost
+          annotations:
+            summary: p95 cost per run has passed the 5-cent launch threshold
+            description: >-
+              p95 cost per run exceeds 5 cents, the threshold in
+              docs/launch-checklist-and-runbook.md §1.3. Sustained over 30
+              minutes, so a single expensive run does not page. Check whether a
+              prompt change increased context size.
+            runbook: docs/launch-checklist-and-runbook.md#incident-runbook
+
+        - alert: PlatformRunLatencyP95High
+          # §1.3: total latency p95 < 8s, backstop 20s.
+          expr: histogram_quantile(0.95, sum by (le) (rate(platform_agent_run_latency_seconds_bucket[15m]))) > 8
+          for: 15m
+          labels:
+            severity: warning
+            component: agent
+          annotations:
+            summary: p95 end-to-end run latency has passed the 8s launch threshold
+            description: >-
+              p95 time from abstention gate to dispatch exceeds 8s, the
+              threshold in docs/launch-checklist-and-runbook.md §1.3. The
+              `outcome` label separates a slow answer from a slow abstention.
+            runbook: docs/launch-checklist-and-runbook.md#incident-runbook

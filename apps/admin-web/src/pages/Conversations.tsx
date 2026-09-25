@@ -1,9 +1,10 @@
 import { useState } from "react";
+import { useUrlState } from "../lib/urlState";
 
 import { apiGet } from "../lib/api";
 import { useAsync } from "../lib/useAsync";
 import type { ConversationList, ConversationReplay, ReplayRun, ReplayTurn } from "../lib/types";
-import { Badge, Card, EmptyState, ListTotal, PageHeader, Spinner } from "../components/ui";
+import { Badge, Card, EmptyState, ListTotal, PageHeader, SkeletonRows, Spinner } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { useLang } from "../lib/i18n";
 import type { DictKey } from "../lib/i18n";
@@ -205,7 +206,11 @@ function Timeline({ replay }: { replay: ConversationReplay }) {
 
 export function Conversations() {
   const { t } = useLang();
-  const [selected, setSelected] = useState<string | null>(null);
+  // In the URL, not in component state: a replay that cannot be linked
+  // cannot be handed to a colleague, and refreshing mid-investigation threw
+  // away whatever the operator had narrowed the list down to.
+  const [selected, setSelectedRaw] = useUrlState("conversation", "");
+  const setSelected = (next: string | null) => setSelectedRaw(next);
   const [offset, setOffset] = useState(0);
 
   const list = useAsync(
@@ -233,7 +238,10 @@ export function Conversations() {
       <PageHeader title={t("conversations.title")} subtitle={t("conversations.subtitle")} />
 
       {list.error ? <LoadError error={list.error} status={list.errorStatus} onRetry={list.reload} /> : null}
-      {list.loading ? <Spinner label={t("conversations.loading")} /> : null}
+      {/* A skeleton rather than a spinner: the spinner unmounted the whole
+          list and remounted it on arrival, so every page load was two
+          layout jumps and the operator lost their scroll position. */}
+      {list.loading ? <SkeletonRows rows={6} label={t("conversations.loading")} /> : null}
       {list.data && list.data.items.length === 0 ? (
         <EmptyState message={t("conversations.empty")} />
       ) : null}

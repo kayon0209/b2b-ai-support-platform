@@ -39,17 +39,22 @@ agent polling does not consume the budget reserved for business writes.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from typing import Any, Protocol
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from observability import JsonLogger
 from observability_metrics import get_metrics
+
+logger = JsonLogger("platform.api")
 
 # Never limited, for the reasons in the module docstring.
 UNLIMITED_PATHS = frozenset({"/healthz", "/metrics", "/openapi.json", "/docs", "/redoc"})
@@ -60,6 +65,17 @@ UNLIMITED_PATHS = frozenset({"/healthz", "/metrics", "/openapi.json", "/docs", "
 # more generous budget rather than sharing the API's.
 WEBHOOK_PREFIX = "/v1/webhooks/"
 WORKBENCH_READ_PREFIX = "/v1/workbench/"
+
+# The customer surface. The visitor token is verified inside the handler, so
+# the middleware cannot resolve a tenant here - which is what makes this path
+# the one that collapses to a single shared bucket without `visitor_key`.
+SUPPORT_PREFIX = "/v1/support/"
+
+# Credential prefix minted by `support_bridge.visitor_token`. Operator tokens
+# are `pt_`; the two never share a bucket.
+# A prefix, not a secret: the full credential is the signed token, and
+# only its digest ever reaches a bucket key.
+VISITOR_TOKEN_PREFIX = "vs_"  # noqa: S105
 
 BUCKET_KEY_PREFIX = "ratelimit"
 
@@ -245,28 +261,118 @@ class HybridRateLimiter:
         return self._local.check(key, policy)
 
 
-def client_address(request: Request) -> str:
-    """Best-effort client identity for the unauthenticated paths.
-
-    `request.client` is the peer address, which behind a proxy is the proxy -
-    so every caller shares one bucket. That is a real limitation and it is
-    stated rather than hidden: honouring `X-Forwarded-For` would let any
-    caller choose its own bucket by sending a header, which is strictly worse
-    than a shared bucket. A deployment behind a proxy should rate-limit at the
-    proxy and treat this as defence in depth.
-    """
+def _peer_address(request: Request) -> str:
     client = getattr(request, "client", None)
     host = getattr(client, "host", None)
     return str(host) if host else "unknown"
 
 
-def bucket_key(request: Request, *, tenant_id: str | None) -> str:
+def _trusted_networks(
+    trusted_proxies: tuple[str, ...] | list[str],
+) -> list[IPv4Network | IPv6Network]:
+    networks: list[IPv4Network | IPv6Network] = []
+    for entry in trusted_proxies:
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(ip_network(entry, strict=False))
+        except ValueError:
+            # A malformed entry must not disable the limiter or crash the
+            # request. Skipping it means that peer keeps the stricter peer
+            # address, which is the safe direction.
+            logger.warning("rate_limit_trusted_proxy_ignored", reason_code="INVALID_CIDR")
+    return networks
+
+
+def client_address(request: Request, *, trusted_proxies: tuple[str, ...] = ()) -> str:
+    """Best-effort client identity for the unauthenticated paths.
+
+    `request.client` is the peer address, which behind a proxy is the proxy. A
+    deployment behind an ingress therefore presented the ingress pod's address
+    to every caller, and since the customer surface never resolves a tenant in
+    the middleware - the visitor token is verified inside the handler - the
+    whole deployment shared one bucket. Measured: Redis held exactly one key,
+    `ratelimit:api:addr:<peer>`, and 200 concurrent visitors produced 39
+    rejections between them.
+
+    `X-Forwarded-For` is honoured only when the peer itself is in
+    `trusted_proxies`. Honouring it unconditionally would let any caller pick
+    its own bucket by sending a header, which is strictly worse than a shared
+    bucket; the configuration turns a guess into a fact, and an empty list
+    keeps the previous behaviour exactly.
+    """
+    peer = _peer_address(request)
+    if not trusted_proxies:
+        return peer
+
+    networks = _trusted_networks(trusted_proxies)
+    if not networks:
+        return peer
+    try:
+        peer_ip = ip_address(peer)
+    except ValueError:
+        return peer
+    if not any(peer_ip in net for net in networks):
+        return peer
+
+    forwarded = request.headers.get("x-forwarded-for", "")
+    # Left-most first hop is the original client. Every later hop is a proxy we
+    # are already behind, and a value that is not an address anywhere in the
+    # chain means the header is not what a trusted proxy would have written.
+    hops = [part.strip() for part in forwarded.split(",") if part.strip()]
+    if not hops:
+        return peer
+    for hop in hops:
+        try:
+            return str(ip_address(hop))
+        except ValueError:
+            return peer
+    return peer
+
+
+def visitor_key(request: Request) -> str | None:
+    """A per-customer bucket for the customer surface, or None.
+
+    The address bucket answers "is this source abusive". It cannot answer "is
+    this one customer being unfair", because everyone behind one corporate NAT
+    shares it - so one chatty customer spends everyone's budget. This key gives
+    each visitor their own allowance on top of that.
+
+    Two conditions, both deliberate:
+
+    - the path must be the customer surface, and
+    - the credential must carry the visitor prefix.
+
+    The prefix check is what keeps an operator's `pt_` token out of this
+    scheme: bucketing an operator by a visitor rule would apply a tiny customer
+    budget to a seat that legitimately polls hard.
+
+    The token is hashed, never stored. It is a credential, and this key ends up
+    in Redis and in metrics; a digest is enough to separate one visitor from
+    another and useless to anyone who reads it.
+    """
+    if not request.url.path.startswith(SUPPORT_PREFIX):
+        return None
+    header = request.headers.get("authorization", "")
+    if not header.startswith("Bearer "):
+        return None
+    token = header.removeprefix("Bearer ").strip()
+    if not token.startswith(VISITOR_TOKEN_PREFIX):
+        return None
+    digest = hashlib.sha256(token.encode()).hexdigest()[:16]
+    return f"{BUCKET_KEY_PREFIX}:visitor:{digest}"
+
+
+def bucket_key(
+    request: Request, *, tenant_id: str | None, trusted_proxies: tuple[str, ...] = ()
+) -> str:
     """Tenant when known, address otherwise.
 
     A tenant key is what stops one noisy tenant from consuming another's
-    budget. Falling back to the address would put every unauthenticated caller
-    in one bucket, which is correct for `/v1/webhooks/` (there is no tenant
-    yet) and harmless elsewhere because nothing else is reachable unauthenticated.
+    budget. Falling back to the address covers `/v1/webhooks/` (no tenant yet)
+    and the customer surface, where the tenant is not resolvable this early -
+    which is why `visitor_key` exists alongside this one.
     """
     if request.url.path.startswith(WEBHOOK_PREFIX):
         scope = "webhook"
@@ -276,7 +382,8 @@ def bucket_key(request: Request, *, tenant_id: str | None) -> str:
         scope = "api"
     if tenant_id:
         return f"{BUCKET_KEY_PREFIX}:{scope}:tenant:{tenant_id}"
-    return f"{BUCKET_KEY_PREFIX}:{scope}:addr:{client_address(request)}"
+    address = client_address(request, trusted_proxies=trusted_proxies)
+    return f"{BUCKET_KEY_PREFIX}:{scope}:addr:{address}"
 
 
 def build_limiter(*, redis_url: str | None) -> HybridRateLimiter:
@@ -325,7 +432,24 @@ def policies_from_settings(settings: Any) -> dict[str, RateLimitPolicy]:
         "webhook": RateLimitPolicy(
             capacity=int(settings.rate_limit_webhook_requests), window_seconds=window
         ),
+        "visitor": RateLimitPolicy(
+            capacity=int(settings.rate_limit_visitor_requests), window_seconds=window
+        ),
     }
+
+
+def trusted_proxies_from_settings(settings: Any) -> tuple[str, ...]:
+    """The configured proxy list, parsed once per process.
+
+    A malformed entry is dropped by `_trusted_networks` rather than failing
+    startup: a typo in a CIDR should not take the API down, and dropping it
+    leaves that peer on the stricter address key.
+    """
+    return tuple(
+        part.strip()
+        for part in str(getattr(settings, "rate_limit_trusted_proxies", "") or "").split(",")
+        if part.strip()
+    )
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -340,6 +464,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         workbench_policy: RateLimitPolicy,
         anonymous_policy: RateLimitPolicy,
         webhook_policy: RateLimitPolicy,
+        visitor_policy: RateLimitPolicy | None = None,
+        trusted_proxies: tuple[str, ...] = (),
         unlimited_paths: frozenset[str] = UNLIMITED_PATHS,
     ) -> None:
         super().__init__(app)  # type: ignore[arg-type]
@@ -348,6 +474,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._workbench_policy = workbench_policy
         self._anonymous_policy = anonymous_policy
         self._webhook_policy = webhook_policy
+        self._visitor_policy = visitor_policy
+        self._trusted_proxies = tuple(trusted_proxies)
         self._unlimited_paths = unlimited_paths
 
     def _policy_for(
@@ -375,8 +503,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if policy is None:
             return await call_next(request)
 
-        key = bucket_key(request, tenant_id=tenant_id)
+        key = bucket_key(request, tenant_id=tenant_id, trusted_proxies=self._trusted_proxies)
         decision = self._limiter.check(key, policy)
+
+        # Second, independent budget for the customer surface. The address
+        # bucket asks whether the *source* is abusive; this one asks whether
+        # this *visitor* is. Both must allow, because each catches what the
+        # other cannot: one chatty customer behind a corporate NAT, or one
+        # abusive source spreading across tokens.
+        if decision.allowed and self._visitor_policy is not None:
+            visitor = visitor_key(request)
+            if visitor is not None:
+                decision = self._limiter.check(visitor, self._visitor_policy)
 
         get_metrics().http_requests_total.labels(
             method=request.method.upper(),

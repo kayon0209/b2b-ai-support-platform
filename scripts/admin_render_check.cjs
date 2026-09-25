@@ -64,6 +64,10 @@ const PAGES = [
   { path: "/admin/cases", expect: null },
   { path: "/admin/workbench", expect: null },
   { path: "/admin/approvals", expect: null },
+  // Added with the route. A page that compiles and bundles but has no route
+  // renders in neither this check nor any test, which is exactly how the roster
+  // page sat unwired for as long as it existed.
+  { path: "/admin/agents", expect: null },
   { path: "/admin/members", expect: null },
   { path: "/admin/usage", expect: "已用运行数" },
   { path: "/admin/branding", expect: null },

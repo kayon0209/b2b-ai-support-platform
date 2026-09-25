@@ -1,0 +1,93 @@
+# TODO
+
+Open work, ordered by the risk it removes. Each item names the evidence that
+put it here, because a backlog entry without one is a wish.
+
+## P0 — blocks a real deployment
+
+- [ ] **Prometheus Operator is not part of this repository.** `70-alerts.yaml`
+      and `71-servicemonitor.yaml` are Operator CRDs; applying them to a
+      cluster without the Operator and its CRDs fails with `no matches for
+      kind`. That is the intended behaviour — a cluster with the Operator but
+      no rules looks exactly like a healthy deployment. Install the Operator,
+      set `OTEL_EXPORTER_OTLP_ENDPOINT` in the ConfigMap for tracing to leave
+      the process, and confirm the alerts reach a real receiver.
+- [ ] **The pool benchmark needs connection headroom.** **Code side done; the connection budget is a deployment setting.** The test now asks the server for its budget (`max_connections` minus what is already connected) *before* opening anything, and skips with an explanation when there is not room for a 50-connection pool plus a 15-connection margin. Verified both ways: with headroom it runs and passes, and with the budget forced low it reports `needs about 65 free connections ... and the server has 8` rather than failing on `too many clients already`.
+      Catching the failure instead would not work: it cannot tell a full host from broken code, and reporting the second as the first is how a sizing test goes permanently red and is eventually deleted. The margin is deliberate — a benchmark that takes the last connection makes every *other* test fail.
+
+- [ ] **Set `APP_RATE_LIMIT_TRUSTED_PROXIES` in the deployment.** **Code side done; a helper now answers the question a deployment actually has.** `python scripts/report_trusted_proxies.py --namespace <ns>` prints the API pod addresses, the ingress controller's load balancer if it can read one, and the command that *verifies* the setting took effect (`redis-cli --scan --pattern 'ratelimit:api:addr:*' | wc -l` — one key means it did not). It changes nothing. With no reachable cluster it exits `2` and says so rather than guessing a value, because empty is the safe default and a wrong CIDR is either the availability bug or the security one.
+      Remaining: run it against the real cluster and put the value in the ConfigMap.
+
+- [x] **The frontend has no deployment path.** **Done (T3.2).** `infra/compose/api.Dockerfile` is a multi-stage build, `platform_core.spa` serves `/assets` with an SPA fallback, and `GET /support` answers 200 from the API image alone. The image build itself is still unverified - see the entry below.
+
+- [x] **No alerting, and traces are not wired.** **Done (T3.3).** `infra/kubernetes/70-alerts.yaml` and `71-servicemonitor.yaml` carry the Prometheus Operator CRDs, and `OTEL_EXPORTER_OTLP_ENDPOINT` is wired with an in-process ring-buffer fallback. Installing the Operator is tracked separately below.
+
+- [ ] **The API image build has never been run.** `infra/compose/api.Dockerfile`
+      is correct by inspection - the multi-stage split, `postgresql-client` for
+      `pg_dump` / `pg_restore` / `psql`, `COPY scripts`, and the frontend
+      `dist/` copy are all present, and the scripts' binary dependencies were
+      checked against the package that provides them. What never happened is the
+      build. The registry was unreachable from the machine doing the work, and
+      "verified except we never ran it" is the state a deployment discovers at
+      3am.
+      `python scripts/verify_image_build.py` now runs the build and then probes
+      the image for the artefacts it claims to carry. Run it where the registry
+      is reachable. It exits `2` when the registry blocks it, distinct from `1`
+      for a real failure, so a blocked run is never mistaken for a pass.
+
+## P1 — correctness, resilience, isolation
+
+- [x] **Object storage has no lifecycle and no scheduled backup.** **Done (T4.2).** Scheduled `pg_dump` plus S3 upload, a quarterly restore drill, retention that deletes object bytes, and orphan reconciliation.
+
+- [x] **Uploads are not scanned.** **Done (T4.2).** Magic-byte type validation, a scan state machine, and an enforcement that an unscanned upload cannot enter retrieval.
+
+- [x] **Cross-tenant sweep coverage.** 52 tables carry `tenant_id` and the
+      sweep now names all 52 — measured against `information_schema`, not
+      maintained by hand. The 24 added here are billing, customer records,
+      connectors and cursors, feature flags, the knowledge authoring surface,
+      identity, SSO/SCIM and visitor-token revocation.
+      All 24 already had RLS policies and phase one's
+      `0055_rls_empty_binding_guard` had already hardened them, so this batch
+      added verification rather than protection — a smaller and different claim
+      than the original gap implied.
+      `test_the_table_list_matches_the_database` now fails when a table gains a
+      `tenant_id` column, so the list cannot drift again silently. The sweep
+      itself was checked by breaking `billing_entries` to `USING (true)`: it
+      fails with `tenant B must see zero rows` and passes again once restored.
+
+## P2 — experience and scale
+
+- [ ] Seat-side deep links: `Conversations.tsx` keeps the replay selection in
+      component state and `Workbench.tsx` keeps queue tab, search and offset in
+      memory, so a refresh loses the operator's place. `Cases.tsx` already
+      writes them to the URL — apply the same pattern.
+- [ ] `pages/Agents.tsx` is implemented and routed nowhere: no import in
+      `main.tsx`, no sidebar entry, so nobody can see team load.
+- [ ] No skeleton states anywhere; every load is a text placeholder, against
+      8-second silent polling.
+- [ ] `Workbench.tsx` modals declare `aria-modal` without Escape handling, a
+      focus trap, initial focus or focus restoration.
+- [ ] `AgentRun` has no version column, so terminal states are assigned
+      directly and a late writer wins.
+- [ ] No per-tenant rate limit (only the monthly quota and a global depth of
+      500), so one tenant can fill the queue.
+- [ ] Workers expose no metrics endpoint, so queue age and event outcomes —
+      the signals that matter most — cannot be scraped.
+- [ ] No dead-letter path for agent runs, and no manual replay entry.
+- [ ] No Redis or database outage injection test, although the code degrades
+      (rate limiting falls back to per-process buckets).
+- [ ] No artifact lineage. `derived_from` / `lineage` / `parent_artifact` do
+      not exist, so a run cannot be traced to the evidence and prompt versions
+      that produced it, and knowledge-gap drafts cannot rejoin their
+      conversation.
+- [ ] Compliance export covers `audit` and `cases` only — documents,
+      attachments, conversations, citations and runs are absent.
+- [ ] `healthz` reports no dependency health and is not what
+      `docs/deployment-and-operations.md` describes.
+- [ ] `apps/api/tests/contract/` contains only `__init__.py`, and no test uses
+      the `contract` marker the configuration declares.
+- [ ] `docs/testing-and-evaluation.md` claims browser journeys and
+      production-like load testing; both are manual scripts. `observability_metrics.py`
+      cites a P1 alert that no document defines.
+- [ ] No k6/locust. The only load evidence is a 100-concurrent insert test and
+      `scripts/concurrency_probe.py`, both single-process.

@@ -53,6 +53,13 @@ class ReadyIn(BaseModel):
     version_label: str | None = Field(default=None, max_length=63)
 
 
+class SpaceIn(BaseModel):
+    # `min_length=1` rejects the empty string at the edge; the service repeats
+    # the check because it is also reachable from tests and future callers, and
+    # a space whose name is whitespace is as unlistable as one with no name.
+    name: str = Field(min_length=1, max_length=255)
+
+
 class DownloadUrlIn(BaseModel):
     expires_seconds: int = Field(default=300, ge=60, le=3600)
 
@@ -304,6 +311,39 @@ async def list_documents(
             }
         )
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.post("/spaces")
+async def create_space(request: Request, body: SpaceIn) -> Any:
+    """Create a knowledge space.
+
+    Gated on `KNOWLEDGE_UPLOAD`, the same action an upload needs: a principal
+    who cannot put a document in a space has no business naming one. That
+    choice also keeps `support_agent` out - the role can read knowledge but
+    not change it, and creating a space is a change.
+
+    The write carries an Idempotency-Key like every other write here, enforced
+    by `_gate`, so a double-click cannot produce two identically named spaces.
+
+    Returns 200 rather than 201: no endpoint in this API returns 201 (zero
+    occurrences across `apps/api/src`), and clients written against that
+    convention branch on 200. Rest-correctness does not outweigh breaking
+    every caller for a status code nobody here uses.
+    """
+    ctx = _ctx_of(request)
+    denial = _gate(request, ctx, Action.KNOWLEDGE_UPLOAD, "knowledge.space.create")
+    if denial is not None:
+        return denial
+
+    try:
+        async with tenant_session(ctx) as session:
+            space = await service.create_space(
+                session, tenant_id=ctx.tenant_id, name=body.name, ctx=ctx
+            )
+    except service.KnowledgeError as exc:
+        return _error(exc)
+
+    return {"id": str(space.id), "name": space.name, "status": space.status}
 
 
 @router.get("/spaces")

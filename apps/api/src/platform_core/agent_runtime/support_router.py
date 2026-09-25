@@ -123,6 +123,38 @@ def _ctx_for(claim: VisitorClaim) -> TenantContext:
     )
 
 
+async def _reject_if_ended(claim: VisitorClaim, session: AsyncSession) -> object | None:
+    """Refuse a claim whose conversation has been ended, or None if it is live.
+
+    The signature check in `verify` cannot see this: it is a pure function, and
+    a twelve-hour-old token is still a validly signed twelve-hour-old token.
+    The revocation record is the only thing that knows the customer closed the
+    window, so every authenticated customer endpoint has to ask - which is why
+    this is one helper called from four places rather than four copies that can
+    drift, and why a new endpoint that forgets it is a bug the tests below
+    cannot see.
+
+    The response is the same 401 an invalid token gets, with the same opaque
+    message. A caller must not be able to distinguish "this token was never
+    valid" from "this token was withdrawn", or ending a session would confirm
+    that a token once existed.
+    """
+    from platform_core.support_bridge.visitor_revocation import async_is_revoked
+
+    if not await async_is_revoked(
+        session,
+        tenant_id=claim.tenant_id,
+        token_jti=claim.token_jti,
+    ):
+        return None
+    return error_response(
+        AUTH_UNRESOLVED,
+        f"visitor token rejected: {VisitorTokenError.__name__}",
+        status_code=401,
+        trace_id=new_trace_id(),
+    )
+
+
 @router.post("/sessions")
 async def open_session(request: Request, body: SessionIn) -> object:
     """Open (or resume) a visitor conversation and return its token."""
@@ -174,6 +206,54 @@ async def open_session(request: Request, body: SessionIn) -> object:
     )
 
 
+@router.post("/sessions/end")
+async def end_session(request: Request) -> object:
+    """Withdraw this conversation's token.
+
+    Takes no body and no path parameter on purpose. The only thing that
+    identifies the conversation is the token in the header, so a caller can
+    close exactly the session they hold and nothing else - a body-supplied
+    `conversation_ref` would let anyone with any valid visitor token close a
+    stranger's chat.
+
+    The withdrawal is per *credential*: the token this request carries, named by
+    its jti. That is the only reading that survives contact with a customer who
+    ends a session and comes back - `POST /v1/support/sessions` mints a fresh
+    token for the same conversation, and it works, while the ended one stays
+    dead. Revoking the conversation instead would make returning impossible, and
+    "end" is not "delete".
+
+    Idempotent, because the page retries and a double-click must not look like
+    a failure. Ending is not deleting: the transcript stays, which is what a
+    support history has to be, and what the retention job is for.
+    """
+    claim = _claim(request)
+    if not isinstance(claim, VisitorClaim):
+        return claim
+
+    from platform_core.support_bridge.visitor_revocation import async_record_revocation
+
+    if claim.token_jti is None:
+        # A token minted before revocation existed cannot be withdrawn, because
+        # it carries nothing to name. Refusing it here would be the only honest
+        # answer, and it expires on its own within the hour.
+        return error_response(
+            AUTH_UNRESOLVED,
+            "visitor token rejected: VisitorTokenError",
+            status_code=401,
+            trace_id=new_trace_id(),
+        )
+
+    async with tenant_session(_ctx_for(claim)) as session:
+        await async_record_revocation(
+            session,
+            tenant_id=claim.tenant_id,
+            token_jti=claim.token_jti,
+            conversation_ref=claim.conversation_ref,
+        )
+    return ok_response({"ended": True, "conversation_ref": str(claim.conversation_ref)})
+
+
 @router.get("/timeline")
 async def timeline(
     request: Request,
@@ -193,6 +273,9 @@ async def timeline(
         return claim
 
     async with tenant_session(_ctx_for(claim)) as session:
+        ended = await _reject_if_ended(claim, session)
+        if ended is not None:
+            return ended
         items = await chat_service.read_timeline(
             session, ref_id=claim.conversation_ref, limit=limit
         )
@@ -349,6 +432,9 @@ async def verify_ownership(request: Request, body: VerifyIn) -> object:
         return claim
 
     async with tenant_session(_ctx_for(claim)) as session:
+        ended = await _reject_if_ended(claim, session)
+        if ended is not None:
+            return ended
         from platform_core.tool_gateway.registry import ConnectorExecutorResolver
 
         executors = await ConnectorExecutorResolver(
@@ -435,6 +521,9 @@ async def rate_conversation(request: Request, body: RatingIn) -> object:
 
     try:
         async with tenant_session(_ctx_for(claim)) as session:
+            ended = await _reject_if_ended(claim, session)
+            if ended is not None:
+                return ended
             owner, _mode = await lease_service.current_owner(
                 session, tenant_id=claim.tenant_id, conversation_ref_id=claim.conversation_ref
             )
@@ -502,6 +591,9 @@ async def post_message(request: Request, body: MessageIn) -> object:
     trace_id = new_trace_id()
 
     async with tenant_session(ctx) as session:
+        ended = await _reject_if_ended(claim, session)
+        if ended is not None:
+            return ended
         turn, duplicate = await chat_service.append_customer_turn(
             session,
             tenant_id=ctx.tenant_id,

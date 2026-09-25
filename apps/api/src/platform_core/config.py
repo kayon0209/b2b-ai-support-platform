@@ -37,6 +37,21 @@ class Settings(BaseSettings):
     app_database_max_overflow: int = Field(
         default=10, ge=0, le=100, validation_alias="APP_DATABASE_APP_MAX_OVERFLOW"
     )
+    # How long a request waits for a connection before the pool gives up.
+    #
+    # Left unset, SQLAlchemy waits 30 seconds - and that default is worse than
+    # useless here. By the time it expires the caller has already hit its own
+    # upstream timeout and gone, so the wait produced no answer while holding a
+    # slot that a request which *could* have succeeded was waiting behind. The
+    # saturated pool then spends the full 30 seconds refusing work it could have
+    # refused immediately.
+    #
+    # 5 seconds is chosen against a typical 30-second request budget: long
+    # enough that a brief burst of concurrency queues rather than fails, short
+    # enough that the answer still arrives while the caller is listening.
+    database_pool_timeout: float = Field(
+        default=5.0, gt=0, le=30, validation_alias="DATABASE_POOL_TIMEOUT"
+    )
     # Reserved. The durable work queue is a Postgres table (inbox_events /
     # outbox_events claimed with SKIP LOCKED), not Redis, so nothing reads this
     # today. It is kept so a future cache or rate-limit feature does not have
@@ -105,6 +120,31 @@ class Settings(BaseSettings):
     # Client-facing access is always a short-lived pre-signed URL
     # (docs/security.md), generated server-side - the API never proxies bytes
     # and never hands out a public path.
+    # Require `document_versions.scan_status = 'clean'` before a version may be
+    # retrieved. The column, the state machine and the upload scan all exist;
+    # this decides whether retrieval enforces them.
+    #
+    # Default is OFF, and that is a judgement rather than an omission:
+    #
+    # The only scanner shipped so far is `knowledge.scanning.ContentScanner`,
+    # which verifies that a file's bytes match its declared type. That is a real
+    # check and it stops a renamed executable, but it is a format check, not an
+    # antivirus. Turning the gate on while it is the only thing producing
+    # `clean` would mark the entire existing corpus as cleared on the strength
+    # of a magic-byte comparison - the fail-closed property would hold in form
+    # and be hollow in substance, which is worse than not claiming it at all.
+    #
+    # The other reason is operational. Every row that predates migration 0059
+    # defaults to `pending`, so switching this on empties the search index until
+    # a backfill has run. That should be a decision somebody makes, having run
+    # the backfill, not a side effect of deploying the mechanism.
+    #
+    # Flip it once a real scanner (the `Scanner` protocol, e.g. a ClamAV
+    # sidecar) is deployed and the corpus has been scanned. `error` is excluded
+    # along with `pending`, so a scanner outage stops retrieval rather than
+    # quietly admitting unexamined content.
+    require_scanned_documents: bool = False
+
     object_storage_endpoint: str = "localhost:9000"
     object_storage_access_key: SecretStr | None = None
     object_storage_secret_key: SecretStr | None = None
@@ -144,6 +184,31 @@ class Settings(BaseSettings):
     # Provider deliveries are burstier and must not be throttled into data
     # loss, so they get their own, more generous budget.
     rate_limit_webhook_requests: int = 1200
+    # Per-visitor budget on the customer surface, charged in addition to the
+    # address bucket. The address bucket answers "is this source abusive"; it
+    # cannot answer "is this one customer being unfair", because every visitor
+    # behind a corporate NAT shares it - so a single chatty customer would
+    # spend everyone's allowance. Sized for a person, not a script: opening a
+    # session, asking, refreshing the timeline.
+    rate_limit_visitor_requests: int = 60
+    # Peers whose `X-Forwarded-For` may be believed, as CIDRs or bare
+    # addresses. Empty means believe none, which is the previous behaviour and
+    # the right default: an unvalidated header lets any caller pick its own
+    # bucket. Measured, this is what the deployment needs - behind the ingress
+    # every request presented the ingress pod's address, so one bucket covered
+    # the entire customer surface (200 concurrent visitors, 39 rejections).
+    rate_limit_trusted_proxies: str = ""
+
+    # Built frontend to serve, when the API is also the static host. Empty
+    # falls back to the path `api.Dockerfile` produces. A checkout with no
+    # `npm run build` has none, and the API then serves the API and nothing
+    # else - which is the correct behaviour for a backend test run and a loud
+    # one to discover in production, because the startup log names the path.
+    #
+    # Named without the `app_` prefix the class fields all share, because the
+    # settings prefix is `APP_`: a field called `app_spa_dist` would be read
+    # from `APP_APP_SPA_DIST`, which is a trap for whoever configures it.
+    spa_dist: str = ""
 
     # --- Chunking and ingestion (iteration plan 1.1/1.6/4.6) ------------------
     # Defaults recorded in each document version's metadata together with the

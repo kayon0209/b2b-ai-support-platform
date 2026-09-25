@@ -29,6 +29,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from platform_core import db
@@ -41,6 +43,7 @@ from platform_core.agent_runtime.router import router as agent_runtime_router
 from platform_core.agent_runtime.support_router import router as support_router
 from platform_core.agent_runtime.workbench_router import router as workbench_router
 from platform_core.api import (
+    DATABASE_SATURATED,
     INTERNAL_ERROR,
     VALIDATION_FAILED,
     error_response,
@@ -92,8 +95,10 @@ from platform_core.rate_limit import (
     RateLimitMiddleware,
     build_limiter,
     policies_from_settings,
+    trusted_proxies_from_settings,
 )
 from platform_core.retrieval.router import router as retrieval_router
+from platform_core.spa import mount_spa, register_spa_fallback
 from platform_core.support_bridge.csat_router import router as csat_router
 from platform_core.tool_gateway.router import (
     catalog_router as tool_catalog_router,
@@ -182,6 +187,86 @@ async def http_exception(request: Request, exc: StarletteHTTPException) -> JSONR
         str(exc.detail),
         status_code=exc.status_code,
         trace_id=new_trace_id(),
+    )
+
+
+def _is_pool_exhausted(exc: Exception) -> bool:
+    """Whether this failure is a pool that ran out, not a fault.
+
+    Takes `Exception` rather than `OperationalError` because the handler is
+    registered for two unrelated types, and the checkout timeout - the one this
+    exists for - is the one that is not an `OperationalError` at all.
+
+    `connection_invalidated` is checked first where the exception has it: that
+    flag is exactly what a timed-out checkout sets. The message match is the
+    fallback, and it is deliberately narrow.
+
+    The narrowing matters in the other direction too: a refused connection or a
+    statement timeout is also a database failure, and both are genuine faults.
+    Mapping those to 503 would tell a client to retry a problem that retrying
+    cannot fix, and would bury a real outage in a page of "busy".
+    """
+    if getattr(exc, "connection_invalidated", False):
+        return True
+    orig = getattr(exc, "orig", None)
+    text = str(orig) if orig is not None else str(exc)
+    lowered = text.lower()
+    return "pool" in lowered and ("timeout" in lowered or "exhaust" in lowered)
+
+
+@app.exception_handler(OperationalError)
+@app.exception_handler(PoolTimeoutError)
+async def database_operational_error(request: Request, exc: Exception) -> JSONResponse:
+    """Answer a connection-pool failure with a code that means something.
+
+    Registered for **two** exception types, and the second one is not
+    optional. A checkout timeout raises `sqlalchemy.exc.TimeoutError`, which
+    subclasses `SQLAlchemyError` directly - it is *not* an `OperationalError`.
+    A handler registered for `OperationalError` alone therefore never fires for
+    the exact failure it was written for, and the saturated-pool response added
+    alongside it was unreachable code. Verified rather than assumed:
+    `issubclass(TimeoutError, OperationalError)` is `False`.
+
+    A saturated pool used to arrive at the generic handler as `INTERNAL_ERROR`,
+    which is marked retryable and so tells a client to come back - but it
+    carries the message "quote the trace id to support" and a 500, and an
+    operator reading a page of identical 500s cannot tell a capacity problem
+    from a bug. Those need opposite responses: the pool drains on its own and
+    the requests succeed, while a bug does not.
+
+    503 rather than 500, because the distinction is not cosmetic. 500 means this
+    endpoint is broken; 503 means this endpoint is fine and the service is busy,
+    which is what a load balancer and a client's backoff both act on correctly.
+
+    Only exhaustion is mapped. Every other `OperationalError` - a refused
+    connection, a dropped server, a syntax problem - is a genuine fault and keeps
+    the generic path, where the traceback reaches the log.
+    """
+    trace_id = new_trace_id()
+    if _is_pool_exhausted(exc):
+        logger.warning(
+            "connection pool exhausted trace_id=%s method=%s path=%s",
+            trace_id,
+            request.method,
+            request.url.path,
+        )
+        return error_response(
+            DATABASE_SATURATED,
+            "the service is busy; retry shortly",
+            status_code=503,
+            trace_id=trace_id,
+        )
+    logger.exception(
+        "database error trace_id=%s method=%s path=%s",
+        trace_id,
+        request.method,
+        request.url.path,
+    )
+    return error_response(
+        INTERNAL_ERROR,
+        "an unexpected error occurred; quote the trace id to support",
+        status_code=500,
+        trace_id=trace_id,
     )
 
 
@@ -275,8 +360,19 @@ if get_settings().rate_limit_enabled:
         workbench_policy=_policies["workbench"],
         anonymous_policy=_policies["anonymous"],
         webhook_policy=_policies["webhook"],
+        visitor_policy=_policies["visitor"],
+        trusted_proxies=trusted_proxies_from_settings(get_settings()),
     )
-app.add_middleware(TenantContextMiddleware, resolver=build_resolver())
+# The built frontend, when this image carries one. Its presence is what makes
+# the browser-router paths exempt from bearer resolution - see `spa.py` for why
+# that grants nothing, and why a checkout with no build keeps answering exactly
+# as it did before. The catch-all route is registered at the very bottom of
+# this module, after every real route.
+_SPA_DIST = mount_spa(app, get_settings().spa_dist)
+
+app.add_middleware(
+    TenantContextMiddleware, resolver=build_resolver(), spa_enabled=_SPA_DIST is not None
+)
 app.add_middleware(HttpMetricsMiddleware)
 
 
@@ -284,6 +380,12 @@ app.add_middleware(HttpMetricsMiddleware)
 def healthz() -> dict[str, str]:
     settings: Settings = get_settings()
     return {"status": "ok", "environment": settings.environment}
+
+
+# Last route registered wins last match, so the browser-router fallback goes
+# here: after `/healthz`, after every router, after everything. Anything
+# defined below this line would be shadowed by the shell.
+register_spa_fallback(app, _SPA_DIST)
 
 
 def run() -> None:

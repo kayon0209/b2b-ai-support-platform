@@ -60,7 +60,21 @@ def _client(tenant: str = TENANT, role: str = "support_agent") -> TestClient:
 
 
 def _headers() -> dict[str, str]:
+    """Read requests need no more than a token.
+
+    Writes carry an `Idempotency-Key`, which the corrections endpoints require
+    (the same reason the agent runtime and identity routers do): recording a
+    correction and reviewing one are both writes, and a client retrying after a
+    timeout would otherwise create a second correction or review an already
+    reviewed one. `_write_headers` exists so the requirement is visible at the
+    call site rather than hidden in a shared dict that reads would then need
+    too.
+    """
     return {"Authorization": "Bearer pt_bootstrap_test"}
+
+
+def _write_headers() -> dict[str, str]:
+    return {**_headers(), "Idempotency-Key": "corrections-test-key"}
 
 
 def _seed() -> None:
@@ -110,7 +124,7 @@ def _record(client: TestClient, *, question: str = "标准交期是几天？") -
             "correct_answer": "标准交期 7 天，加急 3 天，以报价单为准。",
             "note": "AI 说了 5 天，实际是 7 天。",
         },
-        headers=_headers(),
+        headers=_write_headers(),
     )
 
 
@@ -148,14 +162,14 @@ def test_approving_needs_the_publish_permission() -> None:
     denied = _client(TENANT, "support_agent").post(
         f"/v1/corrections/{created['id']}/review",
         json={"approve": True},
-        headers=_headers(),
+        headers=_write_headers(),
     )
     assert denied.status_code == 403
 
     allowed = _client(TENANT, "tenant_owner").post(
         f"/v1/corrections/{created['id']}/review",
         json={"approve": True},
-        headers=_headers(),
+        headers=_write_headers(),
     )
     assert allowed.status_code == 200, allowed.text[:300]
     assert allowed.json()["status"] == "approved"
@@ -171,7 +185,7 @@ def test_a_correction_cannot_be_reviewed_twice() -> None:
     first = owner.post(
         f"/v1/corrections/{created['id']}/review",
         json={"approve": False},
-        headers=_headers(),
+        headers=_write_headers(),
     )
     assert first.status_code == 200
     assert first.json()["status"] == "dismissed"
@@ -179,7 +193,7 @@ def test_a_correction_cannot_be_reviewed_twice() -> None:
     second = owner.post(
         f"/v1/corrections/{created['id']}/review",
         json={"approve": True},
-        headers=_headers(),
+        headers=_write_headers(),
     )
     assert second.status_code == 409
 
@@ -229,7 +243,7 @@ def test_approving_a_correction_drafts_it_for_the_knowledge_base() -> None:
     approved = _client(TENANT, "tenant_owner").post(
         f"/v1/corrections/{created['id']}/review",
         json={"approve": True},
-        headers=_headers(),
+        headers=_write_headers(),
     )
     assert approved.status_code == 200, approved.text[:200]
 

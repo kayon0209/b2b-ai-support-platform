@@ -6,6 +6,7 @@ import {
   UsersRound, X,
 } from "lucide-react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { isOneOf, useUrlState } from "../lib/urlState";
 import { ToolCard, type ToolCardData } from "../components/ToolCard";
 import { apiGet, apiPost, apiUpload } from "../lib/api";
 import { newIdempotencyKey } from "../lib/idempotency";
@@ -13,6 +14,9 @@ import { useLang } from "../lib/i18n";
 import "../styles-workbench.css";
 
 type Tab = "queue" | "mine" | "waiting";
+/** Every tab the page can render. Kept beside the type so a new tab cannot
+ *  be added to the union without also becoming a valid `?tab=` value. */
+const ALL_TABS = ["queue", "mine", "waiting"] as const satisfies readonly Tab[];
 type RightTab = "reply" | "knowledge" | "tools";
 type Action = "claim" | "release" | "transfer" | "close";
 type Origin = "free" | "canned" | "ai_suggestion";
@@ -151,8 +155,17 @@ export function Workbench() {
   const { conversationRef, caseId } = useParams<{ conversationRef?: string; caseId?: string }>();
   const navigate = useNavigate();
   const { lang } = useLang();
-  const [tab, setTab] = useState<Tab>("queue");
-  const [query, setQuery] = useState("");
+  // Tab and search go in the URL. This page already put `caseId` and
+  // `conversationRef` in the path, so half of it was linkable and half was
+  // not: an operator could share a case but not "my queue, filtered to this
+  // customer", which is the view they actually want a second pair of eyes on.
+  //
+  // `isOneOf` is not decoration. A hand-edited or stale `?tab=whatever` would
+  // otherwise put the page into a state no render path handles.
+  const [tabParam, setTabParam] = useUrlState("tab", "queue");
+  const tab: Tab = isOneOf(tabParam, ALL_TABS) ? tabParam : "queue";
+  const setTab = (next: Tab) => setTabParam(next);
+  const [query, setQuery] = useUrlState("q", "");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [offset, setOffset] = useState(0);
   const [queue, setQueue] = useState<QueueResponse | null>(null);

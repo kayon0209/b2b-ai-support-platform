@@ -109,6 +109,20 @@ jobs:
           cache-dependency-path: apps/admin-web/package-lock.json
       - name: Install dependencies
         run: npm ci
+      - name: Runtime guards
+        # Catches the class of defect `tsc` cannot see: a page calling
+        # `crypto.randomUUID()` directly, which throws on any deployment
+        # reached over plain http. It has happened here twice - once in the
+        # quota form, then again on the customer chat surface. Cheap, and it
+        # is the only gate that would have caught the second one.
+        run: npm run check:runtime
+      - name: Behaviour tests
+        # The URL-state decisions (replace-not-push, empty-removes-parameter,
+        # unknown-value-falls-back) were previously guarded by matching strings
+        # in the source. That guard failed on a rename with identical behaviour
+        # and passed on a real regression that broke parameter removal - verified
+        # both ways. These run the decisions instead.
+        run: npm test
       - name: Typecheck
         run: npm run typecheck
       - name: Build

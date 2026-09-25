@@ -50,15 +50,23 @@ def admin() -> object:
     engine.dispose()
 
 
-def _insert(admin: object, *, status: str, received_at: int, tag: str) -> uuid.UUID:
+def _insert(
+    admin: object,
+    *,
+    status: str,
+    received_at: int,
+    tag: str,
+    claimed_at: int | None = None,
+    heartbeat_at: int | None = None,
+) -> uuid.UUID:
     event_id = uuid.uuid4()
     with admin.begin() as conn:  # type: ignore[attr-defined]
         conn.execute(
             text(
                 "INSERT INTO inbox_events "
                 "(id, tenant_id, delivery_id, event_type, payload_hash, "
-                " minimized_payload, status, received_at) VALUES "
-                "(:id, :tid, :did, 'message_created', 'h', '{}'::jsonb, :st, :ra)"
+                " minimized_payload, status, received_at, claimed_at, heartbeat_at) VALUES "
+                "(:id, :tid, :did, 'message_created', 'h', '{}'::jsonb, :st, :ra, :ca, :hb)"
             ),
             {
                 "id": str(event_id),
@@ -66,6 +74,8 @@ def _insert(admin: object, *, status: str, received_at: int, tag: str) -> uuid.U
                 "did": f"reclaim-{tag}-{event_id}",
                 "st": status,
                 "ra": received_at,
+                "ca": claimed_at,
+                "hb": heartbeat_at,
             },
         )
     return event_id
@@ -112,6 +122,82 @@ async def test_fresh_processing_row_is_left_alone(admin: object) -> None:
         await session.commit()
 
     assert _status_of(admin, in_flight) == "processing"
+
+
+async def test_just_claimed_row_is_not_reclaimed_even_when_enqueued_long_ago(
+    admin: object,
+) -> None:
+    """The defect this suite could not previously express.
+
+    A backlog is the precondition. An event sits in RECEIVED for longer than
+    the reclaim threshold, a worker finally claims it, and the *next* poll
+    cycle looks at it again - and because the old predicate compared
+    `received_at` rather than the claim time, the row was handed straight back
+    to the queue while the first worker was still processing it. Two workers,
+    one customer message: duplicated model calls, duplicated tool executions,
+    duplicated spend. The customer-facing duplicate is suppressed downstream by
+    the outbound command id; the cost is not.
+
+    Reproduced against the live stack before the fix: a row enqueued 11 minutes
+    earlier and claimed a moment ago came back as `received` on the next poll.
+    """
+    from platform_core.db import get_session_factory
+
+    now = int(time.time())
+    # Enqueued well past the threshold, claimed and heartbeated just now.
+    claimed = _insert(
+        admin,
+        status="processing",
+        received_at=now - 3600,
+        claimed_at=now,
+        heartbeat_at=now,
+        tag="claimed-now",
+    )
+    # Control: same age, but the claim itself is stale - a dead worker. This
+    # one must still be recovered, or the fix would trade a duplicate for a
+    # silent drop.
+    dead = _insert(
+        admin,
+        status="processing",
+        received_at=now - 3600,
+        claimed_at=now - 3600,
+        heartbeat_at=now - 3600,
+        tag="claim-stale",
+    )
+
+    async with get_session_factory()() as session:
+        reclaimed = await reclaim_stale_processing(session)
+        await session.commit()
+
+    assert _status_of(admin, claimed) == "processing", "a live claim was stolen"
+    assert _status_of(admin, dead) == "received", "a dead claim was not recovered"
+    assert reclaimed >= 1
+
+
+async def test_heartbeat_keeps_a_long_run_out_of_reclaim(admin: object) -> None:
+    """A run that outlives the threshold stays claimed while it heartbeats.
+
+    Without this, a slow-but-healthy worker is indistinguishable from a dead
+    one, and the only way to tell them apart is the claim timestamp - which a
+    long run keeps moving.
+    """
+    from platform_core.db import get_session_factory
+
+    now = int(time.time())
+    long_run = _insert(
+        admin,
+        status="processing",
+        received_at=now - 3600,
+        claimed_at=now - 3600,
+        heartbeat_at=now,  # heartbeating
+        tag="long-run",
+    )
+
+    async with get_session_factory()() as session:
+        await reclaim_stale_processing(session, timeout_seconds=30)
+        await session.commit()
+
+    assert _status_of(admin, long_run) == "processing"
 
 
 async def test_terminal_rows_are_never_reclaimed(admin: object) -> None:

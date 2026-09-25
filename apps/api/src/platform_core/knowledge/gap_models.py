@@ -107,6 +107,17 @@ class KnowledgeDraft(Base, PkMixin, TenantMixin):
     gap_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("knowledge_gaps.id"), nullable=False, index=True
     )
+    # The conversation this draft was written to answer (migration 0062). Not a
+    # foreign key, deliberately: a draft is a record of what somebody wrote and
+    # should outlive the conversation that prompted it, and a constraint would
+    # block that deletion.
+    #
+    # It lives here rather than on the gap because a gap is aggregated - one gap
+    # represents many conversations, which is what `question_hash` and
+    # `frequency` are for - so a single origin on the gap would be false for
+    # every gap that recurred. NULL means written without a conversation in
+    # front of the author, which is a real state.
+    conversation_ref_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(31), nullable=False, default=DraftStatus.PENDING)

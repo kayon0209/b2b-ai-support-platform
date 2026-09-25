@@ -39,6 +39,7 @@ from platform_core.agent_runtime.conversation import (
 )
 from platform_core.agent_runtime.emotion import detect_emotion
 from platform_core.agent_runtime.generator import MAX_EXCERPT_CHARS, LlmAnswerGenerator
+from platform_core.agent_runtime.handoff import hand_off_to_human_queue
 from platform_core.agent_runtime.hours import is_open, offline_notice
 from platform_core.agent_runtime.intent import (
     NON_ANSWERABLE_ROUTES,
@@ -914,7 +915,16 @@ class AgentOrchestrator:
         # `test_orchestrator_lease_race.py`).
         if str(lease.owner_type) == "queue":
             run.route = route
-            run.status = RunStatus.HANDED_OFF.value
+            # SUPERSEDED, not HANDED_OFF. This run was accepted, never
+            # executed, and the conversation is parked in a queue that no human
+            # has claimed. `handed_off` asserts a person is on it, and every
+            # list, replay and metric that reads the status then reports an
+            # unanswered question as answered-by-a-colleague. Where the lease
+            # moved while this run sat in the queue,
+            # `chat_service.supersede_queued_runs` has usually already set
+            # this status; arriving here means the run was claimed before the
+            # move and is only now reaching the guard.
+            run.status = RunStatus.SUPERSEDED.value
             run.latency_ms = int((time.monotonic() - started) * 1000)
             await self._session.flush()
             logger.info(
@@ -923,14 +933,14 @@ class AgentOrchestrator:
                 reason_code=f"owner is {lease.owner_type}",
             )
             get_metrics().observe_run(
-                outcome="handed_off",
+                outcome="superseded",
                 route=route,
                 latency_seconds=run.latency_ms / 1000.0,
                 citation_count=0,
             )
             return RunOutcome(
                 run_id=run.id,
-                status=RunStatus.HANDED_OFF,
+                status=RunStatus.SUPERSEDED,
                 route=route,
                 answer_text="",
                 send_blocked_reason=f"AI_NOT_OWNER: owner is {lease.owner_type}",
@@ -1525,6 +1535,51 @@ class AgentOrchestrator:
                 trace_id=ctx.trace_id,
             )
 
+        # --- 8b. Take exclusive right to finish this run. ---
+        #
+        # Placed here, immediately before the dispatch, and that placement is the
+        # point. A compare-and-set at the *terminal write* would be worthless:
+        # the reply has already gone out by then, so the loser would discover it
+        # had lost only after the customer had received two answers. The claim
+        # has to come before the side effect it protects.
+        #
+        # `run.version` is what this worker observed when it loaded the run, so
+        # the predicate is "still the run I started working on". A lease expiry
+        # or a redelivered queue message gives a second worker the same row, and
+        # without this both of them reach the dispatch.
+        from platform_core.agent_runtime.terminal import claim_terminal
+
+        claimed_version = await claim_terminal(
+            self._session,
+            run_id=run.id,
+            expected_status=run.status,
+            expected_version=run.version,
+        )
+        if claimed_version is None:
+            # Someone else finished this run while we were thinking. Not an
+            # error and not a retry: the work is done, by someone, and repeating
+            # it would be the duplicate reply this check exists to prevent.
+            get_metrics().lease_conflicts_total.inc()
+            logger.info(
+                "terminal_claim_lost",
+                ctx,
+                run_id=str(run.id),
+                route=route,
+            )
+            return RunOutcome(
+                run_id=run.id,
+                status=RunStatus.SUPERSEDED,
+                route=route,
+                answer_text="",
+                send_blocked_reason="TERMINAL_CLAIM_LOST",
+                citation_count=0,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                trace_id=ctx.trace_id,
+            )
+        # Kept in step with the row so the flush below cannot write a stale
+        # value back over the bump.
+        run.version = claimed_version
+
         # --- 9. Dispatch through Chatwoot with an idempotency key. ---
         #
         # Shadow mode (feature list 9.2): produce everything, send nothing.
@@ -1576,6 +1631,25 @@ class AgentOrchestrator:
             run.status = RunStatus.FAILED.value
             run.latency_ms = int((time.monotonic() - started) * 1000)
             await self._session.flush()
+            # A failed run used to leave exactly one thing behind: a status.
+            # An operator's only view was a count in a dashboard, with no
+            # reason on the row and no way to try again - the customer whose
+            # question went unanswered had no path to an answer except somebody
+            # noticing the number. Same dead-letter table as connector failures,
+            # so there is one operator list rather than two.
+            #
+            # The error code travels; the message does not. This table is read
+            # by an operational endpoint and copied into backups, and an
+            # exception message can carry a connection string with a password.
+            from platform_core.agent_runtime.rerun import record_run_failure
+
+            await record_run_failure(
+                self._session,
+                run_id=run.id,
+                tenant_id=tenant_id,
+                error_code=send_error,
+                attempts=1,
+            )
             get_metrics().observe_run(
                 outcome="failed",
                 route=route,
@@ -2602,7 +2676,11 @@ class AgentOrchestrator:
                 logger.warning("gap_record_failed", ctx, reason_code=decision.reason_code)
 
         if decision.handoff:
-            await lease_service.release_to_queue(
+            # Moves the lease, closes out the runs this conversation was still
+            # holding, and tells the customer once if anything was closed. See
+            # `agent_runtime.handoff` for why that is one operation and not
+            # three: the count is only knowable at the moment ownership moves.
+            await hand_off_to_human_queue(
                 self._session,
                 tenant_id=tenant_id,
                 conversation_ref_id=conversation_ref_id,
@@ -3000,6 +3078,15 @@ class AgentOrchestrator:
         came from a path that does not execute -- stays `queued`, which is now an
         honest state meaning "accepted, never executed" rather than a duplicate
         of a run that did happen.
+
+        A `superseded` placeholder is adopted too, and returned untouched. It
+        was already settled by `hand_off_to_human_queue` when the conversation
+        left the AI, so there is nothing to execute and nothing to overwrite -
+        but its inbox event is still in the queue and still arriving here. If
+        adoption only looked for `queued`, that event would find no placeholder
+        and create a *second* run for a question that already has one, so a
+        twenty-message burst produced 39 run rows for 20 turns. Returning the
+        row as-is is what keeps one logical run to one row.
         """
         placeholder = (
             await self._session.execute(
@@ -3007,7 +3094,7 @@ class AgentOrchestrator:
                 .where(
                     AgentRun.tenant_id == tenant_id,
                     AgentRun.conversation_ref_id == conversation_ref_id,
-                    AgentRun.status == RunStatus.QUEUED.value,
+                    AgentRun.status.in_((RunStatus.QUEUED.value, RunStatus.SUPERSEDED.value)),
                     AgentRun.input_hash == "",
                 )
                 .order_by(AgentRun.started_at.asc())
@@ -3015,6 +3102,11 @@ class AgentOrchestrator:
                 .with_for_update(skip_locked=True)
             )
         ).scalar_one_or_none()
+
+        if placeholder is not None and placeholder.status == RunStatus.SUPERSEDED.value:
+            # Already has its outcome. Overwriting `status` would resurrect it,
+            # and writing `started_at` would report a run that never began.
+            return placeholder
 
         # What the *enqueue* path recorded about this run's purpose, read before
         # the overwrite below destroys it.

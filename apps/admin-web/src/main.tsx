@@ -11,6 +11,7 @@ import { RouteError } from "./components/ErrorBoundary";
 import { Layout } from "./components/Layout";
 import "./styles.css";
 
+const Agents = lazy(() => import("./pages/Agents").then((page) => ({ default: page.Agents })));
 const Approvals = lazy(() => import("./pages/Approvals").then((page) => ({ default: page.Approvals })));
 const AuthCallback = lazy(() => import("./pages/AuthCallback").then((page) => ({ default: page.AuthCallback })));
 const Branding = lazy(() => import("./pages/Branding").then((page) => ({ default: page.Branding })));
@@ -81,6 +82,10 @@ const OPERATOR_PAGES = [
   // page then picks the first case as before.
   { path: "workbench/:caseId", element: <Workbench /> },
   { path: "approvals", element: <Approvals /> },
+  // The roster page was written and never wired: no import, no route, no
+  // nav entry, so the agent list existed only as dead code. Placed next to
+  // approvals because both answer "who is handling what".
+  { path: "agents", element: <Agents /> },
   { path: "members", element: <Members /> },
   { path: "usage", element: <Usage /> },
   { path: "branding", element: <Branding /> },

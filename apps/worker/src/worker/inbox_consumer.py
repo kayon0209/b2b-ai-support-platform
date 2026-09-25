@@ -20,12 +20,17 @@ event id: a re-run of the same event cannot produce a second customer
 message.
 """
 
+import asyncio
+import contextlib
+import os
+import socket
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger, new_trace_context
@@ -47,6 +52,15 @@ logger = JsonLogger("platform.worker")
 # wide margin while still bounding how long a question can go unanswered
 # after a crash.
 STALE_PROCESSING_SECONDS = 600
+
+# How often a worker holding a row re-announces that it is still on it. Well
+# inside `STALE_PROCESSING_SECONDS`: a run that heartbeats is never reclaimable
+# no matter how long it takes, which is what separates "slow" from "dead".
+HEARTBEAT_INTERVAL_SECONDS = 60
+
+# Which process holds a row. Written at claim time so a stuck row can be
+# attributed to a worker rather than merely counted.
+WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 # Events the AI should act on. Everything else is recorded and acked so the
 # inbox does not grow unbounded on conversation-lifecycle chatter.
@@ -111,6 +125,7 @@ async def claim_events(
     questions keep them waiting. Remaining capacity fills with normal FIFO.
     """
     rows: list[InboxEvent] = []
+    now = int(time.time())
     if priority:
         escalated = (
             select(InboxEvent)
@@ -142,7 +157,16 @@ async def claim_events(
     await session.execute(
         update(InboxEvent)
         .where(InboxEvent.id.in_([r.id for r in rows]))
-        .values(status=InboxEventStatus.PROCESSING.value)
+        .values(
+            status=InboxEventStatus.PROCESSING.value,
+            # The claim timestamp is what separates "this worker died holding
+            # it" from "this row has been waiting a long time". Writing only
+            # the status made those two indistinguishable, and a backlog was
+            # enough to confuse them - see `reclaim_stale_processing`.
+            claimed_at=now,
+            heartbeat_at=now,
+            worker_id=WORKER_ID,
+        )
     )
     return [
         ClaimedEvent(
@@ -191,19 +215,87 @@ async def reclaim_stale_processing(
     event id, so a duplicate send for the same event is suppressed by
     Chatwoot-side idempotency rather than reaching the customer twice.
 
-    `received_at` is left untouched: it is the FIFO ordering key, and a
-    reclaimed question should keep its original place in the queue.
+    **The predicate is the claim, not the arrival.** It used to compare
+    `received_at` alone, which answers "how long did this wait" and says
+    nothing about who is working on it now. Under a backlog that is enough to
+    rob a live claim: the row waited past the threshold, a worker finally took
+    it, and the next poll handed it straight back - two workers on one customer
+    message. The outbound id hides the duplicate reply, so nothing looks wrong
+    while the model and the tools run twice.
+
+    `received_at` stays in the coalesce as the fallback for rows written before
+    this shipped, which have no claim timestamp; it is the last resort, not the
+    rule. `received_at` is otherwise untouched and remains the FIFO key.
     """
     cutoff = int(time.time()) - timeout_seconds
+    liveness = func.coalesce(InboxEvent.heartbeat_at, InboxEvent.claimed_at, InboxEvent.received_at)
     result = await session.execute(
         update(InboxEvent)
         .where(
             InboxEvent.status == InboxEventStatus.PROCESSING.value,
-            InboxEvent.received_at < cutoff,
+            liveness < cutoff,
         )
-        .values(status=InboxEventStatus.RECEIVED.value)
+        .values(
+            status=InboxEventStatus.RECEIVED.value,
+            # The next worker gets a clean claim; leaving the dead worker's
+            # timestamp here would make a freshly re-queued row look abandoned
+            # on the following poll.
+            claimed_at=None,
+            heartbeat_at=None,
+            worker_id=None,
+        )
     )
     return result.rowcount or 0  # type: ignore[attr-defined]
+
+
+async def heartbeat_claim(event_id: uuid.UUID) -> None:
+    """Move the liveness stamp forward for a row this worker still holds.
+
+    Uses its own short-lived session on the administrative connection: the
+    caller's session is mid-batch and must not be shared across a concurrent
+    write. A failure here is logged and swallowed - the claim is still
+    recoverable either way, and a heartbeat outage must not abort the run it
+    was protecting.
+    """
+    from platform_core.db import get_session_factory
+
+    try:
+        async with get_session_factory()() as session:
+            await session.execute(
+                update(InboxEvent)
+                .where(
+                    InboxEvent.id == event_id,
+                    InboxEvent.status == InboxEventStatus.PROCESSING.value,
+                )
+                .values(heartbeat_at=int(time.time()))
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 - liveness aid, never fatal
+        logger.warning("claim_heartbeat_failed", error_code=type(exc).__name__)
+
+
+@contextlib.asynccontextmanager
+async def keepalive(event_id: uuid.UUID) -> AsyncIterator[None]:
+    """Hold a claim open for as long as the work takes.
+
+    Yields immediately and schedules a periodic heartbeat for the duration.
+    Without it, a run that legitimately exceeds the reclaim threshold is
+    indistinguishable from a worker that died holding it, and the only two
+    possible answers are a duplicate or a stuck row.
+    """
+
+    async def beat() -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            await heartbeat_claim(event_id)
+
+    task = asyncio.create_task(beat())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def case_conversation_ref() -> Any:
@@ -733,8 +825,9 @@ async def drain_once(
     processed = 0
     for event in events:
         try:
-            async with tenant_session(_event_context(event)) as event_session:
-                await process_event(event_session, event, deps=deps)
+            async with keepalive(event.event_id):
+                async with tenant_session(_event_context(event)) as event_session:
+                    await process_event(event_session, event, deps=deps)
         except Exception as exc:  # noqa: BLE001 - per-event isolation
             await mark_failed(session, event.event_id, f"{type(exc).__name__}: {exc}")
             logger.error(

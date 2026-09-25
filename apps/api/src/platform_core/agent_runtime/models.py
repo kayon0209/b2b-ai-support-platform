@@ -31,6 +31,14 @@ class RunStatus(enum.StrEnum):
     # counter and the replay list have to guess which. See
     # `agent_runtime/abandoned.py`.
     ABANDONED = "abandoned"
+    # Accepted, never executed, and nobody is on it. Distinct from
+    # HANDED_OFF, which is a claim about a *person*: the conversation left the
+    # AI and went to the human queue, so until somebody claims it, no one has
+    # it. Recording these as HANDED_OFF made eighteen unanswered questions look
+    # like eighteen answered-by-a-colleague ones in every list, replay and
+    # metric that reads the status. Measured on a live stack: 20 messages in,
+    # 3 replies out, 18 runs reported as handed to a human.
+    SUPERSEDED = "superseded"
 
 
 class Route(enum.StrEnum):
@@ -81,6 +89,19 @@ class AgentRun(Base, PkMixin, TenantMixin):
     code_version: Mapped[str] = mapped_column(String(63), nullable=False, default="dev")
     trace_id: Mapped[str] = mapped_column(String(63), nullable=False, default="")
     input_hash: Mapped[str] = mapped_column(String(127), nullable=False, default="")
+    # Number of terminal claims taken on this run (migration 0060). Bumped by
+    # `agent_runtime/terminal.claim_terminal` inside the same UPDATE that checks
+    # the status, so it is the receipt for a compare-and-set - and a run whose
+    # version moved without the status becoming terminal is one a worker claimed
+    # and then did not finish. See that module for why the claim has to be
+    # taken before the reply is dispatched.
+    version: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
+    # Set when this run exists because an operator asked for the failed one to
+    # be attempted again (migration 0061). This is the difference between a
+    # re-run and a duplicate: without it, a re-run is indistinguishable from a
+    # second customer message, and the first attempt's failure - the reason
+    # somebody is looking at it - stops being visible.
+    replay_of_run_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     output_hash: Mapped[str | None] = mapped_column(String(127), nullable=True)
     token_usage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     latency_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

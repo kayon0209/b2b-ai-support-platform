@@ -22,6 +22,7 @@ from typing import Any
 from sqlalchemy import func as sa_func
 from sqlalchemy import select, tuple_
 from sqlalchemy import text as sa_text
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime.models import AgentRun, ConversationTurn, RunStatus
@@ -523,3 +524,50 @@ async def queue_agent_run(
         "conversation_ref": str(conversation_ref_id),
         "idempotency_key": idem,
     }
+
+
+async def supersede_queued_runs(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_ref_id: uuid.UUID,
+) -> int:
+    """Close out the runs a conversation was still holding when ownership moved.
+
+    Returns the number of runs closed, so the caller knows whether anyone needs
+    telling.
+
+    The runs already exist: a message accepted a moment ago wrote its turn and
+    its `queued` run in the same transaction, and the tenant's monthly quota
+    already counts it. When the conversation then leaves the AI - a
+    clarification limit, an out-of-hours abstain, a safety refusal - nothing
+    in the run path owns those rows any more. Each would otherwise sit in
+    `queued` until a worker picked it up, discovered the conversation is no
+    longer the AI's to answer, and recorded it as `handed_off`: a status that
+    asserts a person is on it, which is exactly what has not happened.
+
+    So the state is made explicit here, at the moment ownership moves, rather
+    than inferred later by whichever worker gets there first. Two consequences,
+    both the point:
+
+    - the operator list can tell "waiting in the queue" from "a colleague has
+      this", which the shared status made impossible;
+    - the customer can be told, because the count is known at the point the
+      lease changes instead of never.
+
+    Only `queued` is touched. A run that already reached an outcome is a
+    decision, and rewriting it would erase the record of what was answered.
+    """
+    result = await session.execute(
+        sa_update(AgentRun)
+        .where(
+            AgentRun.tenant_id == tenant_id,
+            AgentRun.conversation_ref_id == conversation_ref_id,
+            AgentRun.status == RunStatus.QUEUED.value,
+        )
+        # No `started_at`: these runs never started, and a run that says
+        # otherwise is indistinguishable from a slow one when the replay is
+        # read.
+        .values(status=RunStatus.SUPERSEDED.value)
+    )
+    return int(result.rowcount or 0)  # type: ignore[attr-defined]

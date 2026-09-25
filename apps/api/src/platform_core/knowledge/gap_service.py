@@ -231,8 +231,15 @@ async def create_draft(
     title: str,
     body: str,
     target_space_id: uuid.UUID | None = None,
+    conversation_ref_id: uuid.UUID | None = None,
 ) -> KnowledgeDraft:
-    """Propose an answer for review. Not knowledge yet."""
+    """Propose an answer for review. Not knowledge yet.
+
+    `conversation_ref_id` records which conversation prompted this draft, so a
+    reviewer can read the two side by side. Optional: a draft written from the
+    gap queue has no conversation in front of its author, and that is a real
+    state rather than missing data.
+    """
     if not title.strip() or not body.strip():
         raise GapError("EMPTY_DRAFT", "a draft needs a title and a body")
 
@@ -265,6 +272,7 @@ async def create_draft(
     draft = KnowledgeDraft(
         tenant_id=ctx.tenant_id,
         gap_id=gap.id,
+        conversation_ref_id=conversation_ref_id,
         title=title.strip()[:512],
         body=body,
         status=DraftStatus.PENDING.value,

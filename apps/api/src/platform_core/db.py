@@ -77,6 +77,11 @@ def create_engine(database_url: str | None = None) -> AsyncEngine:
         pool_pre_ping=True,
         pool_size=pool_size,
         max_overflow=max_overflow,
+        # Explicit, because the framework default is 30 seconds and inheriting
+        # it means a saturated pool holds every queued request for half a minute
+        # after the callers have gone. See `Settings.database_pool_timeout` for
+        # why the refusal has to arrive while the caller is still listening.
+        pool_timeout=settings.database_pool_timeout,
     )
 
 
