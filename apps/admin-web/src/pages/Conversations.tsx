@@ -3,7 +3,7 @@ import { useState } from "react";
 import { apiGet } from "../lib/api";
 import { useAsync } from "../lib/useAsync";
 import type { ConversationList, ConversationReplay, ReplayRun, ReplayTurn } from "../lib/types";
-import { Badge, Card, EmptyState, ListTotal, PageHeader, Spinner } from "../components/ui";
+import { Badge, Card, EmptyState, ListTotal, PageHeader, SkeletonRows, Spinner } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { useLang } from "../lib/i18n";
 import type { DictKey } from "../lib/i18n";
@@ -233,7 +233,10 @@ export function Conversations() {
       <PageHeader title={t("conversations.title")} subtitle={t("conversations.subtitle")} />
 
       {list.error ? <LoadError error={list.error} status={list.errorStatus} onRetry={list.reload} /> : null}
-      {list.loading ? <Spinner label={t("conversations.loading")} /> : null}
+      {/* A skeleton rather than a spinner: the spinner unmounted the whole
+          list and remounted it on arrival, so every page load was two
+          layout jumps and the operator lost their scroll position. */}
+      {list.loading ? <SkeletonRows rows={6} label={t("conversations.loading")} /> : null}
       {list.data && list.data.items.length === 0 ? (
         <EmptyState message={t("conversations.empty")} />
       ) : null}
