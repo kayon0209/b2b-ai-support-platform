@@ -156,4 +156,7 @@ async def _propose_as_draft(
         gap_id=record.gap_id,
         title=correction.question[:80],
         body=correction.correct_answer,
+        # No conversation here. `Correction` carries none, and guessing one
+        # from the question text would manufacture a provenance claim this row
+        # cannot support - which is worse than an honest NULL.
     )

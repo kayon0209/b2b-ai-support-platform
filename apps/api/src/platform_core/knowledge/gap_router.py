@@ -59,6 +59,11 @@ class DraftIn(BaseModel):
     title: str = Field(min_length=1, max_length=512)
     body: str = Field(min_length=1)
     target_space_id: str | None = None
+    # Which conversation prompted this draft, when the operator is writing it
+    # with one open. Optional and never inferred: a draft written from the gap
+    # queue has no conversation, and a review that cannot see the customer is
+    # the honest state rather than a wrong link.
+    conversation_ref_id: str | None = None
 
 
 class ReviewIn(BaseModel):
@@ -160,6 +165,10 @@ def _draft_out(row: Any) -> dict[str, Any]:
         "published_document_id": (
             str(row.published_document_id) if row.published_document_id else None
         ),
+        # Echoed so the console can offer "open the conversation" beside the
+        # draft, and so a reviewer can tell "written without one" from "the link
+        # is missing" - in the payload those two look identical otherwise.
+        "conversation_ref_id": (str(row.conversation_ref_id) if row.conversation_ref_id else None),
     }
 
 
@@ -291,6 +300,11 @@ async def create_gap_draft(
                 target_space_id=(
                     _uuid(payload.target_space_id, "knowledge space")
                     if payload.target_space_id
+                    else None
+                ),
+                conversation_ref_id=(
+                    _uuid(payload.conversation_ref_id, "conversation")
+                    if payload.conversation_ref_id
                     else None
                 ),
             )
