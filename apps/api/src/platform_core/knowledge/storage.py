@@ -23,6 +23,12 @@ ALLOWED_CONTENT_TYPES = {
 }
 
 
+# SHA-256 of the empty body. SigV4 signs the payload hash for every request,
+# including the ones with no payload at all - DELETE, HEAD and the bucket
+# create - so this is a constant rather than a per-call computation.
+EMPTY_PAYLOAD_HASH = hashlib.sha256(b"").hexdigest()
+
+
 class StorageValidationError(Exception):
     pass
 
@@ -135,6 +141,42 @@ class MinioStorage:
             "x-amz-date": now.strftime("%Y%m%dT%H%M%SZ"),
         }
 
+    def _send(
+        self,
+        method: str,
+        path: str,
+        query: dict[str, str],
+        *,
+        payload_hash: str,
+        body: bytes | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> object:
+        """One signed request.
+
+        The new operations below (create bucket, delete, head, list) each need a
+        signed request, and the signing has to agree with the URL that is
+        actually sent - `canonical_query` in `_signature` sorts and encodes,
+        so the URL is assembled by the same rule rather than by hand. Writing
+        that four times is how one of them ends up signed differently from the
+        others, and the difference only appears as a 403 from the server, which
+        no string-shaped test can see.
+        """
+        import httpx
+
+        now = datetime.now(UTC)
+        headers = self._base_headers(payload_hash, now)
+        if extra_headers:
+            headers.update(extra_headers)
+        auth, _ = self._signature(method, path, query, headers, payload_hash, now)
+        headers["authorization"] = auth
+
+        url = f"{'https' if self._secure else 'http'}://{self.endpoint}{path}"
+        if query:
+            url += "?" + "&".join(
+                f"{quote(k, safe='-._~')}={quote(v, safe='-._~')}" for k, v in sorted(query.items())
+            )
+        return httpx.request(method, url, content=body, headers=headers, timeout=30.0)
+
     # --- Public API (sync httpx; storage calls are not latency-critical) ---
 
     def put_object(
@@ -192,6 +234,124 @@ class MinioStorage:
         if resp.status_code >= 300:
             raise StorageValidationError(f"get_object failed: {resp.status_code}")
         return resp.content
+
+    def object_exists(self, key: str) -> bool:
+        """Whether the key is present.
+
+        Retention needs this because S3's DELETE is idempotent by design: it
+        answers 204 whether or not the object was there. Without a separate
+        probe, "I deleted it" and "it was never there" are the same result, and
+        a sweep cannot tell a successful erasure from a key that was lost
+        before the sweep ran.
+        """
+        path = f"/{self.bucket}/{quote(key, safe='/-._~')}"
+        resp = self._send("HEAD", path, {}, payload_hash=EMPTY_PAYLOAD_HASH)
+        status = int(resp.status_code)  # type: ignore[attr-defined]
+        if status == 404:
+            return False
+        if status >= 300:
+            raise StorageValidationError(f"object_exists failed: {status} for {key}")
+        return True
+
+    def delete_object(self, key: str) -> bool:
+        """Remove the bytes. Returns False when the object was already absent.
+
+        Not raising on absence is deliberate. The caller - the retention sweep -
+        is idempotent and retrying, and raising would leave a row undeletable
+        because its object happened to be gone already. Whether anything was
+        actually removed is the return value, so the caller can record it.
+        """
+        if not self.object_exists(key):
+            return False
+
+        path = f"/{self.bucket}/{quote(key, safe='/-._~')}"
+        resp = self._send("DELETE", path, {}, payload_hash=EMPTY_PAYLOAD_HASH)
+        status = int(resp.status_code)  # type: ignore[attr-defined]
+        if status >= 300:
+            raise StorageValidationError(f"delete_object failed: {status} for {key}")
+        return True
+
+    def list_objects(self, prefix: str = "") -> list[str]:
+        """Every key under `prefix`, following continuation tokens.
+
+        Reconciliation is the caller: it walks the bucket looking for objects
+        no row refers to. The prefix is the tenant id, so the walk stays inside
+        one tenant - an unprefixed walk would enumerate every tenant's objects
+        from a job that has no reason to read any of them.
+
+        Pagination is followed rather than assumed away. A single page caps at
+        1000 keys, and a tenant with more objects than that would otherwise be
+        silently reconciled only in part: the missing ones would stay
+        unflagged, which is the failure the job exists to catch.
+        """
+        import xml.etree.ElementTree as ET
+
+        keys: list[str] = []
+        continuation: str | None = None
+        while True:
+            query = {"list-type": "2", "prefix": prefix, "max-keys": "1000"}
+            if continuation:
+                query["continuation-token"] = continuation
+            resp = self._send("GET", f"/{self.bucket}", query, payload_hash=EMPTY_PAYLOAD_HASH)
+            status = int(resp.status_code)  # type: ignore[attr-defined]
+            if status >= 300:
+                raise StorageValidationError(f"list_objects failed: {status} for prefix {prefix!r}")
+
+            # Refuse a DTD before the parser ever sees the bytes. The body is
+            # whatever the configured endpoint answered with, and over plain
+            # HTTP that is not authenticated in the response direction - so
+            # entity declarations are rejected outright rather than parsed and
+            # then hoped to be harmless. This closes the classes S314 warns
+            # about (billion laughs, XXE, quadratic blowup) at the boundary,
+            # the same way channels/wechat.py does.
+            body_bytes = bytes(resp.content)  # type: ignore[attr-defined]
+            lowered = body_bytes[:4096].lower()
+            if b"<!doctype" in lowered or b"<!entity" in lowered:
+                raise StorageValidationError(
+                    "list_objects refused a response carrying a DTD or entity declaration"
+                )
+
+            # The response carries an S3 namespace; matching on the local name
+            # keeps the parse independent of which one the endpoint declares.
+            root = ET.fromstring(body_bytes)
+            for node in root.iter():
+                if node.tag.rpartition("}")[2] == "Key" and node.text:
+                    keys.append(node.text)
+
+            truncated = any(
+                node.tag.rpartition("}")[2] == "IsTruncated" and node.text == "true"
+                for node in root.iter()
+            )
+            if not truncated:
+                return keys
+            continuation = next(
+                (
+                    node.text
+                    for node in root.iter()
+                    if node.tag.rpartition("}")[2] == "NextContinuationToken"
+                ),
+                None,
+            )
+            if not continuation:
+                # Truncated with no token means the endpoint disagrees with
+                # itself; stopping is preferable to looping on the same page.
+                return keys
+
+    def ensure_bucket(self) -> bool:
+        """Create the bucket if absent. True only when this call created it.
+
+        Runs from more than one place - a migration job and the retention
+        worker - so it has to be re-runnable. S3 answers 409
+        (BucketAlreadyOwnedByYou) for a bucket this credential already owns,
+        which is the ordinary case after the first run and is not a failure.
+        """
+        resp = self._send("PUT", f"/{self.bucket}", {}, payload_hash=EMPTY_PAYLOAD_HASH, body=b"")
+        status = int(resp.status_code)  # type: ignore[attr-defined]
+        if status == 409:
+            return False
+        if status >= 300:
+            raise StorageValidationError(f"ensure_bucket failed: {status} for {self.bucket!r}")
+        return True
 
     def presign_get(self, key: str, *, expires_seconds: int = 300) -> str:
         """Pre-signed short-lived GET URL (default 5 minutes)."""

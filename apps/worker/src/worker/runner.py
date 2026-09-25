@@ -31,6 +31,7 @@ import asyncio
 import os
 import signal
 import sys
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
@@ -275,11 +276,20 @@ class RetentionWorker:
     # three indexed deletes/updates per tenant.
     DEFAULT_INTERVAL_SECONDS = 3600.0
 
+    # Reconciliation is a different shape of work from the sweep: it lists the
+    # tenant's whole prefix in the bucket, so its cost scales with the tenant's
+    # object count rather than with its backlog. Running that hourly, per
+    # tenant, is a list call per tenant per hour forever to find - usually -
+    # nothing. Daily, and with the first run at startup so a deployment
+    # immediately accounts for what is already in the bucket.
+    RECONCILE_INTERVAL_SECONDS = 86400.0
+
     def __init__(self, config: WorkerConfig | None = None) -> None:
         self._config = config or WorkerConfig(
             poll_interval_seconds=self.DEFAULT_INTERVAL_SECONDS, batch=1
         )
         self._stopping = False
+        self._last_reconcile_at: float | None = None
 
     def request_stop(self) -> None:
         self._stopping = True
@@ -288,8 +298,24 @@ class RetentionWorker:
     def stopping(self) -> bool:
         return self._stopping
 
+    def _reconcile_due(self) -> bool:
+        """Whether this cycle should walk the buckets.
+
+        Stamped only *after* a successful cycle, so a reconciliation that
+        raised does not wait another day to be retried - the failure is already
+        logged by the consumer, and the next cycle should be allowed to try
+        again.
+        """
+        return (
+            self._last_reconcile_at is None
+            or time.monotonic() - self._last_reconcile_at >= self.RECONCILE_INTERVAL_SECONDS
+        )
+
     async def run_once(self) -> int:
-        stats = await drain_retention_once()
+        due = self._reconcile_due()
+        stats = await drain_retention_once(reconcile=due)
+        if due:
+            self._last_reconcile_at = time.monotonic()
         return stats.changed_rows
 
     async def run_forever(self) -> None:

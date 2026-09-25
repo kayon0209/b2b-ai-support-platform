@@ -91,6 +91,15 @@ ALLOWED_LOG_FIELDS = {
     "pruned_dead_letters",
     "pruned_inbox_events",
     "abandoned_runs",
+    # Object-storage retention (stage 4). Counts only - what the erasure pass
+    # removed, what it could not, and what reconciliation found pointing at
+    # bytes that are no longer there. No keys and no tenant object names: a
+    # document key contains a filename, which is customer content.
+    "objects_erased",
+    "objects_failed",
+    "orphan_objects_removed",
+    "orphan_objects_failed",
+    "rows_missing_object",
     "reason",
 }
 
