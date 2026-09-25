@@ -30,10 +30,28 @@ MAIN = WEB / "main.tsx"
 LAYOUT = WEB / "components" / "Layout.tsx"
 
 
+def _string_literals(body: str, key: str) -> set[str]:
+    """Every value assigned to `key`, in either quote style.
+
+    Measured: a route written as `` path: `agents` `` instead of
+    `path: "agents"` - a legitimate style, and one this file's own prose has
+    used throughout - made the guard report `/admin/agents` as having no route.
+    The route was there. The parser only understood double quotes.
+
+    So the pattern accepts a backtick as readily as a quote. It is still a
+    regex over source, deliberately: a route table *is* a text manifest, and the
+    alternative - mounting the app in a DOM and reading `createBrowserRouter`'s
+    routes - is a far larger change for a check that already catches the defect
+    it was written for. What is not acceptable is a parser that fails on a
+    spelling choice, because that is a guard which cries wolf and gets deleted.
+    """
+    return set(re.findall(rf"{key}\s*:\s*[`\"]([^`\"]+)[`\"]", body))
+
+
 def _route_paths() -> set[str]:
     source = MAIN.read_text(encoding="utf-8")
     body = source.split("const OPERATOR_PAGES = [", 1)[1].split("\n];", 1)[0]
-    return set(re.findall(r'path:\s*"([^"]+)"', body))
+    return _string_literals(body, "path")
 
 
 def _nav_paths() -> set[str]:
@@ -41,7 +59,7 @@ def _nav_paths() -> set[str]:
     # NAV is the full expanded menu. PRIMARY is deliberately a shortlist for
     # the narrow rail, so it is not part of the contract.
     body = source.split("const NAV = [", 1)[1].split("\n] as const", 1)[0]
-    return {p for p in re.findall(r'to:\s*"(/admin[^"]*)"', body)}
+    return {p for p in _string_literals(body, "to") if p.startswith("/admin")}
 
 
 def test_every_menu_entry_has_a_route() -> None:

@@ -29,27 +29,29 @@ put it here, because a backlog entry without one is a wish.
       the cluster. A deployment that leaves it empty behind an ingress keeps the
       original defect. Fill it from the actual Ingress/load-balancer network
       and re-run the probe; `docs/deployment-and-operations.md` now says so.
-- [ ] **The frontend has no deployment path.** The API mounts no static
-      assets, neither the K8s manifests nor the Compose file carry a frontend
-      workload, and `GET /support` answers 401. The product cannot ship its own
-      interface. Planned approach: multi-stage Docker build and a FastAPI SPA
-      mount, because that adds no new infrastructure component (AGENTS.md §9).
-- [ ] **No alerting, and traces are not wired.** `/metrics` exposes 169
-      series; the repository contains no `PrometheusRule`, `ServiceMonitor`,
-      Grafana dashboard or Alertmanager config, and `requirements.txt` does not
-      list `opentelemetry-*` — so `trace_id` reaches logs but not across
-      processes. Minimum viable: alerts on queue age, abstention rate, tool
-      failure rate and 429 ratio; one overview dashboard.
+- [x] **The frontend has no deployment path.** **Done (T3.2).** `infra/compose/api.Dockerfile` is a multi-stage build, `platform_core.spa` serves `/assets` with an SPA fallback, and `GET /support` answers 200 from the API image alone. The image build itself is still unverified - see the entry below.
+
+- [x] **No alerting, and traces are not wired.** **Done (T3.3).** `infra/kubernetes/70-alerts.yaml` and `71-servicemonitor.yaml` carry the Prometheus Operator CRDs, and `OTEL_EXPORTER_OTLP_ENDPOINT` is wired with an in-process ring-buffer fallback. Installing the Operator is tracked separately below.
+
+- [ ] **The API image build has never been run.** `infra/compose/api.Dockerfile`
+      is correct by inspection - the multi-stage split, `postgresql-client` for
+      `pg_dump` / `pg_restore` / `psql`, `COPY scripts`, and the frontend
+      `dist/` copy are all present, and the scripts' binary dependencies were
+      checked against the package that provides them. What never happened is the
+      build. The registry was unreachable from the machine doing the work, and
+      "verified except we never ran it" is the state a deployment discovers at
+      3am.
+      `python scripts/verify_image_build.py` now runs the build and then probes
+      the image for the artefacts it claims to carry. Run it where the registry
+      is reachable. It exits `2` when the registry blocks it, distinct from `1`
+      for a real failure, so a blocked run is never mistaken for a pass.
 
 ## P1 — correctness, resilience, isolation
 
-- [ ] **Object storage has no lifecycle and no scheduled backup.** Retention
-      purges rows and leaves the bytes; nothing creates the bucket, configures
-      versioning or expires prefixes; `backup_restore_drill.py` is manual and
-      no CronJob runs it.
-- [ ] **Uploads are not scanned.** Content-type allowlist and size cap only —
-      no magic-byte check, no malware scan — while `docs/security.md` requires
-      one. Retrieval must stay closed to un-scanned documents.
+- [x] **Object storage has no lifecycle and no scheduled backup.** **Done (T4.2).** Scheduled `pg_dump` plus S3 upload, a quarterly restore drill, retention that deletes object bytes, and orphan reconciliation.
+
+- [x] **Uploads are not scanned.** **Done (T4.2).** Magic-byte type validation, a scan state machine, and an enforcement that an unscanned upload cannot enter retrieval.
+
 - [ ] **Cross-tenant sweep coverage.** 51 tables carry `tenant_id`;
       `test_cross_tenant_negative.py` now names 28. Still unswept:
       `answer_corrections`, `billing_entries`, `case_escalations`,

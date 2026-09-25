@@ -23,10 +23,15 @@ What is pinned
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
 WEB = pathlib.Path(__file__).resolve().parents[3] / "admin-web" / "src"
+# `WEB` ends in `.../admin-web/src`, so its parent is the package root. Named
+# rather than recomputed inline, because getting this wrong produces a
+# FileNotFoundError on a path that reads correctly.
+ADMIN_WEB = WEB.parent
 
 
 def _sources() -> list[pathlib.Path]:
@@ -44,61 +49,74 @@ def _code_only(text: str) -> str:
     return re.sub(r"//[^\n]*", "", re.sub(r"/\*.*?\*/", "", text, flags=re.S))
 
 
-def test_every_dialog_rendered_as_an_overlay_declares_itself_modal() -> None:
-    """A backdrop is a modal, so it has to say so.
+def test_the_accessibility_claims_are_checked_by_rendering_not_by_matching() -> None:
+    """The attributes are read off rendered HTML now.
 
-    Scoped to dialogs rendered inside a `*backdrop*` element rather than to the
-    attribute as such. `Prompt.tsx` declares `aria-modal="false"` on a
-    `role="dialog"` panel, and that is **correct**: it is an inline panel, not
-    an overlay, and the ARIA default for `role="dialog"` is exactly that. A
-    blunt "no `false` anywhere" rule would have flagged a right decision and
-    taught somebody to delete it.
+    This file used to assert `aria-modal="true"` appeared in the source, and
+    measured how that guard behaves:
 
-    `TokenDialog` was the real instance. It covered the page - it has a
-    backdrop, it swallows clicks - and announced the opposite, so assistive
-    technology treated the console behind it as still live while a keyboard user
-    tabbed straight into it.
+    - Writing `aria-modal={MODAL}` where `MODAL` is `"true"` - identical
+      behaviour, and a reasonable thing to do when a value appears twice -
+      produced **two** failures, one claiming an overlay was not modal and one
+      claiming the primitive was missing `aria-modal="true"`.
+
+    Both failures name a literal, so the guard protected a spelling. The
+    replacement renders the component with `react-dom/server` and reads the
+    attributes off the HTML, and was checked the same way: the refactor above
+    passes silently, and removing `aria-hidden` from the skeleton - a real
+    defect, since a screen reader would then announce placeholder rows as
+    content - fails two assertions.
     """
-    offenders: list[str] = []
-    for path in _sources():
-        code = _code_only(path.read_text(encoding="utf-8"))
-        # A backdrop element and its dialog child are on adjacent lines in
-        # every case here; the window is generous enough for the indented form.
-        for match in re.finditer(r'className="[^"]*backdrop[^"]*"', code):
-            window = code[match.start() : match.start() + 600]
-            if 'role="dialog"' in window and 'aria-modal="true"' not in window:
-                offenders.append(str(path.relative_to(WEB)))
-                break
-    assert not offenders, f"overlay dialogs that are not modal: {sorted(set(offenders))}"
+    tests_dir = ADMIN_WEB / "tests"
+    behaviour = tests_dir / "dialog-a11y.test.mts"
+    assert behaviour.is_file(), (
+        "apps/admin-web/tests/dialog-a11y.test.mts is missing; the console's "
+        "accessibility claims have no executed guard left"
+    )
+
+    body = behaviour.read_text(encoding="utf-8")
+    assert "renderToStaticMarkup" in body, (
+        "the test must render the component; reading its source is the thing this replaced"
+    )
+    assert "SkeletonRows" in body and "Dialog" in body, (
+        "both primitives are claimed accessible and both must be rendered"
+    )
+
+    # The build step, because Node cannot import `.tsx` directly and a missing
+    # step makes the test fail with a loader error rather than an assertion.
+    assert (tests_dir / "build-components.mjs").is_file(), (
+        "the component build step the test depends on is missing"
+    )
+
+    package = json.loads((ADMIN_WEB / "package.json").read_text(encoding="utf-8"))
+    script = package.get("scripts", {}).get("test", "")
+    assert "dialog-a11y" in script, f"`npm test` does not run the accessibility tests: {script!r}"
+    assert "build-components" in script, (
+        "`npm test` must build the components first; importing `.tsx` directly "
+        "fails with ERR_UNKNOWN_FILE_EXTENSION"
+    )
 
 
-def test_the_dialog_primitive_carries_every_modality_property() -> None:
-    """Asserted as presence, not behaviour - the point is that none is dropped.
+def test_an_inline_panel_is_still_allowed_to_be_non_modal() -> None:
+    """The distinction the first version of this rule got wrong, kept.
 
-    A dialog that traps focus but does not restore it is the common partial
-    fix, and it is invisible until somebody closes one by keyboard and loses
-    their place. The comment on the primitive records why each is here.
+    "No component may declare `aria-modal=\"false\"`" flagged `Prompt.tsx`,
+    where false is **correct**: it is an inline panel, not an overlay, and false
+    is the ARIA default for `role="dialog"`. A rule that flags a right decision
+    gets deleted rather than fixed.
+
+    Asserted on the source deliberately, because the property is about which
+    element a component is - and the rendered HTML of an inline panel is
+    indistinguishable from an overlay's once a backdrop is involved. Here the
+    check is a presence check on a named constant, not a string match on the
+    attribute value, so a refactor that extracts the value is not a failure.
     """
-    source = (WEB / "components" / "ui.tsx").read_text(encoding="utf-8")
-    body = source.split("export function Dialog(", 1)[1]
-    for needed, why in [
-        ('aria-modal="true"', "tells assistive technology the rest of the page is inert"),
-        ("openerRef.current?.focus", "returns focus to the control that opened it"),
-        ('event.key === "Escape"', "the only way out for a user who cannot see a close button"),
-        ('event.key !== "Tab"', "the focus trap, which is what makes it modal for a keyboard"),
-        ("document.body.style.overflow", "stops the page scrolling behind under a trackpad"),
-    ]:
-        assert needed in body, f"Dialog is missing {needed!r}: {why}"
-
-
-def test_skeleton_placeholders_are_hidden_from_assistive_technology() -> None:
-    """A skeleton is a picture of content that does not exist yet.
-
-    Announcing the placeholder rows would be noise; the live region beside them
-    is what actually says "loading", and that is asserted here too so the two
-    cannot be separated by a later edit.
-    """
-    source = (WEB / "components" / "ui.tsx").read_text(encoding="utf-8")
-    body = source.split("export function SkeletonRows(", 1)[1]
-    assert 'aria-hidden="true"' in body, "skeleton rows would be announced as content"
-    assert 'role="status"' in body, "nothing tells a screen reader the page is loading"
+    prompt = (WEB / "components" / "Prompt.tsx").read_text(encoding="utf-8")
+    code = _code_only(prompt)
+    if 'role="dialog"' not in code:
+        # Prompt no longer renders a dialog at all; the rule has nothing to say.
+        return
+    assert "backdrop" not in code, (
+        'Prompt.tsx now renders a backdrop, so `aria-modal="false"` would be '
+        "wrong there and the exemption no longer applies"
+    )
