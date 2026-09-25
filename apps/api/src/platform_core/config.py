@@ -37,6 +37,21 @@ class Settings(BaseSettings):
     app_database_max_overflow: int = Field(
         default=10, ge=0, le=100, validation_alias="APP_DATABASE_APP_MAX_OVERFLOW"
     )
+    # How long a request waits for a connection before the pool gives up.
+    #
+    # Left unset, SQLAlchemy waits 30 seconds - and that default is worse than
+    # useless here. By the time it expires the caller has already hit its own
+    # upstream timeout and gone, so the wait produced no answer while holding a
+    # slot that a request which *could* have succeeded was waiting behind. The
+    # saturated pool then spends the full 30 seconds refusing work it could have
+    # refused immediately.
+    #
+    # 5 seconds is chosen against a typical 30-second request budget: long
+    # enough that a brief burst of concurrency queues rather than fails, short
+    # enough that the answer still arrives while the caller is listening.
+    database_pool_timeout: float = Field(
+        default=5.0, gt=0, le=30, validation_alias="DATABASE_POOL_TIMEOUT"
+    )
     # Reserved. The durable work queue is a Postgres table (inbox_events /
     # outbox_events claimed with SKIP LOCKED), not Redis, so nothing reads this
     # today. It is kept so a future cache or rate-limit feature does not have

@@ -43,13 +43,19 @@ VALIDATION_FAILED = "VALIDATION_FAILED"
 IDEMPOTENCY_KEY_REQUIRED = "IDEMPOTENCY_KEY_REQUIRED"
 PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
 INTERNAL_ERROR = "INTERNAL_ERROR"
+# The connection pool is exhausted. Distinct from `INTERNAL_ERROR` because the
+# two need different responses from the caller: this one succeeds on a retry
+# once the pool drains, while a genuine bug does not and retrying it just
+# reproduces the failure. Both are marked retryable, so the difference is in
+# what an operator and a client can *tell*, not in whether to try again.
+DATABASE_SATURATED = "DATABASE_SATURATED"
 
 # Domain-specific codes referenced by docs/api-contracts.md
 CASE_NOT_FOUND = "CASE_NOT_FOUND"
 CASE_TRANSITION_NOT_ALLOWED = "CASE_TRANSITION_NOT_ALLOWED"
 CASE_VERSION_CONFLICT = "CASE_VERSION_CONFLICT"
 
-RETRYABLE_CODES = frozenset({PROVIDER_UNAVAILABLE, INTERNAL_ERROR})
+RETRYABLE_CODES = frozenset({PROVIDER_UNAVAILABLE, INTERNAL_ERROR, DATABASE_SATURATED})
 
 
 def error_response(
