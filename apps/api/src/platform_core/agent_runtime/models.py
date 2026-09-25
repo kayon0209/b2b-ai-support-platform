@@ -96,6 +96,12 @@ class AgentRun(Base, PkMixin, TenantMixin):
     # and then did not finish. See that module for why the claim has to be
     # taken before the reply is dispatched.
     version: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
+    # Set when this run exists because an operator asked for the failed one to
+    # be attempted again (migration 0061). This is the difference between a
+    # re-run and a duplicate: without it, a re-run is indistinguishable from a
+    # second customer message, and the first attempt's failure - the reason
+    # somebody is looking at it - stops being visible.
+    replay_of_run_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     output_hash: Mapped[str | None] = mapped_column(String(127), nullable=True)
     token_usage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     latency_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

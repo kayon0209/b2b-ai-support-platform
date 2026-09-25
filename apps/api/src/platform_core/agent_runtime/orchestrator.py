@@ -1631,6 +1631,25 @@ class AgentOrchestrator:
             run.status = RunStatus.FAILED.value
             run.latency_ms = int((time.monotonic() - started) * 1000)
             await self._session.flush()
+            # A failed run used to leave exactly one thing behind: a status.
+            # An operator's only view was a count in a dashboard, with no
+            # reason on the row and no way to try again - the customer whose
+            # question went unanswered had no path to an answer except somebody
+            # noticing the number. Same dead-letter table as connector failures,
+            # so there is one operator list rather than two.
+            #
+            # The error code travels; the message does not. This table is read
+            # by an operational endpoint and copied into backups, and an
+            # exception message can carry a connection string with a password.
+            from platform_core.agent_runtime.rerun import record_run_failure
+
+            await record_run_failure(
+                self._session,
+                run_id=run.id,
+                tenant_id=tenant_id,
+                error_code=send_error,
+                attempts=1,
+            )
             get_metrics().observe_run(
                 outcome="failed",
                 route=route,
