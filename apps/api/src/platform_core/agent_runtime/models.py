@@ -89,6 +89,13 @@ class AgentRun(Base, PkMixin, TenantMixin):
     code_version: Mapped[str] = mapped_column(String(63), nullable=False, default="dev")
     trace_id: Mapped[str] = mapped_column(String(63), nullable=False, default="")
     input_hash: Mapped[str] = mapped_column(String(127), nullable=False, default="")
+    # Number of terminal claims taken on this run (migration 0060). Bumped by
+    # `agent_runtime/terminal.claim_terminal` inside the same UPDATE that checks
+    # the status, so it is the receipt for a compare-and-set - and a run whose
+    # version moved without the status becoming terminal is one a worker claimed
+    # and then did not finish. See that module for why the claim has to be
+    # taken before the reply is dispatched.
+    version: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
     output_hash: Mapped[str | None] = mapped_column(String(127), nullable=True)
     token_usage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     latency_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

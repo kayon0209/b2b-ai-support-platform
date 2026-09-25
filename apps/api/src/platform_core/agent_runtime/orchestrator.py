@@ -1535,6 +1535,51 @@ class AgentOrchestrator:
                 trace_id=ctx.trace_id,
             )
 
+        # --- 8b. Take exclusive right to finish this run. ---
+        #
+        # Placed here, immediately before the dispatch, and that placement is the
+        # point. A compare-and-set at the *terminal write* would be worthless:
+        # the reply has already gone out by then, so the loser would discover it
+        # had lost only after the customer had received two answers. The claim
+        # has to come before the side effect it protects.
+        #
+        # `run.version` is what this worker observed when it loaded the run, so
+        # the predicate is "still the run I started working on". A lease expiry
+        # or a redelivered queue message gives a second worker the same row, and
+        # without this both of them reach the dispatch.
+        from platform_core.agent_runtime.terminal import claim_terminal
+
+        claimed_version = await claim_terminal(
+            self._session,
+            run_id=run.id,
+            expected_status=run.status,
+            expected_version=run.version,
+        )
+        if claimed_version is None:
+            # Someone else finished this run while we were thinking. Not an
+            # error and not a retry: the work is done, by someone, and repeating
+            # it would be the duplicate reply this check exists to prevent.
+            get_metrics().lease_conflicts_total.inc()
+            logger.info(
+                "terminal_claim_lost",
+                ctx,
+                run_id=str(run.id),
+                route=route,
+            )
+            return RunOutcome(
+                run_id=run.id,
+                status=RunStatus.SUPERSEDED,
+                route=route,
+                answer_text="",
+                send_blocked_reason="TERMINAL_CLAIM_LOST",
+                citation_count=0,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                trace_id=ctx.trace_id,
+            )
+        # Kept in step with the row so the flush below cannot write a stale
+        # value back over the bump.
+        run.version = claimed_version
+
         # --- 9. Dispatch through Chatwoot with an idempotency key. ---
         #
         # Shadow mode (feature list 9.2): produce everything, send nothing.
