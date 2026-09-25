@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useUrlState } from "../lib/urlState";
 
 import { apiGet } from "../lib/api";
 import { useAsync } from "../lib/useAsync";
@@ -205,7 +206,11 @@ function Timeline({ replay }: { replay: ConversationReplay }) {
 
 export function Conversations() {
   const { t } = useLang();
-  const [selected, setSelected] = useState<string | null>(null);
+  // In the URL, not in component state: a replay that cannot be linked
+  // cannot be handed to a colleague, and refreshing mid-investigation threw
+  // away whatever the operator had narrowed the list down to.
+  const [selected, setSelectedRaw] = useUrlState("conversation", "");
+  const setSelected = (next: string | null) => setSelectedRaw(next);
   const [offset, setOffset] = useState(0);
 
   const list = useAsync(
