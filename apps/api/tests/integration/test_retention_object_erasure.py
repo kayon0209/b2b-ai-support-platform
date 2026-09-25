@@ -181,6 +181,15 @@ def _insert(*rows: dict) -> None:
     admin.dispose()
 
 
+def _storage_cleanup(bucket: str) -> None:
+    """Empty a scratch bucket so the probe does not accumulate."""
+    from platform_core.knowledge.storage import MinioStorage
+
+    scratch = MinioStorage(endpoint=S3_ENDPOINT, bucket=bucket)
+    for key in scratch.list_objects(prefix=""):
+        scratch.delete_object(key)
+
+
 def _status_of(version_id: str) -> str | None:
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
@@ -330,3 +339,75 @@ def test_tenant_prefixes_are_not_crossed() -> None:
         )
     finally:
         storage.delete_object(foreign_key)
+
+
+def test_a_versioned_bucket_is_never_certified_as_erased() -> None:
+    """The failure this guard exists for, measured rather than imagined.
+
+    On a versioned bucket a DELETE writes a delete marker: the current version
+    404s, which is exactly what `object_exists` reports, while the earlier
+    versions stay stored and readable by `version_id`. An erasure pass that
+    trusted that check would stamp `bytes_deleted_at` and certify - in a column
+    an auditor reads - that a document the tenant asked us to forget had been
+    erased, while its bytes were one `version_id` away from being read back.
+
+    So the pass refuses to stamp at all. The row stays unproven, the count
+    shows as failed, and the next cycle tries again: a wrong alarm on a
+    misconfigured bucket is recoverable, a false compliance record is not.
+    """
+    from platform_core.knowledge.models import IngestionStatus
+    from platform_core.knowledge.storage import MinioStorage
+
+    bucket = f"versioned-{uuid.uuid4().hex[:8]}"
+    storage = MinioStorage(endpoint=S3_ENDPOINT, bucket=bucket)
+    storage.ensure_bucket()
+    storage.set_bucket_versioning(True)
+    try:
+        assert storage.bucket_versioning_enabled() is True, "precondition not established"
+
+        version_id, key = str(uuid.uuid4()), f"{TENANT}/{uuid.uuid4()}/kept.pdf"
+        storage.put_object(key, b"a document we were told to forget", "application/pdf")
+        _insert(
+            _version_row(
+                version_id,
+                status=IngestionStatus.EXPIRED.value,
+                expires_at=NOW - DAY,
+                key=key,
+            )
+        )
+
+        counts = _run(_erase_with(storage))
+
+        assert counts["objects_erased"] == 0, counts
+        assert counts["objects_failed"] == 1, counts
+        assert _bytes_deleted_at(version_id) is None, (
+            "recorded a completed erasure on a bucket where the bytes survive"
+        )
+    finally:
+        storage.set_bucket_versioning(False)
+        _storage_cleanup(bucket)
+
+
+def test_an_unversioned_bucket_does_not_pay_for_the_check() -> None:
+    """The guard must not disable erasure on a correctly configured bucket.
+
+    A safety check that fires on every healthy deployment trains people to turn
+    it off. This is the negative case: same code path, versioning off, erasure
+    proceeds.
+    """
+    from platform_core.knowledge.models import IngestionStatus
+
+    storage = _storage()
+    assert storage.bucket_versioning_enabled() is False, "the shared bucket is versioned"
+
+    version_id, key = str(uuid.uuid4()), f"{TENANT}/{uuid.uuid4()}/ordinary.pdf"
+    storage.put_object(key, b"expired as usual", "application/pdf")
+    _insert(
+        _version_row(
+            version_id, status=IngestionStatus.EXPIRED.value, expires_at=NOW - DAY, key=key
+        )
+    )
+
+    counts = _run(_erase_with(storage))
+    assert counts["objects_erased"] == 1, counts
+    assert _bytes_deleted_at(version_id) is not None

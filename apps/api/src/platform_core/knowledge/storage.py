@@ -10,6 +10,7 @@ import hashlib
 import hmac
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import quote, urlparse
 
 ALLOWED_CONTENT_TYPES = {
@@ -284,36 +285,14 @@ class MinioStorage:
         silently reconciled only in part: the missing ones would stay
         unflagged, which is the failure the job exists to catch.
         """
-        import xml.etree.ElementTree as ET
-
         keys: list[str] = []
         continuation: str | None = None
         while True:
             query = {"list-type": "2", "prefix": prefix, "max-keys": "1000"}
             if continuation:
                 query["continuation-token"] = continuation
-            resp = self._send("GET", f"/{self.bucket}", query, payload_hash=EMPTY_PAYLOAD_HASH)
-            status = int(resp.status_code)  # type: ignore[attr-defined]
-            if status >= 300:
-                raise StorageValidationError(f"list_objects failed: {status} for prefix {prefix!r}")
+            root = self._read_s3_xml("GET", f"/{self.bucket}", query)
 
-            # Refuse a DTD before the parser ever sees the bytes. The body is
-            # whatever the configured endpoint answered with, and over plain
-            # HTTP that is not authenticated in the response direction - so
-            # entity declarations are rejected outright rather than parsed and
-            # then hoped to be harmless. This closes the classes S314 warns
-            # about (billion laughs, XXE, quadratic blowup) at the boundary,
-            # the same way channels/wechat.py does.
-            body_bytes = bytes(resp.content)  # type: ignore[attr-defined]
-            lowered = body_bytes[:4096].lower()
-            if b"<!doctype" in lowered or b"<!entity" in lowered:
-                raise StorageValidationError(
-                    "list_objects refused a response carrying a DTD or entity declaration"
-                )
-
-            # The response carries an S3 namespace; matching on the local name
-            # keeps the parse independent of which one the endpoint declares.
-            root = ET.fromstring(body_bytes)
             for node in root.iter():
                 if node.tag.rpartition("}")[2] == "Key" and node.text:
                     keys.append(node.text)
@@ -336,6 +315,79 @@ class MinioStorage:
                 # Truncated with no token means the endpoint disagrees with
                 # itself; stopping is preferable to looping on the same page.
                 return keys
+
+    def bucket_versioning_enabled(self) -> bool:
+        """Whether the bucket keeps prior versions of an object.
+
+        This is not a curiosity. On a versioned bucket a DELETE writes a delete
+        marker and the previous bytes stay stored and readable by `version_id`.
+        Measured against MinIO, not assumed: after deleting an object, the
+        current version 404s while both earlier versions still return their
+        full content.
+
+        That matters because "the current version is gone" is exactly what
+        `object_exists` reports and exactly what the erasure pass records as a
+        completed erasure. On a versioned bucket that record would be false -
+        the tenant's document is still fully recoverable, and the platform would
+        have certified otherwise. See `evaluation.pii.erase_expired_objects`,
+        which refuses to stamp in that case.
+        """
+        body = self._read_s3_xml("GET", f"/{self.bucket}", {"versioning": ""})
+        for node in body.iter():
+            if node.tag.rpartition("}")[2] == "Status" and node.text:
+                return str(node.text).strip() == "Enabled"
+        # An absent Status element is what S3 sends for "never configured",
+        # which is the unversioned case.
+        return False
+
+    def _read_s3_xml(self, method: str, path: str, query: dict[str, str]) -> Any:
+        """Signed request, DTD-refused, parsed. Shared by the XML endpoints.
+
+        The DOCTYPE/ENTITY refusal is the same one `list_objects` applies and
+        for the same reason: these are endpoint responses, and over plain HTTP
+        the response direction is unauthenticated.
+        """
+        import xml.etree.ElementTree as ET
+
+        resp = self._send(method, path, query, payload_hash=EMPTY_PAYLOAD_HASH)
+        status = int(resp.status_code)  # type: ignore[attr-defined]
+        if status >= 300:
+            raise StorageValidationError(f"{method} {path} failed: {status}")
+
+        raw = bytes(resp.content)  # type: ignore[attr-defined]
+        lowered = raw[:4096].lower()
+        if b"<!doctype" in lowered or b"<!entity" in lowered:
+            raise StorageValidationError(
+                f"{method} {path}: response carried a DTD or entity declaration"
+            )
+        return ET.fromstring(raw)
+
+    def set_bucket_versioning(self, enabled: bool) -> None:
+        """Turn object versioning on or off for this bucket.
+
+        Exists for the *backup* bucket. The live documents bucket must stay
+        unversioned - see `bucket_versioning_enabled` for the measurement that
+        makes that a correctness requirement rather than a preference - so
+        nothing in the retention path calls this.
+        """
+        body = (
+            "<VersioningConfiguration>"
+            f"<Status>{'Enabled' if enabled else 'Suspended'}</Status>"
+            "</VersioningConfiguration>"
+        ).encode()
+        resp = self._send(
+            "PUT",
+            f"/{self.bucket}",
+            {"versioning": ""},
+            payload_hash=hashlib.sha256(body).hexdigest(),
+            body=body,
+            extra_headers={"content-type": "application/xml"},
+        )
+        status = int(resp.status_code)  # type: ignore[attr-defined]
+        if status >= 300:
+            raise StorageValidationError(
+                f"set_bucket_versioning failed: {status} for {self.bucket!r}"
+            )
 
     def ensure_bucket(self) -> bool:
         """Create the bucket if absent. True only when this call created it.

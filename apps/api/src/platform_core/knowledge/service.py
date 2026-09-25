@@ -367,7 +367,7 @@ def _secret(value: Any) -> str | None:
     return value.get_secret_value() if hasattr(value, "get_secret_value") else str(value)
 
 
-def object_storage(settings: Any) -> Any:
+def object_storage(settings: Any, *, bucket: str | None = None) -> Any:
     """Build the object-store client. **The one construction site.**
 
     Public because the store is shared infrastructure that happens to live
@@ -376,6 +376,14 @@ def object_storage(settings: Any) -> Any:
     how an object ends up written to an endpoint the presigner does not sign
     for. The caller supplies its own content-type policy - see
     `MinioStorage.put_object`.
+
+    `bucket` overrides only the bucket, never the endpoint or the credentials.
+    That is what the backup job needs: it writes to a *different* bucket - the
+    one where versioning is safe, because the live documents bucket must stay
+    unversioned for erasure to mean anything - over the same connection. An
+    override that could also redirect the endpoint would be a way for a caller
+    to silently ship data somewhere else, which is the exact failure this
+    function exists to prevent.
 
     (`knowledge/storage.py` mixes this infrastructure with `ObjectKey`, which
     is a knowledge concept. Splitting them is a rename, not a redesign, and is
@@ -387,7 +395,7 @@ def object_storage(settings: Any) -> Any:
         endpoint=settings.object_storage_endpoint,
         access_key=_secret(settings.object_storage_access_key),
         secret_key=_secret(settings.object_storage_secret_key),
-        bucket=settings.object_storage_bucket,
+        bucket=bucket or settings.object_storage_bucket,
         secure=settings.object_storage_secure,
     )
 

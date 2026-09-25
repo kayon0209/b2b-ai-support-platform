@@ -267,6 +267,30 @@ async def erase_expired_objects(
     ).all()
 
     counts = {"objects_erased": 0, "objects_already_absent": 0, "objects_failed": 0}
+    if not rows:
+        return counts
+
+    # A versioned bucket cannot be erased through DELETE.
+    #
+    # Measured against MinIO rather than assumed: after deleting an object from
+    # a versioned bucket, the current version 404s - which is exactly what
+    # `object_exists` reports - while every earlier version still returns its
+    # full content when fetched by `version_id`. So the stamp below would
+    # record a completed erasure of bytes that remain completely readable, and
+    # an auditor reading `bytes_deleted_at` would be told the opposite of the
+    # truth.
+    #
+    # Not raised: the exception would propagate out of the per-tenant loop and
+    # stop every other tenant's retention, which is a much larger blast radius
+    # than the one misconfigured bucket. Counting them as failed keeps the rows
+    # unstamped (so the backlog stays visible and the alert keeps firing)
+    # while the dead-letter and inbox pruning still completes.
+    try:
+        versioned = await asyncio.to_thread(storage.bucket_versioning_enabled)
+    except Exception:  # noqa: BLE001 - cannot establish the precondition
+        versioned = True
+    if versioned:
+        return {"objects_erased": 0, "objects_already_absent": 0, "objects_failed": len(rows)}
 
     for version_id, raw_uri in rows:
         key = str(raw_uri or "")

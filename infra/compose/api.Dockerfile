@@ -25,6 +25,17 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# PostgreSQL client binaries. Needed by the backup CronJob (`pg_dump`) and by
+# `scripts/backup_restore_drill.py` (`pg_dump`/`pg_restore`/`psql`).
+#
+# They live in *this* image rather than a dedicated backup image so the restore
+# drill runs against the same artifacts that serve traffic. A drill performed
+# with different tooling is a different recovery path from the one that would
+# actually be used at 3am, and it would report on the wrong one.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends postgresql-client \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml ./
 COPY requirements.txt ./
 
@@ -40,6 +51,10 @@ COPY apps/api/src ./apps/api/src
 COPY apps/worker/src ./apps/worker/src
 COPY packages ./packages
 COPY apps/api/migrations ./apps/api/migrations
+# Operational scripts travel with the image because the backup CronJob and the
+# restore drill are invoked from it. Without this they would run a version
+# pinned in a ConfigMap, and the drill would stop testing what is deployed.
+COPY scripts ./scripts
 
 # The editable install stays after the source COPY because it needs the
 # package layout present to build against. It is cheap next to the step above

@@ -27,6 +27,12 @@ resources:
   # the metrics.
   - 70-alerts.yaml
   - 71-servicemonitor.yaml
+  # Scheduled work. The backup writes to a bucket that is not the one the
+  # platform serves, because the documents bucket must stay unversioned for
+  # retention's erasure to mean anything - see 80-backup-cronjob.yaml, which
+  # carries the measurement that establishes it.
+  - 80-backup-cronjob.yaml
+  - 81-backup-drill-cronjob.yaml
 # `11-secret.example.yaml` is intentionally absent: it holds placeholders, and
 # applying it would create a Secret whose values look configured. Create the
 # real Secret from your secret manager first.
