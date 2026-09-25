@@ -24,11 +24,17 @@ explanation - which reads as "there are no cases", not "that link is wrong".
 
 from __future__ import annotations
 
+import json
 import pathlib
-import re
 
 WEB = pathlib.Path(__file__).resolve().parents[3] / "admin-web" / "src"
 HOOK = WEB / "lib" / "urlState.ts"
+# `WEB` ends in `.../admin-web/src`, so its parent is the package root. Named
+# rather than recomputed inline, because getting this wrong produced a
+# FileNotFoundError on a path that reads correctly - the kind of failure that
+# looks like a missing file rather than a wrong one.
+ADMIN_WEB = WEB.parent
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
 
 
 def _read(path: pathlib.Path) -> str:
@@ -56,28 +62,53 @@ def test_the_hook_exists_and_both_pages_in_scope_use_it() -> None:
         assert "useUrlState" in source, f"{name} does not use the shared hook"
 
 
-def test_the_hook_replaces_rather_than_pushes_by_default() -> None:
-    """A search box that pushes per keystroke makes Back useless.
+def test_the_behaviour_decisions_are_exercised_by_a_real_run() -> None:
+    """The decisions live in `tests/url-state.test.mts`, and that file runs them.
 
-    Walking Back through the letters of the last word typed is the specific
-    failure; so is walking Back through every conversation an operator clicked.
-    Neither is what anybody means by Back in a workbench.
+    The three decisions this hook makes - replace-not-push, empty removes the
+    parameter, an unknown value falls back - used to be guarded here by matching
+    strings in the source. That guard was wrong in both directions, and both
+    were measured rather than argued:
+
+    - Renaming `push` to `replaceByDefault` **failed** it with the behaviour
+      completely unchanged.
+    - Replacing the removal branch with `updated.set(key, next ?? "")` - which
+      leaves `?q=` behind for every cleared search - **passed** it.
+
+    A guard that cries wolf on a rename and misses the real defect trains people
+    to protect a variable name instead of a behaviour. So the decisions were
+    extracted into `applyUrlValue`, `readUrlValue` and `isOneOf`, which need
+    neither React nor a DOM, and are executed by Node's type stripping.
+
+    What is asserted here is that the real tests exist and are wired into the
+    project's own entry points - a test file nobody runs is a comment.
     """
-    body = _read(HOOK)
-    assert "push = false" in body, "the default has to be replace, not push"
-    assert "{ replace: !push }" in body, "the decision has to be wired to the option"
+    behaviour_test = ADMIN_WEB / "tests" / "url-state.test.mts"
+    assert behaviour_test.is_file(), (
+        "apps/admin-web/tests/url-state.test.mts is missing; the URL-state "
+        "decisions have no executable guard left"
+    )
 
+    body = behaviour_test.read_text(encoding="utf-8")
+    for subject, why in [
+        ("applyUrlValue", "the write path"),
+        ("readUrlValue", "the read path"),
+        ("isOneOf", "the unknown-value fallback"),
+    ]:
+        assert subject in body, f"the behaviour test does not exercise {subject}: {why}"
 
-def test_an_empty_value_removes_the_parameter() -> None:
-    """`?q=` looks like a filter set to nothing.
+    package = json.loads((ADMIN_WEB / "package.json").read_text(encoding="utf-8"))
+    assert "test" in package["scripts"], (
+        "apps/admin-web has no `npm test`, so the behaviour tests have no entry "
+        "point and will silently stop running"
+    )
+    assert "--experimental-strip-types" in package["scripts"]["test"], (
+        "the runner must strip types natively rather than need a build step"
+    )
 
-    A link carrying `?q=` is a different request from one carrying no parameter,
-    and it renders as a filter the operator has to clear before it behaves.
-    """
-    body = _read(HOOK)
-    assert "updated.delete(key)" in body, "an empty value must remove the parameter"
-    assert re.search(r'next\s*===\s*null\s*\|\|\s*next\s*===\s*""', body), (
-        "null and the empty string both have to count as absent"
+    ci = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    assert ci.is_file() and "npm test" in ci.read_text(encoding="utf-8"), (
+        "CI does not run `npm test`; a test that CI skips is a test that rots"
     )
 
 

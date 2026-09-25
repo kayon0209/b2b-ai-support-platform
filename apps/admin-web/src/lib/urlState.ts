@@ -39,6 +39,51 @@ import { useSearchParams } from "react-router-dom";
  *   passed through. A hand-edited `?tab=whatever` must not put the page into a
  *   state no code path can reach.
  */
+/**
+ * Apply a value to a query string, returning the new one.
+ *
+ * Extracted from the hook so the decisions it makes can be tested without a
+ * browser. The hook needs React and a router; this needs neither, and the tests
+ * that used to assert on the hook's *source text* could not tell a rename from
+ * a behaviour change - renaming `push` to something else failed them while the
+ * behaviour was identical, which teaches people to protect names instead of
+ * behaviour.
+ *
+ * The three decisions, in one place and testable:
+ * - `null` and `""` both remove the parameter, so a cleared search does not
+ *   leave behind `?q=` that reads as a filter set to nothing.
+ * - Anything else is set, replacing whatever was there.
+ * - Other parameters are preserved: a link with `?tab=queue&q=x` must keep
+ *   `tab` when the search changes, and dropping it would silently reset the
+ *   operator's view.
+ */
+export function applyUrlValue(
+  current: URLSearchParams,
+  key: string,
+  next: string | null,
+): URLSearchParams {
+  const updated = new URLSearchParams(current);
+  if (next === null || next === "") updated.delete(key);
+  else updated.set(key, next);
+  return updated;
+}
+
+/**
+ * Read a value, treating "absent" and "empty" as the same thing.
+ *
+ * `?q=` and no `q` at all mean the same request, and a caller asking for the
+ * fallback should get it for both.
+ */
+export function readUrlValue(
+  params: URLSearchParams,
+  key: string,
+  fallback: string,
+): string {
+  const stored = params.get(key);
+  if (stored === null || stored === "") return fallback;
+  return stored;
+}
+
 export function useUrlState(
   key: string,
   fallback: string,
@@ -46,21 +91,12 @@ export function useUrlState(
 ): readonly [string, (next: string | null) => void] {
   const { push = false } = options;
   const [params, setParams] = useSearchParams();
-  const stored = params.get(key);
-  const value = useMemo(() => {
-    if (stored === null || stored === "") return fallback;
-    return stored;
-  }, [stored, fallback]);
+  const value = useMemo(() => readUrlValue(params, key, fallback), [params, key, fallback]);
 
   const set = useCallback(
     (next: string | null) => {
       setParams(
-        (current) => {
-          const updated = new URLSearchParams(current);
-          if (next === null || next === "") updated.delete(key);
-          else updated.set(key, next);
-          return updated;
-        },
+        (current) => applyUrlValue(current, key, next),
         { replace: !push },
       );
     },
