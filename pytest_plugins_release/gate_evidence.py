@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -44,6 +45,10 @@ EVIDENCE_PATH = (
     Path(__file__).resolve().parents[1] / "tests" / "artifacts" / "release_gate_evidence.json"
 )
 MARKER = "zero_tolerance"
+
+# One id per session. Generated per *write* instead, two artifacts from the
+# same run would disagree about which run it was, which defeats the field.
+_RUN_ID = f"{os.getpid()}-{int(time.time())}"
 
 
 class ZeroToleranceCollector:
@@ -148,7 +153,16 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         "tests_collected": _collected_tests,
         "invariants_covered": len(snapshot["invariants"]),  # type: ignore[arg-type]
     }
+    # Stamped with provenance. `docs/research/chinese-intent-measurement.md`
+    # already records that this file is overwritten by *any* pytest run, which
+    # means a release gate can be reading whichever run finished last, on
+    # whatever branch that was, with nothing in the file to say so. The
+    # envelope turns "we believe this number" into "we believe this number,
+    # from this code, in this run".
+    from platform_core.evaluation.artifacts import stamp
+
+    document = stamp("release_gate_evidence", snapshot, run_id=_RUN_ID)
     EVIDENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    EVIDENCE_PATH.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
+    EVIDENCE_PATH.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
     if os.environ.get("RELEASE_GATE_EVIDENCE_VERBOSE"):
         print(f"\nrelease-gate evidence written to {EVIDENCE_PATH}")

@@ -138,9 +138,18 @@ EXPECTED_MIGRATIONS = 61
 POOL_SIZE = 10
 
 
-def _write_artifact(name: str, payload: dict[str, Any]) -> None:
+# One run id shared by every artifact this session writes, so a reviewer can
+# ask "were these two produced by the same run?" - the question a migration
+# report and a performance report from different runs cannot answer.
+_ARTIFACT_RUN_ID = f"{os.getpid()}-{int(time.time())}"
+
+
+def _write_artifact(name: str, payload: dict[str, Any], **stamp_kwargs: Any) -> None:
+    from platform_core.evaluation.artifacts import stamp
+
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    (ARTIFACT_DIR / name).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    document = stamp(name.removesuffix(".json"), payload, run_id=_ARTIFACT_RUN_ID, **stamp_kwargs)
+    (ARTIFACT_DIR / name).write_text(json.dumps(document, indent=2), encoding="utf-8")
 
 
 # --- 1. Migration testing ----------------------------------------------------
@@ -551,7 +560,7 @@ def test_100_concurrent_ingest_p95(perf_tenant: str) -> None:
         "persisted_rows": persisted,
         "duplicate_replay_detected": duplicate,
     }
-    _write_artifact("performance_report.json", report)
+    _write_artifact("performance_report.json", report, derived_from=("release_gate_evidence",))
 
     assert persisted == n, f"expected {n} rows, got {persisted}"
     assert duplicate, "replayed delivery id was not detected as a duplicate"
