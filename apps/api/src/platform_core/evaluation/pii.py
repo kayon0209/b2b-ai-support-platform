@@ -106,6 +106,18 @@ def minimize_payload(
 
 # --- Retention (docs/deployment-and-operations.md backup/recovery) ---
 
+# `DocumentVersion.status` and `DocumentVersion.ingestion_status` are two
+# different vocabularies that happen to share two strings. `status` is
+# draft/processing/active/superseded/expired/failed and is what retrieval filters
+# on (`dv.status = 'active'`); `ingestion_status` is the `IngestionStatus` enum,
+# which has no `active` member at all. So the retention sweep's use of
+# `IngestionStatus.EXPIRED.value` reads as the authority for that column and is
+# only correct because the two happen to spell 'expired' the same way.
+#
+# Named here so a future edit to either vocabulary does not silently move
+# retention's meaning. The value is the contract, not the enum member.
+VERSION_EXPIRED = "expired"
+
 
 @dataclass(frozen=True)
 class RetentionPolicy:
@@ -252,14 +264,14 @@ async def erase_expired_objects(
 
     from sqlalchemy import select, update
 
-    from platform_core.knowledge.models import DocumentVersion, IngestionStatus
+    from platform_core.knowledge.models import DocumentVersion
 
     rows = (
         await session.execute(
             select(DocumentVersion.id, DocumentVersion.object_uri)
             .where(
                 DocumentVersion.tenant_id == tenant_id,
-                DocumentVersion.status == IngestionStatus.EXPIRED.value,
+                DocumentVersion.status == VERSION_EXPIRED,
                 DocumentVersion.bytes_deleted_at.is_(None),
             )
             .limit(limit)

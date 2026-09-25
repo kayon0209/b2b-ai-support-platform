@@ -126,10 +126,10 @@ TENANT_TABLES = (
 # "how many revisions are registered", and a stray untracked file on one
 # machine must not be able to satisfy it.
 #
-# 57 as of 2026-09-25. `0058_version_bytes_deleted_at` is the newest registered
+# 58 as of 2026-09-25. `0059_version_scan_status` is the newest registered
 # revision; keep this synchronized with the tracked revision set, excluding
 # `.gitkeep` and any local-only migration files.
-EXPECTED_MIGRATIONS = 57
+EXPECTED_MIGRATIONS = 58
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

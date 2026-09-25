@@ -105,6 +105,31 @@ class Settings(BaseSettings):
     # Client-facing access is always a short-lived pre-signed URL
     # (docs/security.md), generated server-side - the API never proxies bytes
     # and never hands out a public path.
+    # Require `document_versions.scan_status = 'clean'` before a version may be
+    # retrieved. The column, the state machine and the upload scan all exist;
+    # this decides whether retrieval enforces them.
+    #
+    # Default is OFF, and that is a judgement rather than an omission:
+    #
+    # The only scanner shipped so far is `knowledge.scanning.ContentScanner`,
+    # which verifies that a file's bytes match its declared type. That is a real
+    # check and it stops a renamed executable, but it is a format check, not an
+    # antivirus. Turning the gate on while it is the only thing producing
+    # `clean` would mark the entire existing corpus as cleared on the strength
+    # of a magic-byte comparison - the fail-closed property would hold in form
+    # and be hollow in substance, which is worse than not claiming it at all.
+    #
+    # The other reason is operational. Every row that predates migration 0059
+    # defaults to `pending`, so switching this on empties the search index until
+    # a backfill has run. That should be a decision somebody makes, having run
+    # the backfill, not a side effect of deploying the mechanism.
+    #
+    # Flip it once a real scanner (the `Scanner` protocol, e.g. a ClamAV
+    # sidecar) is deployed and the corpus has been scanned. `error` is excluded
+    # along with `pending`, so a scanner outage stops retrieval rather than
+    # quietly admitting unexamined content.
+    require_scanned_documents: bool = False
+
     object_storage_endpoint: str = "localhost:9000"
     object_storage_access_key: SecretStr | None = None
     object_storage_secret_key: SecretStr | None = None

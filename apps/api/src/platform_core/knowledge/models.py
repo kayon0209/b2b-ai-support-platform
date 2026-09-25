@@ -126,6 +126,13 @@ class DocumentVersion(Base, PkMixin, TenantMixin):
     # what happened to the bytes, and only one of those survives a worker that
     # dies between marking a row expired and reaching the endpoint.
     bytes_deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Whether the bytes have been examined by a scanner (migration 0059):
+    # pending|clean|infected|error. Retrieval requires `clean`, so the default
+    # is deliberately not searchable - see `knowledge/scanning.py` for why
+    # `error` is not a pass either.
+    scan_status: Mapped[str] = mapped_column(
+        String(31), nullable=False, default="pending", server_default="pending"
+    )
     parser_version: Mapped[str] = mapped_column(String(63), nullable=False, default="v1")
     ingestion_status: Mapped[str] = mapped_column(String(31), nullable=False, default="uploaded")
     # Both timestamps are bigint epoch seconds and are owned by the database

@@ -686,3 +686,94 @@ def test_listing_requires_knowledge_read(client: TestClient, monkeypatch) -> Non
     # An agent may read knowledge, so this is the allowed case; the point is
     # that the route consults the gate rather than defaulting to open.
     assert denied.status_code in (200, 403)
+
+
+# --- 1b. The bytes have to match the label ---------------------------------
+
+
+def test_an_upload_whose_bytes_contradict_its_type_is_refused(
+    client: TestClient, stub_storage: dict
+) -> None:
+    """The rename attack, through the real endpoint rather than the helper.
+
+    Everything above proves uploads *work*. This proves the one thing that
+    mattered before `knowledge/scanning.py` existed: a file is not trusted
+    because the request said so. A `report.pdf` carrying a DOS executable
+    header is refused, and refused before storage - the call log is empty,
+    because a rejected file has no business occupying the bucket.
+    """
+    resp = client.post(
+        "/v1/knowledge/documents",
+        headers=_token(OWNER_USER),
+        data={
+            "space_id": SPACE,
+            "title": "Quarterly report",
+            "canonical_uri": f"doc://{uuid.uuid4()}",
+            "classification": "internal",
+            "version_label": "v1",
+        },
+        files={
+            "file": (
+                "report.pdf",
+                b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00",
+                "application/pdf",
+            )
+        },
+    )
+
+    assert resp.status_code >= 400, f"a mislabelled upload was accepted: {resp.text}"
+    assert "MISMATCH" in resp.text, resp.text
+    assert stub_storage["puts"] == [], "a rejected upload was written to storage"
+
+
+def test_an_image_declared_pdf_is_refused(client: TestClient, stub_storage: dict) -> None:
+    """The reverse direction: a real PNG wearing a PDF label.
+
+    A one-directional check would pass the previous test by rejecting anything
+    it could not parse, and would let this through.
+    """
+    resp = client.post(
+        "/v1/knowledge/documents",
+        headers=_token(OWNER_USER),
+        data={
+            "space_id": SPACE,
+            "title": "Chart",
+            "canonical_uri": f"doc://{uuid.uuid4()}",
+            "classification": "internal",
+            "version_label": "v1",
+        },
+        files={"file": ("chart.pdf", b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, "application/pdf")},
+    )
+
+    assert resp.status_code >= 400, f"a PNG declared as a PDF was accepted: {resp.text}"
+    assert "MISMATCH" in resp.text, resp.text
+
+
+def test_a_genuine_pdf_is_accepted(client: TestClient, stub_storage: dict) -> None:
+    """The negative case, so a check that refused everything could not pass.
+
+    Without this, "reject anything unrecognised" would satisfy both tests above
+    and silently break every knowledge upload - a security control that costs
+    the product its entire corpus is not a control anyone should keep.
+    """
+    resp = client.post(
+        "/v1/knowledge/documents",
+        headers=_token(OWNER_USER),
+        data={
+            "space_id": SPACE,
+            "title": "Real PDF",
+            "canonical_uri": f"doc://{uuid.uuid4()}",
+            "classification": "internal",
+            "version_label": "v1",
+        },
+        files={
+            "file": (
+                "real.pdf",
+                b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF\n",
+                "application/pdf",
+            )
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert stub_storage["puts"], "a valid PDF was not stored"

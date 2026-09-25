@@ -44,6 +44,13 @@ from platform_core.knowledge.models import (
     IngestionStatus,
     KnowledgeSpace,
 )
+from platform_core.knowledge.scanning import (
+    ContentScanner,
+    ContentTypeMismatch,
+    ScanVerdict,
+    run_scan,
+    verify_declared_type,
+)
 from platform_core.knowledge.storage import (
     ObjectKey,
     StorageValidationError,
@@ -97,9 +104,19 @@ def _validate_upload(content_type: str | None, data: bytes) -> str:
             f"upload exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB",
         )
     try:
-        return validate_content_type(content_type)
+        media = validate_content_type(content_type)
     except StorageValidationError as exc:
         raise KnowledgeError("UNSUPPORTED_CONTENT_TYPE", str(exc)) from exc
+
+    # The allowlist above answers "is this type acceptable"; this answers "are
+    # these bytes that type". Before this, a file labelled PDF carrying an
+    # executable passed the whole upload path and was retrieved as ordinary
+    # knowledge.
+    try:
+        verify_declared_type(media, data)
+    except ContentTypeMismatch as exc:
+        raise KnowledgeError("CONTENT_TYPE_MISMATCH", str(exc)) from exc
+    return media
 
 
 async def create_space(
@@ -209,10 +226,27 @@ async def create_document(
     session.add(document)
     await session.flush()
 
+    # The scanner runs on the bytes already in hand, before the object is
+    # uploaded, so a rejected file never occupies storage. A scanner outage is
+    # recorded as `error` rather than treated as a pass: the version is stored
+    # and stays invisible to retrieval until a scan succeeds.
+    verdict = run_scan(
+        ContentScanner(),
+        key="",
+        data=data,
+        declared_type=media_type,
+    )
+    if verdict is ScanVerdict.INFECTED:
+        raise KnowledgeError(
+            "UPLOAD_REJECTED",
+            "the file's contents do not match its declared type",
+        )
+
     version = DocumentVersion(
         tenant_id=tenant_id,
         document_id=document.id,
         version_label=version_label,
+        scan_status=verdict.as_status().value,
         content_hash=content_hash(data),
         status="processing",
         object_uri="",  # filled in below, once the key is derived

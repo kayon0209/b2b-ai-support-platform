@@ -359,9 +359,16 @@ async def hybrid_search(
     else:
         acl = ""
 
+    # The scan gate. Off by default, deliberately - the reasoning is long and
+    # belongs where an operator will meet it, at the setting itself.
+    from platform_core.config import get_settings
+
+    scan_gate = "AND dv.scan_status = 'clean'" if get_settings().require_scanned_documents else ""
+
     base_where = f"""
         WHERE c.tenant_id = CAST(:tid AS uuid)
           AND dv.status = 'active'
+          {scan_gate}
           AND (dv.effective_at IS NULL OR dv.effective_at <= :now)
           AND (dv.expires_at IS NULL OR dv.expires_at > :now)
           {space_filter}

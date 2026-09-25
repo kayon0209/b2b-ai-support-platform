@@ -181,6 +181,12 @@ def _insert(*rows: dict) -> None:
     admin.dispose()
 
 
+# What `service.py` writes to `DocumentVersion.status` once ingestion
+# completes. `IngestionStatus` has no such member: that enum drives
+# `ingestion_status`, and the two vocabularies only overlap on 'expired'.
+VERSION_ACTIVE = "active"
+
+
 def _storage_cleanup(bucket: str) -> None:
     """Empty a scratch bucket so the probe does not accumulate."""
     from platform_core.knowledge.storage import MinioStorage
@@ -269,12 +275,11 @@ def test_an_active_version_is_never_erased() -> None:
     corpus the tenant is actively searching, and unlike leaking expired bytes
     there is no second pass that can put it back.
     """
-    from platform_core.knowledge.models import IngestionStatus
 
     storage = _storage()
     version_id, key = str(uuid.uuid4()), f"{TENANT}/{uuid.uuid4()}/live.pdf"
     storage.put_object(key, b"in force", "application/pdf")
-    _insert(_version_row(version_id, status=IngestionStatus.READY.value, expires_at=None, key=key))
+    _insert(_version_row(version_id, status=VERSION_ACTIVE, expires_at=None, key=key))
 
     counts = _run(_erase_with(storage))
 
@@ -307,11 +312,10 @@ def test_reconciliation_reports_a_missing_object_rather_than_deleting_the_row() 
     cannot prove happened. So the row stays and the report names it, which is
     what makes the difference between "deleted" and "missing" visible.
     """
-    from platform_core.knowledge.models import IngestionStatus
 
     storage = _storage()
     version_id, key = str(uuid.uuid4()), f"{TENANT}/{uuid.uuid4()}/vanished.pdf"
-    _insert(_version_row(version_id, status=IngestionStatus.READY.value, expires_at=None, key=key))
+    _insert(_version_row(version_id, status=VERSION_ACTIVE, expires_at=None, key=key))
     # Deliberately never uploaded: row points at bytes that were never there.
 
     report = _run(_reconcile_with(storage))
