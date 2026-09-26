@@ -41,6 +41,7 @@ from platform_core.agent_runtime.customer_router import router as customer_route
 from platform_core.agent_runtime.prompt_router import router as prompt_router
 from platform_core.agent_runtime.router import router as agent_runtime_router
 from platform_core.agent_runtime.support_router import router as support_router
+from platform_core.agent_runtime.tasks_router import router as tasks_router
 from platform_core.agent_runtime.workbench_router import router as workbench_router
 from platform_core.api import (
     DATABASE_SATURATED,
@@ -309,6 +310,10 @@ app.include_router(agent_runtime_router)
 app.include_router(customer_router)
 app.include_router(agent_reply_router)
 app.include_router(workbench_router)
+# Conversation tasks and copilot jobs. Mounted on the same prefix as the
+# workbench and carries its own policy gates; the paths are distinct so a
+# route added here cannot shadow a workbench read.
+app.include_router(tasks_router)
 app.include_router(support_router)
 app.include_router(tool_gateway_router)
 app.include_router(tool_catalog_router)

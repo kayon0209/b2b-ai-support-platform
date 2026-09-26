@@ -33,7 +33,10 @@ ADMIN_URL = os.environ.get(
     "APP_ADMIN_DATABASE_URL",
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
-APP_URL = "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform"
+APP_URL = os.environ.get(
+    "APP_TEST_DATABASE_URL",
+    "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
+)
 SECRET_ENV = "E2E_CHANNEL_WEBHOOK_SECRET"
 SECRET = os.environ.get(SECRET_ENV, "e2e-channel-secret")
 EMAIL_FROM = "buyer@example.test"

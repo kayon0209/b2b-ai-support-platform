@@ -6,6 +6,7 @@
 - clearing the quota restores unlimited use
 """
 
+import os
 import uuid
 
 import pytest
@@ -14,7 +15,10 @@ from sqlalchemy import create_engine, text
 
 pytestmark = pytest.mark.integration
 
-ADMIN_URL = "postgresql+psycopg://platform:platform@localhost:5435/platform"
+ADMIN_URL = os.environ.get(
+    "APP_ADMIN_DATABASE_URL",
+    "postgresql+psycopg://platform:platform@localhost:5435/platform",
+)
 TENANT = "0190d000-0000-7000-8000-0000000000f4"
 
 

@@ -214,6 +214,14 @@ version or ownership conflicts return HTTP 409. Queue items may have `case: null
 The customer-visible reply still uses `POST /v1/conversations/{ref}/replies`,
 which is idempotent for the same `(tenant, ref, key)`.
 
+The workbench may also send `copilot_job_id` when a human reply was composed
+from an AI draft. The server resolves source turn references from that
+tenant-bound job and rechecks the current actor, lease version, and timeline
+revision before it writes the customer-visible turn. Clients cannot submit or
+forge `source_refs`; stale jobs return 409. The returned timeline only exposes
+these provenance pointers to the authenticated workbench, not to the customer
+support surface.
+
 The older case-specific context endpoint remains for bookmarked cases:
 
 ```text
