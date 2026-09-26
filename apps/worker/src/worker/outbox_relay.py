@@ -40,8 +40,8 @@ from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
+from observability_metrics import get_metrics
 from platform_core.billing.service import handle_usage_recorded
-from platform_core.db import session_scope
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
 from platform_core.outbox import OutboxEvent
 from platform_core.outbox_service import claim_pending, mark_failed, mark_sent
@@ -163,11 +163,17 @@ class OutboxRelay:
 
             handler = self.handlers.get(row.event_type)
             if handler is None:
-                logger.info(
+                # Warning, not info. This is an event the platform published
+                # and then dropped on the floor - a producer with no consumer.
+                # It is still retired so the queue drains, but "sent" is a
+                # claim about the queue and not about delivery, so the fact
+                # that it went nowhere has to be countable somewhere.
+                logger.warning(
                     "outbox_event_unhandled",
                     event_type=row.event_type,
                     event_id=str(row.event_id),
                 )
+                get_metrics().outbox_unhandled_total.labels(event_type=row.event_type).inc()
                 await mark_sent(session, row.id)
                 stats.unhandled += 1
                 continue
@@ -218,6 +224,76 @@ async def log_only_handler(session: AsyncSession, event: OutboxEvent) -> None:
     )
 
 
+async def handle_agent_reply(session: AsyncSession, event: OutboxEvent) -> None:
+    """Deliver a human agent's reply over the channel the customer wrote in on.
+
+    **Every read here is scoped by an explicit `tenant_id`.** The relay runs on
+    the owner role (see `OutboxWorker.run_once`), so RLS filters nothing on this
+    path and the `tenant_id` in the WHERE clause is the whole isolation. That is
+    why this reads the turn by `(tenant_id, id)` rather than by id alone.
+
+    Failure is raised, not swallowed. A reply that cannot be delivered must park
+    the event where an operator can see it - the alternative is a message the
+    customer never received and a queue that reported success, which is the
+    `worker_cannot_send` shape this repository keeps finding.
+
+    `command_id` is derived from the turn id, so a retry after an ambiguous
+    failure re-uses the same idempotency key at the transport rather than
+    sending the reply twice.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import select as _select
+
+    from platform_core.agent_runtime.models import ConversationTurn
+    from platform_core.channels.outbound import (
+        ChannelNotConfigured,
+        build_channel_sender,
+    )
+    from platform_core.config import get_settings
+
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    channel = str(payload.get("channel") or "").strip()
+    address = str(payload.get("address") or "").strip()
+    turn_id = str(payload.get("turn_id") or "").strip()
+    conversation_key = str(payload.get("conversation_key") or "").strip()
+    if not (channel and address and turn_id):
+        # A malformed event is a producer bug. Raising parks it after the retry
+        # budget rather than silently retiring a message that never went out.
+        raise ValueError("agent reply event is missing its delivery target")
+
+    text = (
+        await session.execute(
+            _select(ConversationTurn.text_redacted).where(
+                ConversationTurn.tenant_id == event.tenant_id,
+                ConversationTurn.id == _uuid.UUID(turn_id),
+            )
+        )
+    ).scalar_one_or_none()
+    if text is None:
+        # The turn was pruned by retention, or the payload names the wrong one.
+        raise ValueError(f"agent reply turn {turn_id} not found")
+
+    sender = build_channel_sender(get_settings())
+    if not sender.configured(channel):
+        # A receive-only deployment. This is exactly the case that must not be
+        # reported as delivered: the reply is persisted, `Workbench` shows it,
+        # and the customer has heard nothing.
+        raise ChannelNotConfigured(f"no outbound transport for {channel!r}")
+
+    result = await sender.send_message(
+        system=channel,
+        address=address,
+        conversation_key=conversation_key,
+        content=str(text),
+        command_id=f"agent-reply:{turn_id}",
+    )
+    if getattr(result, "ambiguous", False):
+        # Unknown outcome: retry with the same command id rather than claim a
+        # success that may be a duplicate.
+        raise RuntimeError("agent reply delivery outcome unknown")
+
+
 def build_default_relay(batch: int = DEFAULT_BATCH) -> OutboxRelay:
     """Relay with the event types the platform currently emits.
 
@@ -235,6 +311,10 @@ def build_default_relay(batch: int = DEFAULT_BATCH) -> OutboxRelay:
     relay.register("case.created", log_only_handler)
     relay.register("case.updated", log_only_handler)
     relay.register("usage.recorded", handle_usage_recorded)
+    # A human's reply is the one event on this relay whose delivery the customer
+    # is actively waiting for, so it gets a real handler rather than the
+    # log-only default.
+    relay.register("conversation.agent_reply", handle_agent_reply)
     return relay
 
 
@@ -263,7 +343,33 @@ class OutboxWorker:
         return self._stopping
 
     async def run_once(self) -> RelayStats:
-        async with session_scope() as session:
+        """Claim and dispatch one batch on the queue's bookkeeping session.
+
+        **Known limitation, stated rather than hidden.** This class still runs
+        both the claim and the dispatch on the owner role, so the per-row
+        `apply_rls_tenant` in `_dispatch` is decoration: on a bypassing
+        connection RLS does not filter anything, and a handler's tenant scoping
+        rests entirely on the explicit `tenant_id` it passes. Contrast
+        `InboxWorker`, which was fixed to claim on this role and process each
+        event on a `tenant_session` after the same measurement showed the flag
+        lookup reading another tenant's row there.
+
+        The fix is the same split - claim here, dispatch each row on a
+        `tenant_session` - and it is *not* applied here yet because it changes
+        this class's documented unit of work: the batch is deliberately one
+        transaction ("a crash mid-batch leaves the whole batch to be retried"),
+        and per-row sessions mean per-row commits, which is a different
+        delivery-dedup story. That deserves its own change and its own
+        verification against a real downstream consumer, which this deployment
+        does not have (the default handler is `log_only_handler`).
+
+        Until then: handlers on this path MUST scope every read and write by an
+        explicit `tenant_id`. `tests/integration/test_outbox_relay.py` covers
+        delivery; nothing there can see the missing boundary.
+        """
+        from worker.wiring import queue_bookkeeping_session
+
+        async with queue_bookkeeping_session() as session:
             return await self._relay.run_once(session)
 
     async def run_forever(self) -> None:

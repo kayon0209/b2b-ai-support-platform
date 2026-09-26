@@ -11,7 +11,7 @@
 ## Trust boundaries
 
 - Browser/customer widget
-- Chatwoot
+- Platform-owned customer channels (`/support`, email and WeChat adapters)
 - Custom API and workers
 - Identity provider
 - Model providers

@@ -56,11 +56,41 @@ ACTIVE_SLUG = "resolve-active"
 SUSPENDED_SLUG = "resolve-suspended"
 NO_MEMBERSHIP_SLUG = "resolve-nomember"
 
-TENANT = "01900000-0000-7000-8000-0000000000d1"
-ACTIVE_TENANT = "01900000-0000-7000-8000-0000000000d2"
-SUSPENDED_TENANT = "01900000-0000-7000-8000-0000000000d3"
-NO_MEMBERSHIP_TENANT = "01900000-0000-7000-8000-0000000000d4"
+# Its own tenant ids - and *derived* rather than hand-picked.
+#
+# This file, `test_cross_tenant_leak_surfaces` and `test_outbox_relay` all used
+# `...d1` while seeding different *slugs*, and each seed guarded on
+# `ON CONFLICT (slug)` - which does not suppress a primary-key conflict.
+# Whichever file ran second lost the race to an existing row and died on
+# `tenants_pkey`. That was fixed by hand-picking `...d5` for `TENANT`, but
+# `ACTIVE_TENANT` kept sharing `...d2` with `test_cross_tenant_leak_surfaces`
+# and failed in exactly the same way. Measured 2026-09-22: the zero-tolerance
+# cross-tenant suite lost 9 of its 15 passing tests to it, and *which* file
+# errored flipped between runs depending on who won.
+#
+# Hand-picking a "free" id fixes today's collision and invites tomorrow's - the
+# whole `d` range is taken now. Deriving them makes the ids distinct by
+# construction, which is the principle stated above, applied so it cannot be
+# forgotten again.
+_MEMBERSHIP_NS = uuid.uuid5(uuid.NAMESPACE_URL, "b2b-ai-support/tests/membership")
 
+
+def _test_id(name: str) -> str:
+    return str(uuid.uuid5(_MEMBERSHIP_NS, name))
+
+
+TENANT = _test_id("tenant")
+ACTIVE_TENANT = _test_id("active-tenant")
+SUSPENDED_TENANT = _test_id("suspended-tenant")
+NO_MEMBERSHIP_TENANT = _test_id("no-membership-tenant")
+
+# These two are deliberately NOT derived, and the difference is not cosmetic.
+# `USER` is shared with ten other files, but each seeds the *same* email, so
+# `ON CONFLICT (primary_email) DO NOTHING` collapses them onto one row. Giving
+# this file a unique id while keeping the shared email would make its insert a
+# no-op and leave its memberships pointing at a row that does not exist - an FK
+# failure instead of a PK one. Tenant ids are different because the colliding
+# files seed different *slugs*, which the conflict clause does not cover.
 USER = "01900000-0000-7000-8000-0000000000e1"
 ORPHAN_USER = "01900000-0000-7000-8000-0000000000e2"
 

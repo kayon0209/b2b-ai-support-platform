@@ -67,6 +67,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from platform_core.agent_runtime.homophones import corrections_in, normalize_for_matching
+from platform_core.agent_runtime.identifiers import names_a_record
 from platform_core.agent_runtime.qa_path import _content_terms, _stem
 
 # --- Reused vocabulary -----------------------------------------------------
@@ -104,6 +106,30 @@ class Scene(StrEnum):
     COMPLAINT = "complaint"
     ACCOUNT_SECURITY = "account_security"
     BILLING = "billing"
+    UNSPECIFIED = "unspecified"
+
+
+class BusinessLine(StrEnum):
+    """Which product line the question belongs to (feature list 3.2).
+
+    Distinct from `Scene`, which is *what the customer wants* (a complaint,
+    a pre-sales question). This is *what they are talking about* - a PCB, a
+    reel of components, an SMT run. The two are independent: "my PCB order
+    is late" is COMPLAINT on the scene axis and PCB here.
+
+    It exists so two downstream consumers stop guessing independently:
+    7.3 routes a handoff to the team that owns this line, and 8.7 counts
+    demand per line. Both previously had nothing to key on.
+
+    `UNSPECIFIED` is a real answer, not a failure: plenty of questions
+    (an invoice query, a password reset) belong to no line, and inventing
+    one to avoid the empty case would put a routing decision on noise.
+    """
+
+    COMPONENT = "component"
+    PCB = "pcb"
+    SMT = "smt"
+    DFM = "dfm"
     UNSPECIFIED = "unspecified"
 
 
@@ -166,13 +192,26 @@ class IntentAction(StrEnum):
 # and the scene the wording was asking for lost to whatever scene happened to
 # be listed first.
 
+# Chinese alternatives are appended to each pattern as a second top-level
+# alternative (`\b(?:en)\b|(?:cn)`), because `\b` never matches between two CJK
+# characters - wrapping CJK in the English `\b` group matches nothing, which is
+# how this file's other CJK patterns are written too.
+#
+# They were missing entirely: `docs/research/chinese-intent-measurement.md`
+# measured every scene pattern as English-only, so **no Chinese message got a
+# scene at all** and every one fell to UNSPECIFIED. The scenes do not decide the
+# route, but they decide which tools are candidates and how wide retrieval
+# reaches (`_top_k_for_scene`), and the pilot's customers write Chinese - so the
+# gap degraded tool ranking and evidence breadth for every conversation the
+# pilot would actually have.
 _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
     (
         Scene.ACCOUNT_SECURITY,
         2.0,
         re.compile(
             r"\b(?:breach\w*|compromi[sz]\w*|locked out|hijack\w*|stolen|"
-            r"unauthori[sz]ed access)\b",
+            r"unauthori[sz]ed access)\b"
+            r"|(?:被盗|泄露|泄漏|未授权|被人登录|账号异常|安全漏洞)",
             re.IGNORECASE,
         ),
     ),
@@ -181,7 +220,8 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
         1.0,
         re.compile(
             r"\b(?:password|passphrase|mfa|2fa|sso|log ?in|sign ?in|"
-            r"api ?key|token|credential|secret|permission\w*|access rights)\b",
+            r"api ?key|token|credential|secret|permission\w*|access rights)\b"
+            r"|(?:密码|验证码|登录|登入|密钥|凭证|令牌|权限)",
             re.IGNORECASE,
         ),
     ),
@@ -192,7 +232,10 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
             r"\b(?:complain\w*|unacceptable|ridiculous|furious|angry|"
             r"fed up|again and again|third time|still not|escalat\w*|"
             r"manager|supervisor|legal action|lawyer|ombudsman|"
-            r"disappoint\w*|disgrace|worst)\b",
+            r"disappoint\w*|disgrace|worst)\b"
+            r"|(?:投诉|抱怨|太差|很差|不满意|无法接受|不能接受|生气|愤怒|"
+            r"还是不行|又出问题|第三次|找经理|找主管|找领导|起诉|律师|"
+            r"走法律|失望|太糟糕|最差|什么态度)",
             re.IGNORECASE,
         ),
     ),
@@ -201,7 +244,8 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
         2.0,
         re.compile(
             r"\b(?:do you support|does your product|is it possible to|"
-            r"before (?:i|we) buy|can your (?:platform|product))\b",
+            r"before (?:i|we) buy|can your (?:platform|product))\b"
+            r"|(?:你们支持|能否支持|是否支持|能支持|买之前|采购前|下单前)",
             re.IGNORECASE,
         ),
     ),
@@ -210,7 +254,8 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
         1.0,
         re.compile(
             r"\b(?:pricing|price list|quote|quotation|trial|demo|evaluate|"
-            r"considering|compar(?:e|ing)|which plan)\b",
+            r"considering|compar(?:e|ing)|which plan)\b"
+            r"|(?:报价|价格|多少钱|单价|试用|演示|对比|哪个套餐|怎么收费)",
             re.IGNORECASE,
         ),
     ),
@@ -220,7 +265,9 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
         re.compile(
             r"\b(?:order|shipment|delivery|deliver\w*|track(?:ing)?|parcel|"
             r"dispatch|shipping|eta|where is my|has (?:it|my order) (?:arrived|shipped)|"
-            r"invoice|package|courier)\b",
+            r"invoice|package|courier)\b"
+            r"|(?:订单|发货|交期|物流|快递|到货|运单|出货|什么时候发|包裹|"
+            r"寄出|签收)",
             re.IGNORECASE,
         ),
     ),
@@ -231,7 +278,10 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
             r"\b(?:error|fault|fail(?:ing|ed|ure)?|crash\w*|hang|timeout|time ?out|"
             r"error code|fault code|not working|broken|defect|"
             r"firmware|hardware version|model number|serial|"
-            r"log file|stack trace|exception|restart|reboot)\b",
+            r"log file|stack trace|exception|restart|reboot)\b"
+            r"|(?:报错|故障|失败|崩溃|卡住|超时|不工作|无法使用|打不开|坏了|"
+            r"不良|缺陷|短路|开路|虚焊|焊点|固件|硬件版本|型号|序列号|"
+            r"日志|异常|重启|死机)",
             re.IGNORECASE,
         ),
     ),
@@ -241,7 +291,9 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
         re.compile(
             r"\b(?:refund|charge[ds]?|billing|invoice|payment|credit(?:ed)?|"
             r"subscription|renewal|overcharged|double charged|cancel(?:lation)?|"
-            r"downgrade|upgrade|proration)\b",
+            r"downgrade|upgrade|proration)\b"
+            r"|(?:退款|退费|退货|扣费|收费|账单|发票|付款|支付|订阅|续费|"
+            r"多扣|重复扣|取消|降级|升级|赔付|赔偿)",
             re.IGNORECASE,
         ),
     ),
@@ -251,6 +303,58 @@ _SCENE_PATTERNS: tuple[tuple[Scene, float, re.Pattern[str]], ...] = (
 # about service, but it must not fire on a pre-sales question. BILLING and
 # ORDER_FULFILMENT are more specific than AFTER_SALES, so they win when both
 # match; AFTER_SALES is only assigned when nothing more specific did.
+# Feature list 3.2: which product line the question is about. Weighted like
+# the scene patterns - a specific term outranks a generic one - with DFM
+# weighted highest because its vocabulary ("拼板", "工艺边") overlaps PCB's
+# and the DFM reading is the more specific one: a customer asking about
+# panelisation wants the manufacturability review, not a board quote.
+#
+# `\bpcb\b` deliberately does not match "pcba": the word boundary fails
+# between b and a, which is what keeps an assembly question out of the bare
+# board line. That distinction is the whole point of having SMT as its own
+# line - PCBA is assembly work, PCB is fabrication, and they are routed to
+# different teams.
+_BUSINESS_LINE_PATTERNS: tuple[tuple[BusinessLine, float, re.Pattern[str]], ...] = (
+    (
+        BusinessLine.DFM,
+        1.2,
+        re.compile(
+            r"dfm|可制造性|制造性设计|工艺评审|工程确认|工程问题确认|\beq\b|拼板|工艺边"
+            r"|邮票孔|钢网开口|可焊性|器件间距|过孔设计",
+            re.I,
+        ),
+    ),
+    (
+        BusinessLine.SMT,
+        1.0,
+        re.compile(
+            r"smt|pcba|贴片|贴装|回流焊|波峰焊|锡膏|钢网|上锡|焊接|炉温|过炉|元件偏移"
+            r"|立碑|虚焊|连锡",
+            re.I,
+        ),
+    ),
+    (
+        BusinessLine.COMPONENT,
+        1.0,
+        re.compile(
+            r"元器件|电子料|元件|芯片|电阻|电容|电感|晶振|连接器|\bic\b|bom|料号|物料"
+            r"|替代料|国产替代|原厂|授权代理|批次|丝印|封装",
+            re.I,
+        ),
+    ),
+    (
+        BusinessLine.PCB,
+        0.8,
+        re.compile(
+            r"\bpcb\b|电路板|线路板|印制板|印制电路|覆铜板|打样|fr-?4|阻抗|沉金|喷锡"
+            r"|层压|板材|孔铜|绿油|阻焊|字符层|板厚|铜厚",
+            re.I,
+        ),
+    ),
+)
+
+_BUSINESS_LINE_CONFIDENCE = 0.6
+
 _AFTER_SALES_HINT = re.compile(
     r"\b(?:my (?:account|plan|subscription|workspace)|existing customer|"
     r"since (?:i|we) (?:signed|upgraded|started)|support ticket|my case)\b",
@@ -377,6 +481,13 @@ class IntentDetection:
     confidence: float
     multi_intent: bool
     signals: tuple[IntentSignal, ...]
+    # Feature list 3.2. Defaulted so callers and tests that construct a
+    # detection without a line keep working; `classify` always sets it.
+    business_line: BusinessLine = BusinessLine.UNSPECIFIED
+    # Feature list 3.8: homophone substitutions applied before matching. Kept
+    # so "why was this routed by 订单 when the customer wrote 定单" has an
+    # answer; the customer's own words stay in the audit log untouched.
+    corrections: tuple[tuple[str, str], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         """Audit-safe snapshot for `AgentRun.model_config`.
@@ -393,6 +504,11 @@ class IntentDetection:
             "action": self.action.value,
             "confidence": round(self.confidence, 3),
             "multi_intent": self.multi_intent,
+            "business_line": self.business_line.value,
+            # Count, not the substitutions: a correction is a decision about
+            # the customer's words, and this snapshot is read back without
+            # re-exposing what they typed.
+            "spelling_corrections": len(self.corrections),
         }
 
 
@@ -423,6 +539,33 @@ def _detect_scene(question: str) -> tuple[Scene, float, list[IntentSignal]]:
     return best, confidence, signals
 
 
+def _detect_business_line(question: str) -> tuple[BusinessLine, float, list[IntentSignal]]:
+    """Which product line the question is about, with its evidence.
+
+    Same scoring shape as `_detect_scene`, and deliberately no fallback
+    heuristic: unlike a scene, where an existing-customer hint is enough to
+    say "after sales", there is no textual hint that makes a question about
+    a line it never mentions. Guessing a line would misroute the handoff to
+    a team that cannot help, which is worse than saying UNSPECIFIED and
+    letting the general queue take it.
+    """
+    signals: list[IntentSignal] = []
+    scores: dict[BusinessLine, float] = {}
+    for line, weight, pattern in _BUSINESS_LINE_PATTERNS:
+        hits = len(pattern.findall(question))
+        if hits:
+            signals.append(IntentSignal("business_line", line.value, f"{hits} match(es)"))
+            scores[line] = scores.get(line, 0.0) + hits * weight
+    best: BusinessLine = BusinessLine.UNSPECIFIED
+    best_score = 0.0
+    for line, _weight, _pattern in _BUSINESS_LINE_PATTERNS:
+        score = scores.get(line, 0.0)
+        if score > best_score:
+            best, best_score = line, score
+    confidence = _BUSINESS_LINE_CONFIDENCE if best is not BusinessLine.UNSPECIFIED else 0.0
+    return best, confidence, signals
+
+
 def _detect_kinds(question: str) -> tuple[list[IntentKind], float, list[IntentSignal]]:
     """Every kind the utterance evidences, strongest first."""
     signals: list[IntentSignal] = []
@@ -443,7 +586,13 @@ def _detect_kinds(question: str) -> tuple[list[IntentKind], float, list[IntentSi
         signals.append(IntentSignal("kind", IntentKind.SENSITIVE_REQUEST.value, "sensitive term"))
         return kinds, 0.95, signals
 
-    if _HUMAN_REQUEST.search(question):
+    if _HUMAN_REQUEST.search(question) or _is_cn_human_request(question):
+        # Checked before the write signal and before the quote frame, because
+        # a customer asking for a person has made a routing decision, and
+        # answering instead - by any machinery - overrules them. The Chinese
+        # pattern was missing until the measurement in
+        # `docs/research/chinese-intent-measurement.md` showed "把这张单转给人工"
+        # and "我要投诉" both landing on the knowledge path.
         kinds.append(IntentKind.HUMAN_REQUEST)
         signals.append(
             IntentSignal("kind", IntentKind.HUMAN_REQUEST.value, "explicit human request")
@@ -491,13 +640,48 @@ def _detect_kinds(question: str) -> tuple[list[IntentKind], float, list[IntentSi
         signals.append(
             IntentSignal("kind", IntentKind.BUSINESS_ACTION.value, "write verb with object")
         )
+    elif _is_cn_action_request(question):
+        # The Chinese frame, evaluated last so an utterance that already
+        # matched an English form keeps the sharper rationale. There is no
+        # ambiguity in practice - the two vocabularies do not overlap - and
+        # ordering it here means the English signals stay byte-identical for
+        # every existing case, which is what the evaluation baseline
+        # (16/16 -> 24 cases) depends on.
+        kinds.append(IntentKind.BUSINESS_ACTION)
+        signals.append(
+            IntentSignal("kind", IntentKind.BUSINESS_ACTION.value, "chinese request frame")
+        )
 
     if _CASE_RECORD.search(question):
         kinds.append(IntentKind.BUSINESS_QUERY)
         signals.append(IntentSignal("kind", IntentKind.BUSINESS_QUERY.value, "case reference"))
+    elif names_a_record(question):
+        # An order, shipment or invoice id. Evaluated with the case reference
+        # above because it is the same evidence: naming a record the platform
+        # holds is a live-data question whatever else the sentence does not
+        # say.
+        #
+        # Added 2026-09-23 for a measured failure on the customer surface. The
+        # platform asked a customer for their order number, they replied
+        # `SO-9001`, and this function saw no noun, no interrogative and no
+        # case reference - so the reply routed to the knowledge path, the order
+        # tool was never selected, and the answer the platform had just asked
+        # for became an abstention. A record id is the sharpest signal there
+        # is; it must not need a noun beside it.
+        kinds.append(IntentKind.BUSINESS_QUERY)
+        signals.append(IntentSignal("kind", IntentKind.BUSINESS_QUERY.value, "record reference"))
     elif _LIVE_DATA.search(question):
         kinds.append(IntentKind.BUSINESS_QUERY)
         signals.append(IntentSignal("kind", IntentKind.BUSINESS_QUERY.value, "live data requested"))
+    elif _CN_LIVE_DATA.search(question) and not _CN_HOW.search(question):
+        # The Chinese frame, evaluated last for the same reason
+        # `_is_cn_action_request` is: the two vocabularies do not overlap in
+        # practice, and ordering it here leaves every English signal
+        # byte-identical, which is what the evaluation baseline rests on.
+        kinds.append(IntentKind.BUSINESS_QUERY)
+        signals.append(
+            IntentSignal("kind", IntentKind.BUSINESS_QUERY.value, "chinese live data requested")
+        )
 
     if is_question or _content_terms(question):
         kinds.append(IntentKind.KNOWLEDGE_QUESTION)
@@ -543,6 +727,15 @@ def _looks_like_a_write(question: str) -> bool:
     return False
 
 
+# The words that open a question about *information* rather than a request for
+# action, and the auxiliaries the request frame is built from. A wh-word
+# directly in front of the frame ("where can I report a bug") makes it the
+# wh-word's question; the same frame in a later clause ("...and can I change
+# the delivery address") is still a request.
+_WH_OPENERS = frozenset({"how", "what", "when", "where", "why", "which", "who", "whose"})
+_REQUEST_AUXILIARIES = frozenset({"can", "could", "will", "would"})
+
+
 def _has_request_frame(question: str) -> bool:
     """`can|could|will|would + I|we + <write verb> + <object marker>`.
 
@@ -556,8 +749,20 @@ def _has_request_frame(question: str) -> bool:
     gate that protects "how do I cancel?" — and that same gate hid the write
     half of "Where is my order, and can I change the delivery address?", a
     request the platform must not silently drop.
+
+    **A wh-word immediately followed by the frame is not a request.** "Where
+    can I report a bug?" asks *where*, and routing it to the write gateway
+    hands a knowledge question to a human. The test is adjacency rather than
+    the opener alone, because the sentence above is exactly a wh-opener whose
+    request lives in a later clause — rejecting wh-openers outright would
+    break the case this function was written for. The defect predates the
+    verbs that made it visible ("where can I change my address?" already
+    misfired); it was found by a guard case written for `report`, which is
+    the argument for writing guard cases rather than reasoning about risk.
     """
     tokens = re.findall(r"[a-z']+", question.lower())
+    if len(tokens) > 1 and tokens[0] in _WH_OPENERS and tokens[1] in _REQUEST_AUXILIARIES:
+        return False
     for index, token in enumerate(tokens[:-2]):
         if token not in {"can", "could", "will", "would"}:
             continue
@@ -568,6 +773,236 @@ def _has_request_frame(question: str) -> bool:
         if _stem(verb) in action_verbs and obj in object_markers:
             return True
     return False
+
+
+# --- Chinese action detection ----------------------------------------------
+#
+# Chinese needs its own mechanism rather than more entries in `ACTION_VERBS`,
+# and that is not a style preference - the English path *cannot* fire on
+# Chinese even with the verbs present:
+#
+# - `is_action_request` requires the token after the verb to be in
+#   `_OBJECT_MARKERS`, which is `{the, a, my, our, this...}`. Chinese has no
+#   such determiners, so `帮我取消这个订单` would fail that check however many
+#   verbs were added;
+# - `_looks_like_a_write` splits on `[a-z']+`, which finds **zero** tokens in a
+#   Chinese sentence, so it returns False before looking at anything;
+# - `\b` word boundaries never match between two CJK characters, so every
+#   `\b...\b` pattern in this module is inapplicable by construction.
+#
+# The evidence for all three is measured in
+# `docs/research/chinese-intent-measurement.md`; the short version is that
+# all 14 Chinese utterances tested routed to `knowledge_qa`, including
+# "我要退款" and "我要投诉".
+#
+# So the request frame is expressed directly, in the shape Chinese actually
+# uses: a first-person desire or an explicit request for help, followed by a
+# write verb, followed by an object.
+#
+# **The object requirement is carried over deliberately.** English needs it
+# (`_looks_like_a_write`'s docstring: without it, 8 of 23 cases moved to
+# business_write because a policy question's *topic* is a write verb), and
+# Chinese needs it more, because Chinese has no word boundaries and a regex
+# can only substring-match. `退款` appears in both "我要退款" (a request) and
+# "退款多久到账？" (a policy question). The frame is what separates them:
+# `我要` + `退款` is a request, while `退款` followed by `多久` is a topic.
+
+# Verbs the platform *performs*. Mirrors the intent of `ACTION_VERBS` for the
+# actions this tenant's flows actually support, rather than translating the
+# whole English list - a verb with no tool behind it would only ever produce a
+# handoff, and the quote vocabulary's lesson (below) is that a term is worth
+# adding when something downstream can act on it.
+_CN_ACTION_VERBS: tuple[str, ...] = (
+    "退款",
+    "退货",
+    "退单",
+    "取消",
+    "退订",
+    "修改",
+    "更改",
+    "变更",
+    "改",
+    "换",
+    "投诉",
+    "举报",
+    "开票",
+    "提交",
+    "申请",
+    "升级",
+    "转人工",
+    "转给人工",
+)
+
+# Raising a ticket. Kept as patterns rather than verbs because Chinese inserts
+# a measure word between the verb and the noun - "建**一张**工单", "开**个**单" -
+# so a verb list would match "建单" but miss the way customers actually write it.
+# `\S{0,3}` is the measure-word gap and is bounded on purpose: an unbounded gap
+# would let "建" and "单" come from different clauses.
+_CN_TICKET_REQUEST = re.compile(
+    r"(?:建|开|创建|提|发起|生成)\S{0,3}(?:工单|单|问题单|ticket)",
+    re.IGNORECASE,
+)
+
+# The `把` construction, which puts the object *before* the verb:
+# "把这张单转给人工" (take this ticket and transfer it), "请把这个订单取消".
+# This is ordinary Chinese word order, not an edge case, so the frame+verb
+# scan above cannot see it: there the verb follows the frame directly.
+#
+# `\S{1,12}` is the object span. Bounded because an unbounded gap would let a
+# `把` in one clause pair with a verb in the next, and 12 characters covers
+# the objects this vocabulary takes ("这个订单", "刚才那张问题工单").
+_CN_BA_CONSTRUCTION = re.compile(r"把\S{1,12}?(?P<verb>" + "|".join(_CN_ACTION_VERBS) + r")")
+
+# First-person desire or explicit request for help. These are the frame; the
+# verb alone is a topic.
+#
+# `我想`/`我要`/`需要` are the desire form (the counterpart of the English
+# `_DESIRE_VERBS`), and `帮我`/`麻烦`/`请` are the request form. `请` is
+# last and is the weakest: "请说明退款政策" is a request for *information*,
+# so it is only honoured when a verb of the platform-acting kind follows
+# immediately.
+_CN_REQUEST_FRAME = re.compile(
+    r"(?:帮我|帮忙|麻烦|我要|我想|我需要|需要|请)"
+    r"(?P<verb>" + "|".join(_CN_ACTION_VERBS) + r")"
+)
+
+# Objects that make a request concrete. Chinese does not need a determiner,
+# but the verb being *followed by something* is what distinguishes an action
+# from a compound noun: `申请退款` is a request, while `退款申请流程` (the
+# refund-application process) is a topic.
+#
+# Matched as "any CJK character follows the verb", which is the closest
+# available analogue to the English object marker. It is deliberately loose:
+# a false positive here only promotes the utterance to the write gateway,
+# where `select_write_tools` still has to find a candidate and the confirmation
+# step still has to be satisfied by a person - whereas a false *negative*
+# leaves a refund request being answered from a policy document.
+_CN_OBJECT = re.compile(r"[\u4e00-\u9fff]")
+
+# A procedure question asks to be told how something works, and must not be
+# read as a request however many verbs and objects it carries - the Chinese
+# counterpart of `_PROCEDURE_QUESTION`. `怎么`/`如何`/`怎样` are the
+# interrogative openers, and `吗`/`呢` are sentence-final question particles
+# that a request never carries.
+_CN_PROCEDURE = re.compile(r"(?:怎么|如何|怎样|什么|哪些|哪|是否|能否|多久|多少|什么时候)")
+_CN_QUESTION_PARTICLE = re.compile(r"[吗呢吧]\s*[?？]?\s*$")
+
+# --- Chinese live-data questions: the read path's counterpart of _LIVE_DATA -
+
+# `_LIVE_DATA` is the signal that sends "where is my order" to `business_read`,
+# and it was English-only. Measured 2026-09-22, five Chinese phrasings of
+# exactly that question - "我的订单 SO-9001 到哪了", "SO-9001 什么时候发货",
+# "帮我查一下订单 SO-9001 的状态", "订单 SO-9001 现在什么状态", "SO-9001 发货了
+# 吗" - all routed to `knowledge_qa` and selected **zero** read tools, while the
+# two English equivalents selected `order.get_status`.
+#
+# The cost is larger than a missing card. `business_read` is the only route into
+# the identity gate (feature 2.2/2.5), so a Chinese customer asking about their
+# order never reached the "prove this order is yours" prompt at all: the whole
+# verify-then-read flow was unreachable in the language the pilot's customers
+# actually write. ADR 0006 makes the same point from the other side - a
+# live-data question must not be answered from the corpus, so `knowledge_qa` is
+# the wrong route for it even when the honest outcome is abstention.
+#
+# Two properties stop this from swallowing the policy questions the guard tests
+# protect:
+#
+# 1. **Every frame names a state in progress, not a topic.** `到哪了`,
+#    `什么时候发货`, `发货了吗`, `查…状态`. A topic noun alone is never enough:
+#    "PCB 订单的增值税专用发票怎么开？" and "ADS1110 现在有货吗？" each name a
+#    record and must stay on the knowledge path, and neither carries a frame.
+# 2. **`多久` / `几天` are deliberately absent from the ETA frame.** They ask how
+#    long the *process* takes - "退款多久到账？" is the existing guard test's own
+#    case, and the corpus answers it - whereas `什么时候` asks about this record.
+#
+# Same substring caveat as the rest of this vocabulary: CJK has no word
+# boundaries, so `\b` cannot appear here and every alternative is a substring
+# match.
+_CN_LIVE_DATA = re.compile(
+    # Where has it got to - "我的订单 SO-9001 到哪了".
+    r"到(?:哪|哪儿|哪里)了?"
+    # An ETA question - "SO-9001 什么时候发货". See (2) above for why not 多久.
+    r"|什么时候\S{0,4}?(?:发货|发出|出库|寄出|到货|到账|送达|送到|处理|完成)"
+    # A completion question - "SO-9001 发货了吗".
+    r"|(?:发货|发出|出库|寄出|到货|到账|送达|送到|处理|完成)了\s*[吗嘛么没]"
+    # An explicit lookup of a named record - "帮我查一下订单 SO-9001 的状态".
+    r"|(?:查|查询|查下|看一下|看下|看看|问一下|告诉我)\S{0,8}?"
+    r"(?:状态|进度|物流|快递|运单|单号|订单|工单|发票|库存|余额|用量|配额)"
+    # A status interrogative - "订单 SO-9001 现在什么状态".
+    r"|(?:什么|啥|怎么样|咋样|如何)\s*(?:状态|进度)"
+    r"|(?:状态|进度)\s*(?:怎么样|咋样|如何|是什么)"
+    # A balance/quota question - "我的额度还有多少".
+    r"|(?:余额|额度|配额|用量|库存)\S{0,4}?(?:还有|剩余|剩|是多少)"
+)
+
+# The counter-guard, and a deliberately narrow one. `_CN_PROCEDURE` cannot be
+# reused here: it lists `什么` / `哪` / `什么时候`, which are the frames above
+# ("现在什么状态", "到哪了", "什么时候发货"), so it would veto every true
+# positive. What is actually needed is the *how-to* question, where the customer
+# asks for the procedure rather than for their own record: "怎么查订单状态"
+# matches the lookup frame and is a knowledge question.
+_CN_HOW = re.compile(r"(?:怎么|如何|怎样|为什么)")
+
+
+def _is_cn_action_request(question: str) -> bool:
+    """A Chinese request for the platform to act.
+
+    Deliberately narrow, in the same spirit as `_is_action_request`: the frame
+    and the verb must both be present, and a question shape disqualifies the
+    utterance outright. The cost of a miss is that the abstention gate still
+    decides on the knowledge path; the cost of a false positive is a policy
+    question routed to the write gateway, which is worse - so the question
+    guard is checked first.
+    """
+    stripped = question.strip()
+    if _CN_PROCEDURE.search(stripped) or _CN_QUESTION_PARTICLE.search(stripped):
+        return False
+    if _CN_TICKET_REQUEST.search(stripped):
+        # The measure-word form, which the frame+verb path cannot see because
+        # "建一张工单" has the verb and the noun separated.
+        return True
+    if _CN_BA_CONSTRUCTION.search(stripped):
+        # Object-before-verb, the way Chinese normally phrases an instruction
+        # about a specific thing: "把这张单转给人工".
+        return True
+    match = _CN_REQUEST_FRAME.search(stripped)
+    if match is None:
+        return False
+    # The verb must be followed by an object inside the same clause, so
+    # "我要退款" fires but a bare `退款` used as a topic does not.
+    rest = stripped[match.end() :]
+    if not rest:
+        # A bare "我要退款" ends at the verb and is still a request: the verb
+        # IS the object ("I want a refund"). Accepted only for the desire
+        # frame, where the customer's own want is the request.
+        return match.group(0).startswith(("我要", "我想", "我需要"))
+    return bool(_CN_OBJECT.match(rest))
+
+
+# The Chinese counterpart of `_HUMAN_REQUEST`. Kept separate from the action
+# vocabulary because asking for a person is a *routing decision the customer
+# has already made*, and `_HUMAN_REQUEST` documents it as honoured
+# "immediately and unconditionally" - which was true for English only.
+_CN_HUMAN_REQUEST = re.compile(r"(?:人工客服|人工|客服|真人|专员|经理|转人工|转给人工|找个?人)")
+
+
+def _is_cn_human_request(question: str) -> bool:
+    """A Chinese request for a person, as opposed to a question about one.
+
+    `转人工` appears in both "转人工客服" (transfer me) and "为什么要转人工"
+    (why does it transfer). Treating the second as a request overrules the
+    customer - the exact failure `_HUMAN_REQUEST`'s "immediately and
+    unconditionally" promise exists to prevent - so the question shape vetoes
+    the match, the same way it does on the write path.
+
+    Kept as a function rather than an inline `and not` so the ordered
+    precedence is local to the Chinese branch: English `_HUMAN_REQUEST` is
+    left untouched, so no existing English case changes its signals.
+    """
+    if not _CN_HUMAN_REQUEST.search(question):
+        return False
+    stripped = question.strip()
+    return not (_CN_PROCEDURE.search(stripped) or _CN_QUESTION_PARTICLE.search(stripped))
 
 
 # A procedure question asks to be *told* how something works. This — not any
@@ -687,8 +1122,18 @@ def classify(question: str) -> IntentDetection:
     a guess: an uncertain routing decision is cheaper to resolve with one
     question than to discover from a wrong answer.
     """
-    scene, scene_confidence, scene_signals = _detect_scene(question)
-    kinds, kind_confidence, kind_signals = _detect_kinds(question)
+    # 3.8: classify against a homophone-corrected copy of the utterance. A
+    # pinyin slip ("定单" for "订单") otherwise misses the vocabulary entirely
+    # and the question is routed by whatever else it happens to contain - or by
+    # nothing. The customer's own text is not rewritten anywhere: this copy
+    # exists only for matching, and the substitutions are recorded so the
+    # routing decision stays explainable.
+    corrections = corrections_in(question)
+    matching_text = normalize_for_matching(question)
+
+    scene, scene_confidence, scene_signals = _detect_scene(matching_text)
+    kinds, kind_confidence, kind_signals = _detect_kinds(matching_text)
+    line, _line_confidence, line_signals = _detect_business_line(matching_text)
     primary = kinds[0]
     secondary = tuple(kinds[1:])
 
@@ -710,7 +1155,9 @@ def classify(question: str) -> IntentDetection:
         action=action,
         confidence=confidence,
         multi_intent=len(kinds) > 1,
-        signals=tuple(scene_signals + kind_signals),
+        signals=tuple(scene_signals + kind_signals + line_signals),
+        business_line=line,
+        corrections=corrections,
     )
 
 

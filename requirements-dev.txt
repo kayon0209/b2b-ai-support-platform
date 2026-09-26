@@ -20,6 +20,10 @@ pytest-asyncio>=0.24
 # The tool_gateway unit suite runs against an in-memory async SQLite engine,
 # so the aiosqlite driver is a test-time requirement, not an optional extra.
 aiosqlite>=0.20
-ruff>=0.8,<0.9
+# Pinned to the ruff the tree is actually linted and formatted with. The
+# previous pin (>=0.8,<0.9) predated the formatter's stable style change, so CI
+# disagreed with every local run; verified 2026-09-23 that 0.16.8 passes both
+# `ruff check` and `ruff format --check` over the whole CI scope.
+ruff>=0.16,<0.17
 mypy>=1.13
 detect-secrets>=1.5

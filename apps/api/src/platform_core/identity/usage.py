@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_core.agent_runtime.models import AgentRun
+from platform_core.agent_runtime.models import AgentRun, RunStatus
 from platform_core.api import (
     error_response,
     get_context,
@@ -80,6 +80,10 @@ class UsageSnapshot:
     prompt_tokens: int
     completion_tokens: int
     quota: int | None
+    # Accepted, never executed, closed by the retention sweep: excluded from
+    # `runs_used`, reported so the gap is explainable rather than looking like
+    # a miscount.
+    abandoned: int = 0
 
     @property
     def remaining(self) -> int | None:
@@ -94,6 +98,7 @@ class UsageSnapshot:
             "period_start": self.period_start,
             "period_end": self.period_end,
             "runs_used": self.runs_used,
+            "abandoned": self.abandoned,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "quota": self.quota,
@@ -117,6 +122,21 @@ async def usage_snapshot(
 
     Runs created before `started_at` was populated have no timestamp and are
     not counted; the quality dashboard treats them the same way.
+
+    Accepted-but-pending runs *are* counted, and that is deliberate: this
+    counter is also the admission gate (`chat_service.queue_agent_run` refuses
+    a burst with 429 when `over_quota`), so it must see work that has been
+    admitted and not yet run. A cheaper-looking predicate - "count only rows
+    with a question hash" - would leave the gate blind to every freshly queued
+    run and admit an unbounded burst. `test_usage_counts_queued_runs` is the
+    test that stops that change being made.
+
+    What is excluded is the run the retention sweep closed as `abandoned`:
+    accepted, never executed, no longer waiting. Counting those inflated a
+    tenant's usage permanently - measured 2026-09-22, one tenant, one month:
+    usage read 76 against 42 that executed. The exclusion is reported as
+    `abandoned` rather than applied silently, so "why is usage lower than the
+    rows I can see" has an answer on the screen.
     """
     ts = int(time.time()) if now is None else now
     start, end = period_bounds(ts)
@@ -126,10 +146,25 @@ async def usage_snapshot(
         AgentRun.started_at >= start,
         AgentRun.started_at < end,
     )
+    not_abandoned = AgentRun.status != RunStatus.ABANDONED.value
 
     runs_used = int(
         (
-            await session.execute(select(func.count()).select_from(AgentRun).where(*in_period))
+            await session.execute(
+                select(func.count()).select_from(AgentRun).where(*in_period, not_abandoned)
+            )
+        ).scalar_one()
+    )
+    abandoned = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(AgentRun)
+                .where(
+                    *in_period,
+                    AgentRun.status == RunStatus.ABANDONED.value,
+                )
+            )
         ).scalar_one()
     )
     prompt_tokens, completion_tokens = (
@@ -156,6 +191,7 @@ async def usage_snapshot(
         prompt_tokens=int(prompt_tokens or 0),
         completion_tokens=int(completion_tokens or 0),
         quota=None if quota is None else int(quota),
+        abandoned=abandoned,
     )
 
 

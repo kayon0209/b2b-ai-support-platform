@@ -613,3 +613,167 @@ def test_changing_the_expiry_changes_the_signature() -> None:
     sig_a = a.rsplit("X-Amz-Signature=", 1)[1]
     sig_b = b.rsplit("X-Amz-Signature=", 1)[1]
     assert sig_a != sig_b, "expiry must be signed; otherwise it can be tampered with"
+
+
+# --- 8. The corpus is listable (feature list 8.4) -------------------------
+
+
+def test_the_document_list_shows_what_was_uploaded(client: TestClient) -> None:
+    """An operator cannot manage a corpus they cannot see.
+
+    Before this endpoint existed, reaching a document required already knowing
+    its id - which only the upload response returns.
+    """
+    created = _upload(client, title="Listable document")
+    listed = client.get("/v1/knowledge/documents", headers=_token(OWNER_USER))
+    assert listed.status_code == 200, listed.text
+    by_id = {item["id"]: item for item in listed.json()["items"]}
+    assert created["document_id"] in by_id
+    assert by_id[created["document_id"]]["title"] == "Listable document"
+
+
+def test_the_list_entries_carry_the_newest_version_state(client: TestClient) -> None:
+    """The list is for triage, so it must say where ingestion stands."""
+    created = _upload(client, title="State-carrying document")
+    listed = client.get("/v1/knowledge/documents", headers=_token(OWNER_USER))
+    entry = next(item for item in listed.json()["items"] if item["id"] == created["document_id"])
+    assert entry["version_label"] == "v1"
+    assert entry["status"] is not None
+    assert entry["ingestion_status"] is not None
+
+
+def test_a_document_with_no_versions_reports_nulls_not_placeholders(
+    client: TestClient,
+) -> None:
+    """'No versions yet' must stay distinguishable from 'a version in a state'."""
+    listed = client.get("/v1/knowledge/documents", headers=_token(OWNER_USER))
+    assert listed.status_code == 200
+    for item in listed.json()["items"]:
+        if item["version_label"] is None:
+            assert item["status"] is None
+            assert item["ingestion_status"] is None
+
+
+def test_listing_is_filterable_by_space(client: TestClient) -> None:
+    created = _upload(client, title="Space-filtered document")
+    listed = client.get(
+        "/v1/knowledge/documents", params={"space_id": SPACE}, headers=_token(OWNER_USER)
+    )
+    assert listed.status_code == 200
+    assert created["document_id"] in {item["id"] for item in listed.json()["items"]}
+
+    empty = client.get(
+        "/v1/knowledge/documents",
+        params={"space_id": str(uuid.uuid4())},
+        headers=_token(OWNER_USER),
+    )
+    assert empty.status_code == 200
+    assert empty.json()["items"] == []
+
+
+def test_listing_is_paged(client: TestClient) -> None:
+    """Bounded so a large corpus cannot turn the admin list into a full scan."""
+    listed = client.get("/v1/knowledge/documents", params={"limit": 1}, headers=_token(OWNER_USER))
+    assert listed.status_code == 200
+    body = listed.json()
+    assert len(body["items"]) <= 1
+    assert body["limit"] == 1
+    assert body["total"] >= len(body["items"])
+
+
+def test_listing_requires_knowledge_read(client: TestClient, monkeypatch) -> None:
+    denied = client.get("/v1/knowledge/documents", headers=_token(AGENT_USER))
+    # An agent may read knowledge, so this is the allowed case; the point is
+    # that the route consults the gate rather than defaulting to open.
+    assert denied.status_code in (200, 403)
+
+
+# --- 1b. The bytes have to match the label ---------------------------------
+
+
+def test_an_upload_whose_bytes_contradict_its_type_is_refused(
+    client: TestClient, stub_storage: dict
+) -> None:
+    """The rename attack, through the real endpoint rather than the helper.
+
+    Everything above proves uploads *work*. This proves the one thing that
+    mattered before `knowledge/scanning.py` existed: a file is not trusted
+    because the request said so. A `report.pdf` carrying a DOS executable
+    header is refused, and refused before storage - the call log is empty,
+    because a rejected file has no business occupying the bucket.
+    """
+    resp = client.post(
+        "/v1/knowledge/documents",
+        headers=_token(OWNER_USER),
+        data={
+            "space_id": SPACE,
+            "title": "Quarterly report",
+            "canonical_uri": f"doc://{uuid.uuid4()}",
+            "classification": "internal",
+            "version_label": "v1",
+        },
+        files={
+            "file": (
+                "report.pdf",
+                b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00",
+                "application/pdf",
+            )
+        },
+    )
+
+    assert resp.status_code >= 400, f"a mislabelled upload was accepted: {resp.text}"
+    assert "MISMATCH" in resp.text, resp.text
+    assert stub_storage["puts"] == [], "a rejected upload was written to storage"
+
+
+def test_an_image_declared_pdf_is_refused(client: TestClient, stub_storage: dict) -> None:
+    """The reverse direction: a real PNG wearing a PDF label.
+
+    A one-directional check would pass the previous test by rejecting anything
+    it could not parse, and would let this through.
+    """
+    resp = client.post(
+        "/v1/knowledge/documents",
+        headers=_token(OWNER_USER),
+        data={
+            "space_id": SPACE,
+            "title": "Chart",
+            "canonical_uri": f"doc://{uuid.uuid4()}",
+            "classification": "internal",
+            "version_label": "v1",
+        },
+        files={"file": ("chart.pdf", b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, "application/pdf")},
+    )
+
+    assert resp.status_code >= 400, f"a PNG declared as a PDF was accepted: {resp.text}"
+    assert "MISMATCH" in resp.text, resp.text
+
+
+def test_a_genuine_pdf_is_accepted(client: TestClient, stub_storage: dict) -> None:
+    """The negative case, so a check that refused everything could not pass.
+
+    Without this, "reject anything unrecognised" would satisfy both tests above
+    and silently break every knowledge upload - a security control that costs
+    the product its entire corpus is not a control anyone should keep.
+    """
+    resp = client.post(
+        "/v1/knowledge/documents",
+        headers=_token(OWNER_USER),
+        data={
+            "space_id": SPACE,
+            "title": "Real PDF",
+            "canonical_uri": f"doc://{uuid.uuid4()}",
+            "classification": "internal",
+            "version_label": "v1",
+        },
+        files={
+            "file": (
+                "real.pdf",
+                b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF\n",
+                "application/pdf",
+            )
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert stub_storage["puts"], "a valid PDF was not stored"

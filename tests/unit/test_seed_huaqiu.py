@@ -87,6 +87,18 @@ def test_the_connector_provider_is_the_one_the_registry_resolves(seed: object) -
 def test_flag_keys_are_the_ones_the_code_reads(seed: object) -> None:
     assert seed.FLAG_BUSINESS_READ == Settings().flag_business_read_tools  # type: ignore[attr-defined]
     assert seed.FLAG_RERANK == RERANK_FLAG_KEY  # type: ignore[attr-defined]
+    assert seed.FLAG_BUSINESS_WRITE == Settings().flag_business_write_tools  # type: ignore[attr-defined]
+
+
+def test_the_agent_write_path_is_seeded_off(seed: object) -> None:
+    """A seed that enables the write path enables it for every pilot at once.
+
+    The flag is seeded so the switch is visible on the FeatureFlags page, and
+    seeded `False` so turning it on stays a deliberate act by someone who is
+    watching the proposal queue.
+    """
+    assert seed.FLAG_BUSINESS_WRITE != seed.FLAG_BUSINESS_READ  # type: ignore[attr-defined]
+    assert seed.BUSINESS_WRITE_ENABLED is False  # type: ignore[attr-defined]
 
 
 def test_business_read_is_pilot_targeted_not_left_to_the_rollout_hash(

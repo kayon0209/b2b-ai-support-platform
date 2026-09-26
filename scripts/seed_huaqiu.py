@@ -119,6 +119,17 @@ FLAG_BUSINESS_READ = "agent.business_read_enabled"
 # partial rollout so its effect is measured, not assumed.
 FLAG_RERANK = "agent.rerank_enabled"
 RERANK_ROLLOUT_PERCENT = 10
+# The agent's write path. Seeded OFF, and deliberately NOT tied to the read
+# connector: a tenant can let the AI answer "where is my order" long before it
+# lets the AI propose a change to an external system, and enabling the second
+# by association with the first is the coupling the separate flag exists to
+# prevent. The row is seeded rather than left absent so the switch is visible
+# on the FeatureFlags page instead of only existing in a config file.
+FLAG_BUSINESS_WRITE = "agent.business_write_enabled"
+# A named constant rather than a literal in the flags tuple, so "the seed does
+# not turn the write path on" is something a test can assert instead of
+# something a reader has to notice.
+BUSINESS_WRITE_ENABLED = False
 
 # Ordered children-first: a superset of seed_admin_demo's list plus the tables
 # this script fills (aliases, departments, accounts, spaces, connectors).
@@ -309,6 +320,12 @@ def main() -> None:
         flags = (
             (FLAG_BUSINESS_READ, connector_ready, 0, "read tools need the ERP connector"),
             (FLAG_RERANK, True, RERANK_ROLLOUT_PERCENT, "partial rollout, measured"),
+            (
+                FLAG_BUSINESS_WRITE,
+                BUSINESS_WRITE_ENABLED,
+                0,
+                "agent write proposals; off until a human watches the queue",
+            ),
         )
         for key, enabled, percent, description in flags:
             flag_id = str(uuid.uuid5(tenant_id, f"flag:{key}"))
@@ -361,6 +378,7 @@ def main() -> None:
     print(f"  erp connector      : {'seeded' if connector_ready else 'NOT configured'}")
     print(f"  {FLAG_BUSINESS_READ}: {'on' if connector_ready else 'off (no connector)'}")
     print(f"  {FLAG_RERANK}: {RERANK_ROLLOUT_PERCENT}% rollout")
+    print(f"  {FLAG_BUSINESS_WRITE}: off (enable from the console once the queue is watched)")
     print("next: upload the corpus into the spaces, then run the stage-1 acceptance")
     print("     gates (scripts/run_eval.py) against the huaqiu eval cases.")
 

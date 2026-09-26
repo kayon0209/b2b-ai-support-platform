@@ -89,6 +89,10 @@ export function PromptRelease() {
               value={template}
               onChange={(e) => setTemplate(e.target.value)}
               placeholder={t("prompts.templatePlaceholder")}
+              // A placeholder is not an accessible name: it is not reliably
+              // announced and it disappears the moment someone types. These two
+              // controls were the only ones in the console without one.
+              aria-label={t("prompts.templateLabel")}
               list="prompt-templates"
             />
             <datalist id="prompt-templates">
@@ -120,11 +124,12 @@ export function PromptRelease() {
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           placeholder={t("prompts.bodyPlaceholder")}
+          aria-label={t("prompts.bodyLabel")}
         />
         <div className="toolbar">
           <button
             className="btn btn-primary"
-            disabled={!draft.trim() || !template.trim()}
+            disabled={action.busy || !draft.trim() || !template.trim()}
             onClick={() => {
               if (!draft.trim() || !template.trim()) return;
               act(
@@ -187,7 +192,7 @@ export function PromptRelease() {
                   </button>
                   <button
                     className="btn"
-                    disabled={v.published}
+                    disabled={action.busy || v.published}
                     onClick={() => act(`/v1/prompts/${v.id}/candidate`, undefined, t("prompts.submitted"))}
                   >
                     {t("prompts.candidate")}

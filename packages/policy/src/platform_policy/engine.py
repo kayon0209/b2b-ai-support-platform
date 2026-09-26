@@ -143,7 +143,32 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
         }
     ),
     "support_viewer": frozenset({Action.CASE_READ, Action.KNOWLEDGE_READ}),
-    "integration_service": frozenset({Action.TOOL_READ, Action.TOOL_WRITE_LOW}),
+    # The AI agent's own identity. Its authority is shaped by the tool
+    # lifecycle rather than by a job title:
+    #
+    # - TOOL_READ lets it answer live-data questions (plan 3.2).
+    # - TOOL_WRITE_LOW lets it perform a write the catalog classifies as
+    #   needing no confirmation (a notification, not a customer-record
+    #   mutation). That risk class exists precisely to be executed
+    #   unattended; withholding the action would leave the class with no
+    #   executor.
+    # - TOOL_WRITE_CONFIRMED lets it *propose* a confirmed write. AGENTS.md
+    #   rule 7 says an LLM may propose a write action, and withholding this
+    #   made that rule unimplementable: the gateway re-checks the risk
+    #   class's action at propose time, so the agent was denied before any
+    #   human could see the proposal. Proposing is inert, and the grant does
+    #   not become a way to approve: the only path that creates an
+    #   ActionConfirmation is `POST /v1/tool-proposals/{id}/confirm`, which
+    #   requires CASE_UPDATE, which this role does not hold. So the agent can
+    #   put a confirmed write in front of a human and cannot be the human.
+    #   (The complement is asserted in the policy tests: adding CASE_UPDATE
+    #   here would silently turn the agent into its own approver.)
+    # - TOOL_HUMAN_APPROVAL deliberately stays with tenant_owner. That class
+    #   is the top of the ladder and must be unreachable by the agent at
+    #   every stage, propose included.
+    "integration_service": frozenset(
+        {Action.TOOL_READ, Action.TOOL_WRITE_LOW, Action.TOOL_WRITE_CONFIRMED}
+    ),
     "auditor": frozenset(
         {
             Action.AUDIT_READ,

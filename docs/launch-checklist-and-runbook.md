@@ -5,6 +5,13 @@
 **清单里的每一条阈值都必须有一个对应的门禁或指标**——写在这里却没有门禁的项，
 视为未实现，不许在验收表上打勾。
 
+> §1.3 的两条阈值（成本 p95、单次运行 p95 延迟）现在由
+> `infra/kubernetes/70-alerts.yaml` 中的 `PlatformRunCostP95High` 与
+> `PlatformRunLatencyP95High` 承接，阈值与本表逐字一致。§2 的错误回答触发信号由
+> `PlatformCitationValidationUnsupported` 承接。该文件与清单的一致性由
+> `apps/api/tests/unit/test_alert_rules.py` 强制：删掉任一条告警、或把查询的指标名
+> 改成服务实际不导出的名字，测试即失败。
+
 ---
 
 ## 1. 上线验收清单
@@ -19,6 +26,7 @@
 | RLS FORCE | 全部租户表 | `test_tenant_owned_tables_force_row_level_security` |
 | append-only 表不可改 | audit/billing | `test_schema_privileges` |
 | bootstrap token | 生产环境禁用 | `config._assert_auth_is_configured` 启动即拒 |
+| 前端 sourcemap 不外发 | 对外可取的 `*.map` = 0 | Vite 生产构建关闭 sourcemap；部署仍须确认静态站点未暴露历史 `.map` 文件 |
 
 ### 1.2 质量（固定语料，`scripts/run_eval.py`）
 

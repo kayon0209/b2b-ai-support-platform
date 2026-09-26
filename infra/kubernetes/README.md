@@ -51,7 +51,7 @@ directory that looks validated and is not is worse than one that admits it:
 | Check | Status |
 |---|---|
 | `kubectl kustomize infra/kubernetes` builds, 20 objects | **run** |
-| Every HA property is asserted by `apps/api/tests/unit/test_kubernetes_manifests.py` (27 tests) | **run** |
+| Every HA property is asserted by `apps/api/tests/unit/test_kubernetes_manifests.py` (29 tests) | **run** |
 | `kubectl apply --dry-run=client` | **not run** - it needs API discovery, so it cannot work without a cluster |
 | Any of it applied to a real cluster | **not run** |
 
@@ -71,10 +71,11 @@ immediately instead of running with more privilege than intended.
 Kubernetes API. A mounted token would be a credential with no purpose, readable
 by anything that got code execution in the pod.
 
-**The API connects as `platform_app`, the migration Job as the owner.** The
-owner role is a superuser with `rolbypassrls`; if the API used it, row-level
-security would stop being a defence and become documentation. The two URLs live
-in two Secrets so reading one does not hand over the other.
+**The API and workers connect as `platform_app`, the migration Job as the
+owner.** The owner role is a superuser with `rolbypassrls`; if the API used it,
+row-level security would stop being a defence and become documentation. The
+workload DSNs live in `platform-secrets`; the migration-only owner DSN is kept
+in a separate Secret so request debugging does not hand over schema authority.
 
 **Ingress is default-deny, and egress excludes `169.254.0.0/16`.** The egress
 rule allows 443 anywhere (the providers' address ranges change and pinning them
