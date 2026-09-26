@@ -38,6 +38,7 @@ from observability_metrics import get_metrics
 from platform_core.agent_runtime.conversation import Turn
 from platform_core.agent_runtime.models import RunStatus
 from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
+from platform_core.agent_runtime.semantic.validator import CapabilityView
 from platform_core.db import app_role_url, session_scope_with_url
 from platform_core.identity.tenant_context import TenantContext, tenant_session
 from platform_core.retrieval.hybrid import PrincipalScope
@@ -757,6 +758,23 @@ async def process_event(
     )
     await _persist_memory(session, event=event, question=question, outcome=outcome)
 
+    # Shadow classification, after the run has been persisted and the answer
+    # dispatched.
+    #
+    # Placed here and not inline for two reasons. First, the customer's answer
+    # is already decided: a shadow timeout must not become a customer-visible
+    # failure of a feature that is supposed to change nothing. Second, it gets
+    # its own transaction below, so a failure to record a comparison cannot
+    # roll back the run that did succeed.
+    shadow_result = await _record_shadow_after_run(
+        session,
+        event=event,
+        conversation_ref_id=conversation_ref_id,
+        question=question,
+        history=history,
+        deps=deps,
+    )
+
     metrics.inbox_events_total.labels(result=outcome.status.value).inc()
     logger.info(
         "event_processed",
@@ -767,7 +785,113 @@ async def process_event(
         route=outcome.route,
         latency_ms=outcome.latency_ms,
     )
+    if shadow_result is not None:
+        # Counted, not logged with the text: the label vocabulary is closed and
+        # the customer's words are not in it.
+        metrics.inbox_events_total.labels(result=f"shadow_{shadow_result}").inc()
     return outcome.status
+
+
+async def _tenant_tool_names(
+    session: AsyncSession, tenant_id: uuid.UUID
+) -> dict[str, CapabilityView]:
+    """The tenant's registered tools, with the registry's own risk class.
+
+    Read through the tenant session, so RLS already restricts this to the
+    tenant's rows plus the platform catalog. The risk class is the registry's
+    value, never anything a model supplied.
+    """
+    from platform_core.tool_gateway.models import ToolDefinition
+
+    rows = (
+        await session.execute(
+            select(ToolDefinition).where(
+                (ToolDefinition.tenant_id == tenant_id) | ToolDefinition.tenant_id.is_(None)
+            )
+        )
+    ).scalars()
+    return {row.name: CapabilityView(tool_name=row.name, risk_class=row.risk) for row in rows}
+
+
+async def _record_shadow_after_run(
+    session: AsyncSession,
+    *,
+    event: ClaimedEvent,
+    conversation_ref_id: uuid.UUID,
+    question: str,
+    history: list[Turn],
+    deps: OrchestratorDeps,
+) -> str | None:
+    """Record a shadow assessment, or say why not.
+
+    Returns a short reason code for the metric label, or None when the tenant
+    has not enabled shadow mode (the overwhelmingly common case, and not
+    worth a label).
+
+    Every failure is swallowed. The alternative - letting an exception here
+    propagate - would mark the inbox event failed after the customer had
+    already been answered, and the retry would re-run the whole agent.
+    """
+    from platform_core.agent_runtime.semantic.modes import (
+        FLAG_SHADOW,
+        resolve_mode,
+    )
+    from platform_core.agent_runtime.semantic.shadow import (
+        ShadowRequest,
+        capabilities_for_shadow,
+        record_shadow,
+    )
+    from platform_core.config import get_settings
+    from platform_core.knowledge import flag_service
+
+    try:
+        settings = get_settings()
+        decisions = await flag_service.evaluate_many(
+            session,
+            flag_keys=[FLAG_SHADOW],
+            tenant_id=event.tenant_id,
+            defaults={FLAG_SHADOW: False},
+        )
+        resolution = resolve_mode(settings, {k: d.enabled for k, d in decisions.items()})
+        if resolution.mode.value != "shadow":
+            return None
+
+        # Only the tools this tenant actually has, so the model is not asked
+        # about capabilities the platform cannot serve. `capabilities_for_shadow`
+        # adds back the task-kind vocabulary, so a read and a write are both
+        # visible to the model and the refusal is recorded rather than hidden.
+        from platform_core.tool_gateway import registry
+
+        await registry.ensure_tool_definitions(session, tenant_id=event.tenant_id)
+        available = capabilities_for_shadow(await _tenant_tool_names(session, event.tenant_id))
+
+        outcome = await record_shadow(
+            session,
+            ShadowRequest(
+                tenant_id=event.tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                turn_id=str(event.minimized_payload.get("message_id") or event.delivery_id),
+                turn_text=question,
+                # `Turn.ref` is the conversation-local turn id the semantic
+                # validator checks evidence offsets against. A turn without one
+                # is skipped rather than given a synthetic id: an evidence
+                # span that points at an id the model was never shown is
+                # exactly what the validator refuses.
+                history=[(t.ref, t.text) for t in history[-8:] if getattr(t, "ref", None)],
+                lease_owner_type="ai",
+                capabilities=available,
+                turn_created_at=int(event.received_at or time.time()),
+            ),
+            provider=deps.generator,
+        )
+        return "recorded" if outcome.recorded else outcome.reason.lower()
+    except Exception:  # noqa: BLE001 - a shadow failure must not affect the run
+        logger.warning(
+            "shadow_record_failed",
+            delivery_id=event.delivery_id,
+            conversation_ref_id=str(conversation_ref_id),
+        )
+        return "failed"
 
 
 async def drain_once(
