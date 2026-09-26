@@ -13,12 +13,28 @@ metadata:
   namespace: b2b-support
 data:
   APP_ENVIRONMENT: "production"
-  # Inside the cluster, so the in-cluster Service names. The API connects as
-  # the non-bypass role (`platform_app`), never as the migration owner: the
-  # migration owner is a superuser and would bypass row-level security.
-  APP_DATABASE_URL: "postgresql+psycopg://platform_app:CHANGE_ME@postgres-primary.b2b-support.svc.cluster.local:5432/platform"
+  # Database DSNs live in Secret; this ConfigMap only carries non-secret
+  # service discovery and pool/rate-budget settings.
+  APP_DATABASE_POOL_SIZE: "2"
+  APP_DATABASE_MAX_OVERFLOW: "0"
+  APP_DATABASE_APP_POOL_SIZE: "3"
+  APP_DATABASE_APP_MAX_OVERFLOW: "0"
+  APP_RATE_LIMIT_REQUESTS: "600"
+  APP_RATE_LIMIT_WORKBENCH_REQUESTS: "24000"
+  APP_RATE_LIMIT_WINDOW_SECONDS: "60"
+  APP_RATE_LIMIT_ANONYMOUS_REQUESTS: "300"
+  # Per-visitor budget on the customer surface, charged on top of the address
+  # bucket. Without it every customer behind one corporate NAT shares a
+  # budget, and one chatty customer spends everyone's.
+  APP_RATE_LIMIT_VISITOR_REQUESTS: "60"
+  # Peers whose X-Forwarded-For may be believed. Empty here on purpose: the
+  # correct value is the ingress controller's pod network, which changes with
+  # the cluster, and a wrong-but-populated list would trust a header from a
+  # peer that is not a proxy at all. Set it from the cluster's actual ingress
+  # CIDR - see docs/deployment-and-operations.md - or every request shares the
+  # ingress pod's own address as its bucket.
+  APP_RATE_LIMIT_TRUSTED_PROXIES: ""
   APP_REDIS_URL: "redis://redis.b2b-support.svc.cluster.local:6379/0"
-  APP_CHATWOOT_BASE_URL: "https://support.example.com"
   APP_LLM_BASE_URL: "https://ai.gitee.com/v1"
   APP_LLM_MODEL: "qwen3.8-flash"
   APP_LLM_EMBEDDING_MODEL: "Qwen3-Embedding-8B"

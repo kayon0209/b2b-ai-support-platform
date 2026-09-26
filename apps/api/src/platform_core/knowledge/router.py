@@ -36,7 +36,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from platform_core.api import error_response, require_write_idempotency, tenant_session
 from platform_core.config import get_settings
@@ -51,6 +51,13 @@ router = APIRouter(prefix="/v1/knowledge", tags=["knowledge"])
 
 class ReadyIn(BaseModel):
     version_label: str | None = Field(default=None, max_length=63)
+
+
+class SpaceIn(BaseModel):
+    # `min_length=1` rejects the empty string at the edge; the service repeats
+    # the check because it is also reachable from tests and future callers, and
+    # a space whose name is whitespace is as unlistable as one with no name.
+    name: str = Field(min_length=1, max_length=255)
 
 
 class DownloadUrlIn(BaseModel):
@@ -214,6 +221,129 @@ async def upload_document(
         "content_hash": created.content_hash,
         "ingestion_status": created.ingestion_status,
     }
+
+
+@router.get("/documents")
+async def list_documents(
+    request: Request,
+    space_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Any:
+    """Documents in the tenant, with the state of their newest version.
+
+    Exists because an operator cannot manage a corpus they cannot see: before
+    this, reaching a document required already knowing its id, which only the
+    upload response returns. Feature list 8.4 (运营台).
+
+    Ordered by title rather than creation time because `documents` carries no
+    timestamp - the trigger-stamped `created_at` lives on `document_versions`.
+    Title ordering is at least stable, which is what a paged list needs.
+    """
+    ctx = _ctx_of(request)
+    denial = _gate(request, ctx, Action.KNOWLEDGE_READ, "knowledge.read")
+    if denial is not None:
+        return denial
+
+    from platform_core.knowledge.models import Document, DocumentVersion
+
+    # Bounded so a corpus with tens of thousands of documents cannot turn the
+    # admin list into an unbounded scan.
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    stmt = select(Document).where(Document.tenant_id == ctx.tenant_id)
+    if space_id:
+        try:
+            stmt = stmt.where(Document.space_id == _uuid(space_id, "space"))
+        except service.KnowledgeError as exc:
+            return _error(exc)
+
+    async with tenant_session(ctx) as session:
+        total = int(
+            (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+        )
+        documents = (
+            (await session.execute(stmt.order_by(Document.title).limit(limit).offset(offset)))
+            .scalars()
+            .all()
+        )
+
+        latest: dict[Any, Any] = {}
+        if documents:
+            # One extra query rather than a correlated subquery per document:
+            # a document has a handful of versions, so fetch them all and pick
+            # in Python instead of asking the database N times.
+            version_rows = (
+                (
+                    await session.execute(
+                        select(DocumentVersion)
+                        .where(
+                            DocumentVersion.tenant_id == ctx.tenant_id,
+                            DocumentVersion.document_id.in_([d.id for d in documents]),
+                        )
+                        .order_by(DocumentVersion.created_at.desc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in version_rows:
+                # Ordered newest-first, so the first row per document wins.
+                latest.setdefault(row.document_id, row)
+
+    items = []
+    for document in documents:
+        version = latest.get(document.id)
+        items.append(
+            {
+                "id": str(document.id),
+                "title": document.title,
+                "canonical_uri": document.canonical_uri,
+                "classification": document.classification,
+                "space_id": str(document.space_id),
+                "version_label": version.version_label if version else None,
+                # Null rather than "unknown": the UI needs to tell "no versions
+                # yet" from "a version in some state", and a placeholder string
+                # would hide that.
+                "status": version.status if version else None,
+                "ingestion_status": version.ingestion_status if version else None,
+            }
+        )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.post("/spaces")
+async def create_space(request: Request, body: SpaceIn) -> Any:
+    """Create a knowledge space.
+
+    Gated on `KNOWLEDGE_UPLOAD`, the same action an upload needs: a principal
+    who cannot put a document in a space has no business naming one. That
+    choice also keeps `support_agent` out - the role can read knowledge but
+    not change it, and creating a space is a change.
+
+    The write carries an Idempotency-Key like every other write here, enforced
+    by `_gate`, so a double-click cannot produce two identically named spaces.
+
+    Returns 200 rather than 201: no endpoint in this API returns 201 (zero
+    occurrences across `apps/api/src`), and clients written against that
+    convention branch on 200. Rest-correctness does not outweigh breaking
+    every caller for a status code nobody here uses.
+    """
+    ctx = _ctx_of(request)
+    denial = _gate(request, ctx, Action.KNOWLEDGE_UPLOAD, "knowledge.space.create")
+    if denial is not None:
+        return denial
+
+    try:
+        async with tenant_session(ctx) as session:
+            space = await service.create_space(
+                session, tenant_id=ctx.tenant_id, name=body.name, ctx=ctx
+            )
+    except service.KnowledgeError as exc:
+        return _error(exc)
+
+    return {"id": str(space.id), "name": space.name, "status": space.status}
 
 
 @router.get("/spaces")

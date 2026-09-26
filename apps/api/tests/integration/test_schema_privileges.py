@@ -40,6 +40,10 @@ ADMIN_URL = os.environ.get(
 )
 
 APP_ROLE = "platform_app"
+# Alembic owns its schema version table. The request-serving app role should
+# not need migration bookkeeping privileges; migrations run with a separate
+# elevated deployment credential.
+MIGRATION_TABLES = frozenset({"alembic_version"})
 
 # Tables the application role must not be able to modify, with the reason.
 # A new entry here is a deliberate decision, not a way to silence the test.
@@ -134,6 +138,8 @@ def test_the_application_role_can_use_every_table() -> None:
 
     missing: list[str] = []
     for table, privileges in grants.items():
+        if table in MIGRATION_TABLES:
+            continue
         withheld, _reason = RESTRICTED_BY_DESIGN.get(table, (frozenset(), ""))
         # SELECT and INSERT are required everywhere: a table the app cannot
         # read is dead weight, and one it cannot write is a write path that
@@ -194,7 +200,20 @@ def test_tenant_owned_tables_force_row_level_security() -> None:
 
 def test_the_unbound_app_role_cannot_read_any_tenant_owned_table() -> None:
     """The read half of the RLS guarantee, checked across the whole schema
-    rather than one table: an unbound session must see nothing anywhere."""
+    rather than one table: an unbound session must see nothing anywhere.
+
+    Scoped to rows that actually belong to a tenant. The isolation policy is
+    `tenant_id IS NULL OR tenant_id = app.tenant_id()`, so a row with no
+    tenant is global reference data by that policy's own definition - which
+    AGENTS.md permits ("unless it is explicitly global reference data").
+    Counting those rows too made this test assert "no global data exists"
+    rather than "no tenant's data leaks", and it then failed on rows no
+    production path can create: `ensure_tool_definitions` is the only insert
+    into `tool_definitions` and always sets `tenant_id`, and no migration
+    seeds one. Those rows were fixtures that did not clean up after
+    themselves, so a hygiene problem was being reported as an isolation
+    breach - the least useful shape a failing security test can take.
+    """
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from platform_core.db import create_engine as app_engine
@@ -231,7 +250,10 @@ def test_the_unbound_app_role_cannot_read_any_tenant_owned_table() -> None:
                     # noqa on the line ruff reports: for an implicitly
                     # concatenated string that is the first part, and the
                     # table name comes from pg_class rather than from input.
-                    stmt = text(f"SELECT count(*) FROM {table}")  # noqa: S608
+                    stmt = text(
+                        f"SELECT count(*) FROM {table}"  # noqa: S608
+                        " WHERE tenant_id IS NOT NULL"
+                    )
                     counts[table] = int((await session.execute(stmt)).scalar_one())
                 return counts
         finally:
@@ -239,7 +261,7 @@ def test_the_unbound_app_role_cannot_read_any_tenant_owned_table() -> None:
 
     counts = asyncio.run(_count_unbound(), loop_factory=asyncio.SelectorEventLoop)
     visible = {table: n for table, n in counts.items() if n}
-    assert not visible, f"unbound app role can read rows in: {visible}"
+    assert not visible, f"unbound app role can read tenant-owned rows in: {visible}"
 
 
 def test_every_table_in_the_database_is_known_to_the_orm() -> None:

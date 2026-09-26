@@ -38,6 +38,11 @@ def seed_tenant() -> None:
     yield
     with admin.begin() as conn:
         conn.execute(text("DELETE FROM case_conversations WHERE tenant_id = :t"), {"t": TENANT_A})
+        # Before `cases`: an escalation carries an FK to the case it belongs to,
+        # so deleting the case first raises `fk_case_escalation_case` and leaves
+        # the tenant dirty for the next run. The escalation link is exercised
+        # here because it is the other half of what priority claiming joins on.
+        conn.execute(text("DELETE FROM case_escalations WHERE tenant_id = :t"), {"t": TENANT_A})
         conn.execute(text("DELETE FROM cases WHERE tenant_id = :t"), {"t": TENANT_A})
         conn.execute(text("DELETE FROM tenants WHERE slug = 'case-test'"))
     admin.dispose()
@@ -173,3 +178,111 @@ def test_case_sla_deadlines_set_on_priority() -> None:
     frd, rd = _run(scenario())
     assert frd == 15 * 60  # 60min * 0.25
     assert rd == 2 * 60 * 60  # 8h * 0.25
+
+
+def test_a_case_created_from_a_conversation_records_the_link() -> None:
+    """`CaseConversation` had a reader and no writer.
+
+    `inbox_consumer.case_conversation_ref` joins it to decide which inbox
+    events belong to an escalated case. Nothing ever inserted a row, so the
+    join could only ever be empty - which means `worker.priority_claim_enabled`
+    changed no behaviour while reporting no error, and an operator turning it
+    on would have concluded it worked.
+
+    Both halves are asserted: the writer this adds, and that the reader's
+    meaning is still "a case with at least one escalation" rather than "any
+    case at all". Fixing the empty join by widening the filter would have
+    traded a silent no-op for a wrong one.
+    """
+    from sqlalchemy import select
+
+    from platform_core.cases.models import CaseConversation
+    from platform_core.cases.service import CaseService
+    from platform_core.db import create_engine
+    from worker.inbox_consumer import case_conversation_ref
+
+    conversation = uuid.uuid4()
+
+    async def scenario() -> tuple[int, list[uuid.UUID], list[uuid.UUID]]:
+        engine = create_engine(APP_URL)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        tid = uuid.UUID(TENANT_A)
+
+        async with factory() as session:
+            await session.execute(
+                text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT_A}
+            )
+            case = await CaseService(session).create_case(
+                tenant_id=tid,
+                subject="EQ 99001: confirm stackup before production",
+                category="eq_confirmation",
+                conversation_ref_id=conversation,
+            )
+            linked = (
+                (
+                    await session.execute(
+                        select(CaseConversation.conversation_ref_id).where(
+                            CaseConversation.case_id == case.id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            before = (await session.execute(case_conversation_ref())).scalars().all()
+            await session.execute(
+                text(
+                    "INSERT INTO case_escalations (id, tenant_id, case_id, clock, level, "
+                    "reason_code) VALUES (:i, :t, :c, 'first_response', 1, 'SLA_BREACH')"
+                ),
+                {"i": str(uuid.uuid4()), "t": TENANT_A, "c": str(case.id)},
+            )
+            after = (await session.execute(case_conversation_ref())).scalars().all()
+            await session.commit()
+
+        await engine.dispose()
+        return len(linked), list(before), list(after)
+
+    linked_count, before, after = _run(scenario())
+
+    assert linked_count == 1, "creating a case from a conversation did not record the link"
+    assert conversation not in before, "priority claiming matched a case that was never escalated"
+    assert conversation in after, "an escalated case's conversation is not discoverable"
+
+
+def test_a_case_with_no_conversation_records_no_link() -> None:
+    """A Case raised from a phone call has no conversation, and inventing one
+    would put it in the priority-claim join under a reference nobody holds."""
+    from sqlalchemy import select
+
+    from platform_core.cases.models import CaseConversation
+    from platform_core.cases.service import CaseService
+    from platform_core.db import create_engine
+
+    async def scenario() -> int:
+        engine = create_engine(APP_URL)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+
+        async with factory() as session:
+            await session.execute(
+                text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT_A}
+            )
+            case = await CaseService(session).create_case(
+                tenant_id=uuid.UUID(TENANT_A), subject="Raised by phone"
+            )
+            rows = (
+                (
+                    await session.execute(
+                        select(CaseConversation.id).where(CaseConversation.case_id == case.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await session.commit()
+
+        await engine.dispose()
+        return len(rows)
+
+    assert _run(scenario()) == 0

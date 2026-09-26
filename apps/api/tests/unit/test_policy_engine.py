@@ -121,3 +121,34 @@ def test_tenant_owner_has_all_actions(engine: PolicyEngine) -> None:
         Action.KNOWLEDGE_ACL_MANAGE,
     ):
         assert engine.check(owner, action).decision == Decision.ALLOW
+
+
+def test_agent_role_may_propose_a_confirmed_write_but_not_approve_one(
+    engine: PolicyEngine,
+) -> None:
+    """The agent's write authority is bounded by the confirmation route.
+
+    `integration_service` holds TOOL_WRITE_CONFIRMED so the agent can put a
+    confirmed write in front of a human. AGENTS.md rule 7 says an LLM may
+    propose a write action, and without this action the gateway denied the
+    agent at propose time — it re-checks the risk class's action — so the
+    rule was unimplementable and no human ever saw the proposal.
+
+    What makes the grant safe is the complement asserted here. The only path
+    that creates an ActionConfirmation is
+    `POST /v1/tool-proposals/{id}/confirm`, which requires CASE_UPDATE, which
+    this role must NOT hold. Adding CASE_UPDATE to this role would silently
+    turn the agent into its own approver and the grant above into a way
+    around the confirmation. TOOL_HUMAN_APPROVAL stays out for the same
+    reason: it is the top of the risk ladder and has to be unreachable by the
+    agent at every stage, propose included.
+    """
+    agent = Principal(tenant_id="t1", actor_id="ai", role="integration_service")
+    assert engine.check(agent, Action.TOOL_READ).decision == Decision.ALLOW
+    assert engine.check(agent, Action.TOOL_WRITE_LOW).decision == Decision.ALLOW
+    assert engine.check(agent, Action.TOOL_WRITE_CONFIRMED).decision == Decision.ALLOW
+
+    confirm_gate = engine.check(agent, Action.CASE_UPDATE)
+    assert confirm_gate.decision == Decision.DENY
+    assert confirm_gate.reason_code == "ROLE_LACKS_ACTION"
+    assert engine.check(agent, Action.TOOL_HUMAN_APPROVAL).decision == Decision.DENY

@@ -81,6 +81,22 @@ def _cleanup(admin: Any) -> None:
         )
         for table in (
             "audit_events",
+            # Children of `cases` first, and this order is the whole point.
+            # `cases` used to be deleted before them, the FK violation rolled
+            # the transaction back, and so *nothing* in this function was
+            # cleaned - the tenants survived, and the next run's fixture died on
+            # `tenants_pkey` against them. That cascade is what made the
+            # zero-tolerance cross-tenant suite fail nondeterministically
+            # (measured 2026-09-22: 15 passing -> 6).
+            #
+            # These three are the complete set: `pg_constraint` lists exactly
+            # `case_attachments`, `case_conversations` and `case_escalations` as
+            # referencing `cases`. Enumerated from the catalog rather than from
+            # memory, because a fourth one added later would silently reintroduce
+            # the rollback.
+            "case_attachments",
+            "case_conversations",
+            "case_escalations",
             "cases",
             "agent_runs",
             "knowledge_acls",
@@ -346,17 +362,17 @@ def test_quality_routes_are_scoped_to_the_calling_tenant() -> None:
 
 @pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_another_tenants_external_id_cannot_be_resolved() -> None:
-    """External ids are attacker-guessable (sequential Chatwoot ids), so the
-    mapping lookup must be tenant-filtered, not merely authenticated.
+    """External ids are attacker-guessable, so a cross-tenant read of the
+    mapping table must return nothing.
 
-    `resolve_tenant_from_account` is the inbound webhook's tenant resolver:
-    a guessed account id that belongs to tenant A must not resolve while the
-    session is scoped to tenant B, or a forged webhook could be attributed
-    to the wrong tenant.
+    This used to call `resolve_tenant_from_account`, the Chatwoot webhook's
+    tenant resolver. That resolver went with the adapter (ADR 0012) and the
+    table has no production reader left - so the guarantee being asserted is
+    now the one that actually protects it: **RLS**, not a query predicate. An
+    unbound or wrongly-bound app-role session must not see tenant A's row.
     """
-    from platform_core.support_bridge.mapping import resolve_tenant_from_account
 
-    async def probe() -> Any:
+    async def probe() -> int:
         from sqlalchemy.ext.asyncio import async_sessionmaker
 
         from platform_core.db import create_engine
@@ -369,9 +385,16 @@ def test_another_tenants_external_id_cannot_be_resolved() -> None:
             await session.execute(
                 text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT_B}
             )
-            found = await resolve_tenant_from_account(session, "leak-ref-999")
+            found = (
+                await session.execute(
+                    text(
+                        "SELECT count(*) FROM external_resource_refs "
+                        "WHERE external_id = 'leak-ref-999'"
+                    )
+                )
+            ).scalar()
             await session.rollback()
         await engine.dispose()
-        return found
+        return int(found or 0)
 
-    assert _run(probe()) is None, "tenant B resolved tenant A's external account reference"
+    assert _run(probe()) == 0, "tenant B saw tenant A's external account reference"

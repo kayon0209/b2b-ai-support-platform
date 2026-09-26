@@ -21,6 +21,7 @@ import uuid
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from uuid6 import uuid7
 
 from platform_core.billing.service import monthly_rollup, record_adjustment, record_usage
 
@@ -42,6 +43,14 @@ EVENT_INSERT = (
     "VALUES (:id, :t, :event_id, 'usage.recorded', 1, 'agent_run', :agg, "
     " CAST(:payload AS jsonb), 'queued', :created, 0, 'trace')"
 )
+
+# The relay does not poll by `created_at`; it takes the outbox in primary-key
+# order (`claim_pending` -> `ORDER BY OutboxEvent.id LIMIT batch FOR UPDATE SKIP
+# LOCKED`). Production ids are UUIDv7, so that ordering is a real FIFO. A random
+# v4 id here would make the relay's own ordering arbitrary in test - the suite
+# would stop pinning the one property the relay depends on. Insert v7, as
+# production does. `event_id`/`aggregate_id` are not ordering keys, so they stay
+# whatever the test needs them to be.
 
 
 def _run(coro):
@@ -129,7 +138,7 @@ def test_usage_recorded_is_aggregated_through_the_relay() -> None:
         conn.execute(
             text(EVENT_INSERT),
             {
-                "id": str(uuid.uuid4()),
+                "id": str(uuid7()),
                 "t": TENANT_A,
                 "event_id": str(event_id),
                 "agg": str(run_id),
@@ -177,7 +186,7 @@ def test_malformed_payload_fails_rather_than_silently_dropping() -> None:
         conn.execute(
             text(EVENT_INSERT),
             {
-                "id": str(uuid.uuid4()),
+                "id": str(uuid7()),
                 "t": TENANT_A,
                 "event_id": str(uuid.uuid4()),
                 "agg": "not-a-uuid",
@@ -229,7 +238,7 @@ def test_run_once_without_commit_does_not_persist() -> None:
         conn.execute(
             text(EVENT_INSERT),
             {
-                "id": str(uuid.uuid4()),
+                "id": str(uuid7()),
                 "t": TENANT_A,
                 "event_id": str(event_id),
                 "agg": str(run_id),

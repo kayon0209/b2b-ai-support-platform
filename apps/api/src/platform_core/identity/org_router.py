@@ -64,6 +64,8 @@ SLUG_TOO_LONG = "SLUG_TOO_LONG"
 NAME_REQUIRED = "NAME_REQUIRED"
 SLUG_TAKEN = "SLUG_TAKEN"
 ACCOUNT_CRM_REF_TAKEN = "ACCOUNT_CRM_REF_TAKEN"
+ACCOUNT_NOT_FOUND = "ACCOUNT_NOT_FOUND"
+CONTACT_ALREADY_BOUND = "CONTACT_ALREADY_BOUND"
 
 # Every code `org.py` can raise, mapped to the status it deserves. `ORG_CYCLE`
 # and the parent codes are 409: the request is well-formed, and it conflicts
@@ -76,6 +78,12 @@ _STATUS_BY_CODE: dict[str, int] = {
     ORG_DEPTH_EXCEEDED: 409,
     SLUG_TAKEN: 409,
     ACCOUNT_CRM_REF_TAKEN: 409,
+    # The account is not this tenant's: indistinguishable from "no such
+    # account", which is the point (see `org.account_sla_facts`).
+    ACCOUNT_NOT_FOUND: 404,
+    # The contact is already bound. The request is well-formed, it conflicts
+    # with existing state - not a malformed body.
+    CONTACT_ALREADY_BOUND: 409,
     TIER_INVALID: 400,
     CONTRACT_STATUS_INVALID: 400,
     SLUG_INVALID: 400,
@@ -92,6 +100,19 @@ class AccountIn(BaseModel):
     parent_id: uuid.UUID | None = None
     external_crm_ref: str | None = Field(default=None, max_length=255)
     attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class ContactIn(BaseModel):
+    """A Chatwoot contact id. Bounded to the column's width, and never empty:
+
+    an empty contact id would bind *every* unmatched contact to this account,
+    since the lookup is an equality match on the stored value.
+    """
+
+    external_contact_id: str = Field(min_length=1, max_length=255)
+    # Optional: a CRM sync often cannot name the channel, and a blank is more
+    # honest than a guess that would then be believed.
+    channel: str | None = Field(default=None, max_length=31)
 
 
 class AccountPatchIn(BaseModel):
@@ -205,6 +226,99 @@ async def create_account(request: Request, body: AccountIn) -> Any:
         payload = _account_out(row)
         await session.commit()
     return ok_response({"account": payload}, trace_id=trace_id)
+
+
+@router.get("/accounts/{account_id}/contacts")
+async def list_account_contacts(request: Request, account_id: uuid.UUID) -> Any:
+    """The Chatwoot contacts bound to this account."""
+    ctx = get_context(request)
+    if ctx is None:
+        return _unresolved()
+    denied = require_policy(ctx, Action.CASE_READ)
+    if denied is not None:
+        return denied
+
+    trace_id = new_trace_id()
+    async with tenant_session(ctx) as session:
+        contacts = await org.list_contacts(session, tenant_id=ctx.tenant_id, account_id=account_id)
+    # Serialised explicitly: a NamedTuple would otherwise go over the wire as
+    # a bare two-element array, and a client reading `contacts[0]["channel"]`
+    # would silently get nothing.
+    return ok_response(
+        {
+            "contacts": [
+                {"external_contact_id": b.external_contact_id, "channel": b.channel}
+                for b in contacts
+            ]
+        },
+        trace_id=trace_id,
+    )
+
+
+@router.post("/accounts/{account_id}/contacts")
+async def bind_account_contact(request: Request, account_id: uuid.UUID, body: ContactIn) -> Any:
+    """Bind a Chatwoot contact to this account.
+
+    This is the write side of tier-driven routing: without a binding the
+    platform cannot tell which contract a conversation is under, so tier never
+    reaches the handoff decision.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return _unresolved()
+    denied = require_policy(ctx, Action.TENANT_ADMIN)
+    if denied is not None:
+        return denied
+    missing_idem = require_write_idempotency(request, Action.TENANT_ADMIN)
+    if missing_idem is not None:
+        return missing_idem
+
+    trace_id = new_trace_id()
+    async with tenant_session(ctx) as session:
+        try:
+            binding_id = await org.bind_contact(
+                session,
+                ctx=ctx,
+                account_id=account_id,
+                external_contact_id=body.external_contact_id,
+                channel=body.channel,
+                actor_id=str(ctx.actor_id) if ctx.actor_id else None,
+            )
+        except org.OrgError as exc:
+            return _org_error(exc)
+        await session.commit()
+    return ok_response(
+        {"contact": body.external_contact_id, "binding_id": str(binding_id)},
+        trace_id=trace_id,
+    )
+
+
+@router.delete("/accounts/{account_id}/contacts/{external_contact_id}")
+async def unbind_account_contact(
+    request: Request, account_id: uuid.UUID, external_contact_id: str
+) -> Any:
+    ctx = get_context(request)
+    if ctx is None:
+        return _unresolved()
+    denied = require_policy(ctx, Action.TENANT_ADMIN)
+    if denied is not None:
+        return denied
+    missing_idem = require_write_idempotency(request, Action.TENANT_ADMIN)
+    if missing_idem is not None:
+        return missing_idem
+
+    trace_id = new_trace_id()
+    async with tenant_session(ctx) as session:
+        removed = await org.unbind_contact(
+            session,
+            tenant_id=ctx.tenant_id,
+            account_id=account_id,
+            external_contact_id=external_contact_id,
+        )
+        await session.commit()
+    if not removed:
+        return error_response(ORG_NOT_FOUND, "contact binding not found", status_code=404)
+    return ok_response({"removed": True}, trace_id=trace_id)
 
 
 @router.get("/accounts/{account_id}")

@@ -84,6 +84,25 @@ class LlmAnswerGenerator:
         """Exposed so the orchestrator can persist prompt lineage."""
         return self._template
 
+    def with_template(self, template: PromptTemplate) -> "LlmAnswerGenerator":
+        """A copy bound to a different prompt template, sharing the provider.
+
+        A copy rather than a mutation. This instance is built once per worker and
+        shared across concurrent runs, so assigning `_template` for one run would
+        change the prompt of every other run in flight - an A/B experiment whose
+        arms leak into each other is worse than no experiment, because it
+        produces a number that looks like a result.
+
+        The provider is passed through rather than re-derived, so the copy shares
+        the circuit breaker and the connection pool with the original.
+        """
+        return LlmAnswerGenerator(
+            self._chat,
+            template=template,
+            max_tokens=self._max_tokens,
+            fallback_model=self._fallback_model,
+        )
+
     def _build_evidence(self, evidence: list[RetrievedChunk]) -> tuple[str, dict[str, str]]:
         """Render evidence and build the id -> chunk_id resolution map.
 

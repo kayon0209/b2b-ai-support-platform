@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
+import { useSearchParams } from "react-router-dom";
+
 import { newIdempotencyKey } from "../lib/idempotency";
 import { useAction } from "../lib/useAction";
 import { useAsync } from "../lib/useAsync";
@@ -40,7 +42,18 @@ function toneForStatus(status: string): "neutral" | "info" | "warn" | "good" | "
 
 export function GapQueue() {
   const { t } = useLang();
-  const [tab, setTab] = useState<"gaps" | "drafts">("gaps");
+  // The tab is part of the view, so it lives in the address: a refresh
+  // keeps the reviewer on the drafts list rather than bouncing them back to
+  // the gap queue.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab: "gaps" | "drafts" = searchParams.get("tab") === "drafts" ? "drafts" : "gaps";
+
+  function setTab(next: "gaps" | "drafts") {
+    const params = new URLSearchParams(searchParams);
+    if (next === "gaps") params.delete("tab");
+    else params.set("tab", next);
+    setSearchParams(params);
+  }
   const [status, setStatus] = useState<string>("open");
 
   const gaps = useAsync<{ items: Gap[]; total: number }>(
@@ -179,7 +192,7 @@ export function GapQueue() {
                     <td className="row-actions">
                       <button
                         className="btn"
-                        disabled={g.status !== "open"}
+                        disabled={action.busy || g.status !== "open"}
                         onClick={() =>
                           act(
                             `/v1/knowledge/gaps/${g.id}/acknowledge`,
@@ -192,7 +205,7 @@ export function GapQueue() {
                       </button>
                       <button
                         className="btn"
-                        disabled={g.status === "resolved" || g.status === "dismissed"}
+                        disabled={action.busy || g.status === "resolved" || g.status === "dismissed"}
                         onClick={async () => {
                           const values = await prompt.ask({
                             title: t("gaps.dismissTitle"),
@@ -214,7 +227,7 @@ export function GapQueue() {
                       </button>
                       <button
                         className="btn"
-                        disabled={g.status === "resolved"}
+                        disabled={action.busy || g.status === "resolved"}
                         onClick={async () => {
                           const values = await prompt.ask({
                             title: t("gaps.draftAnswerTitle"),
@@ -283,7 +296,7 @@ export function GapQueue() {
                     <td className="row-actions">
                       <button
                         className="btn"
-                        disabled={d.status !== "pending"}
+                        disabled={action.busy || d.status !== "pending"}
                         onClick={async () => {
                           const values = await prompt.ask({
                             title: t("gaps.approveTitle", { title: d.title }),
@@ -310,7 +323,7 @@ export function GapQueue() {
                       </button>
                       <button
                         className="btn"
-                        disabled={d.status !== "pending"}
+                        disabled={action.busy || d.status !== "pending"}
                         onClick={async () => {
                           const values = await prompt.ask({
                             title: t("gaps.rejectTitle", { title: d.title }),
@@ -330,7 +343,7 @@ export function GapQueue() {
                       </button>
                       <button
                         className="btn"
-                        disabled={d.status !== "approved"}
+                        disabled={action.busy || d.status !== "approved"}
                         onClick={async () => {
                           const spaceItems = spaces.data?.items ?? [];
                           const values = await prompt.ask({

@@ -233,6 +233,40 @@ def expand_with_aliases(query: str, aliases: list[tuple[str, str, float]]) -> tu
     return f"{query} {' '.join(sorted(applied))}", applied
 
 
+def _embedder_identity(embedder: Embedder) -> str:
+    """Which embedder produced a vector, for the cache key (11.3).
+
+    Two embedders produce vectors that are not comparable, so serving one's
+    vector to the other would corrupt every similarity downstream without
+    raising anything. Type name plus the model the instance reports is enough
+    to keep them apart, and it is read defensively because `Embedder` is a
+    protocol - a test double legitimately has no model attribute.
+    """
+    model = getattr(embedder, "_model", None) or getattr(embedder, "model", None)
+    return f"{type(embedder).__name__}:{model or ''}"
+
+
+async def _cached_embed_query(embedder: Embedder, query: str) -> list[float]:
+    """Embed a query, reusing the vector when the same text came before.
+
+    Only the embedding is cached, never the result set: an embedding depends on
+    the text alone, while a result set also depends on tenant and ACL, so it is
+    the one thing here that is safe to key on a string. See
+    `retrieval.cache` for the full reasoning.
+    """
+    from platform_core.retrieval.cache import embedding_cache, embedding_key
+
+    key = embedding_key(query, model=_embedder_identity(embedder))
+    cached = embedding_cache.get(key)
+    if cached is not None:
+        return cached
+    vector = await embedder.embed_query(query)
+    # Stored only after a successful call: a failed embed must be retried, not
+    # remembered.
+    embedding_cache.put(key, vector)
+    return vector
+
+
 async def hybrid_search(
     session: AsyncSession,
     *,
@@ -325,9 +359,16 @@ async def hybrid_search(
     else:
         acl = ""
 
+    # The scan gate. Off by default, deliberately - the reasoning is long and
+    # belongs where an operator will meet it, at the setting itself.
+    from platform_core.config import get_settings
+
+    scan_gate = "AND dv.scan_status = 'clean'" if get_settings().require_scanned_documents else ""
+
     base_where = f"""
         WHERE c.tenant_id = CAST(:tid AS uuid)
           AND dv.status = 'active'
+          {scan_gate}
           AND (dv.effective_at IS NULL OR dv.effective_at <= :now)
           AND (dv.expires_at IS NULL OR dv.expires_at > :now)
           {space_filter}
@@ -394,7 +435,7 @@ async def hybrid_search(
 
     if "vector" in paths:
         active_embedder: Embedder = embedder or DeterministicEmbedder()
-        vec = await active_embedder.embed_query(query)
+        vec = await _cached_embed_query(active_embedder, query)
         params["vec"] = _vector_literal(vec)
         results["vector"] = list((await session.execute(vec_sql, params)).mappings().all())
 

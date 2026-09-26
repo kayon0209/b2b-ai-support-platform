@@ -19,7 +19,9 @@ from platform_core.integrations.models import Connector, ConnectorStatus
 from platform_core.integrations.sdk import ConnectorContext
 from platform_core.tool_gateway.gateway import ToolExecutor
 from platform_core.tool_gateway.registry import (
+    PLATFORM_TOOLS,
     TOOL_CAPABILITY,
+    TOOL_CATALOG,
     TOOL_PROVIDERS,
     AdapterFactory,
     ConnectorExecutorResolver,
@@ -238,6 +240,38 @@ async def test_resolver_query_is_tenant_scoped_in_sql() -> None:
     # The bound parameter carries this tenant's id, so the filter is real
     # rather than a placeholder that a caller forgot to populate.
     assert any(str(TENANT) in str(v) for v in compiled.params.values()), compiled.params
+
+
+def test_every_platform_tool_is_in_the_catalog() -> None:
+    """A tool the registry builds but the catalog does not define is
+    unproposable: the gateway refuses `TOOL_NOT_REGISTERED` before the executor
+    is ever reached, so the tool exists and cannot be called."""
+    assert PLATFORM_TOOLS <= set(TOOL_CATALOG)
+
+
+def test_platform_tools_are_not_connector_backed() -> None:
+    """They read and write the platform's own tables, so a provider entry
+    would be a claim that some external system serves them."""
+    assert not (PLATFORM_TOOLS & set(TOOL_PROVIDERS))
+    assert not (PLATFORM_TOOLS & set(TOOL_CAPABILITY))
+
+
+@pytest.mark.asyncio
+async def test_a_platform_tool_resolves_with_no_connectors_at_all() -> None:
+    """The point of the platform path: no connector is required, which is what
+    lets the HTTP surface execute these tools and not only the orchestrator.
+
+    `case.read` used to be injected by hand inside the read path, so it was
+    executable from exactly one caller and answered `TOOL_EXECUTOR_MISSING`
+    through `POST /v1/tool-proposals/{id}/execute`.
+    """
+    resolver = ConnectorExecutorResolver(
+        _FakeSession([]), tenant_id=TENANT, factories=_factories([])
+    )
+
+    executors = await resolver.executors_for(["case.read", "case.eq_confirm"])
+
+    assert set(executors) == {"case.read", "case.eq_confirm"}
 
 
 def test_tool_vocabulary_is_fully_declared() -> None:

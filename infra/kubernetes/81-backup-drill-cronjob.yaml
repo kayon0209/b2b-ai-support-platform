@@ -1,0 +1,98 @@
+# Quarterly restore drill: prove the backup actually restores.
+#
+# Why this is a CronJob and not a release-gate step
+# --------------------------------------------------
+# A gate proves the recovery path worked *at release time*. That is worth
+# having, and `scripts/backup_restore_drill.py --dsn` is what makes it
+# runnable at all outside one developer's laptop. It is not sufficient on its
+# own: it runs against whatever database the pipeline has, which is normally a
+# freshly migrated empty schema, so it proves the tool works and not that *the
+# backup taken eleven weeks ago* restores. That question can only be answered
+# against a real backup, on a real schedule, and a schedule is what a CronJob
+# is.
+#
+# Quarterly is the cadence `docs/deployment-and-operations.md` already promises.
+# The interval matters more than it looks: restore tooling drifts with
+# PostgreSQL major versions, and the failure mode - a drill nobody ran since
+# the upgrade - is invisible until the night it is needed.
+#
+# `concurrencyPolicy: Forbid` because a drill creates and drops a scratch
+# database. Two at once would race on the database name.
+#
+# `--dsn` is required here. The script's default target is a local docker
+# container name, which does not exist in a cluster, and the resulting failure
+# is a connection error that reads like PostgreSQL being down.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: platform-backup-drill
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: backup-drill
+spec:
+  # 04:23 UTC, quarterly - early enough in the quarter to leave time to react,
+  # and not on an hour boundary for the same reason the backup is at 02:17.
+  schedule: "23 4 1 1,4,7,10 *"
+  timeZone: UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 4
+  failedJobsHistoryLimit: 8
+  jobTemplate:
+    spec:
+      # Unlike the backup, a failed drill is retried: it is a read-only check
+      # over a scratch database, so repeating it cannot make anything worse,
+      # and a transient failure should not consume a quarter's evidence.
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 2592000
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: platform
+            app.kubernetes.io/component: backup-drill
+        spec:
+          restartPolicy: Never
+          serviceAccountName: platform
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: drill
+              # The same image the backup and the API run from - the drill is
+              # only meaningful if it exercises the deployed artifacts.
+              image: registry.example.com/b2b-support/platform:REPLACE_ME_TAG
+              # The DSN comes from the same Secret as the backup. Passing it
+              # explicitly is what puts the script in DSN mode; without the
+              # argument it falls back to a local docker container name that
+              # does not exist in a cluster.
+              command: ["sh", "-c"]
+              args: ['exec python scripts/backup_restore_drill.py --dsn "$APP_DATABASE_URL"']
+              env:
+                - name: APP_DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: platform-migration-owner
+                      key: APP_ADMIN_DATABASE_URL
+              resources:
+                requests:
+                  cpu: "200m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "1"
+                  memory: "1Gi"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}

@@ -413,6 +413,18 @@ async def rollout_preview(
 # --- Internals --------------------------------------------------------------
 
 
+def validate_flag_key(key: str) -> bool:
+    """Whether a key is usable as a flag or experiment identifier.
+
+    Public because the A/B experiment key follows the same rule and should not
+    restate it: the rule exists so the key is safe in a URL, a log line and a
+    metric label, and a second copy would drift the day one of them is tightened.
+    """
+    if not key.strip() or len(key) > 127:
+        return False
+    return all(c.isalnum() or c in "._-" for c in key)
+
+
 def _validate_key(key: str) -> None:
     if not key.strip():
         raise FlagError("KEY_REQUIRED", "a flag needs a key")

@@ -2,7 +2,7 @@
 
 ## Ownership rule
 
-The source system owns its resources. The custom platform references Chatwoot entities through external mappings and never duplicates them as authoritative records.
+The platform owns customer conversations and cases. Channel adapters retain external contact/thread references for delivery, while tenant identity and business state remain owned here.
 
 ## Identity and tenancy
 
@@ -23,7 +23,7 @@ Tenant
 
 ### EnterpriseAccount
 
-Represents the tenant's own customer/account hierarchy. Do not confuse it with a Chatwoot Account.
+Represents the tenant's own customer/account hierarchy. Provider-side accounts remain external references only.
 
 ```text
 EnterpriseAccount
@@ -70,7 +70,7 @@ UNIQUE(tenant_id, system, resource_type, external_id)
 
 ## Support and Case
 
-Chatwoot owns Conversation and Message. The custom platform owns Case.
+The platform owns ConversationTurn, ConversationControlLease and Case. A Case may link to a conversation, but an AI-to-human handoff can exist without a Case.
 
 ```text
 Case
@@ -80,7 +80,11 @@ Case
 - requester_user_ref?
 - subject
 - description
-- category
+- category: general | eq_confirmation
+  (a free-form column and a *vocabulary*, not a constraint — an unrecognised
+  value stays readable rather than becoming an error. `eq_confirmation` marks
+  a case whose customer owes an answer to an engineering question and whose
+  production is held until they give it; it is what scopes `case.eq_confirm`.)
 - priority: p0|p1|p2|p3
 - status
 - assignee_ref?
@@ -113,13 +117,23 @@ RESOLVED/CLOSED → REOPENED → IN_PROGRESS
 
 All transitions are explicit commands and audited. SLA pause behavior is determined by policy, not inferred from labels.
 
+**Recording an EQ confirmation uses `WAITING_CUSTOMER → IN_PROGRESS`.** That is
+deliberate, and the reason is the SLA policy rather than taste: `DEFAULT_SLA`
+keeps the clocks running in `NEW`, `TRIAGED`, `IN_PROGRESS` and `REOPENED`, and
+pauses them in the three waiting states. Moving the case to `WAITING_INTERNAL`
+when the customer confirms would pause the resolution clock at exactly the
+moment the customer has done their part and the work is ours — the platform
+granting itself an extension for the interval it is most obliged to be quick
+about. `IN_PROGRESS` restarts the clock against us, which is the incentive the
+flow needs, and it is already a legal transition, so no edge was added for it.
+
 ## Conversation control
 
 ```text
 ConversationControlLease
 - tenant_id
 - conversation_ref_id
-- owner_type: ai|human|queue
+- owner_type: ai|human|queue|closed
 - owner_ref?
 - mode
 - lease_version
@@ -129,6 +143,8 @@ ConversationControlLease
 ```
 
 A customer-visible AI send requires compare-and-set on `lease_version` immediately before dispatch.
+`closed` is the completed conversation state; it does not imply the linked Case
+is resolved. A customer starting a new issue receives a new conversation ref.
 
 ## Knowledge
 
