@@ -8,6 +8,31 @@
 
 本文件逐项报告**实际**状态。Codex 的验收报告未被修改，也未被合入本分支。
 
+> 当前状态以文末 §7「Codex follow-up 修复与复验」为准；§1–§6 保留 WorkBuddy 原交付时的记录。
+
+## Codex 后续修复（2026-09-26）
+
+以下为本交付报告编写后的代码修复与复验结果；下文原始交付说明保留 WorkBuddy 当时的状态记录。
+
+| 发现 | 修复 |
+|---|---|
+| 影子分析、副驾请求只有 consumer 函数，没有运行入口；通用 relay 会认领未知事件 | `SemanticWorker` 已加入 interactive worker 生命周期，独立轮询影子、副驾与任务规划事件；默认 relay 排除这三类专属事件。消费者只在 owner 连接读取队列标识，之后在租户 RLS 会话读取 payload 与业务数据。 |
+| 任务规划在 Inbox 事件内等待模型 | 改为事务 outbox 的后台任务；事件仅携带会话与轮次 ID，consumer 从租户 RLS 会话读取脱敏对话。工作台空列表会短时自动刷新。 |
+| 坐席补录信息写成 `customer` 发言 | 改为 `origin=agent_collected`，保留坐席 actor 与采集时间；不再制造客户消息。敏感补录值继续不落库。 |
+| `processing` 过期回收依据事件创建时间，老队列事件可能刚领取就被重复回收 | 新增 nullable `outbox_events.processing_started_at`，迁移号 `0064_outbox_claim_started`；过期恢复依据实际领取时间。迁移总数门禁更新为 63。 |
+| R1 表未进入跨租户负例扫描；旅程 fixture 把工具定义写为全局行 | 四张新表加入跨租户扫描和 seed；旅程测试改用租户级工具定义并清理自身数据。 |
+| 集成测试有硬编码本地 `platform` URL；迁移测试会 DROP 固定数据库名 | 集成测试连接统一改读 `APP_TEST_DATABASE_URL` / `APP_ADMIN_DATABASE_URL`；迁移测试数据库改为进程唯一名称。 |
+
+### 本地验收结果
+
+- Unit 与 contracts：**1573 passed**。
+- PostgreSQL integration：**1076 passed, 2 skipped**；另加两个生产 worker 入口验收（任务规划与副驾各 1 项）均通过。
+- Admin Web：TypeScript typecheck、production build 通过；UI 状态测试 **29 passed**。
+- Ruff lint/format、Mypy（236 个源文件）和 Python compile 均通过。
+- 本地集成测试使用独立数据库 `r1_codex_20260926`，全量完成后未写入项目开发库。GitHub Actions 尚待本次提交触发。
+
+**仍未完成生产发布验收**：真实模型质量评测、真实浏览器双窗口与接管竞态、生产近似负载/队列积压测量、故障注入与回滚演练。所有新 feature flags 仍默认关闭；本地测试使用 stub 模型证明队列与数据路径，不代表真实模型质量或生产性能。
+
 ---
 
 ## 1. 阻断缺陷处理结果
@@ -216,5 +241,25 @@ cd apps/admin-web && npm run typecheck && npm run build && npm test       # 29 p
    `test_copilot_job_persistence.py`。
 3. 迁移重编号（0055 → 0063）与 `EXPECTED_MIGRATIONS` 同步值得单独确认。
 4. §5 的五项是本次交接**没有**关闭的，不是待优化。
+
+---
+
+## 7. Codex follow-up 修复与复验（2026-09-26）
+
+本节为 WorkBuddy 原交付说明之后的 follow-up，覆盖本地代码复核发现的阻断：
+代码修复提交：`2653c06`。
+
+1. `SemanticWorker` 已由 interactive worker 启动，独立处理影子、副驾及任务规划 outbox；默认 relay 排除这些专属事件。owner 队列连接只选择事件标识，payload 与业务记录由租户 RLS session 读取。
+2. 任务规划改为事务 outbox 异步请求，事件只携带会话/轮次 ID。模型输入从 tenant-bound 数据库读取已脱敏轮次，Inbox 不再等待规划模型。
+3. 坐席补录写入 `agent_collected` 来源、actor 与时间戳，不再写成 customer turn；敏感字段值仍不持久化。
+4. 新增 `outbox_events.processing_started_at` 与迁移 `0064_outbox_claim_started`，stale reclaim 按领取时刻计算。迁移数量门禁更新到 63。
+5. 跨租户负例扫描纳入四张 R1 表；集成测试不再把工具目录定义写入全局行。
+6. 全部集成测试数据库连接改为环境变量，迁移验收数据库按进程命名，避免操作共享开发库。
+
+本地复验：unit + contracts **1573 passed**；完整 PostgreSQL integration **1076 passed、2 skipped**；任务规划 worker 与副驾 worker 各自的真实入口集成测试在全量跑测后新增并单独通过。Admin Web typecheck、production build 通过，前端测试 **29 passed**；Ruff、Mypy（236 个源文件）、Python compile 通过。
+
+最初在本机执行 integration suite 时，代码中硬编码的连接串使部分 app-role 操作落到了共享 `platform` 开发库。已按本轮时间窗、只选 tenant 不存在的测试 ID，清理 40 个测试租户对应的 7111 行，并清理之后残留的 2 条测试 outbox 记录。修正连接配置后，完整 suite 在独立的 `r1_codex_20260926` 数据库通过；最终验证没有写入开发库。
+
+GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36239136194) 已在代码提交 `2653c06` 上全部通过，包含 Release Evidence。真实模型质量、浏览器双窗口/接管竞态、生产近似负载、故障注入与回滚演练仍未完成，所有新 feature flags 保持关闭；本节的本地 stub-model 验收不代表真实模型质量或生产性能。
 
 本交接不包含自动合并或生产发布授权。
