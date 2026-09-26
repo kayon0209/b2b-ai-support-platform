@@ -44,6 +44,7 @@ from platform_core.agent_runtime.semantic.contracts import (
 )
 from platform_core.agent_runtime.semantic.service import (
     REGISTERED_CONDITION_FIELDS,
+    SEMANTIC_SYSTEM_PROMPT,
     SemanticBudget,
     SemanticUnderstandingService,
 )
@@ -108,6 +109,15 @@ def test_invalid_enum_value_is_rejected() -> None:
     with pytest.raises(Exception) as exc:
         _parse(_payload(primary_intent="escalate_to_vip"))
     assert exc.value.code == "SEMANTIC_INVALID_OUTPUT"
+
+
+def test_missing_primary_intent_is_rejected() -> None:
+    payload = _payload()
+    del payload["primary_intent"]
+    with pytest.raises(Exception) as exc:
+        _parse(payload)
+    assert exc.value.code == "SEMANTIC_INVALID_OUTPUT"
+    assert exc.value.detail.startswith("primary_intent:")
 
 
 def test_too_many_intents_is_rejected() -> None:
@@ -542,6 +552,25 @@ def test_prompt_carries_no_tenant_actor_or_credential() -> None:
         assert banned not in prompt
 
 
+def test_system_prompt_names_the_strict_output_contract() -> None:
+    for field in (
+        "primary_intent",
+        "secondary_intents",
+        "scene",
+        "business_line",
+        "intents",
+        "evidence_spans",
+        "confidence_band",
+        "needs_clarification",
+        "emotion_signal",
+        "tool_candidates",
+    ):
+        assert field in SEMANTIC_SYSTEM_PROMPT
+    assert "primary_intent is mandatory" in SEMANTIC_SYSTEM_PROMPT
+    assert '"business_query"' in SEMANTIC_SYSTEM_PROMPT
+    assert '"customer_stated"' in SEMANTIC_SYSTEM_PROMPT
+
+
 def test_log_projection_hashes_the_turn_instead_of_copying_it() -> None:
     ctx = build_context(
         current_turn_id="now",
@@ -610,9 +639,7 @@ async def test_provider_exception_does_not_escape() -> None:
 
 @pytest.mark.asyncio
 async def test_timeout_degrades_rather_than_hanging() -> None:
-    from platform_core.llm.provider import ModelUnavailable
-
-    provider = _StubProvider(raises=ModelUnavailable("timeout"))
+    provider = _StubProvider(json.dumps(_payload()), delay=0.1)
     result = await SemanticUnderstandingService(
         provider, budget=SemanticBudget(deadline_seconds=0.05)
     ).analyze(
@@ -624,7 +651,8 @@ async def test_timeout_degrades_rather_than_hanging() -> None:
         lease_owner_type="ai",
     )
     assert result.model_output is None
-    assert result.reason_codes
+    assert "SEMANTIC_MODEL_TIMEOUT" in result.reason_codes
+    assert result.latency_ms >= 40
 
 
 @pytest.mark.asyncio

@@ -142,7 +142,7 @@ write 为 `needs_human` + `SEMANTIC_NO_WRITE_CAPABILITY`，缺参保留，地址
 | T00 基线与契约差异 | 完成 | `baseline-and-contract-delta.md`；三条假设被证伪并记录 |
 | T01 语义契约与裁决 | 完成 | 44 项单测；CLASSIFY 路由接入生产调用点 |
 | T02 影子模式 | 完成（SHD-01/OPS-01 部分） | 9 项集成测试实测零业务副作用；已移入持久队列 |
-| T03 评测框架 | 完成（EVAL-02 阻塞） | 25 项单测；无真实模型质量数字 |
+| T03 评测框架 | 部分完成（EVAL-02 阻塞） | 提示词/超时观测有离线修复；真实模型合成探测不通过 schema/时限，固定保留集未执行 |
 | T04 任务表与状态机 | 完成 | 29 单测 + 16 集成；迁移往返实测 |
 | T05 工具候选与补参 | 完成 | 能力过滤 + 规划器 + 7 项提案集成测试 |
 | T06 副驾 job | 完成 | 24 单测 + 10 集成 + 独立 consumer |
@@ -170,7 +170,7 @@ UX-01（数据层验证；**无浏览器验证**）
 SEC-03、UI-01、UI-02、UX-02、UX-03、PERF-01、PERF-02、CI-01
 
 **阻塞**：
-EVAL-02（无真实模型凭据与预算）、DOC-02（依赖上面未执行项）
+EVAL-02（合成语义输出未过严格 schema/时限，固定保留集未执行）、DOC-02（依赖上面未执行项）
 
 新功能开关全部默认 false；本次交接不启用任何一项。
 
@@ -225,8 +225,9 @@ cd apps/admin-web && npm run typecheck && npm run build && npm test       # 29 p
 2. **无接管竞态与故障注入**。SEC-03、OPS-01 的 worker 重启、OPS-02 的回滚
    演练均未做。
 3. **无性能实测**。PERF-01/02 需要生产近似负载。
-4. **EVAL-02 阻塞**。无真实模型凭据，`semantic_read` 不可启用，ADR 仍为
-   Proposed。
+4. **EVAL-02 阻塞**。本地 Gitee 凭据已配置，但 Qwen3.8-Flash 的合成语义输出未通过
+   严格 schema，完整请求也未达到分类时限；600 条固定保留集尚未执行，`semantic_read`
+   不可启用，ADR 仍为 Proposed。
 5. **既存缺陷**：`intent.RESTRICTED_TERMS` 仅英文，中文"改银行账号"不被识别为
    敏感请求。属规则基线，需独立评测；语义层不能修复，因为它不能覆盖规则。
 
@@ -308,4 +309,12 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 
 **仍阻塞生产放量**：EVAL-02、PERF-01/02、OPS-01 worker 重启、OPS-02 回滚、SEC-03 两坐席在途接管、完整 UI/UX 无障碍矩阵。所有生产租户新开关继续默认关闭，`semantic_read` 不启用。
 
-**GitHub Actions**：[run #36244375661](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36244375661) 在 head `d498b0e9947540893fe2b14c5f71d2bc8ad2fc29` 全部通过，包含 Release Evidence。CI-01 已关闭；CI 通过不替代上述真实模型/生产容量/回滚门槛。PR #19 保持打开；本报告不授权合并或生产发布。
+**最近一次已通过 GitHub Actions**：[run #36248940564](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36248940564) 在 head `29f6a5d4f7bed8b8bc215a834beaee87fd3ce282` 全部通过，包含 Release Evidence。该运行早于本节 2026-09-27 的提示词/超时观测修复；新 commit 必须重新通过 CI。PR #19 保持打开；本报告不授权合并或生产发布。
+
+### 2026-09-27 Gitee 提供方诊断与后续修复
+
+- 使用现有全模型 Token 资源包创建了项目专用通用令牌；本地 `.env` 权限为 `0600`，文件被忽略且未纳入 Git。令牌只允许从当前资源包扣费，关闭订阅、代金券、账户余额和新购资源包自动授权，并启用按 Token 计费。没有新购资源包。
+- Docker `ai-api` 容器读取到 `https://api.moark.com/v1` 和新令牌，`/healthz` 返回正常。该容器镜像来自主工作区，不包含本分支的语义服务；此结果只证明本地提供方连通性，不是分支端到端验收。
+- 合成最小聊天请求由 Qwen3.8-Flash 成功返回，耗时 4,259ms，报告 59 个输入和 30 个输出 Token；请求 `max_tokens=8`，但 usage 报告了 30 个输出 Token。另一次 `max_tokens=300` 的语义探测报告了 1,518 个输出 Token。当前不能把 `max_tokens` 当作已验证的计费上限，分类请求也未达到 2 秒目标。
+- 语义探测使用合成订单文本、当前生产提示词和空能力集，没有真实客户数据或工具执行。默认思考模式在 8 秒和 15 秒服务预算下超时；直接提供方调用耗时 56,448ms、报告 231 个输入和 1,518 个输出 Token，严格 schema 校验失败。关闭思考参数的两次直接调用分别耗时 9,954ms 和 5,728ms，均未通过严格 schema；最后一次的安全校验详情显示缺少必需的 `primary_intent` 字段。以上探测对应旧提示词 `semantic-v1`，不是正式质量评测。
+- 随后已将提示词版本升为 `semantic-v2`，明确列出必需字段、枚举值、嵌套对象形状和证据偏移规则；超时/失败现在记录已耗时长。受影响单测 **47 passed**，Ruff 与 Mypy 通过。`semantic_read` 和其他生产开关继续关闭；新提示词尚未进行真实模型复测，EVAL-02 与 PERF-02 仍阻塞。

@@ -36,7 +36,7 @@ REASON_HISTORY_DROPPED = "history_dropped_for_budget"
 REASON_ATTACHMENTS_DROPPED = "attachments_omitted"
 REASON_HISTORY_WINDOW = "history_window_trimmed"
 
-SYSTEM_PROMPT_VERSION = "semantic-v1"
+SYSTEM_PROMPT_VERSION = "semantic-v2"
 
 
 @dataclass
