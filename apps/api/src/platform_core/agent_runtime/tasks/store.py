@@ -165,6 +165,11 @@ class TaskCommand:
     # that carry a source and a confirmation flag - a caller that could write
     # a bare value here would be a way to assert a fact with no provenance.
     slots: list[dict[str, Any]] | None = None
+    # The proposal this transition produced. B1-05: the task used to reach
+    # `awaiting_confirmation` with no proposal behind it, so there was nothing
+    # for an agent to confirm. The id is written here so the row and the
+    # proposal cannot drift apart.
+    proposal_id: uuid.UUID | None = None
     # When set, the action's arguments changed: bump the revision so any
     # confirmation bound to the old one stops matching.
     bump_action_revision: bool = False
@@ -370,6 +375,8 @@ async def transition(
         values["action_revision"] = task.action_revision + 1
     if command.completion_evidence is not None:
         values["completion_evidence"] = command.completion_evidence
+    if command.proposal_id is not None:
+        values["proposal_id"] = command.proposal_id
 
     result = await session.execute(
         update(ConversationTask)

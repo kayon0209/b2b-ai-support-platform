@@ -486,19 +486,209 @@ async def _build_command(
             **base,
         )
 
-    # prepare_proposal. A proposal is created by the gateway through the
-    # existing tool-proposals route with a human actor; this command only
-    # moves the task to the state where a confirmation would be meaningful, and
-    # bumps the action revision so a confirmation bound to the previous
-    # arguments no longer matches.
+    # prepare_proposal. B1-05: the previous revision only moved the task to
+    # `awaiting_confirmation` and bumped the revision. No `ToolProposal` was
+    # created, `proposal_id` stayed NULL, and the UI said "生成待确认提案"
+    # over a task with nothing to confirm.
+    #
+    # A real proposal is created here, through the same `ToolGateway.propose`
+    # the proposals route uses, and the resulting id is written onto the task.
+    # If no write capability exists for this tenant the task goes to
+    # `needs_human` with the reason, rather than sitting in a state that
+    # advertises a confirmation that will never arrive.
     if task.kind != TaskKind.WRITE.value:
         return None
+    if TaskStatus(task.status) is not TaskStatus.READY:
+        return None
+
+    proposal = await _create_proposal(
+        session,
+        ctx=ctx,
+        task=task,
+        trace_id=trace_id,
+    )
+    if proposal is None:
+        # No write capability. Park it with the reason the planner would have
+        # used, so the panel says the same thing whichever path produced it.
+        return task_store.TaskCommand(
+            target=TaskStatus.NEEDS_HUMAN,
+            reason_code="SEMANTIC_NO_WRITE_CAPABILITY",
+            blocked_reason="SEMANTIC_NO_WRITE_CAPABILITY",
+            **base,
+        )
+
     return task_store.TaskCommand(
         target=TaskStatus.AWAITING_CONFIRMATION,
         reason_code="TASK_PROPOSAL_PREPARED",
         bump_action_revision=True,
+        proposal_id=proposal.id,
         **base,
     )
+
+
+async def _create_proposal(
+    session: Any,
+    *,
+    ctx: TenantContext,
+    task: Any,
+    trace_id: str,
+) -> Any | None:
+    """Create a real `ToolProposal` for a write task, or None when it cannot.
+
+    The gateway is the only path to a business write, and this calls it rather
+    than writing a proposal-shaped row: a second way to create a proposal would
+    be a second set of rules about what a confirmation authorises.
+
+    Returns None - and the caller parks the task - when:
+
+    - the task names no tool, because nothing chose one for it; and
+    - the tenant has no registered write tool at all, which is the R1 case for
+      an address change.
+
+    The idempotency key is derived from the task id and its action revision
+    rather than generated per request, so a double-clicked "准备提案" creates
+    one proposal rather than two.
+    """
+    from sqlalchemy import select as sa_select
+
+    from platform_core.tool_gateway.gateway import ToolDenied, ToolGateway, ToolGatewayError
+    from platform_core.tool_gateway.models import ToolDefinition, ToolProposal
+
+    tool_name = _write_tool_for(task)
+    if not tool_name:
+        return None
+
+    tool = (
+        await session.execute(
+            sa_select(ToolDefinition)
+            .where(
+                (ToolDefinition.tenant_id == ctx.tenant_id) | ToolDefinition.tenant_id.is_(None),
+                ToolDefinition.name == tool_name,
+            )
+            .order_by(ToolDefinition.version.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if tool is None or tool.risk not in ("low_write", "confirmed_write", "human_approval"):
+        return None
+
+    arguments = _proposal_arguments(task)
+    if arguments is None:
+        # A required argument has no value. Proposing anyway would produce a
+        # proposal the gateway refuses with a schema error the agent cannot
+        # map back to a field.
+        return None
+
+    required_action = {
+        "low_write": "tool.write.low",
+        "confirmed_write": "tool.write.confirmed",
+        "human_approval": "tool.human_approval",
+    }[tool.risk]
+
+    # The gateway's `propose` always inserts: it is a "freeze these arguments"
+    # operation with no replay semantics of its own. So the replay check lives
+    # here, keyed on the same (task, revision) pair the idempotency key encodes.
+    #
+    # Without it, a double-clicked "准备提案" produced two proposals and two
+    # confirmations to choose between, and the second was indistinguishable
+    # from a deliberate re-proposal with changed arguments - which is the exact
+    # distinction the action revision exists to make.
+    key = f"task-{task.id}-r{task.action_revision}"
+    existing = (
+        await session.execute(
+            sa_select(ToolProposal).where(
+                ToolProposal.tenant_id == ctx.tenant_id,
+                ToolProposal.idempotency_key == key,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    gateway = ToolGateway(session, {})
+    if ctx.actor_id is None:
+        # The route refuses an unidentified caller before reaching here; this
+        # is the type-level statement of the same rule, because a proposal
+        # with no actor is a write nobody can be shown to have authorised.
+        return None
+    try:
+        return await gateway.propose(
+            tenant_id=ctx.tenant_id,
+            actor_id=ctx.actor_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            role=ctx.role or "unknown",
+            # Stable per (task, revision): a replay is the same proposal, and a
+            # bumped revision is deliberately a different one, which is what
+            # makes the old confirmation stop matching.
+            idempotency_key=key,
+            permission_allowed=True,
+            required_action=required_action,
+        )
+    except (ToolGatewayError, ToolDenied) as exc:
+        # Logged, not swallowed. The previous revision caught this and returned
+        # None with nothing recorded, which is how a proposal that was never
+        # created looked identical to one that was refused: the task went to
+        # needs_human either way, and the reason was unreadable.
+        #
+        # A refusal here is a real answer - the arguments failed the tool's
+        # schema, or the actor lacks the permission - and an operator debugging
+        # "why did my task not become a proposal" needs it.
+        _log_proposal_refusal(tool_name, exc)
+        return None
+
+
+def _log_proposal_refusal(tool_name: str, exc: Exception) -> None:
+    """Record why a proposal was refused, without the arguments.
+
+    The tool name and the gateway's code are the two things an operator needs.
+    The arguments are not logged: they carry the customer's own words and a
+    confirmed write's arguments are the thing about to be approved.
+    """
+    import logging
+
+    # Both gateway errors carry `.code`; the fallback keeps the call total if a
+    # future exception type does not, because a missing reason code is better
+    # than a crash in the logging path of a business refusal.
+    code = getattr(exc, "code", type(exc).__name__)
+    logging.getLogger("platform.tasks").warning(
+        "proposal_refused", extra={"tool_name": tool_name, "reason_code": str(code)}
+    )
+
+
+def _write_tool_for(task: Any) -> str | None:
+    """The write tool this task would act through, if one was recorded.
+
+    A task whose slots name a `tool` slot has been told which tool to use by
+    the capability filter. A task without one is not guessed at: R1 has no
+    deterministic way to choose a write tool from a set of collected fields, and
+    choosing wrong would propose a real write against the wrong target.
+    """
+    for slot in task.slots or []:
+        if slot.get("name") == "tool" and slot.get("value"):
+            return str(slot["value"])
+    return None
+
+
+def _proposal_arguments(task: Any) -> dict[str, Any] | None:
+    """Build the tool arguments from the task's slots, or None if incomplete.
+
+    Only non-sensitive, confirmed-by-presence slot values are used. A withheld
+    value cannot become an argument: the proposal would carry an empty string
+    where the customer gave an address, and the gateway would accept it.
+    """
+    arguments: dict[str, Any] = {}
+    for slot in task.slots or []:
+        name = slot.get("name")
+        if not name or name == "tool":
+            continue
+        if slot.get("value_withheld") or slot.get("inferred"):
+            # Either withheld by policy or never sourced. Both mean "we do not
+            # have a value we are willing to write".
+            return None
+        if "value" in slot:
+            arguments[str(name)] = slot["value"]
+    return arguments or None
 
 
 # `TaskConflict` is imported late so the module docstring's import list stays
