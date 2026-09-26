@@ -57,6 +57,12 @@ class CopilotKind(StrEnum):
     REPLY = "reply"
 
 
+# The outbox event type the workbench route writes and the worker's copilot
+# consumer reads. Named here, like the shadow one, so a producer that invented
+# its own string would enqueue work nothing consumes - a silent no-op that
+# looks exactly like "the model is slow".
+COPILOT_EVENT_TYPE = "copilot.generate_requested"
+
 # A queued job nobody has picked up within this window is expired rather than
 # left to be discovered later. It is well beyond any observed generation time
 # and short enough that the workbench does not show a "generating" spinner for
@@ -296,6 +302,7 @@ def replace(job: CopilotJob, **changes: Any) -> CopilotJob:
 
 
 __all__ = [
+    "COPILOT_EVENT_TYPE",
     "JOB_TTL_SECONDS",
     "MAX_INSTRUCTIONS_CHARS",
     "REASON_ACTOR_CHANGED",

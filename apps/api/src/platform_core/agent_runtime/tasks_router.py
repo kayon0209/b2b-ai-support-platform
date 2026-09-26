@@ -33,8 +33,12 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import select as sa_select
+from sqlalchemy.exc import IntegrityError
 
+from platform_core.agent_runtime import chat_service
 from platform_core.agent_runtime.copilot import (
+    COPILOT_EVENT_TYPE,
     CopilotError,
     CopilotJobStatus,
     CopilotKind,
@@ -42,6 +46,7 @@ from platform_core.agent_runtime.copilot import (
     new_job,
     should_expire,
 )
+from platform_core.agent_runtime.models import ConversationTurn
 from platform_core.agent_runtime.tasks import store as task_store
 from platform_core.agent_runtime.tasks.models import CopilotDraft
 from platform_core.agent_runtime.tasks.state_machine import (
@@ -64,7 +69,6 @@ from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.outbox_service import enqueue
-from platform_core.tool_gateway.models import ProposalStatus
 from platform_policy import Action
 
 router = APIRouter(prefix="/v1/workbench", tags=["workbench-tasks"])
@@ -360,7 +364,6 @@ async def _persist_collected(
     is the point of B1-04: "no persisted evidence" must never read as
     "collected".
     """
-    from platform_core.agent_runtime import chat_service
 
     text = "\n".join(f"{name}: {value}" for name, value in fields.items())
     # `append_customer_turn`, not a hand-rolled insert: the collected text is
@@ -703,10 +706,28 @@ TaskConflict_ = task_store.TaskConflict
 async def create_copilot_job(
     request: Request, conversation_ref: uuid.UUID, body: CopilotJobIn
 ) -> Any:
-    """Queue a summary or a reply draft. Never sends anything.
+    """Persist a queued draft request and return its job id.
 
-    Returns 202 with a job id. The workbench polls the job; a queued job that
-    nobody collects expires rather than being discovered much later.
+    B1-03: the previous revision built a `CopilotJob` in memory, returned it,
+    and wrote no row - so the POST answered `queued` and the GET that followed
+    it answered 404. A job that does not exist cannot be polled, and an
+    operator watching a spinner that will never resolve is worse than an
+    error.
+
+    The row is written before the response, in the same transaction as the
+    ownership check, so a 202 always means a job exists. The generation itself
+    is enqueued for the worker; nothing is generated inline and nothing is
+    ever sent.
+
+    Two validations that the old version skipped:
+
+    - **Source turns must belong to this conversation and this tenant.** A
+      caller could name any turn id and get a `queued`; a summary's sources
+      are what COP-01 requires it to be checkable against, so a source that
+      does not resolve is refused rather than recorded.
+    - **The lease must still be the caller's**, re-read inside the
+      transaction. A request queued for a conversation somebody else now owns
+      would be generated against state its requester cannot see.
     """
     ctx, denied = _auth(request, Action.CASE_UPDATE)
     if denied is not None:
@@ -753,6 +774,18 @@ async def create_copilot_job(
                     status_code=409,
                 )
 
+            sources = await _resolve_sources(
+                session,
+                conversation_ref=conversation_ref,
+                turn_ids=body.source_turn_ids,
+            )
+            if sources is None:
+                return error_response(
+                    "COPILOT_SOURCE_NOT_FOUND",
+                    "a named source turn does not belong to this conversation",
+                    status_code=404,
+                )
+
             kind = CopilotKind(body.kind)
             job = new_job(
                 tenant_id=ctx.tenant_id,
@@ -763,11 +796,80 @@ async def create_copilot_job(
                 lease_version=body.lease_version,
                 instructions=body.instructions,
                 task_id=body.task_id,
-                source_refs=[{"turn_id": t} for t in body.source_turn_ids],
+                source_refs=sources,
+            )
+
+            row = CopilotDraft(
+                tenant_id=ctx.tenant_id,
+                conversation_ref_id=conversation_ref,
+                actor_id=actor_id,
+                job_id=job.job_id,
+                task_id=body.task_id,
+                kind=job.kind.value,
+                status=CopilotJobStatus.QUEUED.value,
+                timeline_revision=job.timeline_revision,
+                lease_version=job.lease_version,
+                source_refs=sources,
+                body="",
+                version=1,
+                edited_by_human=False,
+                created_at=job.created_at,
+                updated_at=job.updated_at,
+            )
+            session.add(row)
+            await session.flush()
+
+            # The generation runs in the worker, from its own claim, so a slow
+            # provider cannot hold this request open. The outbox row is written
+            # in the same transaction as the draft, so a job cannot exist
+            # without a consumer able to see it.
+            await enqueue(
+                session,
+                tenant_id=ctx.tenant_id,
+                event_type=COPILOT_EVENT_TYPE,
+                aggregate_type="copilot_draft",
+                aggregate_id=str(row.job_id),
+                payload={
+                    "job_id": str(job.job_id),
+                    "draft_id": str(row.id),
+                    "conversation_ref": str(conversation_ref),
+                    "kind": job.kind.value,
+                    "timeline_revision": job.timeline_revision,
+                    "lease_version": job.lease_version,
+                },
+                trace_id=trace_id,
             )
     except CopilotError as exc:
         status = 422 if exc.code.endswith("REQUIRES_SOURCES") else 400
         return error_response(exc.code, exc.detail, status_code=status, trace_id=trace_id)
+    except IntegrityError:
+        # The (tenant_id, job_id) unique constraint fired: this exact request
+        # already exists. Returning the original is the correct replay
+        # behaviour, and it is a 200 rather than a 5xx because the caller
+        # asked for something that is already true.
+        async with tenant_session(ctx) as session:
+            existing = (
+                await session.execute(
+                    sa_select(CopilotDraft).where(
+                        CopilotDraft.tenant_id == ctx.tenant_id,
+                        CopilotDraft.job_id == job.job_id,
+                    )
+                )
+            ).scalar_one_or_none()
+        if existing is None:
+            return error_response(
+                "CONFLICT", "the job could not be created", status_code=409, trace_id=trace_id
+            )
+        return ok_response(
+            {
+                "job_id": str(existing.job_id),
+                "kind": existing.kind,
+                "status": existing.status,
+                "timeline_revision": existing.timeline_revision,
+                "lease_version": existing.lease_version,
+            },
+            trace_id=trace_id,
+        )
 
     return ok_response(
         {
@@ -781,27 +883,71 @@ async def create_copilot_job(
     )
 
 
+async def _resolve_sources(
+    session: Any,
+    *,
+    conversation_ref: uuid.UUID,
+    turn_ids: list[str],
+) -> list[dict[str, Any]] | None:
+    """Resolve source turn ids against this conversation, or None if any miss.
+
+    Read through the tenant session, so a turn belonging to another tenant is
+    invisible rather than refused - the two are indistinguishable to the
+    caller, which is the point.
+
+    A summary with no sources is refused upstream by `new_job`; this function
+    handles the other half, where sources were named but do not exist.
+    """
+    if not turn_ids:
+        return []
+    rows = (
+        await session.execute(
+            sa_select(ConversationTurn).where(
+                ConversationTurn.conversation_ref_id == conversation_ref,
+                ConversationTurn.id.in_(turn_ids),
+            )
+        )
+    ).scalars()
+    found = {str(r.id) for r in rows}
+    if found != set(turn_ids):
+        return None
+    # Offsets are recorded so a later review can point at the exact span. The
+    # text itself stays in `conversation_turns`.
+    return [{"turn_id": t, "role": "customer", "offset": [0, 0]} for t in turn_ids]
+
+
 @router.get("/conversations/{conversation_ref}/copilot/jobs/{job_id}")
 async def read_copilot_job(request: Request, conversation_ref: uuid.UUID, job_id: uuid.UUID) -> Any:
-    """Poll a job. Cross-conversation ids are indistinguishable from unknown."""
+    """Poll a job. Cross-conversation ids are indistinguishable from unknown.
+
+    B1-03 also: the previous revision called `session.get(CopilotDraft,
+    job_id)`, which looks the row up by *primary key*. The URL carries the
+    `job_id` column, which is a different column with a unique constraint -
+    so even once rows were being written, every poll would have 404'd. The
+    lookup is by (tenant, job_id) now, and the tenant predicate is
+    belt-and-braces on top of RLS rather than a substitute for it.
+    """
     ctx, denied = _auth(request, Action.CASE_READ)
     if denied is not None:
         return denied
     assert ctx is not None
 
     async with tenant_session(ctx) as session:
-        row = await session.get(CopilotDraft, job_id)
+        row = (
+            await session.execute(
+                sa_select(CopilotDraft).where(
+                    CopilotDraft.tenant_id == ctx.tenant_id,
+                    CopilotDraft.job_id == job_id,
+                )
+            )
+        ).scalar_one_or_none()
         if row is None or row.conversation_ref_id != conversation_ref:
             return error_response("NOT_FOUND", "job not found", status_code=404)
-        if row.tenant_id != ctx.tenant_id:
-            return error_response("NOT_FOUND", "job not found", status_code=404)
 
-        payload = {
+        payload: dict[str, Any] = {
             "job_id": str(row.job_id),
             "kind": row.kind,
             "status": row.status,
-            # The draft's own primary key. `job_id` is a separate unique column
-            # carrying the derived job identity, and is what the poll URL uses.
             "draft_id": str(row.id) if row.id else None,
             "body": row.body,
             "source_refs": row.source_refs,
@@ -813,21 +959,29 @@ async def read_copilot_job(request: Request, conversation_ref: uuid.UUID, job_id
         # Staleness is evaluated on read, because the world can change between
         # the worker writing `succeeded` and the agent reading it. A job that
         # went stale while nobody was looking must read as stale.
-        current_revision = await _timeline_revision(session, conversation_ref=conversation_ref)
-        lease = await lease_service.lease_snapshot(
-            session, tenant_id=ctx.tenant_id, conversation_ref_id=conversation_ref
-        )
-        if lease is not None and row.status == CopilotJobStatus.SUCCEEDED.value:
-            job = _row_to_job(row)
-            refreshed = apply_staleness(
-                job,
-                current_timeline_revision=current_revision,
-                current_lease_version=lease.lease_version,
-                current_actor_id=ctx.actor_id or uuid.UUID(int=0),
+        if row.status == CopilotJobStatus.SUCCEEDED.value:
+            current_revision = await _timeline_revision(session, conversation_ref=conversation_ref)
+            lease = await lease_service.lease_snapshot(
+                session, tenant_id=ctx.tenant_id, conversation_ref_id=conversation_ref
             )
-            payload["status"] = refreshed.status.value
-            payload["error_code"] = refreshed.error_code
-            payload["can_insert"] = refreshed.can_insert()
+            if lease is not None:
+                refreshed = apply_staleness(
+                    _row_to_job(row),
+                    current_timeline_revision=current_revision,
+                    current_lease_version=lease.lease_version,
+                    current_actor_id=ctx.actor_id or uuid.UUID(int=0),
+                )
+                payload["status"] = refreshed.status.value
+                payload["error_code"] = refreshed.error_code
+                payload["can_insert"] = refreshed.can_insert()
+        elif row.status == CopilotJobStatus.QUEUED.value:
+            # An uncollected job that has aged out is expired, not queued.
+            # Reported on read rather than only by the worker's sweep, because
+            # the operator is the one watching the spinner.
+            job = _row_to_job(row)
+            if should_expire(job):
+                payload["status"] = CopilotJobStatus.EXPIRED.value
+                payload["error_code"] = "COPILOT_JOB_EXPIRED"
 
     return ok_response(payload)
 
@@ -840,14 +994,12 @@ async def _timeline_revision(session: Any, *, conversation_ref: uuid.UUID) -> in
     means a stale draft gets inserted. Turn count cannot drift: every turn is
     a row, and a new customer message is a new row.
     """
-    from sqlalchemy import func, select
-
-    from platform_core.agent_runtime.models import ConversationTurn
+    from sqlalchemy import func
 
     return int(
         (
             await session.execute(
-                select(func.count())
+                sa_select(func.count())
                 .select_from(ConversationTurn)
                 .where(ConversationTurn.conversation_ref_id == conversation_ref)
             )
@@ -878,14 +1030,4 @@ def _row_to_job(row: Any) -> Any:
     )
 
 
-# Imported at module scope: the router already depends on the task package
-# for `store` and the state machine, and a function masquerading as a model
-# class reads like a dependency that has not been declared.
-
-
 __all__ = ["ALLOWED_COMMANDS", "router"]
-
-
-# `should_expire` and `ProposalStatus` are imported for the worker consumer
-# that will use them; referenced here so the import is not dropped.
-_ = (should_expire, ProposalStatus)
