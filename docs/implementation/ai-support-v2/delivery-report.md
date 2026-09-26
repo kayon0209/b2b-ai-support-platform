@@ -309,7 +309,7 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 
 **仍阻塞生产放量**：EVAL-02、PERF-01/02、OPS-01 worker 重启、OPS-02 回滚、SEC-03 两坐席在途接管、完整 UI/UX 无障碍矩阵。所有生产租户新开关继续默认关闭，`semantic_read` 不启用。
 
-**最近一次已通过 GitHub Actions**：[run #36248940564](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36248940564) 在 head `29f6a5d4f7bed8b8bc215a834beaee87fd3ce282` 全部通过，包含 Release Evidence。该运行早于本节 2026-09-27 的提示词/超时观测修复；新 commit 必须重新通过 CI。PR #19 保持打开；本报告不授权合并或生产发布。
+**GitHub Actions**：[run #36255342567](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36255342567) 在代码 head `85f25f387d40d2aa6ad9160851ee3ebe741e5f44` 全部通过，包含 Release Evidence。该 run 验证了本节提示词/超时观测修复；当前后续仅更新验收记录。CI 通过不替代真实模型质量/生产容量/回滚门槛。PR #19 保持打开；本报告不授权合并或生产发布。
 
 ### 2026-09-27 Gitee 提供方诊断与后续修复
 
