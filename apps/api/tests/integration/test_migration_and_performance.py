@@ -126,10 +126,11 @@ TENANT_TABLES = (
 # "how many revisions are registered", and a stray untracked file on one
 # machine must not be able to satisfy it.
 #
-# 61 as of 2026-09-25. `0062_draft_conversation_ref` is the newest registered
-# revision; keep this synchronized with the tracked revision set, excluding
+# 62 as of 2026-09-26. `0063_conversation_tasks` is the newest registered
+# revision (R1 conversation tasks, tasks events, copilot drafts and semantic
+# assessments); keep this synchronized with the tracked revision set, excluding
 # `.gitkeep` and any local-only migration files.
-EXPECTED_MIGRATIONS = 61
+EXPECTED_MIGRATIONS = 62
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

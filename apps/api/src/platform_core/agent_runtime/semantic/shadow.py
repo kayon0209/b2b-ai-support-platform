@@ -38,6 +38,7 @@ from platform_core.agent_runtime.semantic.contracts import (
     SemanticAssessment,
     SemanticMode,
 )
+from platform_core.agent_runtime.semantic.service import SemanticBudget
 from platform_core.agent_runtime.semantic.validator import CapabilityView
 from platform_core.agent_runtime.tasks import store as task_store
 
@@ -49,6 +50,14 @@ SHADOW_TTL_SECONDS = 7 * 24 * 3600
 # A cap per conversation, so one verbose customer cannot fill the table and
 # crowd out every other tenant's samples.
 MAX_SAMPLES_PER_CONVERSATION = 50
+
+# The outbox event type the inbox consumer writes and `shadow_consumer` reads.
+#
+# Named here rather than at the producer so the two halves cannot drift: a
+# producer that invented its own string would enqueue work nothing consumes,
+# and the symptom - a silent no-op - is exactly what this module exists to
+# make impossible to miss.
+SHADOW_EVENT_TYPE = "semantic.shadow_requested"
 
 REASON_SHADOW_EXPIRED = "SEMANTIC_SHADOW_SAMPLE_EXPIRED"
 REASON_SHADOW_QUOTA = "SEMANTIC_SHADOW_CONVERSATION_QUOTA"
@@ -89,12 +98,18 @@ async def record_shadow(
     session: AsyncSession,
     request: ShadowRequest,
     provider: Any | None,
+    *,
+    budget: SemanticBudget | None = None,
 ) -> ShadowOutcome:
     """Run one shadow classification and persist the comparison record.
 
-    Called from the inbox consumer *after* the run has been persisted and the
-    answer dispatched, inside its own transaction boundary so a failure here
-    cannot roll back the customer-facing work.
+    Called from `worker.shadow_consumer` in its own transaction, so a failure
+    here cannot roll back the customer-facing run that queued the work.
+
+    `budget` is a parameter rather than fixed so the consumer can set a
+    deadline appropriate to a background classification. A shadow record is
+    worth less than a fast customer answer; spending the interactive budget on
+    it would let a background comparison delay the queue.
     """
     now = int(time.time())
     if now - request.turn_created_at > SHADOW_TTL_SECONDS:
@@ -128,10 +143,11 @@ async def record_shadow(
         ),
         provider=provider,
         capabilities=request.capabilities,
-        # Shadow shares the classification budget with the live path, and the
-        # live path has already spent its deadline. A shadow record is worth
-        # less than a fast answer, so it gets a short one.
-        budget=SemanticBudget(deadline_seconds=1.0, max_retries=0),
+        # The caller's budget when given, otherwise a short one. Shadow shares
+        # the classification budget with the live path and the live path has
+        # already spent its deadline; a shadow record is worth less than a fast
+        # answer.
+        budget=budget or SemanticBudget(deadline_seconds=1.0, max_retries=0),
     )
 
     await task_store.record_assessment(

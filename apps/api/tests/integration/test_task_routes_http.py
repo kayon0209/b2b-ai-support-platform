@@ -37,15 +37,15 @@ ADMIN_URL = os.environ.get(
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
 
-TENANT = "01900000-0000-7000-8000-000000000b01"
-OTHER = "01900000-0000-7000-8000-000000000b02"
+TENANT = "01900000-0000-7000-8000-0000000c001"
+OTHER = "01900000-0000-7000-8000-0000000c002"
 SLUG = "r1-tasks-http"
 OTHER_SLUG = "r1-tasks-http-other"
 
-CONV = "01900000-0000-7000-8000-000000000b10"
-OTHER_CONV = "01900000-0000-7000-8000-000000000b11"
-TASK = "01900000-0000-7000-8000-000000000b20"
-OTHER_TASK = "01900000-0000-7000-8000-000000000b21"
+CONV = "01900000-0000-7000-8000-0000000c010"
+OTHER_CONV = "01900000-0000-7000-8000-0000000c011"
+TASK = "01900000-0000-7000-8000-0000000c020"
+OTHER_TASK = "01900000-0000-7000-8000-0000000c021"
 
 AGENT_REF = "r1-agent-1"
 OTHER_AGENT_REF = "r1-agent-2"
@@ -485,7 +485,7 @@ def test_the_same_request_twice_yields_the_same_job_id() -> None:
 
 def test_polling_an_unknown_job_is_404() -> None:
     resp = _client().get(
-        f"/v1/workbench/conversations/{CONV}/copilot/jobs/01900000-0000-7000-8000-000000000b99"
+        f"/v1/workbench/conversations/{CONV}/copilot/jobs/01900000-0000-7000-8000-0000000c099"
     )
     assert resp.status_code == 404, resp.text
 

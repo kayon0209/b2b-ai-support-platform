@@ -1,7 +1,7 @@
 """Conversation tasks, their event log, and copilot drafts.
 
-Revision ID: 0055_conversation_tasks
-Revises: 0054_workbench_queue_indexes
+Revision ID: 0063_conversation_tasks
+Revises: 0062_draft_conversation_ref
 Create Date: 2026-09-26
 
 R1 of the semantic enhancement (docs/implementation/ai-support-v2). Four tables,
@@ -61,8 +61,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0055_conversation_tasks"
-down_revision: str | None = "0054_workbench_queue_indexes"
+revision: str = "0063_conversation_tasks"
+down_revision: str | None = "0062_draft_conversation_ref"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

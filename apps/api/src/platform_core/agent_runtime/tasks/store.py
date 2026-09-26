@@ -71,6 +71,36 @@ class TaskConflict(Exception):
         self.detail = detail
 
 
+def _value_digest(value: Any) -> str:
+    """A stable digest of a slot value, or a marker for its absence.
+
+    Why the value has to be in the hash: the hash is what makes a *replayed or
+    corrected* turn distinguishable from the original. Excluding values meant
+    `SO-1` and `SO-2` - two different orders from the same customer in the same
+    turn - hashed identically, so `create_or_get` returned the first task and
+    the second order's query was silently dropped. The comment on an earlier
+    revision claimed values were excluded on purpose; the reasoning was about
+    the *stored* row, not the *hash*, and applying it to the hash is what
+    produced that defect.
+
+    Why a digest and not the value: `content_hash` is stored beside the task
+    and compared on every redelivery, so a plain value would be a copy of
+    customer data in a column nothing needs to read. The digest is one-way, so
+    a hash comparison detects "this is a different order" without being able
+    to say which order it was.
+
+    A value that was never stored - a withheld sensitive slot, or an inferred
+    one - hashes as the absence marker. That is correct rather than lossy: two
+    tasks that both withheld their address really are indistinguishable from
+    each other by their content, and the identity of the withheld value is
+    carried by the transcript, not by this column.
+    """
+    if value is None:
+        return "-"
+    canonical = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:32]
+
+
 def content_hash(
     *,
     kind: TaskKind,
@@ -82,15 +112,21 @@ def content_hash(
 
     Sequence, version and timestamps are excluded on purpose: they change when
     the same logical task is re-derived, and including them would make every
-    redelivery look like a different task.
+    redelivery look like a different task. Slot *values* are included as
+    digests - see `_value_digest` for why, and what it costs.
     """
     canonical = json.dumps(
         {
             "kind": kind.value,
-            # Slot values are excluded; names, origins and confirmation are
-            # what determine whether this is the same request.
             "slots": [
-                {"name": s.get("name"), "origin": s.get("origin"), "confirmed": s.get("confirmed")}
+                {
+                    "name": s.get("name"),
+                    "origin": s.get("origin"),
+                    "confirmed": s.get("confirmed"),
+                    # `None` for a withheld or inferred slot, which is exactly
+                    # what `_value_digest` then hashes as the absence marker.
+                    "value": _value_digest(s.get("value")),
+                }
                 for s in slots
             ],
             "missing_slots": sorted(missing_slots),

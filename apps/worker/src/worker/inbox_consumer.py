@@ -758,21 +758,49 @@ async def process_event(
     )
     await _persist_memory(session, event=event, question=question, outcome=outcome)
 
-    # Shadow classification, after the run has been persisted and the answer
-    # dispatched.
+    # Shadow classification is *enqueued*, not performed.
     #
-    # Placed here and not inline for two reasons. First, the customer's answer
-    # is already decided: a shadow timeout must not become a customer-visible
-    # failure of a feature that is supposed to change nothing. Second, it gets
-    # its own transaction below, so a failure to record a comparison cannot
-    # roll back the run that did succeed.
-    shadow_result = await _record_shadow_after_run(
+    # The previous revision awaited the model call here, inside the per-event
+    # session, before returning so the row could be marked COMPLETED. That made
+    # the claim in this function's comment false: the customer's event was not
+    # complete until a classification finished, so a slow provider delayed
+    # event completion and held a connection for the duration.
+    #
+    # What happens here is now only: resolve the flag, and if shadow is on,
+    # write an outbox row in the same transaction as the run. The classification
+    # itself runs in `shadow_consumer`, in its own tenant session, with its own
+    # deadline, quota and expiry. Nothing on the customer path waits for it.
+    shadow_enqueued = await _enqueue_shadow(
         session,
-        event=event,
+        tenant_id=event.tenant_id,
+        conversation_ref_id=conversation_ref_id,
+        turn_id=str(event.minimized_payload.get("message_id") or event.delivery_id),
+        question=question,
+        history=[(t.ref, t.text) for t in history[-8:] if getattr(t, "ref", None)],
+        turn_created_at=int(event.received_at or time.time()),
+    )
+
+    # Conversation tasks, from a real assessment.
+    #
+    # B1-02: `plan_tasks` and `create_or_get` had no caller, so a customer
+    # message produced no tasks and the workbench panel had nothing to show.
+    #
+    # This runs *after* the run is persisted and the answer dispatched, and
+    # only when `agent.conversation_tasks` is on. With the flag off it reads
+    # one flag row and returns; the customer's path is byte-for-byte what it
+    # was before R1. Unlike the shadow work it is synchronous, because a task
+    # the agent is expected to act on has to exist by the time they open the
+    # conversation - deferring it would make the panel empty on first render
+    # and the feature would look broken rather than slow.
+    tasks_created = await _plan_conversation_tasks(
+        session,
+        tenant_id=event.tenant_id,
         conversation_ref_id=conversation_ref_id,
         question=question,
-        history=history,
+        history=[(t.ref, t.text) for t in history[-8:] if getattr(t, "ref", None)],
+        lease_owner_type="ai",
         deps=deps,
+        turn_created_at=int(event.received_at or time.time()),
     )
 
     metrics.inbox_events_total.labels(result=outcome.status.value).inc()
@@ -784,12 +812,178 @@ async def process_event(
         status=outcome.status.value,
         route=outcome.route,
         latency_ms=outcome.latency_ms,
+        # Counts only. The task rows carry the detail, and a log line that
+        # quoted a task would be a copy of customer content in a place with
+        # weaker access control. `count` is the allowlisted name; a new field
+        # would have to be added to the redaction boundary's schema, and this
+        # does not justify widening it.
+        count=tasks_created,
     )
-    if shadow_result is not None:
-        # Counted, not logged with the text: the label vocabulary is closed and
-        # the customer's words are not in it.
-        metrics.inbox_events_total.labels(result=f"shadow_{shadow_result}").inc()
+    if shadow_enqueued:
+        get_metrics().inbox_events_total.labels(result="shadow_enqueued").inc()
     return outcome.status
+
+
+async def _plan_conversation_tasks(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_ref_id: uuid.UUID,
+    question: str,
+    history: list[tuple[str, str]],
+    lease_owner_type: str,
+    deps: OrchestratorDeps,
+    turn_created_at: int,
+) -> int:
+    """Analyse the turn and persist whatever tasks it implies. Returns a count.
+
+    Gated twice: `agent.conversation_tasks` must be on, and the process kill
+    switch must be up. With either off this returns before touching a table.
+
+    Every failure is swallowed. The customer's answer is already committed by
+    the time this runs, and a planner error must not mark their message failed
+    and trigger a retry that re-answers them.
+    """
+    from platform_core.agent_runtime.semantic.context import build_context
+    from platform_core.agent_runtime.semantic.contracts import SemanticMode
+    from platform_core.agent_runtime.semantic.modes import (
+        FLAG_ASSIST,
+        FLAG_TASKS,
+        resolve_mode,
+    )
+    from platform_core.agent_runtime.semantic.service import (
+        AnalysisRequest,
+        SemanticBudget,
+        analyze,
+    )
+    from platform_core.agent_runtime.semantic.shadow import capabilities_for_shadow
+    from platform_core.agent_runtime.tasks.planning_seam import run_task_planning
+    from platform_core.config import get_settings
+    from platform_core.knowledge import flag_service
+    from platform_core.tool_gateway import registry
+
+    try:
+        decisions = await flag_service.evaluate_many(
+            session,
+            flag_keys=[FLAG_TASKS, FLAG_ASSIST],
+            tenant_id=tenant_id,
+            defaults={FLAG_TASKS: False, FLAG_ASSIST: False},
+        )
+        if not decisions.get(FLAG_TASKS) or not decisions[FLAG_TASKS].enabled:
+            return 0
+        # Tasks come from an assist-mode suggestion. A tenant that turned on
+        # task persistence but not assist has asked for the storage without the
+        # suggestion, and there is nothing to store.
+        if not decisions.get(FLAG_ASSIST) or not decisions[FLAG_ASSIST].enabled:
+            return 0
+        resolution = resolve_mode(get_settings(), {k: d.enabled for k, d in decisions.items()})
+        if resolution.mode is SemanticMode.OFF:
+            return 0
+
+        from worker import shadow_consumer
+
+        provider = shadow_consumer.chat_provider(deps)
+        if provider is None:
+            return 0
+
+        await registry.ensure_tool_definitions(session, tenant_id=tenant_id)
+        capabilities = capabilities_for_shadow(await _tenant_tool_names(session, tenant_id))
+
+        ctx = build_context(
+            current_turn_id=str(turn_created_at),
+            current_text=question,
+            history=history,
+            mode=SemanticMode.ASSIST,
+            capabilities=capabilities,
+        )
+        assessment = await analyze(
+            AnalysisRequest(context=ctx, lease_owner_type=lease_owner_type),
+            provider=provider,
+            capabilities=capabilities,
+            # Longer than the shadow budget: this one is on the request path
+            # and its result is meant to be visible to the agent immediately.
+            budget=SemanticBudget(deadline_seconds=3.0, max_retries=0),
+        )
+        outcome = await run_task_planning(
+            session,
+            tenant_id=tenant_id,
+            conversation_ref_id=conversation_ref_id,
+            assessment=assessment,
+            capabilities=capabilities,
+        )
+        if outcome.created:
+            get_metrics().inbox_events_total.labels(result="tasks_created").inc(outcome.created)
+        return outcome.created
+    except Exception as exc:  # noqa: BLE001 - planning must not fail the message
+        logger.warning(
+            "task_planning_failed",
+            conversation_ref_id=str(conversation_ref_id),
+            error_code=type(exc).__name__,
+        )
+        return 0
+
+
+async def _enqueue_shadow(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_ref_id: uuid.UUID,
+    turn_id: str,
+    question: str,
+    history: list[tuple[str, str]],
+    turn_created_at: int,
+) -> bool:
+    """Queue a shadow classification if this tenant has shadow mode on.
+
+    Returns whether a row was written. No model call happens here, and no
+    failure propagates: a shadow enqueue that cannot be written must not fail
+    an event whose customer answer is already committed.
+
+    The outbox row is the *request*. It carries the turn text because the
+    consumer needs it and the consumer is asynchronous; it is written inside
+    the tenant transaction, so it is as protected as the run itself, and the
+    consumer re-reads the turn from `conversation_turns` rather than trusting a
+    long-lived copy in a queue payload.
+    """
+    from platform_core.agent_runtime.semantic.modes import FLAG_SHADOW, resolve_mode
+    from platform_core.agent_runtime.semantic.shadow import SHADOW_EVENT_TYPE
+    from platform_core.config import get_settings
+    from platform_core.knowledge import flag_service
+    from platform_core.outbox_service import enqueue
+
+    try:
+        decisions = await flag_service.evaluate_many(
+            session,
+            flag_keys=[FLAG_SHADOW],
+            tenant_id=tenant_id,
+            defaults={FLAG_SHADOW: False},
+        )
+        resolution = resolve_mode(get_settings(), {k: d.enabled for k, d in decisions.items()})
+        if resolution.mode.value != "shadow":
+            return False
+
+        await enqueue(
+            session,
+            tenant_id=tenant_id,
+            event_type=SHADOW_EVENT_TYPE,
+            aggregate_type="conversation",
+            aggregate_id=str(conversation_ref_id),
+            payload={
+                "conversation_ref": str(conversation_ref_id),
+                "turn_id": turn_id,
+                "turn_created_at": turn_created_at,
+                # Carried so the consumer can run without re-reading a
+                # minimised inbox payload, and so a turn that has since been
+                # pruned is still explainable. Bounded by the same truncation
+                # the synchronous path would have applied.
+                "question": question[:2000],
+                "history": history,
+            },
+        )
+        return True
+    except Exception:  # noqa: BLE001 - shadow must never fail the customer path
+        logger.warning("shadow_enqueue_failed", conversation_ref_id=str(conversation_ref_id))
+        return False
 
 
 async def _tenant_tool_names(
@@ -811,87 +1005,6 @@ async def _tenant_tool_names(
         )
     ).scalars()
     return {row.name: CapabilityView(tool_name=row.name, risk_class=row.risk) for row in rows}
-
-
-async def _record_shadow_after_run(
-    session: AsyncSession,
-    *,
-    event: ClaimedEvent,
-    conversation_ref_id: uuid.UUID,
-    question: str,
-    history: list[Turn],
-    deps: OrchestratorDeps,
-) -> str | None:
-    """Record a shadow assessment, or say why not.
-
-    Returns a short reason code for the metric label, or None when the tenant
-    has not enabled shadow mode (the overwhelmingly common case, and not
-    worth a label).
-
-    Every failure is swallowed. The alternative - letting an exception here
-    propagate - would mark the inbox event failed after the customer had
-    already been answered, and the retry would re-run the whole agent.
-    """
-    from platform_core.agent_runtime.semantic.modes import (
-        FLAG_SHADOW,
-        resolve_mode,
-    )
-    from platform_core.agent_runtime.semantic.shadow import (
-        ShadowRequest,
-        capabilities_for_shadow,
-        record_shadow,
-    )
-    from platform_core.config import get_settings
-    from platform_core.knowledge import flag_service
-
-    try:
-        settings = get_settings()
-        decisions = await flag_service.evaluate_many(
-            session,
-            flag_keys=[FLAG_SHADOW],
-            tenant_id=event.tenant_id,
-            defaults={FLAG_SHADOW: False},
-        )
-        resolution = resolve_mode(settings, {k: d.enabled for k, d in decisions.items()})
-        if resolution.mode.value != "shadow":
-            return None
-
-        # Only the tools this tenant actually has, so the model is not asked
-        # about capabilities the platform cannot serve. `capabilities_for_shadow`
-        # adds back the task-kind vocabulary, so a read and a write are both
-        # visible to the model and the refusal is recorded rather than hidden.
-        from platform_core.tool_gateway import registry
-
-        await registry.ensure_tool_definitions(session, tenant_id=event.tenant_id)
-        available = capabilities_for_shadow(await _tenant_tool_names(session, event.tenant_id))
-
-        outcome = await record_shadow(
-            session,
-            ShadowRequest(
-                tenant_id=event.tenant_id,
-                conversation_ref_id=conversation_ref_id,
-                turn_id=str(event.minimized_payload.get("message_id") or event.delivery_id),
-                turn_text=question,
-                # `Turn.ref` is the conversation-local turn id the semantic
-                # validator checks evidence offsets against. A turn without one
-                # is skipped rather than given a synthetic id: an evidence
-                # span that points at an id the model was never shown is
-                # exactly what the validator refuses.
-                history=[(t.ref, t.text) for t in history[-8:] if getattr(t, "ref", None)],
-                lease_owner_type="ai",
-                capabilities=available,
-                turn_created_at=int(event.received_at or time.time()),
-            ),
-            provider=deps.generator,
-        )
-        return "recorded" if outcome.recorded else outcome.reason.lower()
-    except Exception:  # noqa: BLE001 - a shadow failure must not affect the run
-        logger.warning(
-            "shadow_record_failed",
-            delivery_id=event.delivery_id,
-            conversation_ref_id=str(conversation_ref_id),
-        )
-        return "failed"
 
 
 async def drain_once(

@@ -241,13 +241,13 @@ def test_local_keys_are_server_shaped_and_distinct() -> None:
     assert make_local_key(TaskKind.READ, 0) != make_local_key(TaskKind.WRITE, 0)
 
 
-def test_content_hash_ignores_slot_values() -> None:
-    """A retry that re-states the same request with different wording of a
-    slot value is the same task.
+def test_content_hash_notices_a_different_slot_value() -> None:
+    """Two different orders from one turn are two different tasks.
 
-    This is why slot values are excluded from the hash: including them would
-    make every paraphrased redelivery look like a new task and defeat the
-    idempotency the key exists to provide.
+    This asserted the opposite before the acceptance review. Excluding values
+    meant `SO-1` and `SO-2` hashed identically, so a customer who named two
+    orders in one message got one task and the other order's query was dropped
+    without a trace. The hash now covers values as digests.
     """
     a = content_hash(
         kind=READ,
@@ -260,8 +260,68 @@ def test_content_hash_ignores_slot_values() -> None:
     b = content_hash(
         kind=READ,
         slots=[
-            {"name": "order_no", "value": "SO-999", "origin": "customer_stated", "confirmed": True}
+            {"name": "order_no", "value": "SO-2", "origin": "customer_stated", "confirmed": True}
         ],
+        missing_slots=[],
+        condition=None,
+    )
+    assert a != b
+
+
+def test_content_hash_is_stable_for_the_same_value() -> None:
+    """A redelivery of the same request must still be recognised as the same
+    one - a hash that moved on every call would defeat the idempotency key."""
+    a = content_hash(
+        kind=READ,
+        slots=[
+            {"name": "order_no", "value": "SO-1", "origin": "customer_stated", "confirmed": True}
+        ],
+        missing_slots=[],
+        condition=None,
+    )
+    b = content_hash(
+        kind=READ,
+        slots=[
+            {"name": "order_no", "value": "SO-1", "origin": "customer_stated", "confirmed": True}
+        ],
+        missing_slots=[],
+        condition=None,
+    )
+    assert a == b
+
+
+def test_content_hash_does_not_leak_the_value() -> None:
+    """The digest is one-way: a hash column nobody needs to read must not be a
+    copy of customer data."""
+    digest = content_hash(
+        kind=READ,
+        slots=[
+            {
+                "name": "order_no",
+                "value": "SO-240918",
+                "origin": "customer_stated",
+                "confirmed": True,
+            }
+        ],
+        missing_slots=[],
+        condition=None,
+    )
+    assert "SO-240918" not in digest
+    assert len(digest) == 64
+
+
+def test_a_withheld_value_hashes_as_absent() -> None:
+    """Two tasks that both withheld their address are indistinguishable by
+    content, and the identity of the withheld value lives in the transcript."""
+    a = content_hash(
+        kind=WRITE,
+        slots=[{"name": "address", "value_withheld": True, "origin": "customer_stated"}],
+        missing_slots=[],
+        condition=None,
+    )
+    b = content_hash(
+        kind=WRITE,
+        slots=[{"name": "address", "value_withheld": True, "origin": "customer_stated"}],
         missing_slots=[],
         condition=None,
     )
