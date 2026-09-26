@@ -44,8 +44,8 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | MIG-01 | 清洁库升级、带合成业务数据升级、回滚到上版应用可读写、隔离库迁移往返；新表 RLS/索引/外键完整 | 迁移全链回滚/重建与 RLS 测试 | 通过（隔离数据库；未做上版应用运行演练） |
 | OPS-01 | 持久任务超时、Worker 重启、provider 429/5xx、连接器断连、重复 outbox 可恢复；无孤儿 executing | 重复 outbox/过期恢复测试 | 部分完成（无进程重启/真实 provider 演练） |
 | OPS-02 | 租户开关/kill switch 生效，旧应用回滚保留数据；待确认动作不被自动执行 | kill switch 测试 | 部分完成（无回滚演练） |
-| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | [代码/评测 run #36257812704](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36257812704)，head `54cd315`；当前评测增补待 CI | 前一验证 head 通过；当前变更待确认 |
-| DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 更新后的验收/交付报告 | 部分完成（缺 CI/回滚/生产证据） |
+| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | [完整 CI + Release Evidence run #36260478409](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36260478409)，head `ade1bf0` | 通过 |
+| DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 更新后的验收/交付报告 | 部分完成（CI 通过；缺回滚演练与生产证据） |
 
 ## 3. 质量阈值：R1 提议的启用门槛
 

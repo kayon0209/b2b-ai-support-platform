@@ -148,7 +148,7 @@ write 为 `needs_human` + `SEMANTIC_NO_WRITE_CAPABILITY`，缺参保留，地址
 | T06 副驾 job | 完成 | 24 单测 + 10 集成 + 独立 consumer |
 | T07 工作台 UI | **部分完成** | 面板与四条路由已交付；**UI-01/UI-02 未验证** |
 | T08 端到端 | **部分完成** | 数据层旅程已验证；**浏览器双窗口、接管竞态、故障注入未做** |
-| T09 文档与证据 | 部分完成 | 本文件 + manifest；CI 在前一验证 head 通过；**本次评测增补待 CI，回滚演练未做** |
+| T09 文档与证据 | 部分完成 | 本文件 + manifest；head `ade1bf0` 的完整 CI 与 Release Evidence 已通过；**回滚演练未做** |
 
 计数：完成 6 / 部分完成 4 / 未开始 0。R2、R3 未实现，未标记完成。
 
@@ -158,7 +158,7 @@ write 为 `needs_human` + `SEMANTIC_NO_WRITE_CAPABILITY`，缺参保留，地址
 
 **完成**（本分支可复现）：
 SEM-01、SEM-02、SHD-01、TASK-01、TASK-02、TOOL-01、TOOL-02、TOOL-03、
-COP-01、COP-02、SEC-01、SEC-04、MIG-01
+COP-01、COP-02、SEC-01、SEC-04、MIG-01、CI-01（run #36260478409）
 
 **部分完成**：
 SEM-03（fake provider 降级通过；**无真实 provider 故障注入**）
@@ -219,9 +219,8 @@ cd apps/admin-web && npm run typecheck && npm run build && npm test       # 29 p
 在干净检出、无 `.env` 的环境下这三个 pricing 测试不失败——这与验收报告测到的
 1566/1384 口径一致，不是本轮修复的结果。
 
-**未执行**：`kubectl kustomize`、完整 `pytest`（含 e2e 脚本）。GitHub Actions 在
-前一验证 head `54cd315` 已全部通过；本次评测指标增补尚未推送，当前变更的 CI-01
-结果待更新。
+**未执行**：`kubectl kustomize`、完整本地 `pytest`（含 e2e 脚本）。GitHub Actions
+在 head `ade1bf0` 的全量套件及 Release Evidence 已通过。
 
 ---
 
@@ -313,11 +312,11 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 | T06 | 完成（worker/job/引用/人工发送） | 自定义指令受限；真实模型质量仍阻塞 |
 | T07 | 部分完成（API、桌面/移动实测） | UI-01 截图矩阵、完整键盘/屏幕阅读器仍未全验 |
 | T08 | 部分完成（合成端到端旅程） | 双坐席并发、provider/connector 故障注入和生产负载未做 |
-| T09 | 部分完成 | CI-01 在 head `54cd315` 已通过；本次变更待 CI；真实回滚演练和发布证据包整理仍未做 |
+| T09 | 部分完成 | CI-01 在 head `ade1bf0` 已通过；真实回滚演练和发布证据包整理仍未做 |
 
 **仍阻塞生产放量**：EVAL-02、PERF-01/02、OPS-01 worker 重启、OPS-02 回滚、SEC-03 两坐席在途接管、完整 UI/UX 无障碍矩阵。所有生产租户新开关继续默认关闭，`semantic_read` 不启用。
 
-**GitHub Actions**：[run #36257812704](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36257812704) 在代码/评测 head `54cd315faf7e7e3db64170ca600a59970e190978` 全部通过，包含 Release Evidence。当前评测指标增补尚未推送；其 CI 结果待更新。CI 通过不替代真实模型质量/生产容量/回滚门槛。PR #19 保持打开；本报告不授权合并或生产发布。
+**GitHub Actions**：[run #36260478409](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36260478409) 在代码/评测 head `ade1bf0ade71578228e633d54d816582b70c0f5c` 全部通过，包含 Release Evidence。CI 通过不替代真实模型质量/生产容量/回滚门槛。PR #19 保持打开；本报告不授权合并或生产发布。
 
 ### 2026-09-27 Gitee 提供方诊断与后续修复
 
@@ -331,4 +330,4 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 
 - T03 的离线比较报告现在支持槽位 exact-match、缺参槽位逐类/宏微 F1、失败样例只记录槽位名而不记录槽位值；数据集哈希包含精确输入文本、授权历史、预期标签、槽位和 provenance，确保输入或标注变化都会改变 digest。
 - 修复评测测试文件中既有的重复 `_family_in` 定义，使本次变更的 Mypy 检查通过。评测模块单测 29 项通过，Ruff、格式检查、Mypy 和 `git diff --check` 通过。
-- 这只是指标与报告能力，不是模型测评结果：600 条独立且复核的固定语义集尚未冻结，未执行真实模型 holdout、p95 或负载试验；没有新增线上模型调用。生产开关保持关闭。此次提交的 GitHub Actions 结果待推送后确认。
+- 这只是指标与报告能力，不是模型测评结果：600 条独立且复核的固定语义集尚未冻结，未执行真实模型 holdout、p95 或负载试验；没有新增线上模型调用。生产开关保持关闭。head `ade1bf0` 的 GitHub Actions 全部通过，包含 Release Evidence。
