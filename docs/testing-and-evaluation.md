@@ -1,247 +1,27 @@
-# Testing and Evaluation
+# 测试与评估策略
 
-## Test pyramid
+当前系统自有客户渠道。旧 Chatwoot e2e 清单为历史记录，不是现行验收路径。平台验收分为可重复的 unit/contract、PostgreSQL+RLS integration、浏览器 journey、LLM eval 与生产近似负载测试。
 
-### Unit tests
+## 工作台发布关键用例
 
-Cover deterministic logic:
+1. **无 Case handoff**：访客进入人工队列后出现在坐席队列，打开详情不返回另一个租户数据。
+2. **并发认领**：两坐席同时认领同一 ref，只有一个租约 owner 成功；另一个拿到 409，不产生第二个 owner。
+3. **容量控制**：同一活跃坐席并发认领不超过 AgentProfile.max_concurrent。
+4. **人工/AI 竞态**：AI 生成中人工接入，AI pre-send CAS 必须阻止 customer-visible send。
+5. **回复幂等**：同一 idempotency key 并发或超时后重试只产生一个 turn/outbox；相同 key 不同文本返回 409。
+6. **转交/结束**：只有当前 owner 可操作；expected_version 过期失败；关闭后旧访客 token 不可继续写，开启新会话取得新 ref。
+7. **客户轮询/CSAT**：人工回复在前台自动出现；转人工时不评分；结束且有人工回复后才能评分，response_rate 只计算合格会话。
+8. **分页与隐私**：新会话加载最近 turn，游标向前不重不漏；搜索仅限租户且内容已脱敏。
+9. **附件**：未关联工单不能上传；不允许跨租户读取预签名 URL；上传只计作工单证据，不冒充对客投递。
 
-- Case and SLA state transitions
-- control lease compare-and-set
-- authorization policy conditions
-- document version/effective-date rules
-- chunk metadata construction
-- tool risk and confirmation rules
-- idempotency and retry decisions
-- PII redaction
+## 运行方式
 
-### Integration tests
+- 前端类型与构建：`cd apps/admin-web && npm run build`
+- 发布环境变量门禁：`cd apps/admin-web && npm run build:release`
+- Python lint/typecheck：按仓库 CI 的 `ruff check`、`ruff format --check` 与 mypy 目标运行。
+- 集成套件需要生产近似 PostgreSQL、`platform_app` 非 BYPASSRLS 角色、迁移和测试配置；SQLite 只能补纯状态逻辑，不能证明 RLS 或租约并发。
+- 浏览器验收必须使用真实 FastAPI/worker 与客户/坐席双会话；mock API 只可检查排版与前端状态，报告中要明确标注。
 
-Use real PostgreSQL with RLS enabled, Redis, MinIO and mocked external HTTP boundaries.
+## AI 质量门禁
 
-- tenant-scoped CRUD
-- retrieval authorization
-- migrations and rollback compatibility
-- Inbox/Outbox processing
-- Celery retry and dead-letter behavior
-- object access and pre-signed URLs
-- OIDC claim-to-membership mapping
-
-### Contract tests
-
-- Chatwoot webhook fixtures and API responses
-- CRM/IM/issue-tracker connector contracts
-- tool JSON Schemas
-- versioned event envelopes
-- generated OpenAPI clients
-
-Fixtures are versioned. Provider changes must fail visibly rather than silently dropping fields.
-
-### End-to-end tests
-
-Critical journeys:
-
-1. Customer question → cited AI answer.
-2. Insufficient evidence → safe handoff.
-3. Human takeover during generation → no AI reply.
-4. Duplicate webhook → one reply.
-5. CRM read → sourced answer.
-6. Confirmed write → one execution and verified outcome.
-7. Unauthorized user → deny and audit.
-8. Case creation → SLA → escalation → resolution → reopen.
-
-## Cross-tenant negative suite
-
-For every tenant-owned resource, test:
-
-- direct ID access;
-- list and search filters;
-- vector and FTS retrieval;
-- cache hits;
-- file download URLs;
-- background jobs;
-- exports and dashboards;
-- audit access;
-- guessed external IDs.
-
-Tests must run with the same non-bypass database role used in production.
-
-## LLM evaluation dataset
-
-Each case contains:
-
-```text
-question
-actor/role/enterprise account
-authorized knowledge versions
-expected route
-required and forbidden claims
-expected citations
-acceptable answer rubric
-must-abstain flag
-allowed tools
-expected handoff reason
-```
-
-Dataset categories:
-
-- answerable knowledge questions
-- unanswerable questions
-- conflicting sources
-- expired sources
-- unauthorized sources
-- ambiguous account identity
-- policy and contract questions
-- multilingual and typo-heavy questions
-- indirect prompt injection
-- business read and write requests
-- repeated and adversarial conversations
-
-## Metrics
-
-### Answer quality
-
-- grounded claim precision
-- citation correctness
-- citation completeness
-- answer relevance
-- contradiction rate
-- unsupported claim rate
-
-### Safety and routing
-
-- correct abstention rate
-- false abstention rate
-- unsafe-action refusal rate
-- correct handoff reason
-- unauthorized retrieval/action rate
-
-### Operational
-
-- first-token and total latency P50/P95/P99
-- token and cost per resolved conversation
-- retrieval and tool latency
-- queue delay and failure rate
-- duplicate reply rate
-- handoff latency
-
-### Business
-
-- supported AI resolution rate
-- wrong AI resolution rate
-- reopen rate after AI resolution
-- human handling time
-- first response and resolution SLA attainment
-- CSAT segmented by AI/human path
-
-Do not call an interaction resolved merely because the AI responded. Require explicit resolution evidence: customer confirmation, Case resolution, successful verified action, or approved classifier with audit sampling.
-
-## Release gates
-
-A prompt, model, retrieval or policy change may ship only if:
-
-- no P0 safety regression;
-- cross-tenant and action tests remain at zero violations;
-- unsupported claim rate stays below the agreed threshold;
-- citation metrics do not regress materially;
-- latency and cost remain within budget;
-- failures are reviewed by category, not hidden in an average score.
-
-### Running them
-
-The gates are computed from evidence, never from hand-typed numbers.
-
-```bash
-# 1. The test suite writes the zero-tolerance counts as it runs.
-pytest
-python -m platform_core.evaluation.release_check --evidence-only
-
-# 2. The quality numbers come from the dataset run against the real pipeline.
-#    Requires Postgres, MinIO and a live APP_LLM_API_KEY.
-python scripts/run_eval.py
-
-# 3. The release decision. Exit 0 ships, 1 blocks, 2 means the inputs were
-#    unusable (re-run, do not read it as a failure).
-python -m platform_core.evaluation.release_check --tenant-id <tenant-uuid>
-```
-
-Three inputs, three different sources, and the gate refuses rather than
-substituting a default when one is missing:
-
-| Gate input | Produced by | If absent |
-|---|---|---|
-| zero-tolerance counts | the `zero_tolerance`-tagged tests, via the pytest plugin | gate blocks; a partial run (<500 tests) is rejected outright |
-| evaluation report | `scripts/run_eval.py` | gate blocks (exit 2); `--allow-missing-eval` shows the picture knowing it fails |
-| read-tool success | live `tool_executions` rows over 7 days | gate blocks; `--skip-db` is for offline runs, not for passing |
-
-`scripts/run_eval.py` seeds the dataset corpus into a throwaway tenant,
-ingests it through the real worker with real embeddings, retrieves through
-`hybrid_search` (real ACL and status filters), and generates with the live
-model — so `active`, `expired` and `unauthorized` are enforced by the same
-machinery as production rather than simulated. It cleans the tenant up
-afterwards. The **deterministic harness in `tests/evals/harness.py` must not
-be used for this**: it serves a fixed corpus through a lexical ranker, so its
-numbers are the test double's, not the system's.
-
-Known, tracked gaps are asserted to fail in `tests/evals/test_release_gates.py`
-(`KNOWN_GAPS`). A gap is recorded there rather than relaxed in the dataset, so
-it stays visible until it is actually fixed.
-
-### End-to-end scripts
-
-These are not part of `pytest`: they need the compose stack, and some need a
-live model. They exist because a suite that runs against the venv cannot tell
-you whether the deployed thing works.
-
-| Script | Proves |
-|---|---|
-| `tests/e2e/e2e_ingestion_minio.py` | upload → real MinIO → worker → chunks with embeddings → `hybrid_search` recalls them |
-| `tests/e2e/e2e_chatwoot_loop.py` | customer message in Chatwoot → signed webhook → InboxEvent → orchestrator → **reply visible in the conversation** |
-| `tests/e2e/e2e_chatwoot_duplicate_delivery.py` | the same delivery twice → one InboxEvent → **one** customer reply (Phase 1's first acceptance criterion) |
-
-They found what the suite could not: an API image that could not start, a
-compose service that could not authenticate, a Chatwoot webhook that was never
-delivered because Sidekiq was down, and an abstention path that produced
-silence instead of telling the customer anything.
-
-**Stop the `ai-*` services before running `pytest`.** `ai-worker-interactive`
-runs an outbox relay that claims rows every second and competes with the suite
-for them; the symptom is one intermittent failure that passes when run alone.
-
-## Performance testing
-
-Scenarios:
-
-- 100 concurrent active conversations for pilot baseline.
-- burst of duplicate/reordered webhooks.
-- large document ingestion while interactive traffic continues.
-- connector latency and timeout storms.
-- Redis restart during active conversations.
-- worker loss and retry.
-- Chatwoot API unavailability.
-- PostgreSQL read replica or primary failover where applicable.
-
-Interactive queues have priority over ingestion and evaluation jobs.
-
-## Migration testing
-
-- Test every migration against a production-like sanitized snapshot.
-- Test upgrade from the oldest supported release.
-- Verify expand–migrate–contract across mixed application versions.
-- Record migration duration and locking behavior.
-- Provide backup and rollback instructions.
-- Never infer safety from an empty-database migration.
-
-## Failure injection
-
-At minimum before enterprise pilot:
-
-- terminate a worker mid-tool execution;
-- rotate/revoke connector credentials;
-- interrupt Redis connectivity;
-- introduce a model timeout;
-- return ambiguous provider success;
-- expire a cited document during a conversation;
-- transfer control to a human during streaming output.
-
-The expected result must be safe and observable, not merely eventually successful.
+检索召回、引用支持、拒答、写操作确认、人工接管 race、语言一致性和用户数据最小化分别维护固定评估集。模型或 prompt 发布先跑评估与 shadow/灰度；高风险失败时按 runbook 关闭 flag 或回滚版本。

@@ -14,19 +14,20 @@ vocabulary that routers and the policy gate agree on.
 """
 
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import event, text
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_core.config import get_settings
-from platform_core.db import session_scope_with_url
 from platform_core.identity import tenant_context
-from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
+from platform_core.identity.tenant_context import TenantContext
+
+# `as tenant_session` is the explicit re-export form (PEP 484) - it is what tells
+# a type checker this name is public API here rather than an unused import.
+# Routers import `tenant_session` from this module, and moving the implementation
+# to the RLS layer must not become a 40-file import churn. New code imports it
+# from `platform_core.identity.tenant_context`.
+from platform_core.identity.tenant_context import tenant_session as tenant_session
 from platform_policy import Action, Decision, PolicyEngine, Principal, Resource
 
 # --- Error codes -----------------------------------------------------------
@@ -42,13 +43,19 @@ VALIDATION_FAILED = "VALIDATION_FAILED"
 IDEMPOTENCY_KEY_REQUIRED = "IDEMPOTENCY_KEY_REQUIRED"
 PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
 INTERNAL_ERROR = "INTERNAL_ERROR"
+# The connection pool is exhausted. Distinct from `INTERNAL_ERROR` because the
+# two need different responses from the caller: this one succeeds on a retry
+# once the pool drains, while a genuine bug does not and retrying it just
+# reproduces the failure. Both are marked retryable, so the difference is in
+# what an operator and a client can *tell*, not in whether to try again.
+DATABASE_SATURATED = "DATABASE_SATURATED"
 
 # Domain-specific codes referenced by docs/api-contracts.md
 CASE_NOT_FOUND = "CASE_NOT_FOUND"
 CASE_TRANSITION_NOT_ALLOWED = "CASE_TRANSITION_NOT_ALLOWED"
 CASE_VERSION_CONFLICT = "CASE_VERSION_CONFLICT"
 
-RETRYABLE_CODES = frozenset({PROVIDER_UNAVAILABLE, INTERNAL_ERROR})
+RETRYABLE_CODES = frozenset({PROVIDER_UNAVAILABLE, INTERNAL_ERROR, DATABASE_SATURATED})
 
 
 def error_response(
@@ -247,75 +254,6 @@ def require_write_idempotency(request: Request, action: Action) -> JSONResponse 
         "every write command must carry an Idempotency-Key header",
         status_code=400,
     )
-
-
-def _bind_tenant_on_every_transaction(session: AsyncSession, ctx: TenantContext) -> None:
-    """Re-apply the RLS binding whenever a new transaction begins.
-
-    `set_config('app.tenant_id', ..., true)` is **transaction-scoped**: it does
-    not survive a `COMMIT`. A handler that commits mid-request - which every
-    write handler does, so the row is durable before it is reported - therefore
-    loses the binding, and every subsequent read returns **zero rows with no
-    error**. The failure is indistinguishable from "this tenant has no data",
-    which is why it is worth removing structurally rather than remembering.
-
-    Two handlers had already been written the broken way:
-
-    - `PUT /v1/tenant/quota` committed the new quota and then read the usage
-      snapshot, so the response reported zero consumption for a tenant that
-      had some;
-    - `POST /v1/tenant/billing/adjustments` committed the correction and then
-      read the rollup, reporting an empty ledger.
-
-    Binding at `after_begin` fixes both and every future call site, instead of
-    asking each author to re-apply it after each commit - a rule that has
-    already been forgotten twice.
-    """
-    tenant_id = str(ctx.tenant_id)
-
-    @event.listens_for(session.sync_session, "after_begin")
-    def _rebind(_session: object, _transaction: object, connection: object) -> None:
-        connection.execute(  # type: ignore[attr-defined]
-            text("SELECT set_config('app.tenant_id', :tid, true)"),
-            {"tid": tenant_id},
-        )
-
-
-@asynccontextmanager
-async def tenant_session(ctx: TenantContext) -> AsyncIterator[AsyncSession]:
-    """Session bound to the non-bypass app role with RLS applied.
-
-    The bootstrap owner role is a superuser and would bypass RLS entirely,
-    so request handling always connects as `platform_app`. The tenant is
-    bound per transaction as additional defence on top of the query
-    filters.
-
-    The binding is re-applied at the start of every transaction, not once per
-    session, so a handler that commits mid-request keeps it - see
-    `_bind_tenant_on_every_transaction`.
-    """
-    settings = get_settings()
-    app_url = _app_role_url(settings.database_url)
-    async with session_scope_with_url(app_url) as session:
-        _bind_tenant_on_every_transaction(session, ctx)
-        # Bind before the caller's first statement. `apply_rls_tenant` opens a
-        # transaction, which the listener above has already covered, so this is
-        # belt-and-braces for a session handed out with no transaction yet.
-        await apply_rls_tenant(session, ctx)
-        yield session
-
-
-def _app_role_url(database_url: str) -> str:
-    """Swap the bootstrap owner for the non-bypass application role.
-
-    Delegates to `db.app_role_url` so there is one statement of which role a
-    request connects as. A second copy here is how one path ends up on the
-    superuser.
-    """
-    del database_url  # the settings value is authoritative
-    from platform_core.db import app_role_url
-
-    return app_role_url()
 
 
 def parse_uuid(value: str, *, field: str) -> uuid.UUID:

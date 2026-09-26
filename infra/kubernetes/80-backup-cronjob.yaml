@@ -1,0 +1,106 @@
+# Scheduled backup: a logical database dump uploaded to the backup bucket.
+#
+# Why the dump goes to a *different* bucket from the one the platform serves
+# -----------------------------------------------------------------------
+# The documents bucket must never have versioning turned on. On a versioned
+# bucket a DELETE writes a delete marker: the current version 404s while every
+# earlier version stays stored and readable by `version_id`. Measured against
+# MinIO, not assumed - see `MinioStorage.bucket_versioning_enabled`. That would
+# make the retention erasure pass stamp `bytes_deleted_at` and record a
+# completed erasure while the tenant's bytes were one version id away from
+# being read back, which is the worst possible outcome: a false compliance
+# record rather than a missing feature.
+#
+# So the backup bucket is the one that gets versioning, and it gets it for the
+# usual reason - a corrupted or malicious overwrite of a backup should leave
+# the previous one intact. The two requirements pull in opposite directions,
+# and splitting the buckets is what lets both hold.
+#
+# `concurrencyPolicy: Forbid` because a dump that overlaps the next one wastes
+# a connection pool and can interleave two dumps into one object. `Forbid` is
+# better than `Replace` here: a killed backup should be retried by the next
+# scheduled run, not replaced by a fresh one that may also fail.
+#
+# `02:17` rather than `02:00`. Every backup job in the world is scheduled on the
+# hour, and a cluster-wide spike at exactly :00 is a self-inflicted incident.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: platform-backup
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: backup
+spec:
+  schedule: "17 2 * * *"
+  timeZone: UTC
+  concurrencyPolicy: Forbid
+  # A missed window (node drain, cluster upgrade) should be recovered, not
+  # silently skipped. Ten minutes is enough for the next start.
+  startingDeadlineSeconds: 600
+  # Keep a week of successes to investigate, and every failure - a backup that
+  # failed once and then vanished is a backup nobody looks at.
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 14
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: platform
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: Never
+          serviceAccountName: platform
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              # Same image as the API. The dump is produced by the same
+              # toolchain that reads the schema, and the drill that proves the
+              # dump restores runs from the same image - see api.Dockerfile.
+              image: registry.example.com/b2b-support/platform:REPLACE_ME_TAG
+              command: ["python", "scripts/backup.py"]
+              args: ["--dump"]
+              envFrom:
+                - configMapRef:
+                    name: platform-config
+              env:
+                # The owner URL from the migration-only Secret. `pg_dump` needs
+                # to read every table including RLS-protected ones, which
+                # `platform_app` cannot do.
+                - name: APP_DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: platform-migration-owner
+                      key: APP_ADMIN_DATABASE_URL
+                - name: APP_BACKUP_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: platform-backup-bucket
+                      key: APP_BACKUP_BUCKET
+              resources:
+                requests:
+                  cpu: "200m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "1"
+                  memory: "1Gi"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}

@@ -286,6 +286,18 @@ class ToolGateway:
         if not proposal.required_confirmation:
             raise ToolGatewayError("CONFIRMATION_NOT_REQUIRED")
 
+        # Note what is deliberately NOT checked here: that the confirming
+        # actor differs from the proposer. An earlier revision refused
+        # self-confirmation, and it was wrong twice over. It is unnecessary -
+        # the only production path that creates a confirmation is
+        # `POST /v1/tool-proposals/{id}/confirm`, which requires
+        # `Action.CASE_UPDATE`, and the agent's `integration_service` role does
+        # not hold it, so the AI cannot approve its own proposal even though it
+        # can now propose one. And it is harmful - a support admin who raises a
+        # proposal in the console and then approves it is the documented flow,
+        # and binding the confirmation to the proposer is what makes them look
+        # at the frozen arguments twice. `ActionConfirmation.actor_id` records
+        # who approved; the route, not the gateway, decides who may.
         confirmation = ActionConfirmation(
             tenant_id=tenant_id,
             proposal_id=proposal.id,

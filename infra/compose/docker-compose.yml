@@ -1,9 +1,9 @@
 name: b2b-ai-support
 
 services:
-  # --- Custom AI platform (separate DB and Redis from Chatwoot, ADR-0001) ---
+  # --- Custom AI platform (its own database, Redis and object storage) ---
   ai-postgres:
-    image: docker.1ms.run/pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: platform
       POSTGRES_PASSWORD: platform
@@ -12,6 +12,7 @@ services:
       - "5435:5432"
     volumes:
       - ai_postgres_data:/var/lib/postgresql/data
+      - ./postgres-init/01-platform-app-role.sql:/docker-entrypoint-initdb.d/01-platform-app-role.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U platform -d platform"]
       interval: 5s
@@ -42,7 +43,15 @@ services:
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      # `mc` is not in the server image - the probe failed with ExitCode -1
+      # ("executable file not found in $PATH") on every attempt, so MinIO
+      # reported `unhealthy` for 14016 consecutive checks while serving
+      # normally. A healthcheck that can never pass is worse than none: it
+      # trains everyone to read the red line as normal, and any future
+      # `depends_on: condition: service_healthy` would hang forever.
+      # `curl` is present in this image and this endpoint is MinIO's own
+      # liveness probe.
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -63,6 +72,7 @@ services:
     build:
       context: ../..
       dockerfile: infra/compose/api.Dockerfile
+    image: b2b-ai-support-ai-api  # named so the workers can reuse this exact image
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
     # so it exited at startup with 'no authentication configured' even
@@ -76,17 +86,21 @@ services:
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
+      APP_DATABASE_APP_URL: postgresql+psycopg://platform_app:platform_app@ai-postgres:5432/platform
+      APP_DATABASE_POOL_SIZE: 10
+      APP_DATABASE_MAX_OVERFLOW: 0
+      APP_DATABASE_APP_POOL_SIZE: 50
+      APP_DATABASE_APP_MAX_OVERFLOW: 0
       APP_REDIS_URL: redis://ai-redis:6379/0
       APP_SECRET_KEY: local-dev-secret
-      # Must match the secret on Chatwoot's webhook row. Read from the
-      # environment so the .env value and this one cannot disagree - they
-      # did, and an API run outside Docker would have rejected every
-      # delivery with a 401 that looks like silence, not misconfiguration.
-      APP_CHATWOOT_WEBHOOK_SECRET: ${APP_CHATWOOT_WEBHOOK_SECRET:-local-dev-webhook-secret}
-      APP_CHATWOOT_BASE_URL: http://chatwoot-web:3000
-      APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
-      APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
-      APP_LLM_MODEL: ${APP_LLM_MODEL:-qwen3.8-flash}
+      # Same class of remap as the two above, and it was missing: the setting
+      # defaults to `localhost:9000`, which inside this container is the
+      # container itself. Document upload failed with
+      # `STORAGE_UNAVAILABLE ... ConnectError` while MinIO was healthy and
+      # serving - the bug was the address, not the service. `.env` cannot fix
+      # this: it holds host-facing addresses (localhost:5435, localhost:6380)
+      # that are equally wrong in here, which is why this block exists.
+      APP_OBJECT_STORAGE_ENDPOINT: minio:9000
     ports:
       - "8000:8000"
     depends_on:
@@ -94,19 +108,26 @@ services:
         condition: service_healthy
       ai-redis:
         condition: service_healthy
+      # Not a correctness requirement - a storage failure returns 503 rather
+      # than corrupting anything - but without it a cold start has a window
+      # where uploads fail on an endpoint that is merely not up yet. The
+      # healthcheck above is what makes this condition mean something.
+      minio:
+        condition: service_healthy
 
   # Customer-visible AI work: InboxEvent -> agent run. Same image as the
   # API, different entrypoint (docs/deployment-and-operations.md worker
   # classes). Runs against the AI database and the AI Redis only.
   #
-  # APP_CHATWOOT_API_TOKEN is required here and NOT optional: the orchestrator
-  # treats a missing sender as "un-sent, not failed", so a worker without a
-  # token would consume real customer messages and reply to nobody while
-  # reporting success. worker.wiring fails closed on this.
+  # Outbound delivery needs at least one channel transport (ADR 0014). A worker
+  # with none would consume real customer messages and reply to nobody while
+  # reporting success - the `worker_cannot_send` shape - so `worker.wiring`
+  # refuses to start when the deployment asks for outbound capability.
   ai-worker-interactive:
-    build:
-      context: ../..
-      dockerfile: infra/compose/api.Dockerfile
+    # Reuses the image `ai-api` builds. Building it a second time
+    # produced a second image that silently drifted from the API's:
+    # a fix present in ai-api was absent from every worker.
+    image: b2b-ai-support-ai-api
     command: ["python", "-m", "worker.runner"]
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
@@ -121,13 +142,13 @@ services:
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
+      APP_DATABASE_APP_URL: postgresql+psycopg://platform_app:platform_app@ai-postgres:5432/platform
+      APP_DATABASE_POOL_SIZE: 2
+      APP_DATABASE_MAX_OVERFLOW: 0
+      APP_DATABASE_APP_POOL_SIZE: 2
+      APP_DATABASE_APP_MAX_OVERFLOW: 0
       APP_REDIS_URL: redis://ai-redis:6379/0
       APP_SECRET_KEY: local-dev-secret
-      APP_CHATWOOT_BASE_URL: http://chatwoot-web:3000
-      APP_CHATWOOT_API_TOKEN: ${APP_CHATWOOT_API_TOKEN:-}
-      APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
-      APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
-      APP_LLM_MODEL: ${APP_LLM_MODEL:-qwen3.8-flash}
     depends_on:
       ai-postgres:
         condition: service_healthy
@@ -137,9 +158,10 @@ services:
   # Bulk work: parsing, chunking, embedding. Lowest priority, so it can
   # never starve interactive work (evaluation.queues reservation model).
   ai-worker-ingestion:
-    build:
-      context: ../..
-      dockerfile: infra/compose/api.Dockerfile
+    # Reuses the image `ai-api` builds. Building it a second time
+    # produced a second image that silently drifted from the API's:
+    # a fix present in ai-api was absent from every worker.
+    image: b2b-ai-support-ai-api
     command: ["python", "-m", "worker.runner"]
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
@@ -154,25 +176,38 @@ services:
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
+      APP_DATABASE_APP_URL: postgresql+psycopg://platform_app:platform_app@ai-postgres:5432/platform
+      APP_DATABASE_POOL_SIZE: 2
+      APP_DATABASE_MAX_OVERFLOW: 0
+      APP_DATABASE_APP_POOL_SIZE: 2
+      APP_DATABASE_APP_MAX_OVERFLOW: 0
       APP_REDIS_URL: redis://ai-redis:6379/0
       APP_SECRET_KEY: local-dev-secret
-      APP_LLM_BASE_URL: ${APP_LLM_BASE_URL:-https://ai.gitee.com/v1}
-      APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
-      APP_LLM_MODEL: ${APP_LLM_MODEL:-qwen3.8-flash}
       APP_WORKER_QUEUE: ingestion
+      # The ingest pipeline reads the stored original to parse it
+      # (`ingestion_consumer.service.get_object`), so this worker needs the
+      # same in-network address the API does. It was missing here too, and
+      # the failure was worse than the API's: the read raised, the consumer
+      # classified it `_Retryable` and released the claim, so the document sat
+      # at `uploaded` and every document was retried forever - the knowledge
+      # base was silently unusable for retrieval while upload looked fine.
+      APP_OBJECT_STORAGE_ENDPOINT: minio:9000
     depends_on:
       ai-postgres:
         condition: service_healthy
       ai-redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
 
   # Applies the tenant retention policy on a long interval (superseded
   # versions -> expired, resolved dead letters and completed inbox events
   # pruned). No LLM key: it touches no external system.
   ai-worker-retention:
-    build:
-      context: ../..
-      dockerfile: infra/compose/api.Dockerfile
+    # Reuses the image `ai-api` builds. Building it a second time
+    # produced a second image that silently drifted from the API's:
+    # a fix present in ai-api was absent from every worker.
+    image: b2b-ai-support-ai-api
     command: ["python", "-m", "worker.runner"]
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
@@ -187,6 +222,11 @@ services:
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
+      APP_DATABASE_APP_URL: postgresql+psycopg://platform_app:platform_app@ai-postgres:5432/platform
+      APP_DATABASE_POOL_SIZE: 2
+      APP_DATABASE_MAX_OVERFLOW: 0
+      APP_DATABASE_APP_POOL_SIZE: 2
+      APP_DATABASE_APP_MAX_OVERFLOW: 0
       APP_SECRET_KEY: local-dev-secret
       APP_WORKER_QUEUE: retention
     depends_on:
@@ -198,9 +238,10 @@ services:
   # notified while it is still actionable) and a sweep on that cadence must
   # not share a poll loop with customer-facing work.
   ai-worker-sla:
-    build:
-      context: ../..
-      dockerfile: infra/compose/api.Dockerfile
+    # Reuses the image `ai-api` builds. Building it a second time
+    # produced a second image that silently drifted from the API's:
+    # a fix present in ai-api was absent from every worker.
+    image: b2b-ai-support-ai-api
     command: ["python", "-m", "worker.runner"]
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
@@ -215,6 +256,11 @@ services:
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
+      APP_DATABASE_APP_URL: postgresql+psycopg://platform_app:platform_app@ai-postgres:5432/platform
+      APP_DATABASE_POOL_SIZE: 2
+      APP_DATABASE_MAX_OVERFLOW: 0
+      APP_DATABASE_APP_POOL_SIZE: 2
+      APP_DATABASE_APP_MAX_OVERFLOW: 0
       APP_SECRET_KEY: local-dev-secret
       APP_WORKER_QUEUE: sla
     depends_on:
@@ -225,9 +271,10 @@ services:
   # key because delivering business events is independent of the AI path --
   # that is why it is its own service rather than bundled with the worker.
   ai-worker-outbox:
-    build:
-      context: ../..
-      dockerfile: infra/compose/api.Dockerfile
+    # Reuses the image `ai-api` builds. Building it a second time
+    # produced a second image that silently drifted from the API's:
+    # a fix present in ai-api was absent from every worker.
+    image: b2b-ai-support-ai-api
     command: ["python", "-m", "worker.runner", "--outbox-only"]
     # The full environment, not a hand-listed subset. The API container
     # previously enumerated its own variables and omitted the auth config,
@@ -242,6 +289,11 @@ services:
     environment:
       APP_ENVIRONMENT: local
       APP_DATABASE_URL: postgresql+psycopg://platform:platform@ai-postgres:5432/platform
+      APP_DATABASE_APP_URL: postgresql+psycopg://platform_app:platform_app@ai-postgres:5432/platform
+      APP_DATABASE_POOL_SIZE: 2
+      APP_DATABASE_MAX_OVERFLOW: 0
+      APP_DATABASE_APP_POOL_SIZE: 2
+      APP_DATABASE_APP_MAX_OVERFLOW: 0
       APP_REDIS_URL: redis://ai-redis:6379/0
       APP_SECRET_KEY: local-dev-secret
     depends_on:
@@ -250,77 +302,7 @@ services:
       ai-redis:
         condition: service_healthy
 
-  # --- Chatwoot support kernel (upstream, separate storage) ---
-  chatwoot-postgres:
-    image: docker.1ms.run/pgvector/pgvector:pg16
-    environment:
-      POSTGRES_USER: chatwoot
-      POSTGRES_PASSWORD: chatwoot
-      POSTGRES_DB: chatwoot
-    ports:
-      - "5434:5432"
-    volumes:
-      - chatwoot_postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U chatwoot"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  chatwoot-redis:
-    image: redis:7-alpine
-    ports:
-      - "6381:6379"
-    volumes:
-      - chatwoot_redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  chatwoot-web:
-    image: docker.1ms.run/chatwoot/chatwoot:latest
-    command: bundle exec rails s -p 3000 -b 0.0.0.0
-    environment:
-      RAILS_ENV: production
-      SECRET_KEY_BASE: 3f8a1c9d2e7b4a6f8d0c2e4b6a8d0f2h4j6l8n0p2r4t6v8x0z2b4d6f8h1j3l
-      FRONTEND_URL: http://localhost:3000
-      DATABASE_URL: postgres://chatwoot:chatwoot@chatwoot-postgres:5432/chatwoot
-      REDIS_URL: redis://chatwoot-redis:6379/0
-      NODE_ENV: production
-      SAFE_FETCH_ALLOW_PRIVATE_NETWORK: "true"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    ports:
-      - "3000:3000"
-    depends_on:
-      chatwoot-postgres:
-        condition: service_healthy
-      chatwoot-redis:
-        condition: service_healthy
-
-  chatwoot-sidekiq:
-    image: docker.1ms.run/chatwoot/chatwoot:latest
-    command: bundle exec sidekiq
-    environment:
-      RAILS_ENV: production
-      SECRET_KEY_BASE: 3f8a1c9d2e7b4a6f8d0c2e4b6a8d0f2h4j6l8n0p2r4t6v8x0z2b4d6f8h1j3l
-      FRONTEND_URL: http://localhost:3000
-      DATABASE_URL: postgres://chatwoot:chatwoot@chatwoot-postgres:5432/chatwoot
-      REDIS_URL: redis://chatwoot-redis:6379/0
-      SAFE_FETCH_ALLOW_PRIVATE_NETWORK: "true"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      chatwoot-postgres:
-        condition: service_healthy
-      chatwoot-redis:
-        condition: service_healthy
-
 volumes:
   ai_postgres_data:
   ai_redis_data:
   minio_data:
-  chatwoot_postgres_data:
-  chatwoot_redis_data:

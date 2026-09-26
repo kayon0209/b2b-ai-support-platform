@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { useLang } from "../lib/i18n";
 
 export function Spinner({ label }: { label?: string }) {
@@ -153,6 +153,158 @@ export function Stat({
     <div className="stat">
       <div className={`stat-value${tone ? ` text-${tone}` : ""}`}>{value}</div>
       <div className="stat-label">{label}</div>
+    </div>
+  );
+}
+
+/**
+ * A modal that is actually modal.
+ *
+ * What was wrong before this existed
+ * ----------------------------------
+ * The one real dialog in the console declared `aria-modal="false"` on a
+ * dialog that covered the page, had no Escape handler, and did not move focus
+ * anywhere. A screen-reader user was told "this is a dialog" and then left free
+ * to tab into the page behind it, where every control still looked live. That
+ * is not a cosmetic gap: the controls behind the dialog are the ones a
+ * keyboard user believes they are operating.
+ *
+ * What this closes, in the order it matters
+ * -----------------------------------------
+ * 1. `aria-modal="true"` - assistive technology treats the rest of the page as
+ *    inert, which is the only way "modal" becomes true rather than asserted.
+ * 2. Focus moves in on open, and is **restored to the opener** on close.
+ *    Without the restore, closing a dialog drops the user at the top of the
+ *    document and they lose their place entirely.
+ * 3. Tab cycles inside. Trapping focus is the part most hand-rolled dialogs
+ *    skip, and it is the part that makes the modal actually modal for a
+ *    keyboard.
+ * 4. Escape closes. Expected everywhere, and it is the only way out for a user
+ *    who cannot see a close button.
+ * 5. Background scroll is locked, so a trackpad wheel does not scroll the page
+ *    behind while the dialog is open.
+ *
+ * `onClose` is called with no arguments, and the opener is captured from
+ * `document.activeElement` at open time rather than passed in - a prop for it
+ * would be wrong whenever the opener is a row button that re-renders.
+ */
+export function Dialog({
+  open,
+  onClose,
+  label,
+  children,
+  className,
+}: {
+  open: boolean;
+  onClose: () => void;
+  /** Accessible name. Prefer wording a user would recognise, not "Dialog". */
+  label: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    openerRef.current = (document.activeElement as HTMLElement | null) ?? null;
+    // Focus the first control, or the panel itself if it has none, so the
+    // next Tab lands inside rather than behind.
+    const focusables = () =>
+      Array.from(
+        panelRef.current?.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+    const first = focusables()[0];
+    (first ?? panelRef.current)?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) {
+        event.preventDefault();
+        panelRef.current?.focus();
+        return;
+      }
+      const firstItem = items[0];
+      const lastItem = items[items.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === firstItem || active === panelRef.current)) {
+        event.preventDefault();
+        lastItem.focus();
+      } else if (!event.shiftKey && active === lastItem) {
+        event.preventDefault();
+        firstItem.focus();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown, true);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKeyDown, true);
+      document.body.style.overflow = previousOverflow;
+      // Restoring focus is what makes the dialog a round trip. Without it the
+      // user is dropped at the top of the page with no idea where they were.
+      openerRef.current?.focus?.();
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+  return (
+    <div className="dialog-backdrop" onClick={onClose}>
+      <div
+        ref={panelRef}
+        className={className ? `dialog ${className}` : "dialog"}
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        tabIndex={-1}
+        onClick={(event) => event.stopPropagation()}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Placeholder rows for a list that is still loading.
+ *
+ * Why this and not the spinner that was already there
+ * ---------------------------------------------------
+ * A centred spinner replaces the whole page and then replaces it again with
+ * content, so every load is two layout jumps and the operator loses their
+ * place. A skeleton holds the shape of what is coming, which means the content
+ * arrives into space that already exists.
+ *
+ * `aria-hidden` because it carries no information: it is a picture of content
+ * that does not exist yet, and a screen reader announcing placeholder rows
+ * would be noise. The live region beside it (`<LoadingRegion>`) is what
+ * actually says "loading".
+ */
+export function SkeletonRows({ rows = 5, label }: { rows?: number; label?: string }) {
+  return (
+    <div className="skeleton-wrap">
+      {label ? (
+        <span role="status" aria-live="polite" className="skeleton-label">
+          {label}
+        </span>
+      ) : null}
+      <div className="skeleton-rows" aria-hidden="true">
+        {Array.from({ length: Math.max(1, rows) }, (_, index) => (
+          <div className="skeleton-row" key={index}>
+            <span className="skeleton-bar skeleton-bar--title" />
+            <span className="skeleton-bar" />
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

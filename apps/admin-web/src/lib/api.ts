@@ -1,7 +1,23 @@
+import { fetchWithTimeout, HttpTimeoutError, REQUEST_TIMEOUT_MS } from "./http";
 import { ApiError } from "./types";
+import { operatorAccessToken } from "./operatorAuth";
 
 const BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 const TOKEN_KEY = "b2b_token";
+
+const ZH_ERRORS: Record<string, string> = {
+  AUTH_UNRESOLVED: "登录状态已失效，请重新登录。",
+  LEASE_CONFLICT: "会话状态已变化，请刷新后重试。",
+  AGENT_UNAVAILABLE: "坐席未在当前企业启用。",
+  AGENT_AT_CAPACITY: "目标坐席已达到接待上限。",
+  CASE_CLAIM_ACTOR_MISMATCH: "只能认领给当前登录的坐席。",
+  CONVERSATION_CLOSED: "会话已结束，请开始新会话。",
+  IDEMPOTENCY_CONFLICT: "这次提交的标识已用于其他内容，请重新操作。",
+};
+
+function isChinese(): boolean {
+  return document.documentElement.lang.startsWith("zh");
+}
 
 let unauthorizedHandler: (() => void) | null = null;
 
@@ -15,10 +31,21 @@ export function setUnauthorizedHandler(fn: (() => void) | null): void {
 }
 
 export function getToken(): string {
-  return localStorage.getItem(TOKEN_KEY) || import.meta.env.VITE_API_TOKEN || "";
+  if (import.meta.env.PROD) return operatorAccessToken();
+  const stored = localStorage.getItem(TOKEN_KEY);
+  if (stored) return stored;
+  // A build-time token would be sent to every visitor, including customers.
+  // Only a local dev build may use one; production reads the OIDC session.
+  return import.meta.env.DEV ? import.meta.env.VITE_API_TOKEN || "" : "";
+}
+
+/** Whether a build-time token is being used (dev only) rather than a stored one. */
+export function usingBuildToken(): boolean {
+  return !localStorage.getItem(TOKEN_KEY) && Boolean(import.meta.env.DEV && import.meta.env.VITE_API_TOKEN);
 }
 
 export function setToken(token: string): void {
+  if (import.meta.env.PROD) throw new Error("生产环境只能使用企业单点登录");
   if (token) localStorage.setItem(TOKEN_KEY, token);
   else localStorage.removeItem(TOKEN_KEY);
 }
@@ -31,24 +58,27 @@ function authHeader(): Record<string, string> {
 /**
  * Nothing in the console ever hung up on the server before: `fetch` has no
  * default timeout, so a request that never answered left the page spinning
- * indefinitely with no error and no way to cancel. Every call now aborts
- * after `REQUEST_TIMEOUT_MS` and reports something actionable.
+ * indefinitely with no error and no way to cancel. The deadline and the
+ * cancellation policy now live in `lib/http.ts`, shared with the customer
+ * surface - they were implemented here first, which is how that surface ended
+ * up with none.
  */
-const REQUEST_TIMEOUT_MS = 20_000;
+const REQUEST_TIMEOUT_MS_VALUE = REQUEST_TIMEOUT_MS;
 
 async function send(path: string, init: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  // The timeout and cancellation policy lives in lib/http.ts, shared with the
+  // customer surface. It was implemented here first, which is how the customer
+  // chat surface ended up without one; a second copy is how that happens again.
   try {
-    return await fetch(`${BASE}${path}`, { ...init, signal: controller.signal });
+    return await fetchWithTimeout(`${BASE}${path}`, init);
   } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") {
+    if (err instanceof HttpTimeoutError) {
       throw new ApiError(
         0,
         "TIMEOUT",
-        `The control plane did not respond within ${
-          REQUEST_TIMEOUT_MS / 1000
-        }s. Check that the API is running, then retry.`,
+        isChinese()
+          ? "服务响应超时，请稍后重试。"
+          : `The control plane did not respond within ${REQUEST_TIMEOUT_MS_VALUE / 1000}s. Check that the API is running, then retry.`,
         true,
       );
     }
@@ -58,13 +88,13 @@ async function send(path: string, init: RequestInit): Promise<Response> {
       throw new ApiError(
         0,
         "NETWORK",
-        "Could not reach the control plane. Check the network or the API host, then retry.",
+        isChinese()
+          ? "无法连接客服服务，请检查网络后重试。"
+          : "Could not reach the control plane. Check the network or the API host, then retry.",
         true,
       );
     }
     throw err;
-  } finally {
-    window.clearTimeout(timer);
   }
 }
 
@@ -114,6 +144,45 @@ export async function apiPut<T>(
   return unwrap<T>(res);
 }
 
+export async function apiPatch<T>(
+  path: string,
+  body: unknown,
+  idempotencyKey?: string,
+): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    ...authHeader(),
+  };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  const res = await send(`${path}`, { method: "PATCH", headers, body: JSON.stringify(body) });
+  return unwrap<T>(res);
+}
+
+/**
+ * POST a multipart body, for endpoints that take a file.
+ *
+ * Separate from `apiPost` rather than a flag on it: `apiPost` sets
+ * `Content-Type: application/json` explicitly, and a multipart request must
+ * *not* set one - the browser generates it from the FormData so it carries the
+ * boundary string. Sending the JSON header with a FormData body makes the
+ * server parse nothing and reject the upload as malformed, which is a
+ * confusing failure for a mistake that looks like a detail.
+ */
+export async function apiUpload<T>(path: string, form: FormData, idempotencyKey?: string): Promise<T> {
+  const res = await send(`${path}`, {
+    method: "POST",
+    // No Content-Type - the browser sets it, boundary included.
+    headers: {
+      Accept: "application/json",
+      ...authHeader(),
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+    },
+    body: form,
+  });
+  return unwrap<T>(res);
+}
+
 export async function apiDelete<T>(path: string, idempotencyKey?: string): Promise<T> {
   const headers: Record<string, string> = {
     Accept: "application/json",
@@ -134,7 +203,25 @@ async function unwrap<T>(res: Response): Promise<T> {
       // A proxy or an ingress can answer with HTML (a 502 page, an auth
       // redirect). Letting JSON.parse throw would surface as a syntax error
       // and hide the status, which is the actionable part.
-      throw new ApiError(res.status, "NON_JSON_RESPONSE", `HTTP ${res.status}`, res.status >= 500);
+      //
+      // A bare status is still not enough, though. The helpful "could not
+      // reach the control plane" branch in `send` only fires when the browser
+      // itself cannot connect, which is not the deployed shape: with a proxy
+      // or an ingress in front, an outage arrives as an HTTP response. Vite's
+      // dev proxy answers 500 when its target is down, so an operator with the
+      // API stopped was shown "HTTP 500" - which reads like a bug in the
+      // server, not like the server being absent.
+      const down = res.status >= 500;
+      throw new ApiError(
+        res.status,
+        "NON_JSON_RESPONSE",
+        down
+          ? isChinese()
+            ? `服务暂时不可用（HTTP ${res.status}），请稍后重试。`
+            : `The control plane answered HTTP ${res.status} without a JSON body, so it is most likely down or restarting. Retry in a moment.`
+          : `HTTP ${res.status}`,
+        down,
+      );
     }
   }
   if (!res.ok) {
@@ -160,7 +247,18 @@ function toApiError(status: number, data: unknown): ApiError {
       : typeof errorBlock.reason === "string"
         ? errorBlock.reason
         : "";
-  const message = stated || `HTTP ${status}`;
+  // A 5xx with nothing to say about itself is the shape of a server that is
+  // not there. This is the common case, not the exotic one: Vite's dev proxy
+  // answers a dead target with `500`, `text/plain`, and an *empty* body, so
+  // neither the JSON branch nor the JSON-parse failure branch above ever runs -
+  // the operator was simply shown "HTTP 500", which reads like a bug in the
+  // control plane rather than like its absence.
+  const message =
+    (isChinese() ? ZH_ERRORS[errorBlock.code] : "") ||
+    (isChinese() && status >= 500 ? `服务暂时不可用（HTTP ${status}），请稍后重试。` : stated) ||
+    (status >= 500
+      ? `The control plane answered HTTP ${status} with no explanation, so it is most likely down or restarting. Retry in a moment.`
+      : `HTTP ${status}`);
   // The trace id is the one thing support needs from a failing request;
   // appending it means every banner shows it without each page caring.
   const traceId = typeof envelope.trace_id === "string" ? envelope.trace_id : "";

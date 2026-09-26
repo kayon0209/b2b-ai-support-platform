@@ -501,10 +501,46 @@ def normalize_colloquial(
 
 # A question with no content terms is not a query: "it?" has nothing to
 # retrieve against, whatever the evidence says.
-# And a question this short, in characters, is a nudge rather than a question
-# ("?", "hi", "hello?"). Answering it from the corpus is how a platform comes
-# to sound certain about nothing.
-MIN_ANSWERABLE_CHARS = 12
+# And a question this short is a nudge rather than a question ("?", "hi",
+# "hello?"). Answering it from the corpus is how a platform comes to sound
+# certain about nothing.
+#
+# Two numbers, because one number cannot mean the same thing in two scripts.
+# 12 Latin characters is about two words; 12 Chinese characters is a whole
+# sentence, so a threshold calibrated on English rejected the questions a
+# Chinese customer actually writes - 怎么退款 (4), 交期是多久 (5),
+# 发票怎么开 (5) - as "too short" and answered them with an English
+# clarification prompt. Measured 2026-09-23 on the customer surface; see
+# `language.answers_in_chinese` for why the script is the right axis.
+#
+# 3 CJK characters, not the 4 that would be the arithmetic counterpart of 12
+# Latin ones. Two reasons, and the second is the one that decided it:
+#
+# 1. A CJK character carries roughly two to three Latin characters of meaning,
+#    so 4-6 would be the like-for-like translation of 12. Any of those numbers
+#    is defensible on paper.
+# 2. This gate is not what stops the platform inventing an answer - the
+#    abstention gate downstream is (`decide_abstention` will not answer
+#    without evidence). What this gate costs is a round trip: a customer asked
+#    to repeat themselves, which the docstring below already calls *the*
+#    expensive failure here. So the floor sits at the lowest value that still
+#    excludes a bare greeting, which is 3: "在吗" (2) is blocked, while a
+#    terse but complete "SO-9001 到哪了" (3) reaches the order lookup it names.
+MIN_ANSWERABLE_LATIN_CHARS = 12
+MIN_ANSWERABLE_CJK_CHARS = 3
+
+
+def _is_too_short_to_answer(text: str) -> bool:
+    """Whether the message carries too little to ask about, in either script.
+
+    Passes as soon as *either* count is met, so a mixed message ("PCB 交期是
+    多久") is measured by the script that carries its meaning.
+    """
+    cjk = len(_CJK_CHAR.findall(text))
+    if cjk >= MIN_ANSWERABLE_CJK_CHARS:
+        return False
+    latin = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+    return latin < MIN_ANSWERABLE_LATIN_CHARS
 
 
 def needs_clarification(question: str, prior: list[Turn]) -> tuple[bool, str]:
@@ -528,7 +564,7 @@ def needs_clarification(question: str, prior: list[Turn]) -> tuple[bool, str]:
     is the expensive failure here.
     """
     stripped = question.strip()
-    if len(stripped) < MIN_ANSWERABLE_CHARS:
+    if _is_too_short_to_answer(stripped):
         return True, "QUESTION_TOO_SHORT"
     if not _content_terms(stripped):
         return True, "NO_QUESTION_CONTENT"

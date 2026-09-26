@@ -7,20 +7,25 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:release": "node scripts/check-release-env.mjs && npm run build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node tests/build-components.mjs && node --experimental-strip-types tests/url-state.test.mts && node --experimental-strip-types tests/dialog-a11y.test.mts",
+    "check:runtime": "node --experimental-strip-types scripts/check-runtime-guards.mjs"
   },
   "dependencies": {
+    "lucide-react": "^1.47.0",
+    "oidc-client-ts": "^3.5.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.26.2"
+    "react-router-dom": "^7.18.4"
   },
   "devDependencies": {
-    "@types/node": "^22.7.5",
+    "@types/node": "^26.6.2",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
     "typescript": "^5.5.4",
-    "vite": "^5.4.8"
+    "vite": "^6.4.3"
   }
 }

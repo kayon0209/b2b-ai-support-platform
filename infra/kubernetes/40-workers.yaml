@@ -62,23 +62,29 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
+            # Stamped on every span this pod emits. The five roles share
+            # one image and one process entrypoint, so without a per-role
+            # name the collector cannot tell an interactive answer from an
+            # ingestion retry.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-worker-interactive"
             - name: APP_WORKER_QUEUE
               value: "interactive"
-            - name: APP_DATABASE_PASSWORD
+            - name: APP_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: platform-secrets
-                  key: APP_DATABASE_PASSWORD
+                  key: APP_DATABASE_URL
+            - name: APP_DATABASE_APP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_APP_URL
             - name: APP_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: platform-secrets
                   key: APP_SECRET_KEY
-            - name: APP_CHATWOOT_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: platform-secrets
-                  key: APP_CHATWOOT_API_TOKEN
             - name: APP_LLM_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -168,13 +174,24 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
+            # Stamped on every span this pod emits. The five roles share
+            # one image and one process entrypoint, so without a per-role
+            # name the collector cannot tell an interactive answer from an
+            # ingestion retry.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-worker-ingestion"
             - name: APP_WORKER_QUEUE
               value: "ingestion"
-            - name: APP_DATABASE_PASSWORD
+            - name: APP_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: platform-secrets
-                  key: APP_DATABASE_PASSWORD
+                  key: APP_DATABASE_URL
+            - name: APP_DATABASE_APP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_APP_URL
             - name: APP_SECRET_KEY
               valueFrom:
                 secretKeyRef:
@@ -258,11 +275,22 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
-            - name: APP_DATABASE_PASSWORD
+            # Stamped on every span this pod emits. The five roles share
+            # one image and one process entrypoint, so without a per-role
+            # name the collector cannot tell an interactive answer from an
+            # ingestion retry.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-worker-outbox"
+            - name: APP_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: platform-secrets
-                  key: APP_DATABASE_PASSWORD
+                  key: APP_DATABASE_URL
+            - name: APP_DATABASE_APP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_APP_URL
             - name: APP_SECRET_KEY
               valueFrom:
                 secretKeyRef:
@@ -325,13 +353,24 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
+            # Stamped on every span this pod emits. The five roles share
+            # one image and one process entrypoint, so without a per-role
+            # name the collector cannot tell an interactive answer from an
+            # ingestion retry.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-worker-retention"
             - name: APP_WORKER_QUEUE
               value: "retention"
-            - name: APP_DATABASE_PASSWORD
+            - name: APP_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: platform-secrets
-                  key: APP_DATABASE_PASSWORD
+                  key: APP_DATABASE_URL
+            - name: APP_DATABASE_APP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_APP_URL
             - name: APP_SECRET_KEY
               valueFrom:
                 secretKeyRef:
@@ -396,13 +435,24 @@ spec:
             - configMapRef:
                 name: platform-config
           env:
+            # Stamped on every span this pod emits. The five roles share
+            # one image and one process entrypoint, so without a per-role
+            # name the collector cannot tell an interactive answer from an
+            # ingestion retry.
+            - name: OTEL_SERVICE_NAME
+              value: "platform-worker-sla"
             - name: APP_WORKER_QUEUE
               value: "sla"
-            - name: APP_DATABASE_PASSWORD
+            - name: APP_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: platform-secrets
-                  key: APP_DATABASE_PASSWORD
+                  key: APP_DATABASE_URL
+            - name: APP_DATABASE_APP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: APP_DATABASE_APP_URL
             - name: APP_SECRET_KEY
               valueFrom:
                 secretKeyRef:

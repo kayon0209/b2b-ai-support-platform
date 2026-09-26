@@ -15,7 +15,7 @@ from collections.abc import Awaitable
 import pytest
 
 from platform_core.agent_runtime.qa_path import DraftAnswer
-from platform_core.evaluation.runner import EvalReport, EvaluationRunner
+from platform_core.evaluation.runner import EvalCase, EvalReport, EvaluationRunner
 from platform_core.retrieval.hybrid import PrincipalScope, RetrievedChunk
 
 from .dataset import (
@@ -199,6 +199,68 @@ def _oracle_runner() -> EvaluationRunner:
         return DraftAnswer(text=top.excerpt, claims=claims, route="knowledge_qa")
 
     return EvaluationRunner(answer, make_retriever(), key_of=corpus_key_of)
+
+
+# --- Declared routes are a taxonomy guard ---------------------------------
+
+
+def test_every_declared_route_is_the_one_the_classifier_produces() -> None:
+    """A declared route is a statement about the taxonomy, so it is checked.
+
+    The field used to default to `knowledge_qa` and be read by nothing, so
+    every case that never set it claimed to expect the knowledge path while
+    seven of them in fact route to `sensitive`, `human_required`,
+    `business_read` or `business_write`. The dataset read as though the
+    classifier were badly broken. Asserting it here is what makes the
+    declarations load-bearing - and they are the guard that has to exist
+    before `ACTION_VERBS` can be widened, because the failure mode of that
+    change is a question moving to a route nobody intended.
+    """
+    from platform_core.agent_runtime.intent import classify
+
+    declared = [c for c in all_cases() if c.expected_route]
+    assert declared, "no case declares a route, so the guard covers nothing"
+    wrong = [
+        (c.case_id, c.expected_route, classify(c.question).route.value)
+        for c in declared
+        if classify(c.question).route.value != c.expected_route
+    ]
+    assert wrong == [], f"declared route no longer produced: {wrong}"
+
+
+def test_a_wrong_declared_route_fails_the_case() -> None:
+    """The guard has to be observable failing, or it is decoration.
+
+    This is the mutation a reviewer would otherwise have to perform by hand:
+    declare a route the classifier does not produce, and confirm the runner
+    says so rather than trusting that it would.
+    """
+    case = EvalCase(
+        question="What is the current status of case 12345?",
+        case_id="probe-wrong-route",
+        # The classifier routes this to `business_read`; the declaration lies.
+        expected_route="knowledge_qa",
+        must_abstain=True,
+        expected_handoff=True,
+    )
+    report = _run(_oracle_runner().run([case]))
+    assert report.failed == 1
+    assert "ROUTE_MISMATCH" in report.results[0].reason_codes
+    # And the route actually taken is on the result, which is the one fact
+    # needed to explain a routing regression and which nothing used to record.
+    assert report.results[0].route == "business_read"
+
+
+def test_an_undeclared_route_is_not_asserted() -> None:
+    """Empty means "no expectation", and that is the honest default.
+
+    A case added without a declaration must not be silently assigned one -
+    which is exactly what the old `knowledge_qa` default did.
+    """
+    case = EvalCase(question="What is the refund window?", case_id="probe-undeclared")
+    assert case.expected_route == ""
+    report = _run(_oracle_runner().run([case]))
+    assert "ROUTE_MISMATCH" not in report.results[0].reason_codes
 
 
 def test_oracle_run_reports_every_category() -> None:

@@ -12,6 +12,29 @@ from typing import Any
 
 import pytest
 
+# Import the model registry before anything maps a model.
+#
+# `models_registry` exists so that `Base.metadata` is complete whenever a
+# process can open a session - its own docstring says so, and `platform_core.db`
+# imports it for exactly that reason. Tests that build their own engine (or
+# import a model module directly) bypass `db`, and then the completeness depends
+# on **collection order**: if `agent_runtime.models` is mapped before
+# `cases.canned_models`, SQLAlchemy resolves `conversation_turns.canned_reply_id`
+# against a metadata that has no `canned_replies` table and raises
+#
+#     NoReferencedTableError: Foreign key associated with column
+#     'conversation_turns.canned_reply_id' could not find table 'canned_replies'
+#
+# Measured 2026-09-23: 13 tests in `unit/tool_gateway/test_gateway.py` failed in
+# a batch run and passed alone, with a different set each time, which reads as
+# flakiness and is not - it is one import that has to happen first. Four files
+# trigger it (`test_intent`, `test_channel_dispatch`, `test_prompt_release`,
+# `test_rerank_flag`), all of which map a model without going through `db`.
+#
+# Doing it here rather than in each test file makes the suite order-independent,
+# which is the property that was actually missing.
+import platform_core.models_registry  # noqa: E402, F401  (side-effect import)
+
 if sys.platform == "win32":
     import asyncio
 

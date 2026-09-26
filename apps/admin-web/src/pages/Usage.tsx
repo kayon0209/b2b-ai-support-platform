@@ -244,6 +244,18 @@ export function Usage() {
                 tone={snapshot.over_quota ? "bad" : "good"}
               />
             </Card>
+            {/* Only when there is something to explain. A permanent zero tile
+                is noise, and this number exists to answer exactly one
+                question: "why is usage lower than the rows I can see". */}
+            {snapshot.abandoned > 0 ? (
+              <Card>
+                <Stat
+                  label={t("usage.abandoned")}
+                  value={int(snapshot.abandoned)}
+                  tone="warn"
+                />
+              </Card>
+            ) : null}
           </div>
 
           <Card title={t("usage.periodTitle")}>
