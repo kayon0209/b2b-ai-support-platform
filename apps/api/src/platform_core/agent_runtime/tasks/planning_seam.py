@@ -156,26 +156,39 @@ async def run_task_planning(
     Returns without touching the database when the flag is off, so the
     `off` path costs one flag read and nothing else.
     """
-    from platform_core.agent_runtime.semantic.modes import FLAG_TASKS, resolve_mode
+    from platform_core.agent_runtime.semantic.modes import (
+        FLAG_ASSIST,
+        FLAG_SHADOW,
+        FLAG_TASKS,
+        resolve_mode,
+    )
     from platform_core.config import get_settings
     from platform_core.knowledge import flag_service
 
     try:
         decisions = await flag_service.evaluate_many(
             session,
-            flag_keys=[FLAG_TASKS],
+            # The mode flags come first because `resolve_mode` derives the
+            # effective mode from them: it only recognises shadow/assist/
+            # semantic_read, so passing it `conversation_tasks` alone yields
+            # OFF and a tenant that had opted in would be refused. The task
+            # flag is a separate switch and is checked on its own below.
+            flag_keys=[FLAG_SHADOW, FLAG_ASSIST, FLAG_TASKS],
             tenant_id=tenant_id,
-            defaults={FLAG_TASKS: False},
+            defaults={FLAG_SHADOW: False, FLAG_ASSIST: False, FLAG_TASKS: False},
         )
         resolution = resolve_mode(get_settings(), {k: d.enabled for k, d in decisions.items()})
         # The task flag is its own switch: it is not implied by shadow or
         # assist being on, because writing rows is a business effect and the
         # flags that turn on *suggestions* must not turn on *persistence*.
-        # Both checks, in this order: the flag is the switch, and a kill
-        # switch on top of it stops the work even for a tenant that opted in.
+        #
+        # Both checks, in this order: the flag is the switch, and a kill switch
+        # on top of it stops the work even for a tenant that opted in.
         if not decisions.get(FLAG_TASKS) or not decisions[FLAG_TASKS].enabled:
             return PlanningOutcome(reason=REASON_TASKS_DISABLED)
         if resolution.mode is SemanticMode.OFF:
+            # The tenant enabled task persistence but no suggestion mode, so
+            # there is nothing to persist. Not an error - silence is right.
             return PlanningOutcome(reason=REASON_TASKS_DISABLED)
     except Exception:  # noqa: BLE001 - a flag read failure must not plan
         return PlanningOutcome(reason=REASON_TASKS_DISABLED)

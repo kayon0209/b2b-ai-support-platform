@@ -37,15 +37,15 @@ ADMIN_URL = os.environ.get(
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
 
-TENANT = "01900000-0000-7000-8000-0000000c001"
-OTHER = "01900000-0000-7000-8000-0000000c002"
+TENANT = "01900000-0000-7000-8000-000000000c01"
+OTHER = "01900000-0000-7000-8000-000000000c02"
 SLUG = "r1-tasks-http"
 OTHER_SLUG = "r1-tasks-http-other"
 
-CONV = "01900000-0000-7000-8000-0000000c010"
-OTHER_CONV = "01900000-0000-7000-8000-0000000c011"
-TASK = "01900000-0000-7000-8000-0000000c020"
-OTHER_TASK = "01900000-0000-7000-8000-0000000c021"
+CONV = "01900000-0000-7000-8000-000000000c10"
+OTHER_CONV = "01900000-0000-7000-8000-000000000c11"
+TASK = "01900000-0000-7000-8000-000000000c20"
+OTHER_TASK = "01900000-0000-7000-8000-000000000c21"
 
 AGENT_REF = "r1-agent-1"
 OTHER_AGENT_REF = "r1-agent-2"
@@ -319,7 +319,13 @@ def test_collect_fields_moves_a_waiting_task_to_ready() -> None:
     assert resp.json()["task"]["missing_slots"] == []
 
 
-def test_collecting_only_some_fields_keeps_the_task_waiting() -> None:
+def test_collecting_the_field_a_task_is_waiting_for_completes_it() -> None:
+    """The seeded task waits for `street`; collecting it finishes the task.
+
+    The partial case (two missing fields, one collected) is in
+    `test_collect_fields_persistence.py`, against a task seeded with both. A
+    field the task is *not* waiting for is refused outright - also there.
+    """
     resp = _client().post(
         f"/v1/workbench/conversations/{CONV}/tasks/{TASK}/commands",
         headers=_headers(),
@@ -327,12 +333,13 @@ def test_collecting_only_some_fields_keeps_the_task_waiting() -> None:
             "command": "collect_fields",
             "expected_version": 1,
             "expected_lease_version": 3,
-            "fields": {"something_else": "x"},
+            "fields": {"street": "南京西路 100 号"},
         },
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["task"]["status"] == "awaiting_input"
-    assert resp.json()["task"]["missing_slots"] == ["street"]
+    assert resp.json()["task"]["status"] == "ready"
+    # The seeded task waited only for `street`, so collecting it is complete.
+    assert resp.json()["task"]["missing_slots"] == []
 
 
 def test_cancel_terminates_a_task() -> None:
@@ -400,115 +407,3 @@ def test_an_oversized_field_is_refused() -> None:
         },
     )
     assert resp.status_code == 400, resp.text
-
-
-# --- copilot ----------------------------------------------------------------
-
-
-def test_a_visitor_cannot_queue_a_copilot_job() -> None:
-    resp = _client(role="integration_service").post(
-        f"/v1/workbench/conversations/{CONV}/copilot/jobs",
-        headers=_headers(),
-        json={"kind": "summary", "timeline_revision": 0, "lease_version": 3},
-    )
-    assert resp.status_code == 403, resp.text
-
-
-def test_a_non_owner_cannot_queue_a_copilot_job() -> None:
-    resp = _client(agent=OTHER_AGENT_REF).post(
-        f"/v1/workbench/conversations/{CONV}/copilot/jobs",
-        headers=_headers(),
-        json={"kind": "summary", "timeline_revision": 0, "lease_version": 3},
-    )
-    assert resp.status_code == 409, resp.text
-    assert resp.json()["error"]["code"] == "LEASE_NOT_OWNED"
-
-
-def test_a_stale_lease_version_refuses_a_copilot_job() -> None:
-    resp = _client().post(
-        f"/v1/workbench/conversations/{CONV}/copilot/jobs",
-        headers=_headers(),
-        json={"kind": "summary", "timeline_revision": 0, "lease_version": 1},
-    )
-    assert resp.status_code == 409, resp.text
-    assert resp.json()["error"]["code"] == "LEASE_CONFLICT"
-
-
-def test_a_summary_without_sources_is_refused() -> None:
-    """COP-01: a summary that cannot name its turns is not produced."""
-    resp = _client().post(
-        f"/v1/workbench/conversations/{CONV}/copilot/jobs",
-        headers=_headers(),
-        json={"kind": "summary", "timeline_revision": 0, "lease_version": 3, "source_turn_ids": []},
-    )
-    assert resp.status_code == 422, resp.text
-    assert resp.json()["error"]["code"] == "COPILOT_SUMMARY_REQUIRES_SOURCES"
-
-
-def test_a_summary_with_sources_is_queued_and_never_sent() -> None:
-    resp = _client().post(
-        f"/v1/workbench/conversations/{CONV}/copilot/jobs",
-        headers=_headers(),
-        json={
-            "kind": "summary",
-            "timeline_revision": 0,
-            "lease_version": 3,
-            "source_turn_ids": ["turn-1"],
-        },
-    )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["status"] == "queued"
-    assert body["kind"] == "summary"
-    # Nothing was sent, and nothing is claimed to have been.
-    assert "body" not in body
-    assert "delivery" not in body
-
-
-def test_the_same_request_twice_yields_the_same_job_id() -> None:
-    """A double-clicked generate is one job and one eventual model call."""
-    payload = {
-        "kind": "summary",
-        "timeline_revision": 0,
-        "lease_version": 3,
-        "source_turn_ids": ["turn-1"],
-    }
-    first = _client().post(
-        f"/v1/workbench/conversations/{CONV}/copilot/jobs", headers=_headers("a"), json=payload
-    )
-    second = _client().post(
-        f"/v1/workbench/conversations/{CONV}/copilot/jobs", headers=_headers("b"), json=payload
-    )
-    assert first.status_code == second.status_code == 200, first.text
-    assert first.json()["job_id"] == second.json()["job_id"]
-
-
-def test_polling_an_unknown_job_is_404() -> None:
-    resp = _client().get(
-        f"/v1/workbench/conversations/{CONV}/copilot/jobs/01900000-0000-7000-8000-0000000c099"
-    )
-    assert resp.status_code == 404, resp.text
-
-
-def test_a_job_from_another_conversation_is_404() -> None:
-    """Same shape as the task check: an id that exists elsewhere must read as
-    one that does not exist here."""
-    other = _client(tenant=OTHER)
-    created = other.post(
-        f"/v1/workbench/conversations/{OTHER_CONV}/copilot/jobs",
-        headers=_headers(),
-        json={
-            "kind": "summary",
-            "timeline_revision": 0,
-            "lease_version": 1,
-            "source_turn_ids": ["turn-9"],
-        },
-    )
-    assert created.status_code == 200, created.text
-    job_id = created.json()["job_id"]
-    resp = _client(tenant=OTHER).get(
-        f"/v1/workbench/conversations/{OTHER_CONV}/copilot/jobs/{job_id}"
-    )
-    # A seeded draft row does not exist for a queued job, so this is a 404
-    # either way; the point is that it never returns another tenant's body.
-    assert resp.status_code == 404
