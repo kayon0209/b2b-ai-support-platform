@@ -62,6 +62,7 @@ from platform_core.api import (
 )
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
+from platform_core.identity.tenant_context import TenantContext
 from platform_core.outbox_service import enqueue
 from platform_core.tool_gateway.models import ProposalStatus
 from platform_policy import Action
@@ -240,6 +241,8 @@ async def command_conversation_task(
 
             command = await _build_command(
                 session,
+                ctx=ctx,
+                conversation_ref=conversation_ref,
                 task=task,
                 body=body,
                 actor_ref=actor_ref,
@@ -269,6 +272,8 @@ async def command_conversation_task(
                 },
                 trace_id=trace_id,
             )
+    except TaskCommandRefused as exc:
+        return error_response(exc.code, exc.detail, status_code=409, trace_id=trace_id)
     except TaskConflict_ as exc:
         return error_response(exc.code, exc.detail, status_code=409, trace_id=trace_id)
     except LeaseConflict as exc:
@@ -279,9 +284,123 @@ async def command_conversation_task(
     return ok_response({"task": _task_out(updated)}, trace_id=trace_id)
 
 
+class TaskCommandRefused(Exception):
+    """The command does not apply to this task. 409, with a reason.
+
+    A distinct type from `TaskTransitionError` because the two mean different
+    things to a client: a transition error is "the task moved on", a refusal is
+    "you asked for something this task was never waiting for".
+    """
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+        self.detail = detail
+
+
+# Slot names whose value is never written into a task row. The value lives in
+# the conversation turn written alongside it; the task records that the field
+# was answered, by whom, and when. Mirrors `tasks.planner.SENSITIVE_SLOT_NAMES`
+# and is re-declared here because the router is the boundary that receives the
+# value and must decide before it reaches the store.
+SENSITIVE_FIELD_NAMES = frozenset(
+    {
+        "address",
+        "street",
+        "city",
+        "postal_code",
+        "tax_id",
+        "phone",
+        "email",
+        "bank_account",
+        "id_card",
+    }
+)
+
+
+def _merge_slots(
+    existing: list[dict[str, Any]], collected: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Replace a slot by name, preserving the rest and their order."""
+    by_name = {s.get("name"): s for s in collected}
+    merged: list[dict[str, Any]] = []
+    for slot in existing:
+        replacement = by_name.get(slot.get("name"))
+        merged.append(replacement if replacement is not None else slot)
+    for slot in collected:
+        if slot.get("name") not in {s.get("name") for s in merged}:
+            merged.append(slot)
+    return merged
+
+
+async def _persist_collected(
+    session: Any,
+    *,
+    ctx: TenantContext,
+    conversation_ref: uuid.UUID,
+    task: Any,
+    fields: dict[str, str],
+    trace_id: str,
+) -> list[dict[str, Any]]:
+    """Write the operator's words to the conversation and return the slots.
+
+    Two writes, in this order and for this reason:
+
+    1. A `human` turn carrying the collected values, so the value has an
+       author and a timestamp in the transcript - the same place the customer's
+       own words live. A slot pointing at a value with no transcript entry is a
+       fact with no source, which is what EVAL-02 counts as a failure.
+    2. The slot rows, with `origin: customer_stated` for a non-sensitive field
+       the customer typed, and `value_withheld` for a sensitive one. The task
+       then records that the field was answered and by whom, without becoming
+       a second copy of an address.
+
+    A task is only moved to `ready` when both writes succeed. If the turn write
+    fails, the exception propagates and the transition does not happen - which
+    is the point of B1-04: "no persisted evidence" must never read as
+    "collected".
+    """
+    from platform_core.agent_runtime import chat_service
+
+    text = "\n".join(f"{name}: {value}" for name, value in fields.items())
+    # `append_customer_turn`, not a hand-rolled insert: the collected text is
+    # the customer's words relayed by an agent, so it belongs in the
+    # conversation under the customer's role, and it must go through the same
+    # redactor every other customer turn does. A new insert path here would be
+    # a way to store unredacted PII.
+    turn, _duplicate = await chat_service.append_customer_turn(
+        session,
+        tenant_id=ctx.tenant_id,
+        ref_id=conversation_ref,
+        text=text,
+    )
+
+    slots: list[dict[str, Any]] = []
+    for name, value in fields.items():
+        sensitive = name.lower() in SENSITIVE_FIELD_NAMES
+        slot: dict[str, Any] = {
+            "name": name,
+            # The customer stated it, relayed by an agent. Not
+            # `verified_receipt`: nobody read it back from a system of record.
+            "origin": "customer_stated",
+            "confirmed": False,
+            # The turn this value now exists in. Without it a slot is an
+            # assertion with nothing behind it.
+            "turn_id": str(turn.id),
+        }
+        if sensitive:
+            slot["value_withheld"] = True
+        else:
+            slot["value"] = value
+        slots.append(slot)
+    return slots
+
+
 async def _build_command(
     session: Any,
     *,
+    ctx: TenantContext,
+    conversation_ref: uuid.UUID,
     task: Any,
     body: TaskCommandIn,
     actor_ref: str,
@@ -309,23 +428,46 @@ async def _build_command(
     base = _base()
 
     if body.command == "collect_fields":
-        # Collecting a field can only ever move a task *towards* ready. It
-        # never writes the value into a slot: the operator's input goes into
-        # the conversation, and the next assessment re-derives the slot with
-        # its origin. A route that accepted a value and wrote it into
-        # `slots` would be a way to assert a fact with no source.
-        remaining = [m for m in task.missing_slots if m not in body.fields]
-        if remaining:
-            return task_store.TaskCommand(
-                target=TaskStatus.AWAITING_INPUT,
-                reason_code="TASK_FIELDS_PARTIAL",
-                missing_slots=remaining,
-                **base,
+        # B1-04: the previous revision removed the field *names* from
+        # `missing_slots` and moved the task to `ready`, while writing the
+        # value nowhere. An operator saw "已记录客户补充的信息" and the
+        # database had no street, no source and no confirmation. The task
+        # looked complete and carried nothing.
+        #
+        # The value is persisted now, with a source, and the field name must
+        # be one this task is actually waiting for. Both halves matter: a
+        # route that accepted arbitrary names would let a caller attach
+        # anything to a task, and a value with no source is the exact shape
+        # EVAL-02 counts as a failure.
+        requested = list(body.fields)
+        unknown = [name for name in requested if name not in task.missing_slots]
+        if unknown:
+            # Refused, not ignored: silently dropping a field the operator
+            # typed would make the UI's confirmation a lie.
+            raise TaskCommandRefused(
+                "TASK_FIELD_NOT_REQUESTED",
+                f"this task is not waiting for: {', '.join(unknown)}",
             )
+
+        # Append the operator's own words to the conversation first, so the
+        # value has a transcript entry with an author. The slot then points at
+        # a turn that exists.
+        collected = await _persist_collected(
+            session,
+            ctx=ctx,
+            conversation_ref=conversation_ref,
+            task=task,
+            fields=body.fields,
+            trace_id=trace_id,
+        )
+
+        remaining = [m for m in task.missing_slots if m not in requested]
+        new_slots = _merge_slots(task.slots, collected)
         return task_store.TaskCommand(
-            target=TaskStatus.READY,
-            reason_code="TASK_FIELDS_COLLECTED",
-            missing_slots=[],
+            target=TaskStatus.READY if not remaining else TaskStatus.AWAITING_INPUT,
+            reason_code=("TASK_FIELDS_COLLECTED" if not remaining else "TASK_FIELDS_PARTIAL"),
+            missing_slots=remaining,
+            slots=new_slots,
             **base,
         )
 

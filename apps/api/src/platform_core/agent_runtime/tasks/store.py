@@ -161,6 +161,10 @@ class TaskCommand:
     completion_evidence: str | None = None
     blocked_reason: str | None = None
     missing_slots: list[str] | None = None
+    # Replace the slot set. Only `collect_fields` sets it, and only with slots
+    # that carry a source and a confirmation flag - a caller that could write
+    # a bare value here would be a way to assert a fact with no provenance.
+    slots: list[dict[str, Any]] | None = None
     # When set, the action's arguments changed: bump the revision so any
     # confirmation bound to the old one stops matching.
     bump_action_revision: bool = False
@@ -351,6 +355,17 @@ async def transition(
         values["blocked_reason"] = command.blocked_reason
     if command.missing_slots is not None:
         values["missing_slots"] = command.missing_slots
+    if command.slots is not None:
+        # Guarded here rather than at the router: a slot without an origin is
+        # an unsourced value, and this is the last place every write passes
+        # through.
+        for slot in command.slots:
+            if not slot.get("origin"):
+                raise TaskConflict(
+                    "TASK_SLOT_WITHOUT_ORIGIN",
+                    f"slot {slot.get('name')!r} has no origin",
+                )
+        values["slots"] = command.slots
     if command.bump_action_revision:
         values["action_revision"] = task.action_revision + 1
     if command.completion_evidence is not None:
