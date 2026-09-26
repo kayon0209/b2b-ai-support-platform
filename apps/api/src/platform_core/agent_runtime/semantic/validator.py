@@ -253,19 +253,30 @@ def _check_conditions(
 def _check_dependency_graph(intents: list[SemanticIntent], reason_codes: list[str]) -> None:
     """Depth limit, unknown dependency, and cycle detection.
 
-    `depends_on` carries a local key, not a model-invented name; an unknown or
-    cyclic reference means the task graph cannot be built deterministically, so
-    it is refused rather than partially resolved.
+    `depends_on` names a sibling by its zero-based position in the model's
+    `intents` array. The spec journey puts every need in one turn, so
+    `source_turn_id` is the same string for all of them and cannot key a
+    dependency; the position is the only identifier stable within one plan. A
+    non-numeric or out-of-range entry is refused rather than resolved, because
+    attaching a write to the wrong read is worse than leaving it unconnected.
     """
-    keys = {intent.source_turn_id for intent in intents}
-    edges = {i.source_turn_id: [d for d in i.depends_on] for i in intents}
-
-    for deps in edges.values():
-        for dep in deps:
-            if dep not in keys:
+    count = len(intents)
+    edges: dict[int, list[int]] = {}
+    for index, intent in enumerate(intents):
+        ordinals: list[int] = []
+        for raw in intent.depends_on:
+            try:
+                ordinal = int(str(raw).strip())
+            except (TypeError, ValueError):
                 raise SemanticInvalidOutput(
-                    "SEMANTIC_INVALID_OUTPUT", "depends_on references an unknown task"
+                    "SEMANTIC_INVALID_OUTPUT", "depends_on must reference an intent position"
+                ) from None
+            if not 0 <= ordinal < count:
+                raise SemanticInvalidOutput(
+                    "SEMANTIC_INVALID_OUTPUT", "depends_on references an unknown intent"
                 )
+            ordinals.append(ordinal)
+        edges[index] = ordinals
 
     # Cycle detection and depth limiting are separate questions and are checked
     # separately. A two-node cycle (a -> b -> a) has depth 2, which is under
@@ -276,8 +287,8 @@ def _check_dependency_graph(intents: list[SemanticIntent], reason_codes: list[st
     # rather than only the first, because a model can hang a cycle off a later
     # dependency.
     for start in edges:
-        path: list[str] = []
-        on_path: set[str] = set()
+        path: list[int] = []
+        on_path: set[int] = set()
         node = start
         while node in edges:
             if node in on_path:
@@ -288,7 +299,7 @@ def _check_dependency_graph(intents: list[SemanticIntent], reason_codes: list[st
                 reason_codes.append("SEMANTIC_DEPENDENCY_TOO_DEEP")
                 break
             deps = edges[node]
-            node = deps[0] if deps else ""
+            node = deps[0] if deps else -1
 
 
 def _unsupported_intents(

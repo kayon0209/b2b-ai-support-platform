@@ -316,21 +316,47 @@ def test_unregistered_condition_field_is_rejected() -> None:
 
 
 def test_dependency_cycle_is_rejected() -> None:
-    def intent(key: str, deps: list[str]) -> dict[str, Any]:
+    def intent(ordinal: int, deps: list[str]) -> dict[str, Any]:
         return {
             "task_kind": "read",
-            "source_turn_id": key,
+            "source_turn_id": "t-1",
             "evidence": [],
             "slots": [],
             "missing_slots": [],
             "depends_on": deps,
         }
 
-    out = _parse(_payload(intents=[intent("a", ["b"]), intent("b", ["a"])]))
+    # depends_on names a sibling by its position in the intents array.
+    out = _parse(_payload(intents=[intent(0, ["1"]), intent(1, ["0"])]))
     with pytest.raises(Exception) as exc:
         validate_semantics(
             out,
-            turns=[TurnView(turn_id="a", text="x"), TurnView(turn_id="b", text="y")],
+            turns=TURNS,
+            capabilities=READ_CAPS,
+            condition_fields=REGISTERED_CONDITION_FIELDS,
+        )
+    assert exc.value.code == "SEMANTIC_INVALID_OUTPUT"
+
+
+def test_an_out_of_range_dependency_is_rejected() -> None:
+    out = _parse(
+        _payload(
+            intents=[
+                {
+                    "task_kind": "read",
+                    "source_turn_id": "t-1",
+                    "evidence": [],
+                    "slots": [],
+                    "missing_slots": [],
+                    "depends_on": ["7"],
+                }
+            ]
+        )
+    )
+    with pytest.raises(Exception) as exc:
+        validate_semantics(
+            out,
+            turns=TURNS,
             capabilities=READ_CAPS,
             condition_fields=REGISTERED_CONDITION_FIELDS,
         )
