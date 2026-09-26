@@ -82,6 +82,10 @@ class EvalCase:
     # text cannot be committed, so the field exists to make the absence
     # explicit and checkable rather than implicit.
     redacted_from: str | None = None
+    # Oldest-first and synthetic/redacted only. Keeping authorized history in
+    # the case lets coreference examples exercise the same input builder as
+    # production without reading a live conversation.
+    history: tuple[tuple[str, str], ...] = ()
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -94,6 +98,7 @@ class EvalCase:
             "missing_slots": list(self.missing_slots),
             "slices": list(self.slices),
             "provenance": self.provenance,
+            "history": [list(turn) for turn in self.history],
         }
 
 
@@ -121,6 +126,7 @@ def dataset_hash(cases: Iterable[EvalCase]) -> str:
                     "case_id": c.case_id,
                     "family": c.family,
                     "text": c.text,
+                    "history": c.history,
                     "intents": sorted(c.expected_intents),
                     "scene": c.expected_scene,
                     "slots": c.expected_slots,
@@ -289,6 +295,42 @@ class IntentClassScore:
 
 
 @dataclass
+class SlotNameScore:
+    """One-vs-rest counts for a required-but-missing slot name."""
+
+    slot_name: str
+    true_positive: int = 0
+    false_positive: int = 0
+    false_negative: int = 0
+
+    @property
+    def precision(self) -> float:
+        denominator = self.true_positive + self.false_positive
+        return self.true_positive / denominator if denominator else 0.0
+
+    @property
+    def recall(self) -> float:
+        denominator = self.true_positive + self.false_negative
+        return self.true_positive / denominator if denominator else 0.0
+
+    @property
+    def f1(self) -> float:
+        denominator = self.precision + self.recall
+        return 2 * self.precision * self.recall / denominator if denominator else 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "slot_name": self.slot_name,
+            "true_positive": self.true_positive,
+            "false_positive": self.false_positive,
+            "false_negative": self.false_negative,
+            "precision": round(self.precision, 4),
+            "recall": round(self.recall, 4),
+            "f1": round(self.f1, 4),
+        }
+
+
+@dataclass
 class ComparisonReport:
     """The result of one rules-vs-model comparison.
 
@@ -307,9 +349,15 @@ class ComparisonReport:
     model: dict[str, float] = field(default_factory=dict)
     rules_intents: list[IntentClassScore] = field(default_factory=list)
     model_intents: list[IntentClassScore] = field(default_factory=list)
+    model_slot_exact_match_rate: float | None = None
+    model_slot_case_count: int = 0
+    model_missing_slots: dict[str, Any] = field(default_factory=dict)
+    model_missing_slot_scores: list[SlotNameScore] = field(default_factory=list)
     rules_slices: list[SliceScore] = field(default_factory=list)
     model_slices: list[SliceScore] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)
+    slot_failures: list[dict[str, Any]] = field(default_factory=list)
+    missing_slot_failures: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -329,12 +377,22 @@ class ComparisonReport:
             "model": self.model,
             "rules_intents": [score.as_dict() for score in self.rules_intents],
             "model_intents": [score.as_dict() for score in self.model_intents],
+            "model_slot_exact_match_rate": self.model_slot_exact_match_rate,
+            "model_slot_case_count": self.model_slot_case_count,
+            "model_missing_slots": self.model_missing_slots,
+            "model_missing_slot_scores": [
+                score.as_dict() for score in self.model_missing_slot_scores
+            ],
             "rules_slices": [s.as_dict() for s in self.rules_slices],
             "model_slices": [s.as_dict() for s in self.model_slices],
             "failure_count": len(self.failures),
+            "slot_failure_count": len(self.slot_failures),
+            "missing_slot_failure_count": len(self.missing_slot_failures),
             # Case ids and reason codes only. A failure row carrying the text
             # would put customer-shaped content in a report that gets shared.
             "failures": self.failures,
+            "slot_failures": self.slot_failures,
+            "missing_slot_failures": self.missing_slot_failures,
             "notes": self.notes,
         }
 
@@ -395,12 +453,54 @@ def score_intents(
     )
 
 
+def score_missing_slots(
+    cases: list[EvalCase], predictions: dict[str, list[str]]
+) -> tuple[dict[str, float], list[SlotNameScore]]:
+    """Score required missing-slot names without including any slot values."""
+    labels = sorted(
+        {label for case in cases for label in case.missing_slots}
+        | {label for case in cases for label in predictions.get(case.case_id, [])}
+    )
+    scores: list[SlotNameScore] = []
+    for label in labels:
+        score = SlotNameScore(slot_name=label)
+        for case in cases:
+            expected = set(case.missing_slots)
+            predicted = set(predictions.get(case.case_id, []))
+            if label in expected and label in predicted:
+                score.true_positive += 1
+            elif label in predicted:
+                score.false_positive += 1
+            elif label in expected:
+                score.false_negative += 1
+        scores.append(score)
+
+    total_tp = sum(score.true_positive for score in scores)
+    total_fp = sum(score.false_positive for score in scores)
+    total_fn = sum(score.false_negative for score in scores)
+    micro_denominator = 2 * total_tp + total_fp + total_fn
+    exact_matches = sum(
+        set(case.missing_slots) == set(predictions.get(case.case_id, [])) for case in cases
+    )
+    macro_f1 = sum(score.f1 for score in scores) / len(scores) if scores else 0.0
+    return (
+        {
+            "macro_f1": round(macro_f1, 4),
+            "micro_f1": round(2 * total_tp / micro_denominator, 4) if micro_denominator else 0.0,
+            "exact_match_rate": round(exact_matches / len(cases), 4) if cases else 0.0,
+        },
+        scores,
+    )
+
+
 def compare(
     cases: list[EvalCase],
     *,
     split: Split,
     rules_predictions: dict[str, list[str]] | None = None,
     model_predictions: dict[str, list[str]] | None = None,
+    model_slot_predictions: dict[str, dict[str, Any]] | None = None,
+    model_missing_slot_predictions: dict[str, list[str]] | None = None,
     model_name: str = "",
     prompt_version: str = "",
 ) -> ComparisonReport:
@@ -477,6 +577,45 @@ def compare(
             )
 
     report.model, report.model_intents = score_intents(subset, model)
+    if model_slot_predictions is not None:
+        report.model_slot_case_count = len(subset)
+        slot_exact = 0
+        for case in subset:
+            expected_slots = case.expected_slots
+            predicted_slots = model_slot_predictions.get(case.case_id, {})
+            if predicted_slots == expected_slots:
+                slot_exact += 1
+                continue
+            report.slot_failures.append(
+                {
+                    "case_id": case.case_id,
+                    "family": case.family,
+                    "slices": list(case.slices),
+                    "expected_slot_names": sorted(expected_slots),
+                    "predicted_slot_names": sorted(predicted_slots),
+                    "reason": "slot_exact_match_mismatch",
+                }
+            )
+        report.model_slot_exact_match_rate = round(slot_exact / len(subset), 4) if subset else 0.0
+
+    if model_missing_slot_predictions is not None:
+        report.model_missing_slots, report.model_missing_slot_scores = score_missing_slots(
+            subset, model_missing_slot_predictions
+        )
+        for case in subset:
+            expected_missing = set(case.missing_slots)
+            predicted_missing = set(model_missing_slot_predictions.get(case.case_id, []))
+            if expected_missing != predicted_missing:
+                report.missing_slot_failures.append(
+                    {
+                        "case_id": case.case_id,
+                        "family": case.family,
+                        "slices": list(case.slices),
+                        "expected": sorted(expected_missing),
+                        "predicted": sorted(predicted_missing),
+                        "reason": "missing_slot_set_mismatch",
+                    }
+                )
     report.model_slices = sorted(model_slices.values(), key=lambda s: s.slice_name)
     return report
 
@@ -491,12 +630,14 @@ __all__ = [
     "IntentClassScore",
     "SliceScore",
     "Split",
+    "SlotNameScore",
     "assign_split",
     "compare",
     "dataset_hash",
     "missing_slice_problems",
     "score_intent_set",
     "score_intents",
+    "score_missing_slots",
     "split_dataset",
     "validate_dataset",
 ]

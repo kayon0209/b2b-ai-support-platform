@@ -142,35 +142,41 @@ write 为 `needs_human` + `SEMANTIC_NO_WRITE_CAPABILITY`，缺参保留，地址
 | T00 基线与契约差异 | 完成 | `baseline-and-contract-delta.md`；三条假设被证伪并记录 |
 | T01 语义契约与裁决 | 完成 | 44 项单测；CLASSIFY 路由接入生产调用点 |
 | T02 影子模式 | 完成（SHD-01/OPS-01 部分） | 9 项集成测试实测零业务副作用；已移入持久队列 |
-| T03 评测框架 | 部分完成（EVAL-02 阻塞） | 哈希绑定精确输入；输出宏/微 F1、exact match 与逐意图 TP/FP/FN；固定语义集和真实保留集仍未完成 |
+| T03 评测框架 | 部分完成（EVAL-02 阻塞） | 哈希绑定精确文本、对话历史、标签与来源；输出意图宏/微 F1、exact match、逐意图 TP/FP/FN、槽位 exact-match、缺参槽位 F1 与脱敏失败切片；固定语义集和真实保留集仍未完成 |
 | T04 任务表与状态机 | 完成 | 29 单测 + 16 集成；迁移往返实测 |
 | T05 工具候选与补参 | 完成 | 能力过滤 + 规划器 + 7 项提案集成测试 |
 | T06 副驾 job | 完成 | 24 单测 + 10 集成 + 独立 consumer |
 | T07 工作台 UI | **部分完成** | 面板与四条路由已交付；**UI-01/UI-02 未验证** |
 | T08 端到端 | **部分完成** | 数据层旅程已验证；**浏览器双窗口、接管竞态、故障注入未做** |
-| T09 文档与证据 | 部分完成 | 本文件 + manifest；**回滚演练未做，CI 未跑** |
+| T09 文档与证据 | 部分完成 | 本文件 + manifest；CI 在前一验证 head 通过；**本次评测增补待 CI，回滚演练未做** |
 
-计数：完成 6 / 部分完成 3 / 未开始 1。R2、R3 未实现，未标记完成。
+计数：完成 6 / 部分完成 4 / 未开始 0。R2、R3 未实现，未标记完成。
 
 ---
 
 ## 3. 验收 ID 实际状态
 
 **完成**（本分支可复现）：
-SEM-01、SEM-02、SEM-03、SHD-01、TASK-01、TASK-02、TASK-03、TOOL-01、
-TOOL-02、TOOL-03、COP-01、COP-02、SEC-01、SEC-02、SEC-04、EVAL-01、
-MIG-01、DOC-01
+SEM-01、SEM-02、SHD-01、TASK-01、TASK-02、TOOL-01、TOOL-02、TOOL-03、
+COP-01、COP-02、SEC-01、SEC-04、MIG-01
 
 **部分完成**：
+SEM-03（fake provider 降级通过；**无真实 provider 故障注入**）
+TASK-03（幂等/恢复控制通过；**无 Worker 重启演练**）
+SEC-02（测试权限负例通过；**真实身份撤权未演练**）
+SEC-03（代码 lease 校验通过；**无真实双坐席在途接管**）
 OPS-01（过期/配额/重放有测试；**无 worker 重启演练**）
 OPS-02（kill switch 有测试；**无回滚演练**）
-UX-01（数据层验证；**无浏览器验证**）
+UI-01/UI-02、UX-01/UX-02/UX-03（部分桌面/移动旅程通过；**完整截图、无障碍与双浏览器矩阵未完成**）
+EVAL-01（评测框架通过；**600-case 固定集未冻结**）
+DOC-01（文档可审；ADR 仍为 Proposed）
+DOC-02（交付说明已更新；**缺回滚及生产证据**）
 
 **未执行**：
-SEC-03、UI-01、UI-02、UX-02、UX-03、PERF-01、PERF-02、CI-01
+PERF-01（生产近似负载）
 
 **阻塞**：
-EVAL-02（合成语义输出未过严格 schema/时限，固定保留集未执行）、DOC-02（依赖上面未执行项）
+EVAL-02（固定保留集未执行，且合成探测延迟超标）、PERF-02（无真实模型 p95/预算测量）
 
 新功能开关全部默认 false；本次交接不启用任何一项。
 
@@ -213,8 +219,9 @@ cd apps/admin-web && npm run typecheck && npm run build && npm test       # 29 p
 在干净检出、无 `.env` 的环境下这三个 pricing 测试不失败——这与验收报告测到的
 1566/1384 口径一致，不是本轮修复的结果。
 
-**未执行**：`kubectl kustomize`、完整 `pytest`（含 e2e 脚本）、GitHub Actions
-全流程。CI-01 因此仍未通过。
+**未执行**：`kubectl kustomize`、完整 `pytest`（含 e2e 脚本）。GitHub Actions 在
+前一验证 head `54cd315` 已全部通过；本次评测指标增补尚未推送，当前变更的 CI-01
+结果待更新。
 
 ---
 
@@ -306,11 +313,11 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 | T06 | 完成（worker/job/引用/人工发送） | 自定义指令受限；真实模型质量仍阻塞 |
 | T07 | 部分完成（API、桌面/移动实测） | UI-01 截图矩阵、完整键盘/屏幕阅读器仍未全验 |
 | T08 | 部分完成（合成端到端旅程） | 双坐席并发、provider/connector 故障注入和生产负载未做 |
-| T09 | 部分完成 | CI-01 已通过；真实回滚演练和发布证据包整理仍未做 |
+| T09 | 部分完成 | CI-01 在 head `54cd315` 已通过；本次变更待 CI；真实回滚演练和发布证据包整理仍未做 |
 
 **仍阻塞生产放量**：EVAL-02、PERF-01/02、OPS-01 worker 重启、OPS-02 回滚、SEC-03 两坐席在途接管、完整 UI/UX 无障碍矩阵。所有生产租户新开关继续默认关闭，`semantic_read` 不启用。
 
-**GitHub Actions**：[run #36257356252](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36257356252) 在代码/评测 head `a63ef3a0215c5c640c2da54027ba18fc7cb4d160` 全部通过，包含 Release Evidence。当前后续提交只刷新本段 CI 链接与验收记录。CI 通过不替代真实模型质量/生产容量/回滚门槛。PR #19 保持打开；本报告不授权合并或生产发布。
+**GitHub Actions**：[run #36257812704](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36257812704) 在代码/评测 head `54cd315faf7e7e3db64170ca600a59970e190978` 全部通过，包含 Release Evidence。当前评测指标增补尚未推送；其 CI 结果待更新。CI 通过不替代真实模型质量/生产容量/回滚门槛。PR #19 保持打开；本报告不授权合并或生产发布。
 
 ### 2026-09-27 Gitee 提供方诊断与后续修复
 
@@ -319,3 +326,9 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 - 合成最小聊天请求由 Qwen3.8-Flash 成功返回，耗时 4,259ms，报告 59 个输入和 30 个输出 Token；请求 `max_tokens=8`，但 usage 报告了 30 个输出 Token。另一次 `max_tokens=300` 的语义探测报告了 1,518 个输出 Token。当前不能把 `max_tokens` 当作已验证的计费上限，分类请求也未达到 2 秒目标。
 - 语义探测使用合成订单文本和空能力集，没有真实客户数据或工具执行。旧提示词 `semantic-v1` 下，默认思考模式在 8 秒和 15 秒服务预算下超时；直接提供方调用耗时 56,448ms、报告 231 个输入和 1,518 个输出 Token，严格 schema 校验失败。关闭思考参数后两次探测分别耗时 9,954ms 和 5,728ms；最后一次安全错误详情为缺少 `primary_intent`。该结果促成了提示词收紧。
 - 提示词现为 `semantic-v2`，明确列出必需字段、枚举、嵌套对象和证据偏移规则；超时/失败现在记录已耗时长。随后使用临时 no-thinking 请求对同一严格校验器做了各一条合成探测：Qwen3.8-Flash 4,844ms / 747 输入 / 192 输出，Qwen3.5-Flash 7,723ms / 752 输入 / 299 输出，均通过 schema；两者都没有满足 2 秒时限。临时 no-thinking 参数尚未进入生产适配器。受影响单测 **74 passed**，Ruff 与 Mypy 通过；已停止 live 模型探测，固定保留集与 PERF p95 仍未测。`semantic_read` 和其他生产开关继续关闭。
+
+### 2026-09-27 评测报告补全
+
+- T03 的离线比较报告现在支持槽位 exact-match、缺参槽位逐类/宏微 F1、失败样例只记录槽位名而不记录槽位值；数据集哈希包含精确输入文本、授权历史、预期标签、槽位和 provenance，确保输入或标注变化都会改变 digest。
+- 修复评测测试文件中既有的重复 `_family_in` 定义，使本次变更的 Mypy 检查通过。评测模块单测 29 项通过，Ruff、格式检查、Mypy 和 `git diff --check` 通过。
+- 这只是指标与报告能力，不是模型测评结果：600 条独立且复核的固定语义集尚未冻结，未执行真实模型 holdout、p95 或负载试验；没有新增线上模型调用。生产开关保持关闭。此次提交的 GitHub Actions 结果待推送后确认。

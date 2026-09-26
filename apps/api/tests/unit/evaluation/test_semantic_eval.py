@@ -70,19 +70,6 @@ def _family_in(split: Split, ordinal: int) -> str:
     raise AssertionError(f"no family found for {split}")
 
 
-def _family_in(split: Split, ordinal: int) -> str:
-    """A family name guaranteed to land in `split`.
-
-    Used instead of a hard-coded name so a test does not silently start
-    measuring an empty subset if the split thresholds ever change.
-    """
-    for i in range(10_000):
-        name = f"fam-{split.value}-{ordinal}-{i}"
-        if assign_split(name) is split:
-            return name
-    raise AssertionError(f"no family found for {split}")
-
-
 def _tiny_dataset() -> list[EvalCase]:
     return [
         _case("c1", "fam-order-1", "查一下 SO-1 到哪了", ("business_query",), _SINGLE),
@@ -153,6 +140,30 @@ def test_the_hash_moves_when_an_expected_slot_changes() -> None:
     b = [
         _case(
             "c1", "f", "查 SO-1", ("business_query",), _SINGLE, expected_slots={"order_id": "SO-2"}
+        )
+    ]
+    assert dataset_hash(a) != dataset_hash(b)
+
+
+def test_the_hash_moves_when_authorized_history_changes() -> None:
+    a = [
+        _case(
+            "c1",
+            "f",
+            "它发货了吗？",
+            ("business_query",),
+            _COREF,
+            history=(("h1", "我的订单是 SO-1"),),
+        )
+    ]
+    b = [
+        _case(
+            "c1",
+            "f",
+            "它发货了吗？",
+            ("business_query",),
+            _COREF,
+            history=(("h1", "我的订单是 SO-2"),),
         )
     ]
     assert dataset_hash(a) != dataset_hash(b)
@@ -283,6 +294,9 @@ def test_a_missing_model_is_blocked_not_zero() -> None:
     assert report.as_dict()["status"] == "blocked"
     # No model accuracy is invented.
     assert report.model == {}
+    assert report.model_slot_exact_match_rate is None
+    assert report.model_slot_case_count == 0
+    assert report.model_missing_slots == {}
     assert any("BLOCKED" in n for n in report.notes)
     # The rules baseline is still measured - it needs no credentials.
     assert report.rules
@@ -354,6 +368,54 @@ def test_failures_carry_no_customer_text() -> None:
     blob = json.dumps(report.failures, ensure_ascii=False)
     assert "SO-1" not in blob
     assert "我的订单" not in blob
+
+
+def test_slot_reports_compare_values_without_emitting_them() -> None:
+    family_a = _family_in(Split.HOLDOUT, 10)
+    family_b = _family_in(Split.HOLDOUT, 11)
+    cases = [
+        _case(
+            "slot-a",
+            family_a,
+            "SECRET-ORDER-VALUE-7f203d",
+            ("business_query",),
+            _SINGLE,
+            expected_slots={"order_id": "SECRET-ORDER-VALUE-7f203d"},
+        ),
+        _case(
+            "slot-b",
+            family_b,
+            "改地址",
+            ("business_action",),
+            _SINGLE,
+            expected_slots={"quantity": "PRIVATE-QUANTITY-a2de7"},
+            missing_slots=("order_id",),
+        ),
+    ]
+    report = compare(
+        cases,
+        split=Split.HOLDOUT,
+        rules_predictions={"slot-a": ["business_query"], "slot-b": ["business_action"]},
+        model_predictions={"slot-a": ["business_query"], "slot-b": ["business_action"]},
+        model_slot_predictions={
+            "slot-a": {"order_id": "SECRET-ORDER-VALUE-7f203d"},
+            "slot-b": {"quantity": "WRONG-QUANTITY-f09c3"},
+        },
+        model_missing_slot_predictions={"slot-a": ["account_id"], "slot-b": ["order_id"]},
+    )
+
+    assert report.model_slot_case_count == 2
+    assert report.model_slot_exact_match_rate == 0.5
+    assert report.model_missing_slots["exact_match_rate"] == 0.5
+    assert report.model_missing_slots["micro_f1"] == 0.6667
+    assert [failure["case_id"] for failure in report.slot_failures] == ["slot-b"]
+    assert [failure["case_id"] for failure in report.missing_slot_failures] == ["slot-a"]
+    assert report.as_dict()["slot_failure_count"] == 1
+    assert report.as_dict()["missing_slot_failure_count"] == 1
+    report_json = json.dumps(report.as_dict())
+    assert "SECRET-ORDER-VALUE-7f203d" not in report_json
+    assert "PRIVATE-QUANTITY-a2de7" not in report_json
+    assert "WRONG-QUANTITY-f09c3" not in report_json
 
 
 def test_macro_f1_is_per_class_and_exact_match_is_reported_separately() -> None:
