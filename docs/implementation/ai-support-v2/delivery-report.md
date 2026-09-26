@@ -304,8 +304,8 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 | T06 | 完成（worker/job/引用/人工发送） | 自定义指令受限；真实模型质量仍阻塞 |
 | T07 | 部分完成（API、桌面/移动实测） | UI-01 截图矩阵、完整键盘/屏幕阅读器仍未全验 |
 | T08 | 部分完成（合成端到端旅程） | 双坐席并发、provider/connector 故障注入和生产负载未做 |
-| T09 | 部分完成 | 本次变更需推送并等待 GitHub Actions；真实回滚演练未做 |
+| T09 | 部分完成 | CI-01 已通过；真实回滚演练和发布证据包整理仍未做 |
 
 **仍阻塞生产放量**：EVAL-02、PERF-01/02、OPS-01 worker 重启、OPS-02 回滚、SEC-03 两坐席在途接管、完整 UI/UX 无障碍矩阵。所有生产租户新开关继续默认关闭，`semantic_read` 不启用。
 
-**下一步**：提交并推送本轮代码到 PR #19，等待完整 CI；CI 通过只关闭 CI-01，不替代上述真实模型/生产容量/回滚门槛。该报告不授权合并或生产发布。
+**GitHub Actions**：[run #36244375661](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36244375661) 在 head `d498b0e9947540893fe2b14c5f71d2bc8ad2fc29` 全部通过，包含 Release Evidence。CI-01 已关闭；CI 通过不替代上述真实模型/生产容量/回滚门槛。PR #19 保持打开；本报告不授权合并或生产发布。
