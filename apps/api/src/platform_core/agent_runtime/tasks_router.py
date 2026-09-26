@@ -16,7 +16,7 @@ command" is a much less actionable error than "here is what you may do".
 was replaced between rendering the panel and clicking a button is refused, not
 silently allowed to act on a conversation somebody else now owns.
 
-**Nothing here sends anything.** `POST .../copilot/jobs` returns 202 and a job
+**Nothing here sends anything.** `POST .../copilot/jobs` returns 200 and a job
 id. Sending is the existing workbench reply path, which the agent uses after
 inserting the generated text into their own draft. The two are separate
 buttons in the UI for the same reason they are separate endpoints here.
@@ -37,16 +37,19 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select as sa_select
 from sqlalchemy.exc import IntegrityError
 
+from platform_core.agent_runtime import chat_service
 from platform_core.agent_runtime.copilot import (
     COPILOT_EVENT_TYPE,
     CopilotError,
     CopilotJobStatus,
     CopilotKind,
     apply_staleness,
+    derive_job_id,
     new_job,
     should_expire,
 )
 from platform_core.agent_runtime.models import ConversationTurn
+from platform_core.agent_runtime.semantic.modes import FLAG_COPILOT
 from platform_core.agent_runtime.tasks import store as task_store
 from platform_core.agent_runtime.tasks.models import CopilotDraft
 from platform_core.agent_runtime.tasks.state_machine import (
@@ -68,6 +71,7 @@ from platform_core.api import (
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
 from platform_core.identity.tenant_context import TenantContext
+from platform_core.outbox import OutboxEvent
 from platform_core.outbox_service import enqueue
 from platform_policy import Action
 
@@ -706,9 +710,57 @@ async def create_copilot_job(
         return error_response(VALIDATION_FAILED, "an identified agent is required", status_code=400)
 
     actor_id = ctx.actor_id
+    idempotency_key = request.headers["Idempotency-Key"]
     trace_id = new_trace_id()
     try:
         async with tenant_session(ctx) as session:
+            replay_job_id = derive_job_id(
+                tenant_id=ctx.tenant_id,
+                conversation_ref_id=conversation_ref,
+                actor_id=actor_id,
+                kind=CopilotKind(body.kind),
+                timeline_revision=body.timeline_revision,
+                lease_version=body.lease_version,
+                request_key=idempotency_key,
+            )
+            replay = (
+                await session.execute(
+                    sa_select(CopilotDraft).where(
+                        CopilotDraft.tenant_id == ctx.tenant_id,
+                        CopilotDraft.job_id == replay_job_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if replay is not None:
+                replay_sources = list(replay.source_refs or [])
+                replay_source_ids = [str(ref.get("turn_id", "")) for ref in replay_sources]
+                if (
+                    replay.conversation_ref_id != conversation_ref
+                    or replay.actor_id != actor_id
+                    or replay.kind != body.kind
+                    or replay.timeline_revision != body.timeline_revision
+                    or replay.lease_version != body.lease_version
+                    or replay.task_id != body.task_id
+                    or replay_source_ids != body.source_turn_ids
+                    or bool(body.instructions.strip())
+                ):
+                    return error_response(
+                        "IDEMPOTENCY_CONFLICT",
+                        "key was used for a different copilot request",
+                        status_code=409,
+                        trace_id=trace_id,
+                    )
+                return ok_response(
+                    {
+                        "job_id": str(replay.job_id),
+                        "kind": replay.kind,
+                        "status": replay.status,
+                        "timeline_revision": replay.timeline_revision,
+                        "lease_version": replay.lease_version,
+                    },
+                    trace_id=trace_id,
+                )
+
             lease = await lease_service.lease_snapshot(
                 session, tenant_id=ctx.tenant_id, conversation_ref_id=conversation_ref
             )
@@ -727,6 +779,27 @@ async def create_copilot_job(
                     "LEASE_CONFLICT",
                     f"lease version moved to {lease.lease_version}",
                     status_code=409,
+                )
+
+            from platform_core.knowledge import flag_service
+
+            copilot_flag = await flag_service.evaluate(
+                session,
+                flag_key=FLAG_COPILOT,
+                tenant_id=ctx.tenant_id,
+                default=False,
+            )
+            if not copilot_flag.enabled:
+                return error_response(
+                    "COPILOT_DISABLED",
+                    "AI 副驾生成当前未启用。",
+                    status_code=403,
+                )
+            if body.instructions.strip():
+                return error_response(
+                    "COPILOT_INSTRUCTIONS_UNAVAILABLE",
+                    "自定义生成指令尚未开放；当前仅使用受控的默认提示词。",
+                    status_code=400,
                 )
 
             current_revision = await _timeline_revision(session, conversation_ref=conversation_ref)
@@ -760,9 +833,9 @@ async def create_copilot_job(
                 kind=kind,
                 timeline_revision=body.timeline_revision,
                 lease_version=body.lease_version,
-                instructions=body.instructions,
                 task_id=body.task_id,
                 source_refs=sources,
+                request_key=idempotency_key,
             )
 
             row = CopilotDraft(
@@ -826,6 +899,21 @@ async def create_copilot_job(
             return error_response(
                 "CONFLICT", "the job could not be created", status_code=409, trace_id=trace_id
             )
+        if (
+            existing.conversation_ref_id != conversation_ref
+            or existing.actor_id != actor_id
+            or existing.kind != job.kind.value
+            or existing.timeline_revision != job.timeline_revision
+            or existing.lease_version != job.lease_version
+            or existing.task_id != job.task_id
+            or list(existing.source_refs or []) != sources
+        ):
+            return error_response(
+                "IDEMPOTENCY_CONFLICT",
+                "key was used for a different copilot request",
+                status_code=409,
+                trace_id=trace_id,
+            )
         return ok_response(
             {
                 "job_id": str(existing.job_id),
@@ -866,20 +954,25 @@ async def _resolve_sources(
     """
     if not turn_ids:
         return []
-    rows = (
-        await session.execute(
-            sa_select(ConversationTurn).where(
-                ConversationTurn.conversation_ref_id == conversation_ref,
-                ConversationTurn.id.in_(turn_ids),
+    rows = list(
+        (
+            await session.execute(
+                sa_select(ConversationTurn).where(
+                    ConversationTurn.conversation_ref_id == conversation_ref,
+                    ConversationTurn.id.in_(turn_ids),
+                )
             )
         )
-    ).scalars()
+        .scalars()
+        .all()
+    )
     found = {str(r.id) for r in rows}
     if found != set(turn_ids):
         return None
     # Offsets are recorded so a later review can point at the exact span. The
     # text itself stays in `conversation_turns`.
-    return [{"turn_id": t, "role": "customer", "offset": [0, 0]} for t in turn_ids]
+    roles = {str(row.id): row.role for row in rows}
+    return [{"turn_id": turn_id, "role": roles[turn_id], "offset": [0, 0]} for turn_id in turn_ids]
 
 
 @router.get("/conversations/{conversation_ref}/copilot/jobs/{job_id}")
@@ -914,6 +1007,8 @@ async def read_copilot_job(request: Request, conversation_ref: uuid.UUID, job_id
             "job_id": str(row.job_id),
             "kind": row.kind,
             "status": row.status,
+            "timeline_revision": row.timeline_revision,
+            "lease_version": row.lease_version,
             "draft_id": str(row.id) if row.id else None,
             "body": row.body,
             "source_refs": row.source_refs,
@@ -940,7 +1035,7 @@ async def read_copilot_job(request: Request, conversation_ref: uuid.UUID, job_id
                 payload["status"] = refreshed.status.value
                 payload["error_code"] = refreshed.error_code
                 payload["can_insert"] = refreshed.can_insert()
-        elif row.status == CopilotJobStatus.QUEUED.value:
+        elif row.status in (CopilotJobStatus.QUEUED.value, CopilotJobStatus.RUNNING.value):
             # An uncollected job that has aged out is expired, not queued.
             # Reported on read rather than only by the worker's sweep, because
             # the operator is the one watching the spinner.
@@ -948,6 +1043,18 @@ async def read_copilot_job(request: Request, conversation_ref: uuid.UUID, job_id
             if should_expire(job):
                 payload["status"] = CopilotJobStatus.EXPIRED.value
                 payload["error_code"] = "COPILOT_JOB_EXPIRED"
+            elif row.status == CopilotJobStatus.QUEUED.value:
+                event_status = (
+                    await session.execute(
+                        sa_select(OutboxEvent.status).where(
+                            OutboxEvent.tenant_id == ctx.tenant_id,
+                            OutboxEvent.event_type == COPILOT_EVENT_TYPE,
+                            OutboxEvent.aggregate_id == str(row.job_id),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if event_status == "processing":
+                    payload["status"] = CopilotJobStatus.RUNNING.value
 
     return ok_response(payload)
 
@@ -960,17 +1067,7 @@ async def _timeline_revision(session: Any, *, conversation_ref: uuid.UUID) -> in
     means a stale draft gets inserted. Turn count cannot drift: every turn is
     a row, and a new customer message is a new row.
     """
-    from sqlalchemy import func
-
-    return int(
-        (
-            await session.execute(
-                sa_select(func.count())
-                .select_from(ConversationTurn)
-                .where(ConversationTurn.conversation_ref_id == conversation_ref)
-            )
-        ).scalar_one()
-    )
+    return await chat_service.timeline_revision(session, ref_id=conversation_ref)
 
 
 def _row_to_job(row: Any) -> Any:

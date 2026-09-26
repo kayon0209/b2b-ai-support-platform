@@ -165,6 +165,29 @@
 .wb-panel > .wb-muted { margin: 5px 0 11px; font-size: 12px; }
 .wb-suggestion { padding: 10px 11px; border: 1px solid #e0e8f0; border-radius: 7px; background: #fff; white-space: pre-wrap; line-height: 1.7; font-size: 13px; }
 .wb-panel-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 9px; }
+.wb-copilot-panel { border-color: #cfe8e5; background: linear-gradient(180deg, #fbffff 0%, #fff 32%); }
+.wb-copilot-kind { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; border: 1px solid #dce8eb; border-radius: 8px; background: #f4f8fa; }
+.wb-copilot-kind button { min-height: 34px; border: 0; border-radius: 6px; background: transparent; color: #607286; font-size: 12px; }
+.wb-copilot-kind button.active { background: #fff; color: #087f7d; font-weight: 700; box-shadow: 0 1px 3px rgb(20 45 66 / 10%); }
+.wb-copilot-ownership, .wb-copilot-hint, .wb-copilot-policy { margin: 9px 0; color: var(--wb-muted); font-size: 11.5px; line-height: 1.55; }
+.wb-copilot-ownership { padding: 8px 9px; border-radius: 6px; background: #f3f6f8; }
+.wb-copilot-ownership.is-owned { background: #eef8f5; color: #276e5d; }
+.wb-copilot-generate { width: 100%; min-height: 36px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid #087f7d; border-radius: 7px; background: #087f7d; color: #fff; font-weight: 650; }
+.wb-copilot-generate:hover:not(:disabled) { background: #076b69; }
+.wb-copilot-policy { margin: 7px 0 0; text-align: center; }
+.wb-copilot-error, .wb-copilot-blocked { margin: 9px 0 0; padding: 8px 9px; border: 1px solid #f1c9c6; border-radius: 6px; background: #fff4f2; color: #a13a34; font-size: 12px; line-height: 1.55; }
+.wb-copilot-result { margin-top: 11px; padding-top: 10px; border-top: 1px solid #e7edf1; }
+.wb-copilot-status { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; color: #50667c; font-size: 11px; }
+.wb-copilot-status strong { color: #087f7d; }
+.wb-copilot-result.is-failed .wb-copilot-status strong, .wb-copilot-result.is-stale .wb-copilot-status strong, .wb-copilot-result.is-expired .wb-copilot-status strong { color: #a13a34; }
+.wb-copilot-sources { display: grid; gap: 4px; margin-top: 9px; }
+.wb-copilot-sources > strong { margin-bottom: 2px; color: #52677c; font-size: 11.5px; }
+.wb-copilot-sources button { min-height: 30px; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 5px 8px; border: 1px solid #e0e8ee; border-radius: 6px; background: #f9fbfd; color: #33566e; text-align: left; font-size: 11px; }
+.wb-copilot-sources button:hover { border-color: #91ccc5; background: #f0faf8; }
+.wb-turn { transition: background-color 180ms ease, box-shadow 180ms ease; }
+.wb-turn.is-source-highlight { border-radius: 10px; background: #fff8d9; box-shadow: 0 0 0 7px #fff8d9; }
+.wb-turn-provenance { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 5px; color: #6e7f8f; font-size: 10.5px; }
+.wb-turn-provenance button { border: 0; padding: 0; background: none; color: #087f7d; text-decoration: underline; font-size: inherit; }
 .wb-resource-row { display: flex; align-items: center; justify-content: space-between; gap: 7px; padding: 10px 3px; border-bottom: 1px solid #e9edf2; color: #35495d; text-decoration: none; overflow-wrap: anywhere; }
 .wb-resource-row:last-child { border-bottom: 0; }
 .wb-resource-row span { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
@@ -255,6 +278,13 @@
 [data-theme="dark"] .wb-queue-row:hover, [data-theme="dark"] .wb-canned-popover button:hover { background: #264352; }
 [data-theme="dark"] .wb-queue-row.selected { background: #224b51; }
 [data-theme="dark"] .wb-global-search, [data-theme="dark"] .wb-queue-search, [data-theme="dark"] .wb-canned-btn, [data-theme="dark"] .wb-suggestion, [data-theme="dark"] .wb-modal { background: #243747; color: var(--wb-ink); border-color: #405568; }
+[data-theme="dark"] .wb-copilot-panel { background: linear-gradient(180deg, #1c3439 0%, #1d2d3b 32%); border-color: #38615e; }
+[data-theme="dark"] .wb-copilot-kind, [data-theme="dark"] .wb-copilot-ownership { background: #243747; border-color: #405568; color: var(--wb-muted); }
+[data-theme="dark"] .wb-copilot-kind button.active { background: #1d2d3b; color: #73d1c6; }
+[data-theme="dark"] .wb-copilot-ownership.is-owned { background: #1b3d3a; color: #a5ddd2; }
+[data-theme="dark"] .wb-copilot-sources button { background: #243747; border-color: #405568; color: #c1d8e8; }
+[data-theme="dark"] .wb-copilot-error, [data-theme="dark"] .wb-copilot-blocked { background: #3b2526; border-color: #704044; color: #f0b8b5; }
+[data-theme="dark"] .wb-turn.is-source-highlight { background: #4b4327; box-shadow: 0 0 0 7px #4b4327; }
 [data-theme="dark"] .wb-global-search input, [data-theme="dark"] .wb-queue-search input, [data-theme="dark"] .wb-composer textarea, [data-theme="dark"] .wb-modal select { color: var(--wb-ink); }
 [data-theme="dark"] .wb-bubble { background: #263a4d; color: var(--wb-ink); border-color: #3e5366; }
 [data-theme="dark"] .wb-turn.is-outgoing .wb-bubble { background: #1b514b; border-color: #286f64; }

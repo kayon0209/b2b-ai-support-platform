@@ -27,10 +27,11 @@ distinction matters to an agent deciding whether to re-generate.
 any regeneration writes, because the one thing worse than a stale suggestion
 is losing what a person typed.
 
-**A replayed request does not pay twice.** `job_id` is derived from
-(tenant, conversation, actor, kind, timeline_revision, lease_version), and the
-unique constraint on (tenant_id, job_id) means the second request returns the
-first job.
+**A replayed request does not pay twice.** API jobs derive `job_id` from the
+tenant and idempotency key. The stored request fields are compared on replay;
+reusing a key for different input conflicts. A fresh key is an explicit
+regeneration. The job remains bound to conversation revision, lease version,
+actor, kind, and source turns for staleness checks.
 """
 
 from __future__ import annotations
@@ -152,23 +153,30 @@ def derive_job_id(
     kind: CopilotKind,
     timeline_revision: int,
     lease_version: int,
+    request_key: str | None = None,
 ) -> uuid.UUID:
     """A deterministic job id, so a replayed request is the same job.
 
-    Derived from the state the generation depends on, not from a fresh uuid:
-    a double-clicked "generate" must not queue two model calls for one
-    revision, and a retry after a client timeout must not either.
+    API callers supply an idempotency key: the same key replays one job, and a
+    new key is an explicit regeneration. Callers without one retain the
+    state-derived identity for domain-level use.
     """
-    canonical = "|".join(
-        (
-            str(tenant_id),
-            str(conversation_ref_id),
-            str(actor_id),
-            kind.value,
-            str(timeline_revision),
-            str(lease_version),
+    if request_key is not None:
+        # A fresh key permits an explicit re-generation while a transport
+        # retry with the same key resolves to the same durable job. The route
+        # compares request contents when this id already exists.
+        canonical = f"copilot-job|{tenant_id}|{request_key}"
+    else:
+        canonical = "|".join(
+            (
+                str(tenant_id),
+                str(conversation_ref_id),
+                str(actor_id),
+                kind.value,
+                str(timeline_revision),
+                str(lease_version),
+            )
         )
-    )
     digest = hashlib.sha256(canonical.encode()).hexdigest()
     return uuid.UUID(hex=digest[:32])
 
@@ -184,6 +192,7 @@ def new_job(
     instructions: str = "",
     task_id: uuid.UUID | None = None,
     source_refs: list[dict[str, Any]] | None = None,
+    request_key: str | None = None,
     now: int | None = None,
 ) -> CopilotJob:
     """Build a queued job. Refuses input it cannot honour rather than
@@ -211,6 +220,7 @@ def new_job(
             kind=kind,
             timeline_revision=timeline_revision,
             lease_version=lease_version,
+            request_key=request_key,
         ),
         tenant_id=tenant_id,
         conversation_ref_id=conversation_ref_id,

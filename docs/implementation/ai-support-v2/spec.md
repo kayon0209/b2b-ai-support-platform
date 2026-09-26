@@ -98,8 +98,11 @@ task version 用于乐观并发；并发执行用数据库唯一约束或事务�
 |---|---|---|
 | GET /v1/workbench/conversations/{ref}/tasks | 分页任务、缺失字段、版本、可用动作 | CASE_READ + 会话同租户/资源授权 |
 | POST /v1/workbench/conversations/{ref}/tasks/{task_id}/commands | command、expected_version、expected_lease_version、fields | CASE_UPDATE + 当前人工 owner；命令只允许 collect_fields、cancel、handoff、prepare_proposal；不能通过此接口标记工具成功 |
-| POST /v1/workbench/conversations/{ref}/copilot/jobs | kind=summary/reply、timeline_revision、lease_version、instructions（长度受限） | 当前人工 owner + CASE_UPDATE；排队生成，返回 202/job_id |
+| POST /v1/workbench/conversations/{ref}/copilot/jobs | kind=summary/reply、timeline_revision、lease_version、source_turn_ids；返回 job_id | 当前人工 owner + CASE_UPDATE + Idempotency-Key；新任务返回 200。相同 key/相同输入重放原 job；同 key 不同输入 409；新 key 才表示重新生成 |
 | GET /v1/workbench/conversations/{ref}/copilot/jobs/{job_id} | queued/running/succeeded/failed/stale/expired；完成后给 draft 与授权来源 | CASE_READ + job 与会话资源授权；跨会话 ID 不可串用 |
+| POST /v1/conversations/{ref}/replies | text、origin、可选 copilot_job_id | CASE_UPDATE + Idempotency-Key；只传 job id，不接受客户端来源列表。服务端校验 tenant、conversation、actor、timeline revision、lease version 与 source turn，过期 job 返回 409；回复行保存来源引用 |
+
+当前部署只使用受控的默认提示词。API 保留 `instructions` 字段以便向后兼容，但非空值返回 `COPILOT_INSTRUCTIONS_UNAVAILABLE`，不写数据库、不发送给模型；恢复该能力前需审批模型目的地和坐席指令的数据边界。
 
 新建任务、执行已确认工具的内部接口不直接暴露给访客；客户端确认与管理者审批是不同角色语义，不能借用户一句“确认”代替有权限人的批准。既有 tool-proposals API 继续做写动作提案/确认/执行，不增加绕过 Gateway 的快捷接口。
 

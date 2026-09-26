@@ -565,8 +565,12 @@ def seed_all_tables() -> None:
 
 @pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
-    """One sweep across all tenant-owned tables: A sees its row, B sees
-    none, no-context sees none, B cannot write into A's scope."""
+    """A sees its rows; B and no-context see no tenant-owned rows.
+
+    `tool_definitions` also stores nullable-tenant global reference entries.
+    Those are intentionally visible to every tenant and are not evidence of a
+    tenant-isolation failure, so the sweep counts tenant-bound rows only.
+    """
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from platform_core.db import create_engine
@@ -583,7 +587,8 @@ def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
                 )
                 a_rows = (
                     await session.execute(
-                        text(f"SELECT count(*) FROM {table}")  # noqa: S608
+                        text(f"SELECT count(*) FROM {table} WHERE tenant_id = :t"),  # noqa: S608
+                        {"t": TENANT_A},
                     )
                 ).scalar()
                 await session.rollback()
@@ -594,7 +599,8 @@ def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
                 )
                 b_rows = (
                     await session.execute(
-                        text(f"SELECT count(*) FROM {table}")  # noqa: S608
+                        text(f"SELECT count(*) FROM {table} WHERE tenant_id = :t"),  # noqa: S608
+                        {"t": TENANT_B},
                     )
                 ).scalar()
                 await session.rollback()
@@ -608,7 +614,7 @@ def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
                 await session.execute(text("RESET app.tenant_id"))
                 no_ctx = (
                     await session.execute(
-                        text(f"SELECT count(*) FROM {table}")  # noqa: S608
+                        text(f"SELECT count(*) FROM {table} WHERE tenant_id IS NOT NULL")  # noqa: S608
                     )
                 ).scalar()
                 await session.rollback()

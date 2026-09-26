@@ -12,6 +12,7 @@ import { ToolCard, type ToolCardData } from "../components/ToolCard";
 import { apiGet, apiPost, apiUpload } from "../lib/api";
 import { newIdempotencyKey } from "../lib/idempotency";
 import { useLang } from "../lib/i18n";
+import { ApiError } from "../lib/types";
 import "../styles-workbench.css";
 
 type Tab = "queue" | "mine" | "waiting";
@@ -21,6 +22,7 @@ const ALL_TABS = ["queue", "mine", "waiting"] as const satisfies readonly Tab[];
 type RightTab = "reply" | "knowledge" | "tools" | "tasks";
 type Action = "claim" | "release" | "transfer" | "close";
 type Origin = "free" | "canned" | "ai_suggestion";
+type CopilotKind = "summary" | "reply";
 
 interface Lease {
   owner: string;
@@ -50,6 +52,8 @@ interface Turn {
   text: string;
   at: number;
   source: string;
+  source_refs?: CopilotSourceRef[];
+  copilot_job_id?: string | null;
   card?: ToolCardData | null;
 }
 interface QueueItem {
@@ -82,6 +86,7 @@ interface AccountInfo {
 }
 interface Detail {
   conversation_ref: string;
+  timeline_revision: number;
   lease: Lease;
   case: CaseInfo | null;
   channel: string | null;
@@ -90,6 +95,35 @@ interface Detail {
   turns: Turn[];
   older_before: string | null;
   ai_suggestion: { text: string; sources: string[] } | null;
+}
+interface CopilotSourceRef {
+  turn_id: string;
+  role: string;
+  offset: number[];
+}
+interface CopilotJobResponse {
+  job_id: string;
+  kind: CopilotKind;
+  status: string;
+  timeline_revision: number;
+  lease_version: number;
+  draft_id: string | null;
+  body: string;
+  source_refs: CopilotSourceRef[];
+  edited_by_human: boolean;
+  error_code: string | null;
+  can_insert: boolean;
+}
+interface CopilotJobView {
+  conversationRef: string;
+  job: CopilotJobResponse;
+}
+interface CopilotJobCreated {
+  job_id: string;
+  kind: CopilotKind;
+  status: string;
+  timeline_revision: number;
+  lease_version: number;
 }
 interface Agent {
   user_ref: string;
@@ -158,6 +192,38 @@ function uniqueTurns(older: Turn[], latest: Turn[]): Turn[] {
   });
 }
 
+function copilotStorageKey(conversationRef: string): string {
+  return `workbench.copilot-job.v1.${conversationRef}`;
+}
+
+function copilotStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    queued: "排队中",
+    running: "生成中",
+    succeeded: "生成完成 · 待人工核验",
+    failed: "生成失败",
+    stale: "结果已过期，不能插入",
+    expired: "任务超时",
+  };
+  return labels[status] ?? "状态未知";
+}
+
+function copilotBlockReason(code: string | null): string {
+  const reasons: Record<string, string> = {
+    TIMELINE_MOVED: "会话有新消息，建议基于最新内容重新生成。",
+    COPILOT_TIMELINE_MOVED: "会话有新消息，建议基于最新内容重新生成。",
+    LEASE_CHANGED: "会话已转交，只有当前接待坐席可以使用新结果。",
+    COPILOT_LEASE_CHANGED: "会话已转交，只有当前接待坐席可以使用新结果。",
+    ACTOR_CHANGED: "该结果属于其他坐席，不能插入当前草稿。",
+    COPILOT_ACTOR_CHANGED: "该结果属于其他坐席，不能插入当前草稿。",
+    COPILOT_RESULT_EXPIRED: "结果已超过可用时限，请重新生成。",
+    COPILOT_JOB_EXPIRED: "任务排队超时，请重新提交。",
+    COPILOT_DISABLED: "当前企业未启用副驾生成，请联系管理员。",
+    COPILOT_DRAFT_EDITED: "草稿已被人工修改，系统保留人工内容。",
+  };
+  return code ? reasons[code] ?? `任务未完成（${code}）。` : "该结果目前不可插入。";
+}
+
 export function Workbench() {
   const { conversationRef, caseId } = useParams<{ conversationRef?: string; caseId?: string }>();
   const navigate = useNavigate();
@@ -188,6 +254,11 @@ export function Workbench() {
   const [origin, setOrigin] = useState<Origin>("free");
   const [cannedId, setCannedId] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState<RightTab>("reply");
+  const [copilotKind, setCopilotKind] = useState<CopilotKind>("reply");
+  const [copilotJob, setCopilotJob] = useState<CopilotJobView | null>(null);
+  const [copilotPending, setCopilotPending] = useState(false);
+  const [copilotError, setCopilotError] = useState<string | null>(null);
+  const [draftCopilotJobId, setDraftCopilotJobId] = useState<string | null>(null);
   const [rightOpen, setRightOpen] = useState(() => window.innerWidth > 1320);
   const [mobileQueue, setMobileQueue] = useState(!conversationRef);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -207,6 +278,8 @@ export function Workbench() {
   const pendingSend = useRef<{ text: string; key: string } | null>(null);
   const detailRequest = useRef(0);
   const queueRequest = useRef(0);
+  const copilotRequest = useRef(0);
+  const copilotIdempotency = useRef<{ conversationRef: string; kind: CopilotKind; key: string } | null>(null);
   const selectedRef = conversationRef ?? null;
 
   useEffect(() => {
@@ -294,6 +367,13 @@ export function Workbench() {
   }, []);
 
   useEffect(() => {
+    const request = ++copilotRequest.current;
+    setCopilotJob(null);
+    setCopilotPending(false);
+    setCopilotError(null);
+    setCopilotKind("reply");
+    setDraftCopilotJobId(null);
+    copilotIdempotency.current = null;
     if (!selectedRef) {
       setDetail(null);
       return;
@@ -303,6 +383,27 @@ export function Workbench() {
     setDraft("");
     setOrigin("free");
     setCannedId(null);
+    try {
+      const stored = sessionStorage.getItem(copilotStorageKey(selectedRef));
+      if (stored) {
+        const remembered = JSON.parse(stored) as { job_id?: unknown; kind?: unknown };
+        if (typeof remembered.job_id === "string" && (remembered.kind === "summary" || remembered.kind === "reply")) {
+          const restoredKind = remembered.kind;
+          setCopilotKind(restoredKind);
+          void apiGet<CopilotJobResponse>(
+            `/v1/workbench/conversations/${selectedRef}/copilot/jobs/${remembered.job_id}`,
+          ).then((job) => {
+            if (copilotRequest.current === request) setCopilotJob({ conversationRef: selectedRef, job });
+          }).catch((reason: unknown) => {
+            if (copilotRequest.current === request) {
+              setCopilotError(reason instanceof Error ? reason.message : String(reason));
+            }
+          });
+        }
+      }
+    } catch {
+      // sessionStorage is an enhancement; the server remains authoritative.
+    }
     setMobileQueue(false);
     void loadDetail(selectedRef);
     const timer = window.setInterval(() => {
@@ -313,6 +414,75 @@ export function Workbench() {
       detailRequest.current += 1;
     };
   }, [selectedRef, loadDetail]);
+
+  useEffect(() => {
+    const current = copilotJob;
+    if (
+      !current ||
+      current.conversationRef !== selectedRef ||
+      !["queued", "running"].includes(current.job.status)
+    ) {
+      return;
+    }
+    let cancelled = false;
+    let timer = 0;
+    const poll = async () => {
+      try {
+        const latest = await apiGet<CopilotJobResponse>(
+          `/v1/workbench/conversations/${current.conversationRef}/copilot/jobs/${current.job.job_id}`,
+        );
+        if (cancelled) return;
+        setCopilotJob((previous) =>
+          previous?.job.job_id === latest.job_id ? { ...previous, job: latest } : previous,
+        );
+        setCopilotError(null);
+        if (["queued", "running"].includes(latest.status)) {
+          timer = window.setTimeout(() => void poll(), 1500);
+        }
+      } catch (reason) {
+        if (!cancelled) {
+          setCopilotError(reason instanceof Error ? reason.message : String(reason));
+          timer = window.setTimeout(() => void poll(), 4000);
+        }
+      }
+    };
+    timer = window.setTimeout(() => void poll(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [copilotJob?.job.job_id, copilotJob?.job.status, copilotJob?.conversationRef, selectedRef]);
+
+  useEffect(() => {
+    const current = copilotJob;
+    if (
+      !current?.job.can_insert ||
+      current.conversationRef !== selectedRef ||
+      !detail ||
+      (detail.timeline_revision === current.job.timeline_revision && detail.lease.version === current.job.lease_version)
+    ) return;
+    const movedLease = detail.lease.version !== current.job.lease_version;
+    setCopilotJob((previous) => previous?.job.job_id === current.job.job_id
+      ? {
+          ...previous,
+          job: {
+            ...previous.job,
+            status: "stale",
+            error_code: movedLease ? "COPILOT_LEASE_CHANGED" : "COPILOT_TIMELINE_MOVED",
+            can_insert: false,
+          },
+        }
+      : previous);
+    void apiGet<CopilotJobResponse>(
+      `/v1/workbench/conversations/${current.conversationRef}/copilot/jobs/${current.job.job_id}`,
+    ).then((latest) => {
+      setCopilotJob((previous) => previous?.job.job_id === latest.job_id
+        ? { ...previous, job: latest }
+        : previous);
+    }).catch((reason: unknown) => {
+      setCopilotError(reason instanceof Error ? reason.message : String(reason));
+    });
+  }, [copilotJob?.job.job_id, copilotJob?.job.can_insert, copilotJob?.job.timeline_revision, copilotJob?.job.lease_version, copilotJob?.conversationRef, detail?.timeline_revision, detail?.lease.version, selectedRef]);
 
   useEffect(() => {
     void apiGet<{ items: Agent[] }>("/v1/agents").then((data) => setAgents(data.items)).catch(() => undefined);
@@ -343,17 +513,134 @@ export function Workbench() {
 
   const myRef = queue?.actor_ref ?? null;
   const canReply = Boolean(detail && myRef && detail.lease.owner === "human" && detail.lease.owner_ref === myRef);
+  const copilotSourceTurnIds = turns
+    .filter((turn) => turn.role === "customer")
+    .slice(-20)
+    .map((turn) => turn.turn_id);
+  const copilotIsActive = Boolean(copilotJob && ["queued", "running"].includes(copilotJob.job.status));
   const due = detail?.case?.first_responded_at
     ? detail.case.resolution_due_at
     : detail?.case?.first_response_due_at ?? detail?.case?.resolution_due_at;
   const slaText = countdown(due, now);
   const humanName = queue?.agent_name || (myRef ? `坐席 ${myRef.slice(0, 8)}` : "未登录");
 
+  async function requestCopilot(kind: CopilotKind) {
+    if (!detail || !canReply || copilotPending) return;
+    if (!copilotSourceTurnIds.length) {
+      setCopilotError("当前会话没有客户消息可作为依据，暂不能生成。");
+      return;
+    }
+    const conversation = detail.conversation_ref;
+    const request = ++copilotRequest.current;
+    const previous = copilotIdempotency.current;
+    const key = previous?.conversationRef === conversation && previous.kind === kind
+      ? previous.key
+      : newIdempotencyKey();
+    copilotIdempotency.current = { conversationRef: conversation, kind, key };
+    setCopilotKind(kind);
+    setCopilotPending(true);
+    setCopilotError(null);
+    try {
+      const created = await apiPost<CopilotJobCreated>(
+        `/v1/workbench/conversations/${conversation}/copilot/jobs`,
+        {
+          kind,
+          timeline_revision: detail.timeline_revision,
+          lease_version: detail.lease.version,
+          source_turn_ids: copilotSourceTurnIds,
+        },
+        key,
+      );
+      if (copilotRequest.current !== request || selectedRef !== conversation) return;
+      const job: CopilotJobResponse = {
+        ...created,
+        draft_id: null,
+        body: "",
+        source_refs: [],
+        edited_by_human: false,
+        error_code: null,
+        can_insert: false,
+      };
+      setCopilotJob({ conversationRef: conversation, job });
+      copilotIdempotency.current = null;
+      try {
+        sessionStorage.setItem(copilotStorageKey(conversation), JSON.stringify({ job_id: created.job_id, kind }));
+      } catch {
+        // Polling remains active for the current page even if storage is blocked.
+      }
+    } catch (reason) {
+      if (copilotRequest.current !== request || selectedRef !== conversation) return;
+      const code = reason instanceof ApiError ? reason.code : "";
+      if (reason instanceof ApiError && reason.status >= 400 && reason.status < 500) {
+        copilotIdempotency.current = null;
+      }
+      if (code === "COPILOT_DISABLED") {
+        setCopilotError("当前企业尚未启用副驾生成，请联系管理员开启 agent.copilot_generate。");
+      } else if (code === "TIMELINE_MOVED" || code === "LEASE_CONFLICT") {
+        setCopilotError("会话或接待人刚刚发生变化，已刷新状态；请确认后重新生成。");
+        void loadDetail(conversation, true);
+      } else if (code === "COPILOT_INSTRUCTIONS_UNAVAILABLE") {
+        setCopilotError("当前部署仅开放受控默认提示词，暂不支持自定义生成指令。");
+      } else {
+        setCopilotError(reason instanceof Error ? reason.message : String(reason));
+      }
+    } finally {
+      if (copilotRequest.current === request && selectedRef === conversation) setCopilotPending(false);
+    }
+  }
+
+  async function insertCopilotDraft(mode: "replace" | "append") {
+    const current = copilotJob;
+    if (!current || !canReply) return;
+    const conversation = current.conversationRef;
+    try {
+      const latest = await apiGet<CopilotJobResponse>(
+        `/v1/workbench/conversations/${conversation}/copilot/jobs/${current.job.job_id}`,
+      );
+      if (selectedRef !== conversation) return;
+      setCopilotJob({ conversationRef: conversation, job: latest });
+      if (!latest.can_insert || latest.status !== "succeeded" || !latest.body.trim()) {
+        setCopilotError(copilotBlockReason(latest.error_code));
+        return;
+      }
+      const result = latest;
+      setCopilotError(null);
+      setDraft((currentDraft) => mode === "append" && currentDraft.trim()
+        ? `${currentDraft.trimEnd()}\n\n${result.body}`
+        : result.body);
+      setOrigin("ai_suggestion");
+      setCannedId(null);
+      setDraftCopilotJobId(result.job_id);
+      setNotice("副驾草稿已插入回复框；尚未发送，请人工核验内容与来源。");
+    } catch (reason) {
+      if (selectedRef === conversation) {
+        setCopilotError(reason instanceof Error ? reason.message : String(reason));
+      }
+    }
+  }
+
+  function jumpToTurn(turnId: string) {
+    const target = document.getElementById(`wb-turn-${turnId}`);
+    if (!target) {
+      setCopilotError("来源消息当前未加载，请先加载更早消息后再查看。");
+      return;
+    }
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    target.classList.add("is-source-highlight");
+    window.setTimeout(() => target.classList.remove("is-source-highlight"), 1800);
+  }
+
   function selectConversation(ref: string) {
     setError(null);
     setNotice(null);
     setMobileQueue(false);
-    navigate(`/admin/workbench/conversation/${ref}`);
+    // The queue view is encoded in the URL, and a conversation is the second
+    // half of that same view. Dropping search here made refresh/back from
+    // “我的会话” silently jump to an empty “待认领” queue.
+    navigate({
+      pathname: `/admin/workbench/conversation/${ref}`,
+      search: window.location.search,
+    });
   }
   function selectTab(next: Tab) {
     setTab(next);
@@ -418,13 +705,24 @@ export function Workbench() {
     try {
       await apiPost(
         `/v1/conversations/${detail.conversation_ref}/replies`,
-        { text, origin, canned_reply_id: origin === "canned" ? cannedId : null },
+        {
+          text,
+          origin,
+          canned_reply_id: origin === "canned" ? cannedId : null,
+          copilot_job_id: origin === "ai_suggestion" ? draftCopilotJobId : null,
+        },
         key,
       );
       pendingSend.current = null;
       setDraft("");
       setOrigin("free");
       setCannedId(null);
+      if (draftCopilotJobId) {
+        setCopilotJob((previous) => previous?.job.job_id === draftCopilotJobId
+          ? { ...previous, job: { ...previous.job, status: "stale", error_code: "COPILOT_TIMELINE_MOVED", can_insert: false } }
+          : previous);
+      }
+      setDraftCopilotJobId(null);
       setNotice("回复已记录并提交投递。");
       await Promise.all([loadDetail(detail.conversation_ref, true), loadQueue(true)]);
     } catch (reason) {
@@ -439,6 +737,7 @@ export function Workbench() {
       setDraft(used.body);
       setOrigin("canned");
       setCannedId(reply.id);
+      setDraftCopilotJobId(null);
       setCannedOpen(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -586,9 +885,9 @@ export function Workbench() {
                 if (turn.role === "tool") return turn.card ? <div className="wb-tool-wrap" key={turn.turn_id}><ToolCard card={turn.card} /></div> : null;
                 if (turn.role === "system") return <div className="wb-system-turn" key={turn.turn_id}>{turn.text}</div>;
                 const outgoing = turn.role === "agent";
-                return <article className={`wb-turn ${outgoing ? "is-outgoing" : "is-customer"}`} key={turn.turn_id}>
+                return <article id={`wb-turn-${turn.turn_id}`} className={`wb-turn ${outgoing ? "is-outgoing" : "is-customer"}`} key={turn.turn_id}>
                   {!outgoing ? <div className="wb-turn-avatar">客</div> : null}
-                  <div className="wb-turn-main"><div className="wb-turn-meta"><strong>{outgoing ? (turn.source === "agent" ? "人工坐席" : "AI 助手") : (detail.contact_ref || "客户")}</strong><time>{clock(turn.at)}</time></div><div className="wb-bubble">{turn.text}</div></div>
+                  <div className="wb-turn-main"><div className="wb-turn-meta"><strong>{outgoing ? (turn.source === "agent" ? "人工坐席" : "AI 助手") : (detail.contact_ref || "客户")}</strong><time>{clock(turn.at)}</time></div><div className="wb-bubble">{turn.text}</div>{outgoing && turn.source_refs?.length ? <div className="wb-turn-provenance"><span>副驾来源 · {turn.source_refs.length} 条</span>{turn.source_refs.map((source) => <button key={source.turn_id} type="button" onClick={() => jumpToTurn(source.turn_id)}>查看来源</button>)}</div> : null}</div>
                   {outgoing ? <div className="wb-turn-avatar is-agent">{turn.source === "agent" ? humanName.slice(0, 1) : "AI"}</div> : null}
                 </article>;
               })}
@@ -599,7 +898,7 @@ export function Workbench() {
                 : !canReply ? <div className="wb-ownership-note">当前由其他坐席接待，回复区为只读。</div> : null}
               <div className="wb-composer">
                 <label className="sr-only" htmlFor="wb-reply-input">回复客户</label>
-                <textarea id="wb-reply-input" value={draft} onChange={(event) => { setDraft(event.target.value); if (origin !== "free") setOrigin("free"); }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendReply(); } }} placeholder="输入回复…  Shift + Enter 换行" maxLength={4000} disabled={!canReply || busy} />
+                <textarea id="wb-reply-input" value={draft} onChange={(event) => { setDraft(event.target.value); if (origin === "canned") { setOrigin("free"); setCannedId(null); } }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendReply(); } }} placeholder="输入回复…  Shift + Enter 换行" maxLength={4000} disabled={!canReply || busy} />
                 <div className="wb-composer-bar">
                   <div className="wb-composer-tools">
                     <input ref={fileRef} type="file" hidden accept=".pdf,.png,.jpg,.jpeg,.txt,.docx" onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadAttachment(file); }} />
@@ -621,7 +920,38 @@ export function Workbench() {
           <div className="wb-right-header"><Sparkles size={20} /><strong>AI 副驾</strong><button type="button" className="wb-right-close" aria-label="收起 AI 副驾" onClick={() => setRightOpen(false)}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label="副驾内容">{(["reply", "knowledge", "tools", "tasks"] as const).map((key) => <button type="button" role="tab" aria-selected={rightTab === key} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)}>{RIGHT_TAB_LABEL[key]}</button>)}</div></div>
           <div className="wb-right-scroll">
             {rightTab === "reply" ? <>
-              <section className="wb-panel"><h3><FileText size={18} />建议回复</h3><p className="wb-muted">基于已记录的会话与引用来源</p>{detail.ai_suggestion?.text ? <><div className="wb-suggestion">{detail.ai_suggestion.text}</div><div className="wb-panel-actions"><button className="wb-primary-small" type="button" disabled={!canReply} onClick={() => { setDraft(detail.ai_suggestion?.text ?? ""); setOrigin("ai_suggestion"); setCannedId(null); }}>插入到回复框</button><button type="button" className="wb-secondary-small" onClick={() => void loadDetail(detail.conversation_ref)}>刷新建议</button></div></> : <p className="wb-muted">当前没有可引用的 AI 建议，请结合会话记录人工回复。</p>}</section>
+              <section className="wb-panel wb-copilot-panel">
+                <h3><Sparkles size={18} />副驾草稿</h3>
+                <p className="wb-muted">仅生成工作草稿，不会自动发送。请核验事实和来源后再回复。</p>
+                <div className="wb-copilot-kind" role="group" aria-label="副驾生成类型">
+                  {(["reply", "summary"] as const).map((kind) => <button key={kind} type="button" aria-pressed={copilotKind === kind} disabled={copilotIsActive} className={copilotKind === kind ? "active" : ""} onClick={() => { setCopilotKind(kind); setCopilotError(null); }}>{kind === "reply" ? "建议回复" : "会话摘要"}</button>)}
+                </div>
+                <div className={`wb-copilot-ownership${canReply ? " is-owned" : ""}`}>
+                  {canReply ? "当前由你接待，可生成并插入到自己的草稿。" : detail.lease.owner === "queue" ? "先接入会话，再生成副驾草稿。" : "只有当前接待坐席可以生成或插入草稿。"}
+                </div>
+                {!copilotSourceTurnIds.length ? <p className="wb-copilot-hint">需要至少一条客户消息作为依据。</p> : null}
+                <button className="wb-copilot-generate" type="button" disabled={!canReply || copilotPending || copilotIsActive || !copilotSourceTurnIds.length} onClick={() => void requestCopilot(copilotKind)}>
+                  <Sparkles size={16} />{copilotPending ? "正在提交…" : copilotIsActive ? "正在生成…" : copilotJob?.job.status === "succeeded" ? "重新生成" : "生成草稿"}
+                </button>
+                <p className="wb-copilot-policy">使用受控默认提示词；自定义生成指令暂未开放。</p>
+                {copilotError ? <div className="wb-copilot-error" role="alert">{copilotError}</div> : null}
+                {copilotJob?.conversationRef === detail.conversation_ref && copilotJob.job.kind === copilotKind ? <div className={`wb-copilot-result is-${copilotJob.job.status}`}>
+                  <div className="wb-copilot-status" role="status" aria-live="polite"><strong>{copilotStatusLabel(copilotJob.job.status)}</strong><span>{copilotJob.job.kind === "reply" ? "建议回复" : "会话摘要"}</span></div>
+                  {copilotJob.job.body ? <>
+                    <div className="wb-suggestion">{copilotJob.job.body}</div>
+                    {copilotJob.job.source_refs.length ? <div className="wb-copilot-sources"><strong>依据消息</strong>{copilotJob.job.source_refs.map((source) => {
+                      const sourceTurn = turns.find((turn) => turn.turn_id === source.turn_id);
+                      const speaker = source.role === "customer" ? "客户" : source.role === "tool" ? "业务数据" : source.role === "agent" ? "坐席" : "系统";
+                      return <button key={source.turn_id} type="button" onClick={() => jumpToTurn(source.turn_id)}>{speaker} · {sourceTurn ? clock(sourceTurn.at) : "查看"}<ChevronRight size={14} /></button>;
+                    })}</div> : null}
+                    <p className="wb-copilot-hint">结果基于 {copilotJob.job.source_refs.length} 条已记录来源；模型文本本身不等同于业务核验。</p>
+                    {copilotJob.job.can_insert && canReply ? <div className="wb-panel-actions">
+                      {draft.trim() ? <><button className="wb-primary-small" type="button" onClick={() => insertCopilotDraft("append")}>追加到草稿</button><button className="wb-secondary-small" type="button" onClick={() => insertCopilotDraft("replace")}>替换草稿</button></> : <button className="wb-primary-small" type="button" onClick={() => insertCopilotDraft("replace")}>插入到回复框</button>}
+                    </div> : ["failed", "stale", "expired"].includes(copilotJob.job.status) ? <p className="wb-copilot-blocked">{copilotBlockReason(copilotJob.job.error_code)}</p> : null}
+                  </> : copilotJob.job.status === "failed" || copilotJob.job.status === "stale" || copilotJob.job.status === "expired" ? <p className="wb-copilot-blocked">{copilotBlockReason(copilotJob.job.error_code)}</p> : null}
+                </div> : null}
+              </section>
+              <section className="wb-panel"><h3><FileText size={18} />历史建议回复</h3>{detail.ai_suggestion?.text ? <><div className="wb-suggestion">{detail.ai_suggestion.text}</div><div className="wb-panel-actions"><button className="wb-secondary-small" type="button" disabled={!canReply} onClick={() => { setDraft(detail.ai_suggestion?.text ?? ""); setOrigin("ai_suggestion"); setCannedId(null); setDraftCopilotJobId(null); }}>插入旧版建议</button><button type="button" className="wb-secondary-small" onClick={() => void loadDetail(detail.conversation_ref)}>刷新</button></div></> : <p className="wb-muted">暂无历史建议。</p>}</section>
               <Sources sources={detail.ai_suggestion?.sources ?? []} />
               <CustomerPanel detail={detail} />
             </> : null}

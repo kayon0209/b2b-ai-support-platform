@@ -8,7 +8,7 @@
 
 本文件逐项报告**实际**状态。Codex 的验收报告未被修改，也未被合入本分支。
 
-> 当前状态以文末 §7「Codex follow-up 修复与复验」为准；§1–§6 保留 WorkBuddy 原交付时的记录。
+> 当前状态以文末 §8「Codex follow-up：工作台副驾闭环与最终本地复验」为准；§1–§6 保留 WorkBuddy 原交付时的记录，§7 保留上一轮 follow-up 记录。
 
 ## Codex 后续修复（2026-09-26）
 
@@ -263,3 +263,49 @@ cd apps/admin-web && npm run typecheck && npm run build && npm test       # 29 p
 GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36239136194) 已在代码提交 `2653c06` 上全部通过，包含 Release Evidence。真实模型质量、浏览器双窗口/接管竞态、生产近似负载、故障注入与回滚演练仍未完成，所有新 feature flags 保持关闭；本节的本地 stub-model 验收不代表真实模型质量或生产性能。
 
 本交接不包含自动合并或生产发布授权。
+
+---
+
+## 8. Codex follow-up：工作台副驾闭环与最终本地复验（2026-09-26）
+
+### 本轮实现
+
+1. **副驾工作台真实接线**：话术侧栏新增“建议回复 / 会话摘要”、明确生成入口、队列/生成/完成/失败/过期状态、来源消息跳转；结果可插入空草稿，或在已有草稿时由坐席明确选择追加/替换。生成不会自动发送。
+2. **刷新与切换保护**：`sessionStorage` 只记每会话最近一个 job id；刷新后从租户 API 重新读取状态。请求、轮询与选中会话绑定，切换会话不把旧结果写入新草稿。切换队列项目时保留 `tab`/搜索参数。
+3. **服务端版本来源**：工作台详情给出服务器计算的 `timeline_revision`。来源引用仅由工作台详情返回，访客 `/support` 时间线不返回这些内部指针。
+4. **幂等与重新生成**：同一个 `Idempotency-Key` 绑定同一个 job；相同请求重放不重复排队；同键异请求返回 409。新 key 才是显式重新生成。重放先于开关/当前版本校验，网络超时后可安全取回已创建 job。
+5. **租约/版本复核**：worker 在调用前检查 job 的 timeline 和 human lease，调用完成后再检查一次；生成期间来了新消息会将结果写成 `stale`，不能插入。回复 API 接受 job id 而不接受客户端来源列表，服务端重验 actor、conversation、timeline、lease 与 source turns；过期草稿拒绝发送。成功回复将 `copilot_job_id` 和来源引用保存到坐席 turn。
+6. **可观测处理中状态**：轮询 API 根据 outbox 的已提交 claim 状态返回 `running`，不需要在外部模型调用前提交半成品业务事务。
+7. **迁移**：新增 `0065_copilot_reply_provenance`，为坐席回复保存来源 job 和 turn refs；新列可空/默认空，旧应用仍能读写已有数据。迁移计数门禁更新到 64。
+8. **隔离扫描**：跨租户测试改为仅统计带 `tenant_id` 的业务行；`tool_definitions.tenant_id IS NULL` 是平台全局参考目录，按架构允许跨租户读取，不再误报为租户泄漏。租户归属行仍必须对其他租户和空上下文不可见。
+9. **自定义指令限制**：目前只允许受控默认提示词。非空 `instructions` 返回 `COPILOT_INSTRUCTIONS_UNAVAILABLE`，不落库、不进入模型请求；前端不提供该输入。自动审核拒绝了把坐席自定义指令扩展到模型 payload 的改动，因为尚未确认可将这类可能含敏感信息的文本发送到当前配置的模型服务。获得明确的数据目的地授权后，才能重新评审此项。
+
+### 本地验收
+
+- Unit + contracts：**1574 passed**。
+- PostgreSQL integration：**1091 passed, 2 skipped**（1093 collected）；完整迁移、RLS 和新副驾/来源测试通过。
+- Admin Web：TypeScript typecheck、production build 通过；UI 状态测试 **29 passed**。
+- Ruff：本轮修改的 Python 文件通过；Mypy：**10 个受影响源文件通过**。
+- Alembic：隔离数据库 `r1_codex_20260926` 应用到 head；integration migration gate 验证所有迁移可从 base 升级、单步回滚再升级，64 个迁移已注册。
+- Computer Use 浏览器旅程使用**独立隔离租户、合成对话和本地 stub provider**：桌面三栏、移动副驾抽屉；生成摘要后可点来源回到原消息、插入到本地草稿但不发送；新客户 turn 到达后 job 变 stale、插入按钮消失、坐席草稿保留；切换两条“我的会话”记录后 URL 仍保留 `?tab=mine`，旧 job 不串入第二条会话。
+- DOM 尺寸测量：1536×1024、1280×800、390×844 以及 768 CSS px（模拟 200% 缩放后的宽度）均未发现横向溢出；未完成真实浏览器 200% 缩放和完整键盘/屏幕阅读器验收。
+- 本地浏览器/数据库 fixture 不包含真实客户内容；生成由 stub 明确完成，无真实模型调用。测试后已清理 UI fixture；隔离验收数据库仍保留，不连接项目开发库。
+
+### T00–T09 与发布门禁当前结论
+
+| 任务 | 当前状态 | 尚未关闭 |
+|---|---|---|
+| T00 | 完成（产物可审） | ADR 仍为 Proposed；影响客户路由的 `semantic_read` 前须正式接受 |
+| T01 | 完成（控制逻辑） | 真实模型语义效果归 EVAL-02 |
+| T02 | 完成（shadow 本地验证） | 真实模型成本/容量归 PERF 门禁；无 worker 重启演练 |
+| T03 | 部分完成 | EVAL-02 被阻塞，未执行真实模型保留集 |
+| T04 | 完成（迁移/RLS/状态机） | 多进程重启恢复场景仍需上线拓扑演练 |
+| T05 | 完成（工具候选/提案边界） | 真实业务连接器沙箱缺席，不计外部业务成功 |
+| T06 | 完成（worker/job/引用/人工发送） | 自定义指令受限；真实模型质量仍阻塞 |
+| T07 | 部分完成（API、桌面/移动实测） | UI-01 截图矩阵、完整键盘/屏幕阅读器仍未全验 |
+| T08 | 部分完成（合成端到端旅程） | 双坐席并发、provider/connector 故障注入和生产负载未做 |
+| T09 | 部分完成 | 本次变更需推送并等待 GitHub Actions；真实回滚演练未做 |
+
+**仍阻塞生产放量**：EVAL-02、PERF-01/02、OPS-01 worker 重启、OPS-02 回滚、SEC-03 两坐席在途接管、完整 UI/UX 无障碍矩阵。所有生产租户新开关继续默认关闭，`semantic_read` 不启用。
+
+**下一步**：提交并推送本轮代码到 PR #19，等待完整 CI；CI 通过只关闭 CI-01，不替代上述真实模型/生产容量/回滚门槛。该报告不授权合并或生产发布。

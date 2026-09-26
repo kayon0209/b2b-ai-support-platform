@@ -38,6 +38,8 @@ from platform_core.agent_runtime.copilot import (
     apply_staleness,
     should_expire,
 )
+from platform_core.agent_runtime.semantic.modes import FLAG_COPILOT
+from platform_core.identity import lease_service
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.outbox import OutboxEvent, OutboxStatus
 
@@ -179,6 +181,30 @@ async def process_copilot_job(
         metrics.inbox_events_total.labels(result="copilot_draft_missing").inc()
         return "failed"
 
+    from platform_core.knowledge import flag_service
+
+    copilot_flag = await flag_service.evaluate(
+        session,
+        flag_key=FLAG_COPILOT,
+        tenant_id=work.tenant_id,
+        default=False,
+    )
+    if not copilot_flag.enabled:
+        await _mark_draft(
+            session,
+            work,
+            status=CopilotJobStatus.FAILED.value,
+            error="COPILOT_DISABLED",
+        )
+        await _finish_event(
+            session,
+            work,
+            status=OutboxStatus.FAILED.value,
+            error="COPILOT_DISABLED",
+        )
+        metrics.inbox_events_total.labels(result="copilot_disabled").inc()
+        return "failed"
+
     if draft.edited_by_human:
         # The person has already typed. Their text wins; the generation is
         # discarded rather than merged, because merging generated text into a
@@ -199,6 +225,19 @@ async def process_copilot_job(
         )
         metrics.inbox_events_total.labels(result="copilot_no_provider").inc()
         return "failed"
+
+    stale = await _refresh_staleness(
+        session,
+        work,
+        draft,
+        body="",
+        status=CopilotJobStatus.QUEUED,
+    )
+    if stale.status is CopilotJobStatus.STALE:
+        await _mark_draft(session, work, status=stale.status.value, error=stale.error_code)
+        await _finish_event(session, work, status=OutboxStatus.SENT.value, error="")
+        metrics.inbox_events_total.labels(result="copilot_stale_before_generation").inc()
+        return stale.status.value
 
     from platform_core.agent_runtime.chat_service import read_timeline_page
     from platform_core.llm.provider import ChatMessage, ProviderRole
@@ -243,18 +282,12 @@ async def process_copilot_job(
     # Staleness decided here rather than only on read: a result that is stale
     # on arrival should not be recorded as `succeeded` and then flip, because a
     # poller that saw `succeeded` may already have rendered it.
-    job = _row_to_copilot(
+    refreshed = await _refresh_staleness(
+        session,
+        work,
         draft,
         body=body,
-        now=int(time.time()),
         status=CopilotJobStatus.SUCCEEDED,
-    )
-    refreshed = apply_staleness(
-        job,
-        current_timeline_revision=work.timeline_revision,
-        current_lease_version=work.lease_version,
-        current_actor_id=draft.actor_id,
-        now=int(time.time()),
     )
     await _mark_draft(
         session,
@@ -266,6 +299,40 @@ async def process_copilot_job(
     await _finish_event(session, work, status=OutboxStatus.SENT.value, error="")
     metrics.inbox_events_total.labels(result=f"copilot_{refreshed.status.value}").inc()
     return refreshed.status.value
+
+
+async def _refresh_staleness(
+    session: AsyncSession,
+    work: CopilotWorkItem,
+    draft: Any,
+    *,
+    body: str,
+    status: CopilotJobStatus,
+) -> CopilotJob:
+    """Compare the job with the current timeline and human owner."""
+    from platform_core.agent_runtime.chat_service import timeline_revision
+
+    current_revision = await timeline_revision(session, ref_id=work.conversation_ref_id)
+    lease = await lease_service.lease_snapshot(
+        session,
+        tenant_id=work.tenant_id,
+        conversation_ref_id=work.conversation_ref_id,
+    )
+    current_lease_version = lease.lease_version if lease is not None else -1
+    current_actor_id = uuid.UUID(int=0)
+    if lease is not None and lease.owner_type == "human" and lease.owner_ref:
+        try:
+            current_actor_id = uuid.UUID(lease.owner_ref)
+        except ValueError:
+            pass
+    job = _row_to_copilot(draft, body=body, now=int(time.time()), status=status)
+    return apply_staleness(
+        job,
+        current_timeline_revision=current_revision,
+        current_lease_version=current_lease_version,
+        current_actor_id=current_actor_id,
+        now=int(time.time()),
+    )
 
 
 def _work_item(claimed: ClaimedCopilot, payload: dict[str, Any]) -> CopilotWorkItem | None:

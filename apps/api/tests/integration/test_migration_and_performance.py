@@ -130,7 +130,7 @@ TENANT_TABLES = (
 # revision (R1 conversation tasks, tasks events, copilot drafts and semantic
 # assessments); keep this synchronized with the tracked revision set, excluding
 # `.gitkeep` and any local-only migration files.
-EXPECTED_MIGRATIONS = 63
+EXPECTED_MIGRATIONS = 64
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

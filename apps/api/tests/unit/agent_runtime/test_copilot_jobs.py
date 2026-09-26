@@ -252,6 +252,15 @@ def test_derive_job_id_is_stable_across_calls() -> None:
     assert derive_job_id(**args) == derive_job_id(**args)  # type: ignore[arg-type]
 
 
+def test_a_new_request_key_is_an_explicit_regeneration() -> None:
+    first = _job(request_key="request-a")
+    replay = _job(request_key="request-a")
+    retry = _job(request_key="request-b")
+
+    assert first.job_id == replay.job_id
+    assert first.job_id != retry.job_id
+
+
 # --- input limits -----------------------------------------------------------
 
 

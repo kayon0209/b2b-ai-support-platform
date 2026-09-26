@@ -50,12 +50,26 @@ async def read_timeline(
     return items
 
 
+async def timeline_revision(session: AsyncSession, *, ref_id: uuid.UUID) -> int:
+    """Return the authoritative turn count used to reject stale copilot jobs."""
+    return int(
+        (
+            await session.execute(
+                select(sa_func.count())
+                .select_from(ConversationTurn)
+                .where(ConversationTurn.conversation_ref_id == ref_id)
+            )
+        ).scalar_one()
+    )
+
+
 async def read_timeline_page(
     session: AsyncSession,
     *,
     ref_id: uuid.UUID,
     limit: int,
     before_id: uuid.UUID | None = None,
+    include_source_refs: bool = False,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Page backwards without dropping recent replies from a long thread."""
     stmt = select(ConversationTurn).where(ConversationTurn.conversation_ref_id == ref_id)
@@ -84,8 +98,9 @@ async def read_timeline_page(
     )
     has_older = len(rows) > limit
     rows = list(reversed(rows[:limit]))
-    items = [
-        {
+    items = []
+    for r in rows:
+        item = {
             "turn_id": str(r.id),
             "role": r.role,
             "text": r.text_redacted,
@@ -99,8 +114,9 @@ async def read_timeline_page(
             # the receipt keeps working.
             "card": build_card(r.text_redacted) if r.role == "tool" else None,
         }
-        for r in rows
-    ]
+        if include_source_refs:
+            item["source_refs"] = list(getattr(r, "source_refs", None) or [])
+        items.append(item)
     return items, str(rows[0].id) if has_older and rows else None
 
 
