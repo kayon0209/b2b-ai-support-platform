@@ -622,6 +622,42 @@ def test_worker_marks_result_stale_when_the_timeline_moves_during_generation() -
     assert provider.calls == 1
 
 
+def test_worker_marks_result_stale_when_the_lease_moves_during_generation() -> None:
+    from platform_core.agent_runtime.orchestrator import OrchestratorDeps
+    from worker.runner import SemanticWorker
+
+    created = _post()
+    job_id = created.json()["job_id"]
+    new_owner = str(uuid.uuid4())
+
+    class _LeaseAdvancingProvider(_ChatProvider):
+        async def complete(self, *args: object, **kwargs: object) -> object:
+            from platform_core.llm.provider import ChatResult
+
+            self.calls += 1
+            admin = create_engine(ADMIN_URL)
+            with admin.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE conversation_control_leases SET owner_ref = :owner, "
+                        "lease_version = 4 WHERE tenant_id = :t AND conversation_ref_id = :c"
+                    ),
+                    {"owner": new_owner, "t": TENANT, "c": CONV},
+                )
+            admin.dispose()
+            return ChatResult(text=self.body, model="stub")
+
+    provider = _LeaseAdvancingProvider("draft from previous owner")
+    _run(SemanticWorker(OrchestratorDeps(extra={"chat": provider})).run_once())
+
+    response = _client().get(f"/v1/workbench/conversations/{CONV}/copilot/jobs/{job_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "stale"
+    assert response.json()["can_insert"] is False
+    assert response.json()["error_code"] == "COPILOT_LEASE_CHANGED"
+    assert provider.calls == 1
+
+
 def test_sent_reply_keeps_server_resolved_copilot_provenance() -> None:
     from platform_core.agent_runtime import chat_service
     from platform_core.agent_runtime.orchestrator import OrchestratorDeps
