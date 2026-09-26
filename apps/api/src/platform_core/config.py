@@ -333,6 +333,26 @@ class Settings(BaseSettings):
     # cross-tenant), so it is a plain switch rather than a tenant flag.
     priority_claim_enabled: bool = False
 
+    # --- R1 semantic enhancement kill switch (ai-support-v2) -----------------
+    # Process-level stop for every semantic/conversation-task/copilot
+    # enhancement, independent of the per-tenant feature flags. Turning this
+    # off halts new enhanced work immediately, which is the difference between
+    # "roll the flag back for one tenant" and "stop it everywhere" during an
+    # incident.
+    #
+    # It gates *starting* work only. A tool call already in flight is recorded
+    # by its own outcome (succeeded/failed/unknown) and reconciled afterwards;
+    # pretending a switch can recall an external side effect would be false.
+    # Any pending write proposal is left un-confirmed rather than auto-approved.
+    #
+    # Defaults True so the code is reachable in a development environment; the
+    # tenant flags all default False, so the effective behaviour is still
+    # closed everywhere until a tenant opts in.
+    semantic_enhancements_enabled: bool = True
+    # Hard deadline for one semantic classification call, including its single
+    # transport retry. A design target pending real-provider measurement.
+    semantic_classify_deadline_seconds: float = 2.0
+
 
 @lru_cache
 def get_settings() -> Settings:
