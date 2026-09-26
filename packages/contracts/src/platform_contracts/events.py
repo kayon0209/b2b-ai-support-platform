@@ -52,6 +52,17 @@ class EventType(enum.StrEnum):
     # consumer should not have to re-derive it from the Case row - which by
     # then may have been resolved.
     CASE_SLA_BREACHED = "case.sla_breached"
+    # Emitted when a conversation task changes state (R1, docs/
+    # implementation/ai-support-v2). Carries the *command* rather than the
+    # resulting status, so a consumer can tell an agent's decision from a
+    # scheduler's: "the agent collected the street field" and "the scheduler
+    # found the dependency met" are different facts about the same transition,
+    # and a consumer that only saw the new status could not tell them apart.
+    #
+    # It carries no slot values and no message content. A consumer that needs
+    # those re-reads the task row under its own authorization rather than
+    # receiving customer data through an event fan-out.
+    CONVERSATION_TASK_UPDATED = "conversation_task.updated"
 
 
 class InboundEventType(enum.StrEnum):
@@ -72,6 +83,7 @@ class AggregateType(enum.StrEnum):
     CASE = "case"
     AGENT_RUN = "agent_run"
     CONNECTOR = "connector"
+    CONVERSATION_TASK = "conversation_task"
 
 
 class _Strict(BaseModel):
@@ -143,6 +155,26 @@ class ConnectorNeedsReauthPayload(_Strict):
     error_code: str = Field(min_length=1)
 
 
+class ConversationTaskUpdatedPayload(_Strict):
+    """One conversation task changed state.
+
+    `command` is the operator's action, `reason_code` the classification of
+    why, and `version` the task's new optimistic-concurrency value. A consumer
+    that wants the resulting status re-reads the row; the status is deliberately
+    absent here because a fan-out carrying it would be a second, unversioned
+    copy of a value the task row already owns authoritatively.
+
+    `conversation_ref` is present so a consumer can group by conversation
+    without a lookup. It is an opaque UUID, not an identifier of any external
+    system, and carries nothing about the customer.
+    """
+
+    task_id: str = Field(min_length=1)
+    conversation_ref: str = Field(min_length=1)
+    command: str = Field(min_length=1)
+    version: int = Field(ge=1)
+
+
 class EventEnvelope(BaseModel):
     """The row shape the outbox guarantees to any consumer.
 
@@ -176,6 +208,7 @@ PAYLOAD_SCHEMAS: dict[EventType, type[BaseModel]] = {
     EventType.USAGE_RECORDED: UsageRecordedPayload,
     EventType.CONNECTOR_NEEDS_REAUTH: ConnectorNeedsReauthPayload,
     EventType.CASE_SLA_BREACHED: CaseSlaBreachedPayload,
+    EventType.CONVERSATION_TASK_UPDATED: ConversationTaskUpdatedPayload,
 }
 
 
