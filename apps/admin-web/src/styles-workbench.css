@@ -262,3 +262,125 @@
 [data-theme="dark"] .wb-tool-wrap .tool-card, [data-theme="dark"] .wb-right-tool .tool-card { background: #243747; color: var(--wb-ink); border-color: #405568; }
 [data-theme="dark"] .workspace-more nav a { color: #c7d7e6; }
 [data-theme="dark"] .workspace-more nav a:hover, [data-theme="dark"] .workspace-more nav a.active { background: #224b51; color: #b6f7ef; }
+
+/* --- Conversation task panel (T07) -----------------------------------------
+ *
+ * Two rules the layout has to keep, because UI-01 and UI-02 are checked on it:
+ *
+ * 1. **The conversation stays the largest region.** The panel lives inside the
+ *    existing right column as a fourth tab, so no grid track was added and the
+ *    centre column keeps `minmax(0, 1fr)`. A third column would have taken
+ *    width from the conversation at exactly the viewport (1536x1024) the
+ *    acceptance checks.
+ *
+ * 2. **Status is never carried by colour alone.** Every status pill carries a
+ *    text label, and the two that matter most - needs_human and succeeded -
+ *    also carry a glyph and a border weight. A colour-blind operator, and an
+ *    operator on a bad monitor in a bright room, must be able to tell a
+ *    blocked task from a completed one.
+ */
+.wb-tasks { display: flex; flex-direction: column; gap: 14px; }
+.wb-tasks-heading { margin: 4px 0 8px; font-size: 13px; font-weight: 600; color: var(--wb-muted); }
+.wb-tasks-empty { margin: 0; color: var(--wb-muted); font-size: 13px; line-height: 1.6; }
+.wb-tasks-error {
+  margin: 0; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5;
+  background: #fdecec; color: #8c1d18; border: 1px solid #f2c2be;
+}
+.wb-tasks-notice {
+  margin: 0; padding: 8px 10px; border-radius: 8px; font-size: 12.5px; line-height: 1.5;
+  background: var(--wb-soft); color: var(--wb-muted); border: 1px solid var(--wb-line);
+}
+.wb-task-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.wb-task-list-done { opacity: .78; }
+
+.wb-task {
+  border: 1px solid var(--wb-line); border-radius: 10px; padding: 11px 12px;
+  background: var(--wb-panel, #fff); display: flex; flex-direction: column; gap: 8px;
+  min-width: 0; overflow-wrap: anywhere;
+}
+/* A blocked task is outlined, not just tinted: the border weight is the
+   non-colour signal, and it survives a greyscale screenshot. */
+.wb-task-needs_human { border-left: 4px solid #b45309; }
+.wb-task-awaiting_input { border-left: 4px solid #0e7490; }
+.wb-task-awaiting_confirmation { border-left: 4px solid #7c3aed; }
+.wb-task-succeeded { border-left: 4px solid #15803d; }
+.wb-task-failed, .wb-task-unknown { border-left: 4px solid #b91c1c; }
+.wb-task-executing { border-left: 4px solid #087f7d; }
+
+.wb-task-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wb-task-status {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid currentColor; background: transparent;
+}
+.wb-task-status-needs_human { color: #8a4b09; }
+.wb-task-status-succeeded { color: #15803d; }
+.wb-task-status-awaiting_input { color: #0e7490; }
+.wb-task-status-awaiting_confirmation { color: #6d28d9; }
+.wb-task-status-failed, .wb-task-status-unknown { color: #b91c1c; }
+.wb-task-status-ready, .wb-task-status-executing { color: #087f7d; }
+.wb-task-status-cancelled { color: var(--wb-muted); }
+
+.wb-task-kind { font-size: 12px; color: var(--wb-muted); }
+.wb-task-verified {
+  font-size: 11px; font-weight: 600; color: #15803d;
+  border: 1px solid currentColor; border-radius: 4px; padding: 1px 5px;
+}
+
+.wb-task-slots { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.wb-task-slot { display: flex; gap: 8px; font-size: 12.5px; align-items: baseline; }
+.wb-task-slot dt { color: var(--wb-muted); min-width: 84px; flex-shrink: 0; }
+.wb-task-slot dd { margin: 0; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.wb-task-origin { font-size: 11px; color: var(--wb-muted); font-style: normal; }
+.wb-task-withheld { color: var(--wb-muted); font-style: italic; }
+
+.wb-task-blocked {
+  margin: 0; font-size: 12.5px; line-height: 1.55; color: #8a4b09;
+  background: #fdf6ec; border: 1px solid #f0dcc0; border-radius: 6px; padding: 7px 9px;
+}
+.wb-task-condition { margin: 0; font-size: 12px; color: var(--wb-muted); }
+.wb-task-condition code { font-size: 11.5px; }
+
+.wb-task-missing { display: flex; flex-direction: column; gap: 5px; }
+.wb-task-missing-label { margin: 0; font-size: 12px; color: var(--wb-muted); }
+.wb-task-missing ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.wb-task-missing li { display: flex; align-items: center; gap: 8px; }
+.wb-task-missing label { font-size: 12.5px; min-width: 96px; flex-shrink: 0; color: var(--wb-ink); }
+.wb-task-missing input {
+  flex: 1 1 auto; min-width: 0; padding: 5px 8px; font-size: 12.5px;
+  border: 1px solid var(--wb-line); border-radius: 6px; background: var(--wb-panel, #fff); color: var(--wb-ink);
+}
+
+.wb-task-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.wb-task-disabled-reason { margin: 0; font-size: 11.5px; color: var(--wb-muted); flex-basis: 100%; }
+
+.wb-task-meta {
+  margin: 2px 0 0; display: flex; flex-direction: column; gap: 3px;
+  font-size: 11.5px; color: var(--wb-muted); border-top: 1px dashed var(--wb-line); padding-top: 7px;
+}
+.wb-task-meta > div { display: flex; gap: 8px; }
+.wb-task-meta dt { min-width: 76px; flex-shrink: 0; }
+.wb-task-meta dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+
+/* 200% zoom at 1280 wide is effectively a 640px viewport, which is narrower
+   than the 760px mobile breakpoint above. The row layout below would put a
+   label and an input on one line with neither fitting, so the input wraps to
+   its own full-width line instead. */
+@media (max-width: 640px) {
+  .wb-task-slot { flex-direction: column; gap: 1px; }
+  .wb-task-slot dt { min-width: 0; }
+  .wb-task-missing li { flex-direction: column; align-items: stretch; gap: 3px; }
+  .wb-task-missing label { min-width: 0; }
+  .wb-task-missing input { width: 100%; }
+  .wb-task-actions .wb-btn { flex: 1 1 auto; }
+}
+
+[data-theme="dark"] .wb-task-blocked { background: #2a2113; color: #e8c48a; border-color: #4a3a1c; }
+[data-theme="dark"] .wb-tasks-error { background: #2c1614; color: #f3b3ad; border-color: #4d211d; }
+[data-theme="dark"] .wb-task-needs_human,
+[data-theme="dark"] .wb-task-awaiting_input,
+[data-theme="dark"] .wb-task-awaiting_confirmation,
+[data-theme="dark"] .wb-task-succeeded,
+[data-theme="dark"] .wb-task-failed,
+[data-theme="dark"] .wb-task-unknown,
+[data-theme="dark"] .wb-task-executing { border-left-color: #8aa4bd; }

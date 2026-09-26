@@ -10,7 +10,7 @@
     "build:release": "node scripts/check-release-env.mjs && npm run build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "node tests/build-components.mjs && node --experimental-strip-types tests/url-state.test.mts && node --experimental-strip-types tests/dialog-a11y.test.mts",
+    "test": "node tests/build-components.mjs && node --experimental-strip-types tests/url-state.test.mts && node --experimental-strip-types tests/dialog-a11y.test.mts && node --experimental-strip-types tests/task-panel-state.test.mts",
     "check:runtime": "node --experimental-strip-types scripts/check-runtime-guards.mjs"
   },
   "dependencies": {

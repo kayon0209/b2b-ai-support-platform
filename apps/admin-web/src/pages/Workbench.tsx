@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { isOneOf, useUrlState } from "../lib/urlState";
+import { TaskPanel } from "../components/TaskPanel";
 import { ToolCard, type ToolCardData } from "../components/ToolCard";
 import { apiGet, apiPost, apiUpload } from "../lib/api";
 import { newIdempotencyKey } from "../lib/idempotency";
@@ -17,7 +18,7 @@ type Tab = "queue" | "mine" | "waiting";
 /** Every tab the page can render. Kept beside the type so a new tab cannot
  *  be added to the union without also becoming a valid `?tab=` value. */
 const ALL_TABS = ["queue", "mine", "waiting"] as const satisfies readonly Tab[];
-type RightTab = "reply" | "knowledge" | "tools";
+type RightTab = "reply" | "knowledge" | "tools" | "tasks";
 type Action = "claim" | "release" | "transfer" | "close";
 type Origin = "free" | "canned" | "ai_suggestion";
 
@@ -122,6 +123,12 @@ const STATUS: Record<string, string> = {
   waiting_customer: "等待客户", waiting_internal: "内部处理中",
   waiting_vendor: "等待供应商", resolved: "已解决", closed: "已关闭",
   reopened: "重新打开",
+};
+const RIGHT_TAB_LABEL: Record<RightTab, string> = {
+  reply: "话术",
+  knowledge: "知识",
+  tools: "工具",
+  tasks: "任务",
 };
 const EMOJIS = ["🙂", "😊", "👍", "🙏", "✅", "📦", "🔧", "💡"];
 
@@ -611,13 +618,22 @@ export function Workbench() {
         </section>
 
         {detail && rightOpen ? <aside className="wb-right" aria-label="AI 副驾与客户上下文">
-          <div className="wb-right-header"><Sparkles size={20} /><strong>AI 副驾</strong><button type="button" className="wb-right-close" aria-label="收起 AI 副驾" onClick={() => setRightOpen(false)}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label="副驾内容">{(["reply", "knowledge", "tools"] as const).map((key) => <button type="button" role="tab" aria-selected={rightTab === key} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)}>{key === "reply" ? "话术" : key === "knowledge" ? "知识" : "工具"}</button>)}</div></div>
+          <div className="wb-right-header"><Sparkles size={20} /><strong>AI 副驾</strong><button type="button" className="wb-right-close" aria-label="收起 AI 副驾" onClick={() => setRightOpen(false)}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label="副驾内容">{(["reply", "knowledge", "tools", "tasks"] as const).map((key) => <button type="button" role="tab" aria-selected={rightTab === key} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)}>{RIGHT_TAB_LABEL[key]}</button>)}</div></div>
           <div className="wb-right-scroll">
             {rightTab === "reply" ? <>
               <section className="wb-panel"><h3><FileText size={18} />建议回复</h3><p className="wb-muted">基于已记录的会话与引用来源</p>{detail.ai_suggestion?.text ? <><div className="wb-suggestion">{detail.ai_suggestion.text}</div><div className="wb-panel-actions"><button className="wb-primary-small" type="button" disabled={!canReply} onClick={() => { setDraft(detail.ai_suggestion?.text ?? ""); setOrigin("ai_suggestion"); setCannedId(null); }}>插入到回复框</button><button type="button" className="wb-secondary-small" onClick={() => void loadDetail(detail.conversation_ref)}>刷新建议</button></div></> : <p className="wb-muted">当前没有可引用的 AI 建议，请结合会话记录人工回复。</p>}</section>
               <Sources sources={detail.ai_suggestion?.sources ?? []} />
               <CustomerPanel detail={detail} />
             </> : null}
+            {rightTab === "tasks" ? (
+              <TaskPanel
+                conversationRef={detail.conversation_ref}
+                leaseVersion={detail.lease.version}
+                isOwner={detail.lease.owner === "human" && detail.lease.owner_ref === myRef}
+                leaseOwnerRef={detail.lease.owner_ref}
+                onChanged={() => void loadDetail(detail.conversation_ref)}
+              />
+            ) : null}
             {rightTab === "knowledge" ? <><Sources sources={detail.ai_suggestion?.sources ?? []} /><section className="wb-panel"><h3><Ticket size={18} />相似工单</h3>{related.length ? related.map((item) => <Link className="wb-resource-row" key={item.case_id} to={`/admin/cases?case=${item.case_id}`}><span><strong>{item.subject}</strong><small>{item.match === "subject" ? "标题相似" : "同类目"} · {STATUS[item.status] ?? item.status}</small></span><ChevronRight size={16} /></Link>) : <p className="wb-muted">暂无相似工单。</p>}</section></> : null}
             {rightTab === "tools" ? <><section className="wb-panel"><h3><CircleHelp size={18} />已查业务数据</h3>{turns.some((turn) => turn.card) ? turns.filter((turn) => turn.card).map((turn) => <div className="wb-right-tool" key={turn.turn_id}><ToolCard card={turn.card!} /></div>) : <p className="wb-muted">当前会话没有业务数据卡片。</p>}</section><section className="wb-panel"><h3><Paperclip size={18} />工单证据</h3>{attachments.length ? attachments.map((item) => item.url ? <a className="wb-resource-row" href={item.url} target="_blank" rel="noreferrer" key={item.attachment_id}><span>{item.filename}</span><ChevronRight size={16} /></a> : <p key={item.attachment_id}>{item.filename}</p>) : <p className="wb-muted">暂无附件。上传文件只保存为工单证据。</p>}</section><Link className="wb-panel-link" to="/admin/approvals">查看待审批操作 <ChevronRight size={16} /></Link></> : null}
           </div>
