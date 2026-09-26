@@ -20,6 +20,8 @@ export default defineConfig({
   },
   build: {
     outDir: "dist",
-    sourcemap: true,
+    // No public sourcemaps until there is a private upload path. A hidden map
+    // is still a real file in dist/ and a naive static deployment serves it.
+    sourcemap: false,
   },
 });

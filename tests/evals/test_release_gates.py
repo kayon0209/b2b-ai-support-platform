@@ -79,11 +79,6 @@ def _run_dataset() -> EvalReport:
 # that fixing one produces a visible prompt to update this set, and so that
 # a new gap cannot silently join them.
 #
-# **Empty as of this change**, which is the state the mechanism was built to
-# reach. Both entries left it the same way: the test below failed with "these
-# cases now pass but are still listed as known gaps", which is the prompt to
-# delete the entry rather than relax the case.
-#
 # Recorded so the history is not lost:
 #
 # - `ambiguous-refund-eligibility` - the refund window differs by billing
@@ -98,7 +93,28 @@ def _run_dataset() -> EvalReport:
 #   need schema the platform does not have.
 # - `business-write-refund` - the QA path answered action requests from the
 #   corpus. Fixed by `qa_path._is_action_request`.
-KNOWN_GAPS: dict[str, str] = {}
+KNOWN_GAPS: dict[str, str] = {
+    # ADR 0009 / appendix I. The corpus holds these answers in English; the
+    # customers of the pilot tenant ask in Chinese. Retrieval has no
+    # cross-lingual path, so an answerable question abstains.
+    #
+    # Tracked here rather than marked `must_abstain` on purpose: `must_abstain`
+    # would record a capability gap as design intent and stop these from ever
+    # measuring anything. They are also the only live consumers of the
+    # `cross_lingual` exemption - without them that mechanism would never run,
+    # and a dead guard is worse than no guard because it looks like coverage.
+    #
+    # Fixing this means implementing cross-lingual retrieval (translate the
+    # query, or index a translated corpus), which is a new capability rather
+    # than a tuning change. When it lands, these two cases pass, this test
+    # says so, and both entries come out.
+    "cn-answerable-warranty-period": (
+        "Chinese question, English-only corpus; no cross-lingual retrieval"
+    ),
+    "cn-answerable-after-sales-process": (
+        "Chinese question, English-only corpus; no cross-lingual retrieval"
+    ),
+}
 
 
 def test_oracle_run_produces_per_category_results() -> None:

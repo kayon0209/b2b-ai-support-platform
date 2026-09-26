@@ -13,6 +13,7 @@ whether a missing model is fatal (answer generation) or degrading
 (retrieval, which can fall back to lexical search).
 """
 
+from enum import StrEnum
 from functools import lru_cache
 
 from platform_core.config import get_settings
@@ -60,3 +61,32 @@ def get_rerank_provider() -> RerankProvider | None:
 def reset_model_bundle() -> None:
     """Drop the cached bundle. Used by tests and on credential rotation."""
     get_model_bundle.cache_clear()
+
+
+class ChatTask(StrEnum):
+    """What the model call is for (feature list 11.2).
+
+    Two tasks with genuinely different requirements, which is what makes
+    routing worth having: classification runs on every message and only has to
+    pick a label, so latency and cost dominate; answer generation runs once and
+    has to reason over evidence, so capability dominates. Serving both with one
+    model means either paying generation prices for classification or accepting
+    classification-grade reasoning in customer-facing answers.
+    """
+
+    CLASSIFY = "classify"
+    GENERATE = "generate"
+
+
+def chat_model_for(task: ChatTask) -> str:
+    """The model name to use for `task`.
+
+    Falls back to `llm_model` when no per-task override is configured, so
+    routing is opt-in per environment rather than something that must be
+    configured before the platform works. Returning the configured default
+    rather than raising keeps an unset override a no-op.
+    """
+    settings = get_settings()
+    if task is ChatTask.CLASSIFY and settings.llm_model_classify:
+        return settings.llm_model_classify
+    return settings.llm_model

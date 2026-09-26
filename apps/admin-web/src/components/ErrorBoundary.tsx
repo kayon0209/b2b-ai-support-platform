@@ -70,7 +70,7 @@ export function RouteError() {
         <pre className="cell-code">{message}</pre>
       </details>
       <p>
-        <Link className="btn" to="/quality">
+        <Link className="btn" to="/admin/quality">
           {t("notFound.home")}
         </Link>
       </p>

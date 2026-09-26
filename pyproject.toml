@@ -1,7 +1,7 @@
 [project]
 name = "b2b-ai-support"
 version = "0.1.0"
-description = "Enterprise AI customer support platform (Chatwoot kernel + FastAPI control plane)"
+description = "Enterprise AI customer support platform with owned customer channels and a FastAPI control plane"
 requires-python = ">=3.12"
 
 [dependency-groups]
@@ -30,6 +30,33 @@ ignore = ["S101"]  # assert allowed in tests
 "apps/api/src/platform_core/retrieval/hybrid.py" = ["S608"]
 # negative suite builds DELETE/SELECT from a code-owned table list
 "apps/api/tests/integration/test_cross_tenant_negative.py" = ["S608"]
+# 0053 interpolates TABLE/COLUMN into an UPDATE. Both are module-level string
+# literals (`"tenants"`, `"brand_display_name"`), not caller input, and the
+# interpolation is unavoidable: Postgres cannot bind an identifier as a
+# parameter, so there is no parameterised form of this statement to prefer.
+# A migration is also not request-handling code - it runs once, from a deploy.
+"apps/api/migrations/versions/0053_brand_display_name_cleanup.py" = ["S608"]
+# channels/wechat.py needs both of these, and neither is avoidable:
+#   S324 sha1 is *mandated* by the WeChat Official Account protocol for its
+#        server-URL signature. It signs a shared token plus a public
+#        timestamp/nonce, not content, and no other digest is accepted.
+#   S314 the XML body is parsed only after the signature has been verified, and
+#        DOCTYPE/ENTITY declarations are refused before parsing - which closes
+#        the known classes (billion laughs, XXE, quadratic blowup) that this
+#        rule warns about. `defusedxml` is not a declared dependency here.
+"apps/api/src/platform_core/channels/wechat.py" = ["S314", "S324"]
+# knowledge/storage.py parses a ListObjectsV2 response:
+#   S314 the body is checked for DOCTYPE/ENTITY *before* the parser sees it and
+#        rejected outright, which closes the known classes (billion laughs,
+#        XXE, quadratic blowup). There is no response-direction signature to
+#        verify against here, so that check is the mitigation rather than a
+#        second line of defence. `defusedxml` is not a declared dependency.
+"apps/api/src/platform_core/knowledge/storage.py" = ["S314"]
+# The channel test computes WeChat's sha1 signature *independently* of the
+# adapter, on purpose: calling the adapter's own helper would make the test agree
+# with the code by construction, and a wrong sort order would pass. The
+# algorithm is fixed by the protocol, so there is nothing to strengthen.
+"apps/api/tests/integration/test_channel_webhooks.py" = ["S324"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -81,7 +108,13 @@ pythonpath = [
     "packages/observability/src",
     ".",
 ]
-testpaths = ["apps/api/tests", "packages/contracts/tests", "tests/evals"]
+# `tests` rather than `tests/evals`: the comment below describes the suite as
+# having two test roots, but only the evals subtree was listed, so every test
+# under `tests/unit` - the Huaqiu seed guard and the worker dispatch tests -
+# was collected by nothing and ran only when named explicitly. `tests/e2e/*`
+# is not collected by the file-name convention (they are scripts, not test
+# modules), so widening the root does not pull them in.
+testpaths = ["apps/api/tests", "packages/contracts/tests", "tests"]
 # Loaded explicitly rather than as a conftest: the suite has two test roots
 # (`apps/api/tests` and `tests/`), so a conftest at either one is not an
 # ancestor of the other, and the release-gate evidence collector must see

@@ -2,7 +2,6 @@
 
 Exposes /healthz plus one router per bounded context:
 
-- support_bridge: Chatwoot webhook intake (persist-before-enqueue)
 - audit:          append-only audit read API
 - cases:          case lifecycle and the command API
 - retrieval:      authorized knowledge search (diagnostics, evaluations)
@@ -30,21 +29,41 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from platform_core import db
+from platform_core.agent_runtime.agent_reply_router import (
+    router as agent_reply_router,
+)
 from platform_core.agent_runtime.customer_router import router as customer_router
 from platform_core.agent_runtime.prompt_router import router as prompt_router
 from platform_core.agent_runtime.router import router as agent_runtime_router
+from platform_core.agent_runtime.support_router import router as support_router
+from platform_core.agent_runtime.workbench_router import router as workbench_router
 from platform_core.api import (
+    DATABASE_SATURATED,
     INTERNAL_ERROR,
     VALIDATION_FAILED,
     error_response,
     new_trace_id,
 )
 from platform_core.audit.router import router as audit_router
+from platform_core.cases.agent_router import router as agent_directory_router
+from platform_core.cases.assignment_router import router as case_assignment_router
+from platform_core.cases.canned_router import router as canned_router
 from platform_core.cases.router import router as cases_router
+from platform_core.cases.sla_router import router as sla_policy_router
+from platform_core.channels.router import router as channels_router
 from platform_core.compliance.router import router as compliance_router
 from platform_core.config import Settings, get_settings
+from platform_core.evaluation.agent_metrics_router import (
+    router as agent_metrics_router,
+)
+from platform_core.evaluation.experiment_router import (
+    router as experiment_router,
+)
 from platform_core.evaluation.router import router as quality_router
 from platform_core.http_metrics import HttpMetricsMiddleware
 from platform_core.identity.branding import router as tenant_branding_router
@@ -67,6 +86,7 @@ from platform_core.integrations.router import (
     router as connectors_router,
 )
 from platform_core.integrations.webhook_router import router as connector_webhook_router
+from platform_core.knowledge.correction_router import router as correction_router
 from platform_core.knowledge.flag_router import router as feature_flag_router
 from platform_core.knowledge.gap_router import router as knowledge_gap_router
 from platform_core.knowledge.router import router as knowledge_router
@@ -75,9 +95,14 @@ from platform_core.rate_limit import (
     RateLimitMiddleware,
     build_limiter,
     policies_from_settings,
+    trusted_proxies_from_settings,
 )
 from platform_core.retrieval.router import router as retrieval_router
-from platform_core.support_bridge.router import router as support_bridge_router
+from platform_core.spa import mount_spa, register_spa_fallback
+from platform_core.support_bridge.csat_router import router as csat_router
+from platform_core.tool_gateway.router import (
+    catalog_router as tool_catalog_router,
+)
 from platform_core.tool_gateway.router import router as tool_gateway_router
 
 
@@ -131,6 +156,120 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
     )
 
 
+_HTTP_ERROR_CODES = {
+    404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED",
+    401: "AUTH_UNRESOLVED",
+    403: "POLICY_DENIED",
+    409: "CONFLICT",
+    413: "PAYLOAD_TOO_LARGE",
+    429: "RATE_LIMITED",
+}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Route-level failures in the same envelope as everything else.
+
+    Starlette answers 404 and 405 with `{"detail": "Not Found"}`. The admin
+    UI reads `error.message` (falling back to `error.reason`), so neither
+    matched and the operator was shown "HTTP 404" - a status code where the
+    useful information is *which* address does not exist and *what* to do.
+    It also carried no `trace_id`, so a support conversation about a bad link
+    had nothing to quote.
+
+    The detail is echoed because it is Starlette's own text ("Not Found",
+    "Method Not Allowed") and never contains caller input - unlike the
+    validation handler, where the body had to be suppressed.
+    """
+    return error_response(
+        _HTTP_ERROR_CODES.get(exc.status_code, f"HTTP_{exc.status_code}"),
+        str(exc.detail),
+        status_code=exc.status_code,
+        trace_id=new_trace_id(),
+    )
+
+
+def _is_pool_exhausted(exc: Exception) -> bool:
+    """Whether this failure is a pool that ran out, not a fault.
+
+    Takes `Exception` rather than `OperationalError` because the handler is
+    registered for two unrelated types, and the checkout timeout - the one this
+    exists for - is the one that is not an `OperationalError` at all.
+
+    `connection_invalidated` is checked first where the exception has it: that
+    flag is exactly what a timed-out checkout sets. The message match is the
+    fallback, and it is deliberately narrow.
+
+    The narrowing matters in the other direction too: a refused connection or a
+    statement timeout is also a database failure, and both are genuine faults.
+    Mapping those to 503 would tell a client to retry a problem that retrying
+    cannot fix, and would bury a real outage in a page of "busy".
+    """
+    if getattr(exc, "connection_invalidated", False):
+        return True
+    orig = getattr(exc, "orig", None)
+    text = str(orig) if orig is not None else str(exc)
+    lowered = text.lower()
+    return "pool" in lowered and ("timeout" in lowered or "exhaust" in lowered)
+
+
+@app.exception_handler(OperationalError)
+@app.exception_handler(PoolTimeoutError)
+async def database_operational_error(request: Request, exc: Exception) -> JSONResponse:
+    """Answer a connection-pool failure with a code that means something.
+
+    Registered for **two** exception types, and the second one is not
+    optional. A checkout timeout raises `sqlalchemy.exc.TimeoutError`, which
+    subclasses `SQLAlchemyError` directly - it is *not* an `OperationalError`.
+    A handler registered for `OperationalError` alone therefore never fires for
+    the exact failure it was written for, and the saturated-pool response added
+    alongside it was unreachable code. Verified rather than assumed:
+    `issubclass(TimeoutError, OperationalError)` is `False`.
+
+    A saturated pool used to arrive at the generic handler as `INTERNAL_ERROR`,
+    which is marked retryable and so tells a client to come back - but it
+    carries the message "quote the trace id to support" and a 500, and an
+    operator reading a page of identical 500s cannot tell a capacity problem
+    from a bug. Those need opposite responses: the pool drains on its own and
+    the requests succeed, while a bug does not.
+
+    503 rather than 500, because the distinction is not cosmetic. 500 means this
+    endpoint is broken; 503 means this endpoint is fine and the service is busy,
+    which is what a load balancer and a client's backoff both act on correctly.
+
+    Only exhaustion is mapped. Every other `OperationalError` - a refused
+    connection, a dropped server, a syntax problem - is a genuine fault and keeps
+    the generic path, where the traceback reaches the log.
+    """
+    trace_id = new_trace_id()
+    if _is_pool_exhausted(exc):
+        logger.warning(
+            "connection pool exhausted trace_id=%s method=%s path=%s",
+            trace_id,
+            request.method,
+            request.url.path,
+        )
+        return error_response(
+            DATABASE_SATURATED,
+            "the service is busy; retry shortly",
+            status_code=503,
+            trace_id=trace_id,
+        )
+    logger.exception(
+        "database error trace_id=%s method=%s path=%s",
+        trace_id,
+        request.method,
+        request.url.path,
+    )
+    return error_response(
+        INTERNAL_ERROR,
+        "an unexpected error occurred; quote the trace id to support",
+        status_code=500,
+        trace_id=trace_id,
+    )
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
     """Return the documented error envelope instead of a bare 500.
@@ -157,17 +296,29 @@ async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
-app.include_router(support_bridge_router)
+app.include_router(channels_router)
 app.include_router(audit_router)
 app.include_router(compliance_router)
 app.include_router(cases_router)
+app.include_router(agent_directory_router)
+app.include_router(case_assignment_router)
+app.include_router(canned_router)
+app.include_router(sla_policy_router)
 app.include_router(retrieval_router)
 app.include_router(agent_runtime_router)
 app.include_router(customer_router)
+app.include_router(agent_reply_router)
+app.include_router(workbench_router)
+app.include_router(support_router)
 app.include_router(tool_gateway_router)
+app.include_router(tool_catalog_router)
 app.include_router(quality_router)
+app.include_router(agent_metrics_router)
+app.include_router(csat_router)
+app.include_router(experiment_router)
 app.include_router(prompt_router)
 app.include_router(knowledge_gap_router)
+app.include_router(correction_router)
 app.include_router(knowledge_router)
 app.include_router(feature_flag_router)
 # Observability last: /metrics is an unauthenticated infrastructure endpoint
@@ -206,10 +357,22 @@ if get_settings().rate_limit_enabled:
         RateLimitMiddleware,
         limiter=build_limiter(redis_url=get_settings().redis_url),
         api_policy=_policies["api"],
+        workbench_policy=_policies["workbench"],
         anonymous_policy=_policies["anonymous"],
         webhook_policy=_policies["webhook"],
+        visitor_policy=_policies["visitor"],
+        trusted_proxies=trusted_proxies_from_settings(get_settings()),
     )
-app.add_middleware(TenantContextMiddleware, resolver=build_resolver())
+# The built frontend, when this image carries one. Its presence is what makes
+# the browser-router paths exempt from bearer resolution - see `spa.py` for why
+# that grants nothing, and why a checkout with no build keeps answering exactly
+# as it did before. The catch-all route is registered at the very bottom of
+# this module, after every real route.
+_SPA_DIST = mount_spa(app, get_settings().spa_dist)
+
+app.add_middleware(
+    TenantContextMiddleware, resolver=build_resolver(), spa_enabled=_SPA_DIST is not None
+)
 app.add_middleware(HttpMetricsMiddleware)
 
 
@@ -217,6 +380,12 @@ app.add_middleware(HttpMetricsMiddleware)
 def healthz() -> dict[str, str]:
     settings: Settings = get_settings()
     return {"status": "ok", "environment": settings.environment}
+
+
+# Last route registered wins last match, so the browser-router fallback goes
+# here: after `/healthz`, after every router, after everything. Anything
+# defined below this line would be shadowed by the shell.
+register_spa_fallback(app, _SPA_DIST)
 
 
 def run() -> None:

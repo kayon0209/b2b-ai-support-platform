@@ -1,15 +1,16 @@
-"""Unit tests: webhook signature verification and payload minimization."""
+"""Unit tests: webhook signature verification and payload minimization.
+
+`verify_webhook` and `sign_payload` are shared by every signed inbound route —
+the connector webhook and both channel adapters — so these assertions cover all
+of them, not one provider's endpoint.
+"""
 
 import json
 import time
 
 import pytest
 
-from platform_core.support_bridge.minimize import (
-    build_envelope,
-    minimize_chatwoot_payload,
-    payload_hash,
-)
+from platform_core.support_bridge.minimize import minimize_inbound_payload
 from platform_core.support_bridge.webhook_security import (
     WebhookVerificationError,
     sign_payload,
@@ -57,32 +58,20 @@ def test_malformed_timestamp_rejected() -> None:
 
 
 def test_minimizer_never_copies_content() -> None:
+    """The policy, stated as an assertion: the body must not survive."""
     payload = {
         "id": 42,
         "content": "SECRET CUSTOMER MESSAGE BODY",
         "message_type": "incoming",
         "conversation": {"id": 7, "inbox_id": 3, "status": "open"},
-        "account": {"id": 1},
         "sender": {"type": "contact", "id": 99},
     }
-    minimized = minimize_chatwoot_payload("message_created", payload)
+    minimized = minimize_inbound_payload("message_created", payload)
     dumped = json.dumps(minimized)
     assert "SECRET CUSTOMER MESSAGE BODY" not in dumped
     assert minimized["message_id"] == "42"
     assert minimized["conversation_id"] == "7"
-    assert minimized["chatwoot_account_id"] == "1"
+    assert minimized["message_type"] == "incoming"
+    # Length only, so an operator can tell a long question from a short one
+    # without the platform keeping either.
     assert minimized["content_length"] == len("SECRET CUSTOMER MESSAGE BODY")
-
-
-def test_envelope_shape() -> None:
-    envelope = build_envelope(
-        event_type="message_created",
-        tenant_id="01900000-0000-7000-8000-000000000001",
-        delivery_id="d1",
-        minimized={"message_id": "42", "conversation_id": "7"},
-    )
-    assert envelope["source"] == "chatwoot"
-    assert envelope["event_version"] == 1
-    assert envelope["resource"] == {"type": "message", "external_id": "42"}
-    assert envelope["event_type"] == "message_created"
-    assert payload_hash(b"x") == payload_hash(b"x")

@@ -231,8 +231,15 @@ async def create_draft(
     title: str,
     body: str,
     target_space_id: uuid.UUID | None = None,
+    conversation_ref_id: uuid.UUID | None = None,
 ) -> KnowledgeDraft:
-    """Propose an answer for review. Not knowledge yet."""
+    """Propose an answer for review. Not knowledge yet.
+
+    `conversation_ref_id` records which conversation prompted this draft, so a
+    reviewer can read the two side by side. Optional: a draft written from the
+    gap queue has no conversation in front of its author, and that is a real
+    state rather than missing data.
+    """
     if not title.strip() or not body.strip():
         raise GapError("EMPTY_DRAFT", "a draft needs a title and a body")
 
@@ -240,9 +247,32 @@ async def create_draft(
     if gap.status == GapStatus.RESOLVED.value:
         raise GapError("ALREADY_RESOLVED", "this gap already has published knowledge")
 
+    # A second submit of the same draft is a duplicate, not a second opinion.
+    # The console generates a fresh idempotency key per click, so the key
+    # cannot catch a double-click; and unlike customer messages there is no
+    # content hash on this path, so without this check two identical drafts
+    # appear and a reviewer has to work out that they are the same thing.
+    # Matching on (gap, title) is deliberately narrow - a genuinely different
+    # title for the same gap is still a new draft.
+    existing = (
+        await session.execute(
+            select(KnowledgeDraft)
+            .where(
+                KnowledgeDraft.tenant_id == ctx.tenant_id,
+                KnowledgeDraft.gap_id == gap.id,
+                KnowledgeDraft.title == title.strip()[:512],
+                KnowledgeDraft.status == DraftStatus.PENDING.value,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
     draft = KnowledgeDraft(
         tenant_id=ctx.tenant_id,
         gap_id=gap.id,
+        conversation_ref_id=conversation_ref_id,
         title=title.strip()[:512],
         body=body,
         status=DraftStatus.PENDING.value,
