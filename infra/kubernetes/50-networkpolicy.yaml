@@ -63,7 +63,7 @@ spec:
         - protocol: TCP
           port: 8000
 ---
-# Egress: DNS, Postgres, Redis, the Chatwoot host, the LLM provider, object
+# Egress: DNS, Postgres, Redis, the LLM provider, object
 # storage, and the OIDC issuer. Each entry is a dependency the code actually
 # calls; anything not listed is not reachable, so a new outbound call fails
 # loudly at the first request rather than silently working in a dev cluster
@@ -106,7 +106,8 @@ spec:
     # published ranges would be tighter and would also break whenever they
     # change it; these are recorded as a known weakening rather than presented
     # as tight.
-    #   443 -> Chatwoot, the LLM provider, object storage, the OIDC issuer.
+    #   443 -> the LLM provider, object storage, the OIDC issuer, and any
+    #          configured outbound channel (SMTP, WeChat).
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0

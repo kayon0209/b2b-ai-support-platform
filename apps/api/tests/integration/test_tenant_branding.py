@@ -114,6 +114,45 @@ class TestReadBranding:
         assert body["primary_color"] is None
 
 
+class TestDisplayNameValidation:
+    """The display name is the one branding field that had no rule.
+
+    It is rendered as text today, so React escapes it and nothing executes -
+    but a name that *is* a script tag is a defect whoever escapes it, and the
+    next consumer (an email, a PDF, a Chatwoot inbox name) may not escape at
+    all. A tenant in this database really did store
+    `<img src=x onerror=alert(2)>` as its display name.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "<img src=x onerror=alert(2)>Acme",
+            "Acme <b>Bold</b>",
+            "   ",
+            "Acme\u0000Corp",
+        ],
+    )
+    def test_markup_and_junk_are_refused(self, value: str) -> None:
+        resp = _client(TENANT, "tenant_owner").put(
+            "/v1/tenant/branding",
+            headers=_headers(str(uuid.uuid4())),
+            json={"display_name": value},
+        )
+        assert resp.status_code == 400, resp.text[:200]
+
+    @pytest.mark.parametrize("value", ["Acme & Co", "华秋电子", "Acme-Électronique"])
+    def test_real_names_still_work(self, value: str) -> None:
+        """The rule refuses markup, not ampersands or other alphabets."""
+        resp = _client(TENANT, "tenant_owner").put(
+            "/v1/tenant/branding",
+            headers=_headers(str(uuid.uuid4())),
+            json={"display_name": value},
+        )
+        assert resp.status_code == 200, resp.text[:200]
+        assert resp.json()["branding"]["display_name"] == value
+
+
 class TestWriteBranding:
     def test_owner_can_set_branding(self) -> None:
         client = _client(TENANT, "tenant_owner")

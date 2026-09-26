@@ -10,7 +10,7 @@ Invariants (docs/agent.md, docs/domain-model.md):
 import enum
 import uuid
 
-from sqlalchemy import BigInteger, Index, String, UniqueConstraint
+from sqlalchemy import BigInteger, Index, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from platform_core.orm_base import Base, PkMixin, TenantMixin
@@ -20,6 +20,7 @@ class LeaseOwner(enum.StrEnum):
     AI = "ai"
     HUMAN = "human"
     QUEUE = "queue"
+    CLOSED = "closed"
 
 
 class ControlLeaseError(Exception):
@@ -35,6 +36,31 @@ class ConversationControlLease(Base, PkMixin, TenantMixin):
     __table_args__ = (
         UniqueConstraint("tenant_id", "conversation_ref_id", name="uq_lease_per_conversation"),
         Index("ix_lease_owner", "owner_type"),
+        # Conversation queue polling is the highest-volume read in the human
+        # workbench. Partial indexes keep exact queue counts and ordered pages
+        # bounded to the matching ownership state instead of scanning every
+        # lease for the tenant on each poll.
+        Index(
+            "ix_workbench_queue_order",
+            "tenant_id",
+            "updated_at",
+            "id",
+            postgresql_where=text("owner_type = 'queue'"),
+        ),
+        Index(
+            "ix_workbench_human_owner_order",
+            "tenant_id",
+            "owner_ref",
+            "updated_at",
+            "id",
+            postgresql_where=text("owner_type = 'human'"),
+        ),
+        Index(
+            "ix_workbench_human_waiting_count",
+            "tenant_id",
+            "owner_ref",
+            postgresql_where=text("owner_type = 'human' AND mode = 'HUMAN_WAITING_CUSTOMER'"),
+        ),
     )
 
     conversation_ref_id: Mapped[uuid.UUID] = mapped_column(nullable=False)

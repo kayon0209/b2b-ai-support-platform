@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from uuid6 import uuid7
 
 from platform_core.db import session_scope
 from platform_core.outbox import OutboxEvent, OutboxStatus
@@ -39,7 +40,11 @@ ADMIN_URL = os.environ.get(
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
 
-TENANT = "01900000-0000-7000-8000-0000000000d1"
+# Its own tenant id - see the note in `test_membership_resolution`. Sharing
+# `...d1` with two other files meant the seed's `ON CONFLICT (slug)` guard did
+# not cover the primary key, so the second file to run failed on
+# `tenants_pkey`.
+TENANT = "01900000-0000-7000-8000-0000000000d6"
 SLUG = "outbox-relay"
 EVENT_TYPE = "relay.test"
 
@@ -103,7 +108,7 @@ def _assert_no_live_relay(admin: Any) -> None:
     local connections (which on Windows includes the test process itself),
     so there is no reliable way to tell the two apart from the catalog.
     """
-    probe = uuid.uuid4()
+    probe = uuid7()
     with admin.begin() as conn:
         conn.execute(
             text(
@@ -156,10 +161,16 @@ def _seed_event(
                 "INSERT INTO outbox_events (id, tenant_id, event_id, event_type, "
                 "event_version, aggregate_type, aggregate_id, payload, status, "
                 "created_at, attempts, trace_id) VALUES "
-                "(gen_random_uuid(), :tid, :eid, :etype, 1, 'case', :agg, "
+                "(:id, :tid, :eid, :etype, 1, 'case', :agg, "
                 "CAST(:payload AS jsonb), :status, :created, :attempts, :trace)"
             ),
             {
+                # UUIDv7, not `gen_random_uuid()`: the relay claims by primary
+                # key (`claim_pending` -> `ORDER BY OutboxEvent.id LIMIT batch`),
+                # and production ids are v7. A random v4 id makes the relay's
+                # own ordering meaningless under test, so the suite stops
+                # pinning the FIFO the relay actually depends on.
+                "id": str(uuid7()),
                 "tid": TENANT,
                 "eid": str(event_id),
                 "etype": event_type,
@@ -290,10 +301,14 @@ def _seed_event_with_payload(payload: str) -> uuid.UUID:
                 "INSERT INTO outbox_events (id, tenant_id, event_id, event_type, "
                 "event_version, aggregate_type, aggregate_id, payload, status, "
                 "created_at, attempts, trace_id) VALUES "
-                "(gen_random_uuid(), :tid, :eid, :etype, 1, 'case', :agg, "
+                "(:id, :tid, :eid, :etype, 1, 'case', :agg, "
                 "CAST(:payload AS jsonb), 'queued', :created, 0, 'tr-batch')"
             ),
             {
+                # UUIDv7 for the same reason as `_seed_event`: the relay claims
+                # in primary-key order, so the id has to be time-sortable for
+                # the test to exercise the ordering production relies on.
+                "id": str(uuid7()),
                 "tid": TENANT,
                 "eid": str(event_id),
                 "etype": EVENT_TYPE,

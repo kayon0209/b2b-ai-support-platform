@@ -20,7 +20,7 @@ Error mapping (stable codes per docs/api-contracts.md):
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Query, Request
+from fastapi import APIRouter, Body, File, Form, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
@@ -41,13 +41,22 @@ from platform_core.api import (
     tenant_session,
 )
 from platform_core.audit import service as audit_service
+from platform_core.cases import attachments as attachment_rules
 from platform_core.cases.models import (
     Case,
+    CaseAttachment,
+    CaseConversation,
     CaseStatus,
     TransitionNotAllowed,
     VersionConflict,
 )
-from platform_core.cases.service import CaseError, CaseService
+from platform_core.cases.service import (
+    RELATED_WINDOW,
+    CaseError,
+    CaseService,
+    find_related_cases,
+)
+from platform_core.config import get_settings
 from platform_core.outbox_service import enqueue
 from platform_policy import Action
 
@@ -65,6 +74,11 @@ class CaseCreateIn(BaseModel):
     # The account this Case is about. Determines the SLA policy via the
     # account's contract tier (see `cases.models.sla_policy_for_tier`).
     enterprise_account_id: uuid.UUID | None = None
+    # The conversation this Case came from, when it came from one. Recorded on
+    # `CaseConversation`, which is what lets an escalated case be traced back
+    # to the customer waiting on it - and what priority claiming filters on.
+    # Optional because a Case can be raised from a phone call or an email.
+    conversation_ref_id: uuid.UUID | None = None
 
 
 class CaseCommandIn(BaseModel):
@@ -133,6 +147,7 @@ async def create_case(request: Request, body: CaseCreateIn) -> Any:
                 priority=body.priority,
                 category=body.category,
                 enterprise_account_id=body.enterprise_account_id,
+                conversation_ref_id=body.conversation_ref_id,
             )
         except CaseError as exc:
             # One code for "no such account" and "another tenant's account":
@@ -229,6 +244,126 @@ async def get_case(request: Request, case_id: str) -> Any:
         payload = _serialize(case)
 
     return ok_response({"case": payload})
+
+
+@router.get("/{case_id}/workbench")
+async def case_workbench(request: Request, case_id: str) -> Any:
+    """Everything an agent needs to take over without re-asking.
+
+    Feature list 7.4/7.6: the complaint about handoffs is never the handoff,
+    it is that the customer then has to repeat themselves. This bundles the
+    case, the conversation so far, the AI's last proposal with the sources it
+    cited, and the account's tier - so the first human message can start from
+    "I can see you asked about…" rather than "could you give me your order
+    number".
+
+    Read-only and derived: it assembles what already exists and writes
+    nothing, so it cannot drift from the underlying rows.
+
+    Related cases carry the signal that selected them (`match`: subject wording
+    or category) plus the computed similarity, because a panel an operator is
+    asked to trust has to be able to say why a row is in front of them. The
+    list is allowed to be short or empty: padding it with same-bucket cases is
+    how it becomes something people learn to ignore.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return error_response("AUTH_UNRESOLVED", "tenant context not resolved", status_code=401)
+    denied = require_policy(ctx, Action.CASE_READ)
+    if denied is not None:
+        return denied
+
+    try:
+        cid = parse_uuid(case_id, field="case_id")
+    except ValueError as exc:
+        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+
+    async with tenant_session(ctx) as session:
+        case = (await session.execute(select(Case).where(Case.id == cid))).scalar_one_or_none()
+        if case is None:
+            return error_response(CASE_NOT_FOUND, "case not found", status_code=404)
+
+        link = (
+            await session.execute(
+                select(CaseConversation.conversation_ref_id)
+                .where(CaseConversation.case_id == cid)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+        conversation: list[dict[str, str]] = []
+        suggestion: dict[str, object] | None = None
+        if link is not None:
+            from platform_core.agent_runtime import conversation_store
+
+            turns = await conversation_store.load_turns(
+                session, tenant_id=ctx.tenant_id, conversation_ref_id=link, limit=50
+            )
+            conversation = [{"role": turn.role.value, "text": turn.text} for turn in turns]
+            latest = await conversation_store.latest_suggestion(
+                session, tenant_id=ctx.tenant_id, conversation_ref_id=link
+            )
+            if latest is not None:
+                suggestion = {"text": latest[0], "sources": latest[1]}
+
+        related = await find_related_cases(session, tenant_id=ctx.tenant_id, case=case, limit=5)
+
+        tier: str | None = None
+        contacts: list[dict[str, str | None]] = []
+        if case.enterprise_account_id is not None:
+            # Through the identity seam, not by importing its models.
+            from platform_core.identity import org
+
+            facts = await org.account_sla_facts(
+                session, tenant_id=ctx.tenant_id, account_id=case.enterprise_account_id
+            )
+            if facts is not None:
+                tier = facts[0]
+            # Feature list 2.1: one company reaches us through several
+            # channels, and each channel may use a distinct contact reference. The
+            # binding already says they are the same account; showing them is
+            # what stops an agent treating the email from last week and the
+            # WeChat message from this morning as two different customers.
+            bindings = await org.list_contacts(
+                session, tenant_id=ctx.tenant_id, account_id=case.enterprise_account_id
+            )
+            contacts = [
+                {"external_contact_id": b.external_contact_id, "channel": b.channel}
+                for b in bindings
+            ]
+
+    return ok_response(
+        {
+            "case": _serialize(case),
+            "conversation_ref": str(link) if link is not None else None,
+            "account_tier": tier,
+            "account_contacts": contacts,
+            "conversation": conversation,
+            "ai_suggestion": suggestion,
+            "related_cases": {
+                # What the query actually computed, so a consumer cannot read
+                # more into the list than it is. Every item also carries the
+                # signal that selected it (`match`) and the terms the two
+                # subjects share (`shared_terms`), because a heading cannot
+                # explain five rows.
+                "basis": "subject_terms_or_category",
+                "window": RELATED_WINDOW,
+                "items": [
+                    {
+                        "case_id": str(item.case_id),
+                        "subject": item.subject,
+                        "status": item.status,
+                        "category": item.category,
+                        "opened_at": item.opened_at,
+                        "match": item.match,
+                        "score": item.score,
+                        "shared_terms": list(item.shared_terms),
+                    }
+                    for item in related
+                ],
+            },
+        }
+    )
 
 
 @router.post("/{case_id}/commands")
@@ -373,3 +508,141 @@ def _validate_parameters(body: CaseCommandIn) -> str:
             if value is not None and (not isinstance(value, str) or len(value) > 255):
                 return f"parameters.{field} must be a string of at most 255 characters"
     return ""
+
+
+# --- Evidence attachments (research report stage 3) ------------------------
+
+
+def _serialize_attachment(row: CaseAttachment, *, url: str | None) -> dict[str, Any]:
+    return {
+        "attachment_id": str(row.id),
+        "filename": row.filename,
+        "content_type": row.content_type,
+        "size_bytes": row.size_bytes,
+        "uploaded_by": row.uploaded_by,
+        "created_at": row.created_at,
+        # Short-lived and only issued on read. Null on the upload response, and
+        # that is deliberate rather than an omission: the upload's job is to
+        # store, and a URL minted at upload time would outlive the request that
+        # asked for it while sitting in a log.
+        "url": url,
+    }
+
+
+@router.post("/{case_id}/attachments")
+async def upload_case_attachment(
+    request: Request,
+    case_id: str,
+    file: Annotated[UploadFile, File()],
+    uploaded_by: Annotated[str | None, Form()] = None,
+) -> Any:
+    """Attach evidence to a case.
+
+    Multipart rather than a pre-signed PUT, for the reason the knowledge upload
+    records: routing the bytes through the API is what lets the content type
+    and the size cap be enforced *before* anything is stored. A pre-signed PUT
+    lets a client write arbitrary bytes and only then have the API discover
+    they are not allowed, after the object exists.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return error_response("AUTH_UNRESOLVED", "tenant context not resolved", status_code=401)
+    denied = require_policy(ctx, Action.CASE_UPDATE)
+    if denied is not None:
+        return denied
+    # A write, and a retried upload is a second copy of the evidence.
+    missing_idem = require_write_idempotency(request, Action.CASE_UPDATE)
+    if missing_idem is not None:
+        return missing_idem
+
+    try:
+        cid = parse_uuid(case_id, field="case_id")
+    except ValueError as exc:
+        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+
+    from platform_core.knowledge.service import object_storage
+
+    data = await file.read()
+    try:
+        content_type = attachment_rules.validate_attachment(
+            content_type=file.content_type, data=data
+        )
+    except attachment_rules.AttachmentError as exc:
+        return error_response(exc.code, exc.detail or str(exc), status_code=400)
+
+    trace_id = new_trace_id()
+    async with tenant_session(ctx) as session:
+        try:
+            row = await attachment_rules.create_attachment(
+                session,
+                tenant_id=ctx.tenant_id,
+                case_id=cid,
+                filename=file.filename or "attachment",
+                content_type=content_type,
+                data=data,
+                uploaded_by=uploaded_by,
+                storage=object_storage(get_settings()),
+            )
+        except attachment_rules.AttachmentError as exc:
+            return error_response(
+                exc.code,
+                # One message for "no such case" and "another tenant's case":
+                # RLS cannot see the latter, and distinguishing them would make
+                # this endpoint a way to enumerate case ids.
+                "the case does not exist in this tenant",
+                status_code=404,
+            )
+        await audit_service.record(
+            session,
+            ctx=ctx,
+            action="case.attachment_added",
+            resource_type="case",
+            resource_id=cid,
+            decision="completed",
+            reason_code="OK",
+            after={
+                "filename": row.filename,
+                "content_type": row.content_type,
+                "size_bytes": row.size_bytes,
+            },
+            trace_id=trace_id,
+        )
+        payload = _serialize_attachment(row, url=None)
+
+    return ok_response({"attachment": payload}, trace_id=trace_id)
+
+
+@router.get("/{case_id}/attachments")
+async def list_case_attachments(request: Request, case_id: str) -> Any:
+    """The case's evidence, each with a short-lived download URL.
+
+    The URL is signed here rather than stored: a pre-signed URL in a row would
+    be expired by the time anyone read it, and one long enough to outlive a
+    review is one long enough to leak.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return error_response("AUTH_UNRESOLVED", "tenant context not resolved", status_code=401)
+    denied = require_policy(ctx, Action.CASE_READ)
+    if denied is not None:
+        return denied
+
+    try:
+        cid = parse_uuid(case_id, field="case_id")
+    except ValueError as exc:
+        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+
+    from platform_core.knowledge.service import presign_for
+
+    async with tenant_session(ctx) as session:
+        case = (await session.execute(select(Case.id).where(Case.id == cid))).scalar_one_or_none()
+        if case is None:
+            return error_response(CASE_NOT_FOUND, "case not found", status_code=404)
+        rows = await attachment_rules.list_attachments(session, case_id=cid)
+        expires = get_settings().presign_expiry_seconds
+        items = [
+            _serialize_attachment(row, url=presign_for(row.object_key, expires_seconds=expires))
+            for row in rows
+        ]
+
+    return ok_response({"items": items, "total": len(items)})

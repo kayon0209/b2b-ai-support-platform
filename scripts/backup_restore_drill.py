@@ -21,19 +21,37 @@ Rules this script obeys
    interval between dumps, which is an operational setting. What this script
    measures is RTO (wall-clock restore) and the integrity of what came back.
 
+Why there are two target modes
+------------------------------
+The first version reached PostgreSQL only through `docker exec` against one
+hard-coded container name, so the drill could run on a developer's machine and
+nowhere else. A recovery path that can only be exercised on one laptop is not
+a gate - it is a script. `--dsn` runs the identical checks against any
+PostgreSQL reachable by connection string, which is what CI and the Kubernetes
+CronJob actually have.
+
+The checks did not change. Only the way the commands are addressed did: in DSN
+mode the binaries run locally and name the database in the connection string,
+rather than being executed inside a container with the database selected by a
+flag.
+
 Run:
-    ./.venv/Scripts/python.exe scripts/backup_restore_drill.py
-    ./.venv/Scripts/python.exe scripts/backup_restore_drill.py --keep   # keep the scratch db
+    python scripts/backup_restore_drill.py                     # local docker stack
+    python scripts/backup_restore_drill.py --keep              # keep the scratch db
+    python scripts/backup_restore_drill.py --dsn "$PGURL"      # CI / Kubernetes
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import pathlib
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 
 CONTAINER = "b2b-ai-support-ai-postgres-1"
 SOURCE_DB = "platform"
@@ -74,9 +92,80 @@ def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[s
     return subprocess.run(cmd, capture_output=True, text=True, check=check)  # noqa: S603
 
 
+# None means "the local docker stack", which stays the default so existing
+# local invocations are unchanged. Set by main() from --dsn.
+DSN: str | None = None
+
+
+def _dsn_for(db: str) -> str:
+    """The base DSN pointed at `db`, in a form the pg tools accept.
+
+    Two adjustments, both found by running it:
+
+    - The application secret is a SQLAlchemy URL (`postgresql+psycopg://`).
+      `pg_dump` and friends want `postgresql://` and reject the driver segment.
+      Handing them the raw secret fails as "invalid URI", which reads like a
+      malformed connection string rather than a driver-suffix problem.
+    - The database is selected by rewriting the URL *path* rather than by
+      string surgery, because the password may legitimately contain characters
+      that look like separators.
+    """
+    normalised = (DSN or "").replace("postgresql+psycopg://", "postgresql://", 1)
+    parsed = urlsplit(normalised)
+    return urlunsplit(parsed._replace(path=f"/{db}"))
+
+
+def _pg_db(db: str) -> list[str]:
+    """Arguments selecting `db` for pg_dump / pg_restore."""
+    if DSN is None:
+        return ["-U", DB_USER, "-d", db]
+    return ["-d", _dsn_for(db)]
+
+
+def _admin_db(db: str) -> list[str]:
+    """Arguments for createdb / dropdb, which take a maintenance database.
+
+    Two things make this different from the other commands, both found by
+    running it:
+
+    - `createdb` cannot connect to the database it is about to create, so it
+      targets `postgres`.
+    - Unlike `psql`, it does *not* accept a connection URI as its positional
+      argument. There it silently falls back to a local socket and fails with
+      "no such file or directory", which reads like a PostgreSQL outage rather
+      than an argument mistake. The URI has to go through `--maintenance-db`,
+      with the database name remaining a separate positional.
+    """
+    if DSN is None:
+        return ["-U", DB_USER, db]
+    return ["--maintenance-db", _dsn_for("postgres"), db]
+
+
+def _psql_db(db: str) -> list[str]:
+    if DSN is None:
+        return ["-U", DB_USER, "-d", db]
+    return [_dsn_for(db)]
+
+
+def _argv(argv: list[str]) -> list[str]:
+    """Prefix a command with `docker exec` only in container mode."""
+    if DSN is None:
+        return ["docker", "exec", CONTAINER, *argv]
+    return argv
+
+
+def _rm(path: str) -> None:
+    """Remove the dump file, in whichever filesystem it was written to."""
+    if DSN is None:
+        _run(["docker", "exec", CONTAINER, "rm", "-f", path], check=False)
+    else:
+        with contextlib.suppress(FileNotFoundError):
+            pathlib.Path(path).unlink()
+
+
 def psql(db: str, sql: str, *, check: bool = True) -> str:
     result = _run(
-        ["docker", "exec", CONTAINER, "psql", "-U", DB_USER, "-d", db, "-tAc", sql],
+        _argv(["psql", *_psql_db(db), "-tAc", sql]),
         check=check,
     )
     return result.stdout.strip()
@@ -85,7 +174,7 @@ def psql(db: str, sql: str, *, check: bool = True) -> str:
 def psql_maybe(db: str, sql: str) -> str | None:
     """Run a query that may fail because a table does not exist yet."""
     result = _run(
-        ["docker", "exec", CONTAINER, "psql", "-U", DB_USER, "-d", db, "-tAc", sql],
+        _argv(["psql", *_psql_db(db), "-tAc", sql]),
         check=False,
     )
     if result.returncode != 0:
@@ -299,15 +388,27 @@ def compare(source: Snapshot, restored: Snapshot) -> list[Finding]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keep", action="store_true", help="keep the scratch database")
+    parser.add_argument(
+        "--dsn",
+        default=None,
+        help=(
+            "PostgreSQL connection string to drill instead of the local docker "
+            "stack. Required in CI and Kubernetes, where no container name exists."
+        ),
+    )
     args = parser.parse_args()
 
+    global DSN
+    DSN = args.dsn
+
     scratch = f"{SCRATCH_PREFIX}{int(time.time())}"
-    # /tmp here is the *container's* filesystem, reached through `docker exec`;
-    # nothing is written to the host's temporary directory. The dump is removed
-    # by this script unless --keep is passed.
+    # In container mode this path is the *container's* /tmp, reached through
+    # `docker exec`; in DSN mode it is the local filesystem. Either way the
+    # dump is removed by this script unless --keep is passed.
     dump_path = f"/tmp/{scratch}.dump"  # noqa: S108
 
-    print(f"source : {SOURCE_DB} (read-only; pg_dump only)")
+    target = "local docker stack" if DSN is None else "DSN"
+    print(f"source : {SOURCE_DB} via {target} (read-only; pg_dump only)")
     print(f"target : {scratch} (created and dropped by this drill)")
     print()
 
@@ -315,14 +416,14 @@ def main() -> int:
 
     print("dumping ...")
     t0 = time.monotonic()
-    _run(["docker", "exec", CONTAINER, "pg_dump", "-U", DB_USER, "-Fc", "-f", dump_path, SOURCE_DB])
+    _run(_argv(["pg_dump", *_pg_db(SOURCE_DB), "-Fc", "-f", dump_path]))
     dump_seconds = time.monotonic() - t0
 
     # Re-read the source: a comparison against a copy is only meaningful if the
     # original held still while it was taken.
     drifted = differences(source, snapshot(SOURCE_DB))
     if drifted:
-        _run(["docker", "exec", CONTAINER, "rm", "-f", dump_path], check=False)
+        _rm(dump_path)
         print()
         print("SOURCE WAS NOT QUIESCENT - drill not attempted")
         for name in drifted:
@@ -333,25 +434,21 @@ def main() -> int:
         return 2
 
     print("restoring into the scratch database ...")
-    _run(["docker", "exec", CONTAINER, "createdb", "-U", DB_USER, scratch])
+    _run(_argv(["createdb", *_admin_db(scratch)]))
     try:
         t1 = time.monotonic()
         # `--no-owner` because the restore runs as the same superuser but a
         # future drill may not; ownership is not what is under test.
         _run(
-            [
-                "docker",
-                "exec",
-                CONTAINER,
-                "pg_restore",
-                "-U",
-                DB_USER,
-                "-d",
-                scratch,
-                "--no-owner",
-                "--no-acl",
-                dump_path,
-            ]
+            _argv(
+                [
+                    "pg_restore",
+                    *_pg_db(scratch),
+                    "--no-owner",
+                    "--no-acl",
+                    dump_path,
+                ]
+            )
         )
         restore_seconds = time.monotonic() - t1
 
@@ -361,8 +458,8 @@ def main() -> int:
         if args.keep:
             print(f"kept scratch database {scratch}")
         else:
-            _run(["docker", "exec", CONTAINER, "dropdb", "-U", DB_USER, scratch], check=False)
-            _run(["docker", "exec", CONTAINER, "rm", "-f", dump_path], check=False)
+            _run(_argv(["dropdb", *_admin_db(scratch)]), check=False)
+            _rm(dump_path)
 
     failed = [f for f in findings if not f.ok]
     width = max(len(f.check) for f in findings)

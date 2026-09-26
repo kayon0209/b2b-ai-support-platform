@@ -35,7 +35,8 @@ from dataclasses import dataclass, field
 
 import pytest
 from sqlalchemy import create_engine, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from uuid6 import uuid7
 
 pytestmark = pytest.mark.integration
 
@@ -204,24 +205,42 @@ def _make_version(
     # the INSERT overrides that default - so the empty case passes `"{}"`, not
     # None. (Same trap as the ORM `server_default` note in the project memory.)
     metadata = json.dumps({"content_type": content_type}) if content_type else "{}"
+    # UUIDv7, matching what production inserts (`PkMixin.default_uuid` ->
+    # `uuid7`), and NOT the `gen_random_uuid()` this fixture used to call.
+    # This is load-bearing rather than cosmetic: the claim orders by
+    # `created_at, id` (migration 0039), and `created_at` is whole seconds, so
+    # every row seeded in one test shares an ordering key and `id` decides the
+    # tie. Under a random v4 the tie order was arbitrary, the FIFO window could
+    # land anywhere, and a narrowed claim could still miss - which showed up as
+    # a different test failing on each run. Inserting v7 makes the fixture's
+    # ordering agree with production's, so "oldest first" means here what it
+    # means there.
+    doc_id_value = uuid7()
+    version_id_value = uuid7()
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
         doc_id = conn.execute(
             text(
                 "INSERT INTO documents (id, tenant_id, space_id, canonical_uri, title, "
-                "classification) VALUES (gen_random_uuid(), :t, :s, :uri, 'Refund policy', "
+                "classification) VALUES (:id, :t, :s, :uri, 'Refund policy', "
                 "'internal') RETURNING id"
             ),
-            {"t": tenant, "s": SPACE if tenant == TENANT else SPACE, "uri": uri},
+            {
+                "id": doc_id_value,
+                "t": tenant,
+                "s": SPACE if tenant == TENANT else SPACE,
+                "uri": uri,
+            },
         ).scalar_one()
         version_id = conn.execute(
             text(
                 "INSERT INTO document_versions (id, tenant_id, document_id, version_label, "
                 "content_hash, status, object_uri, ingestion_status, metadata) VALUES "
-                "(gen_random_uuid(), :t, :d, :label, 'sha256:stub', 'processing', :key, "
+                "(:id, :t, :d, :label, 'sha256:stub', 'processing', :key, "
                 "'uploaded', CAST(:meta AS jsonb)) RETURNING id"
             ),
             {
+                "id": version_id_value,
                 "t": tenant,
                 "d": doc_id,
                 "label": f"v-{uuid.uuid4().hex[:8]}",
@@ -259,9 +278,57 @@ def _read_version(version_id: str) -> dict:
     }
 
 
+class _ClosingSession(AsyncSession):
+    """An `AsyncSession` that always ends its transaction when it goes away.
+
+    Why this exists, and why it is a class rather than a rule in a docstring.
+
+    `async with factory() as session:` does **not** end the transaction on exit
+    - it returns the connection to the pool with whatever transaction was open
+    still open. For a read-only test that is invisible. For a test that calls
+    `claim_versions` it is not: the claim runs `... FOR UPDATE SKIP LOCKED` and
+    then UPDATEs the claimed rows, so the session holds **row locks** on
+    `document_versions`. Closing without commit/rollback leaves those locks
+    held by a pooled connection, which Postgres reports as `idle in
+    transaction`.
+
+    The consequence is not a leak, it is a *cross-test* failure with a
+    misleading symptom:
+
+    - The next claim on that same pooled connection hits `FOR UPDATE SKIP
+      LOCKED`, which **skips** a locked row rather than waiting on it, so the
+      claim silently returns fewer rows than requested. Measured: `claim(3)`
+      over 3 requested ids returned 2, missing exactly the locked one.
+    - A narrowed claim can therefore still miss its own row, and
+      `drain_versions` reports `IngestionError: ... never ingested` for a
+      document that is perfectly ingestable. Before this class, three
+      consecutive runs of this file failed three *different* tests, and a
+      fourth run was green.
+    - Worse, the stale locks deadlock against the module fixture's teardown
+      `DELETE FROM document_versions`, which aborts the cleanup and leaves
+      `documents` rows referencing a deleted `knowledge_spaces` row - so the
+      *next* run dies on a foreign-key violation that has nothing to do with
+      what it was testing.
+
+    Fixing the one call site that happened to leak first was not enough: the
+    idiom is used 27 times in this file, and every claim-issuing one has the
+    same latent bug. Ending the transaction centrally means no call site can
+    reintroduce it, and a future test cannot forget.
+    """
+
+    async def __aexit__(self, *args: object) -> None:  # type: ignore[override]
+        # Roll back rather than commit: this runs *after* the test body, so a
+        # commit would be a second, unreviewed write. The tests that need their
+        # work persisted commit explicitly; everything else is rolled back, and
+        # the rollback is what releases the row locks.
+        if self.in_transaction():
+            await self.rollback()
+        await super().__aexit__(*args)  # type: ignore[arg-type]
+
+
 def _session_factory(url: str) -> tuple[object, object]:
     engine = create_async_engine(url, pool_pre_ping=True)
-    return engine, async_sessionmaker(engine, expire_on_commit=False)
+    return engine, async_sessionmaker(engine, expire_on_commit=False, class_=_ClosingSession)
 
 
 # --- 1. The happy path ----------------------------------------------------
@@ -274,7 +341,7 @@ def test_ingestion_produces_chunks_and_marks_ready(monkeypatch: pytest.MonkeyPat
     Chunks without READY means the document stays invisible; READY without
     chunks means a citation to nothing.
     """
-    from worker.ingestion_consumer import drain_ingestion_once
+    from worker.ingestion_consumer import drain_versions
 
     version_id = _make_version()
     monkeypatch.setattr(
@@ -287,11 +354,12 @@ def test_ingestion_produces_chunks_and_marks_ready(monkeypatch: pytest.MonkeyPat
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                stats = await drain_ingestion_once(session, embedder=embedder, batch=5)
-                # `drain_ingestion_once` does not commit: the caller owns the
-                # unit of work, same contract as `inbox_consumer.drain_once`.
-                # Omitting this rolls the whole pipeline back and leaves the
-                # row at `uploaded` while every log line reports success.
+                stats = await drain_versions(session, [uuid.UUID(version_id)], embedder=embedder)
+                # `drain_versions` does not commit: the caller owns the
+                # unit of work, same contract as `drain_ingestion_once` and
+                # `inbox_consumer.drain_once`. Omitting this rolls the whole
+                # pipeline back and leaves the rows at `uploaded` while every
+                # log line reports success.
                 await session.commit()
                 return stats
         finally:
@@ -314,7 +382,7 @@ def test_chunks_carry_section_paths_and_ordinals(monkeypatch: pytest.MonkeyPatch
     discarded it, excerpts would lose the context that makes a citation
     intelligible ("within five days" of what?).
     """
-    from worker.ingestion_consumer import drain_ingestion_once
+    from worker.ingestion_consumer import drain_versions
 
     version_id = _make_version()
     monkeypatch.setattr(
@@ -325,11 +393,12 @@ def test_chunks_carry_section_paths_and_ordinals(monkeypatch: pytest.MonkeyPatch
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                await drain_ingestion_once(session, embedder=StubEmbedder(), batch=5)
-                # `drain_ingestion_once` does not commit: the caller owns the
-                # unit of work, same contract as `inbox_consumer.drain_once`.
-                # Omitting this rolls the whole pipeline back and leaves the
-                # row at `uploaded` while every log line reports success.
+                await drain_versions(session, [uuid.UUID(version_id)], embedder=StubEmbedder())
+                # `drain_versions` does not commit: the caller owns the
+                # unit of work, same contract as `drain_ingestion_once` and
+                # `inbox_consumer.drain_once`. Omitting this rolls the whole
+                # pipeline back and leaves the rows at `uploaded` while every
+                # log line reports success.
                 await session.commit()
         finally:
             await engine.dispose()  # type: ignore[attr-defined]
@@ -367,7 +436,7 @@ def test_embeddings_are_written_so_the_vector_half_of_fusion_works(
     `embedding IS NULL` are excluded from the second, so RRF would fuse one
     list instead of two and nothing would report an error.
     """
-    from worker.ingestion_consumer import drain_ingestion_once
+    from worker.ingestion_consumer import drain_versions
 
     version_id = _make_version()
     monkeypatch.setattr(
@@ -378,11 +447,12 @@ def test_embeddings_are_written_so_the_vector_half_of_fusion_works(
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                await drain_ingestion_once(session, embedder=StubEmbedder(), batch=5)
-                # `drain_ingestion_once` does not commit: the caller owns the
-                # unit of work, same contract as `inbox_consumer.drain_once`.
-                # Omitting this rolls the whole pipeline back and leaves the
-                # row at `uploaded` while every log line reports success.
+                await drain_versions(session, [uuid.UUID(version_id)], embedder=StubEmbedder())
+                # `drain_versions` does not commit: the caller owns the
+                # unit of work, same contract as `drain_ingestion_once` and
+                # `inbox_consumer.drain_once`. Omitting this rolls the whole
+                # pipeline back and leaves the rows at `uploaded` while every
+                # log line reports success.
                 await session.commit()
         finally:
             await engine.dispose()  # type: ignore[attr-defined]
@@ -414,7 +484,7 @@ def test_search_vector_is_generated_by_the_database(monkeypatch: pytest.MonkeyPa
     would be rejected. This asserts the resulting column is non-null, which
     is what makes the lexical half of retrieval work.
     """
-    from worker.ingestion_consumer import drain_ingestion_once
+    from worker.ingestion_consumer import drain_versions
 
     version_id = _make_version()
     monkeypatch.setattr(
@@ -425,11 +495,12 @@ def test_search_vector_is_generated_by_the_database(monkeypatch: pytest.MonkeyPa
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                await drain_ingestion_once(session, embedder=StubEmbedder(), batch=5)
-                # `drain_ingestion_once` does not commit: the caller owns the
-                # unit of work, same contract as `inbox_consumer.drain_once`.
-                # Omitting this rolls the whole pipeline back and leaves the
-                # row at `uploaded` while every log line reports success.
+                await drain_versions(session, [uuid.UUID(version_id)], embedder=StubEmbedder())
+                # `drain_versions` does not commit: the caller owns the
+                # unit of work, same contract as `drain_ingestion_once` and
+                # `inbox_consumer.drain_once`. Omitting this rolls the whole
+                # pipeline back and leaves the rows at `uploaded` while every
+                # log line reports success.
                 await session.commit()
         finally:
             await engine.dispose()  # type: ignore[attr-defined]
@@ -474,7 +545,9 @@ def test_the_claim_returns_an_unquoted_content_type() -> None:
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                claimed = await claim_versions(session, batch=50)
+                claimed = await claim_versions(
+                    session, batch=50, version_ids=[uuid.UUID(version_id)]
+                )
                 await session.commit()
                 match = [c for c in claimed if str(c.version_id) == version_id]
                 assert match, "the seeded version was not claimed"
@@ -505,7 +578,9 @@ def test_a_missing_content_type_yields_an_empty_string_not_a_literal() -> None:
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                claimed = await claim_versions(session, batch=50)
+                claimed = await claim_versions(
+                    session, batch=50, version_ids=[uuid.UUID(version_id)]
+                )
                 await session.commit()
                 match = [c for c in claimed if str(c.version_id) == version_id]
                 assert match, "the seeded version was not claimed"
@@ -527,7 +602,7 @@ def test_an_api_style_upload_with_a_content_type_ingests_to_ready(
     regression in the claim function fails here instead of only in
     `tests/e2e/e2e_ingestion_minio.py`.
     """
-    from worker.ingestion_consumer import drain_ingestion_once
+    from worker.ingestion_consumer import drain_versions
 
     version_id = _make_version(content_type="text/markdown")
     monkeypatch.setattr(
@@ -538,7 +613,9 @@ def test_an_api_style_upload_with_a_content_type_ingests_to_ready(
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                stats = await drain_ingestion_once(session, embedder=StubEmbedder(), batch=5)
+                stats = await drain_versions(
+                    session, [uuid.UUID(version_id)], embedder=StubEmbedder()
+                )
                 await session.commit()
                 return stats
         finally:
@@ -568,10 +645,12 @@ def test_a_claimed_version_is_not_claimed_twice(monkeypatch: pytest.MonkeyPatch)
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                first = await claim_versions(session, batch=50)
+                first = await claim_versions(session, batch=50, version_ids=[uuid.UUID(version_id)])
                 await session.commit()
             async with factory() as session:  # type: ignore[operator]
-                second = await claim_versions(session, batch=50)
+                second = await claim_versions(
+                    session, batch=50, version_ids=[uuid.UUID(version_id)]
+                )
                 await session.commit()
             return len(first), len(second)
         finally:
@@ -760,7 +839,9 @@ def test_stale_claim_is_reclaimed_and_keeps_its_queue_position(
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                claimed = await claim_versions(session, batch=5)
+                claimed = await claim_versions(
+                    session, batch=5, version_ids=[uuid.UUID(version_id)]
+                )
                 await session.commit()
             # The claim is committed; the worker now "dies".
             return len(claimed)
@@ -796,13 +877,13 @@ def test_a_fresh_claim_is_not_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None
     from worker.ingestion_consumer import claim_versions
     from worker.ingestion_consumer import reclaim_stale_ingestion as reclaim
 
-    _make_version()
+    version_id = _make_version()
 
     async def _claim_then_reclaim() -> tuple[int, int]:
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                await claim_versions(session, batch=50)
+                await claim_versions(session, batch=50, version_ids=[uuid.UUID(version_id)])
                 await session.commit()
             async with factory() as session:  # type: ignore[operator]
                 stolen = await reclaim(session, timeout_seconds=900)
@@ -825,7 +906,7 @@ def test_a_binary_document_fails_explicitly(monkeypatch: pytest.MonkeyPatch) -> 
     garbage that embeds cleanly and is undetectable downstream. Failing is
     the honest outcome, and the operator can see why.
     """
-    from worker.ingestion_consumer import drain_ingestion_once
+    from worker.ingestion_consumer import drain_versions
 
     version_id = _make_version()
     monkeypatch.setattr(
@@ -836,7 +917,9 @@ def test_a_binary_document_fails_explicitly(monkeypatch: pytest.MonkeyPatch) -> 
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                stats = await drain_ingestion_once(session, embedder=StubEmbedder(), batch=5)
+                stats = await drain_versions(
+                    session, [uuid.UUID(version_id)], embedder=StubEmbedder()
+                )
                 await session.commit()
                 return stats
         finally:
@@ -859,6 +942,17 @@ def test_a_missing_object_fails_rather_than_retrying_forever(
     Storage raising is classified as retryable, so the version returns to
     `uploaded` and stays pending - visible as unprocessed work rather than
     disappearing into a log line.
+
+    `drain_ingestion_once`, not `drain_versions`, and the distinction is the
+    subject of the test rather than a convenience. Deferral means the row goes
+    *back to* `uploaded`, which is a claimable state - so `drain_versions`,
+    whose whole contract is "loop until these ids leave the claimable set",
+    would re-claim this row forever and fail with `IngestionError` after
+    `max_rounds` instead of reporting the deferral it was asked about. There is
+    no settled state to wait for here: a deferred row is *supposed* to still be
+    claimable. The claim is narrowed to this row so the single-shot call cannot
+    be starved by a busy queue (see `test_a_targeted_claim_reaches_a_row_the_
+    fifo_would_starve` for why that narrowing is load-bearing).
     """
     from worker.ingestion_consumer import drain_ingestion_once
 
@@ -873,7 +967,9 @@ def test_a_missing_object_fails_rather_than_retrying_forever(
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                stats = await drain_ingestion_once(session, embedder=StubEmbedder(), batch=5)
+                stats = await drain_ingestion_once(
+                    session, embedder=StubEmbedder(), version_ids=[uuid.UUID(version_id)]
+                )
                 await session.commit()
                 return stats
         finally:
@@ -889,6 +985,11 @@ def test_an_embedder_outage_defers_rather_than_failing(monkeypatch: pytest.Monke
 
     Parking the document in FAILED would mean a human has to notice and
     requeue, for a failure that clears on its own.
+
+    Single-shot for the same structural reason as the storage-outage test
+    above: a deferral puts the row *back* into a claimable state, so
+    `drain_versions` - which loops until its ids stop being claimable - would
+    spin on it and raise. The narrow claim keeps the single shot honest.
     """
     from worker.ingestion_consumer import drain_ingestion_once
 
@@ -902,11 +1003,14 @@ def test_an_embedder_outage_defers_rather_than_failing(monkeypatch: pytest.Monke
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                stats = await drain_ingestion_once(session, embedder=embedder, batch=5)
+                stats = await drain_ingestion_once(
+                    session, embedder=embedder, version_ids=[uuid.UUID(version_id)]
+                )
                 # `drain_ingestion_once` does not commit: the caller owns the
-                # unit of work, same contract as `inbox_consumer.drain_once`.
-                # Omitting this rolls the whole pipeline back and leaves the
-                # row at `uploaded` while every log line reports success.
+                # unit of work, same contract as `drain_versions` and
+                # `inbox_consumer.drain_once`. Omitting this rolls the whole
+                # pipeline back and leaves the rows at `uploaded` while every
+                # log line reports success.
                 await session.commit()
                 return stats
         finally:
@@ -939,11 +1043,23 @@ def test_one_poison_document_does_not_block_the_batch(monkeypatch: pytest.Monkey
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                stats = await drain_ingestion_once(session, embedder=embedder, batch=5)
-                # `drain_ingestion_once` does not commit: the caller owns the
-                # unit of work, same contract as `inbox_consumer.drain_once`.
-                # Omitting this rolls the whole pipeline back and leaves the
-                # row at `uploaded` while every log line reports success.
+                # `drain_ingestion_once`, not `drain_versions`: this test is
+                # about what happens *within one batch*, so a caller-level
+                # retry loop would hide the behaviour under test (it would
+                # re-claim the deferred rows and the stats would no longer be
+                # a single batch's). Both seeded versions are named so the
+                # batch is exactly this test's rows.
+                stats = await drain_ingestion_once(
+                    session,
+                    embedder=embedder,
+                    batch=5,
+                    version_ids=[uuid.UUID(good), uuid.UUID(bad)],
+                )
+                # `drain_versions` does not commit: the caller owns the
+                # unit of work, same contract as `drain_ingestion_once` and
+                # `inbox_consumer.drain_once`. Omitting this rolls the whole
+                # pipeline back and leaves the rows at `uploaded` while every
+                # log line reports success.
                 await session.commit()
                 return stats
         finally:
@@ -968,7 +1084,7 @@ def test_reingestion_replaces_chunks_rather_than_duplicating(
     first keeps the operation idempotent, which is what makes stale-claim
     recovery safe.
     """
-    from worker.ingestion_consumer import drain_ingestion_once
+    from worker.ingestion_consumer import drain_versions
 
     version_id = _make_version()
     monkeypatch.setattr(
@@ -979,11 +1095,12 @@ def test_reingestion_replaces_chunks_rather_than_duplicating(
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                await drain_ingestion_once(session, embedder=StubEmbedder(), batch=5)
-                # `drain_ingestion_once` does not commit: the caller owns the
-                # unit of work, same contract as `inbox_consumer.drain_once`.
-                # Omitting this rolls the whole pipeline back and leaves the
-                # row at `uploaded` while every log line reports success.
+                await drain_versions(session, [uuid.UUID(version_id)], embedder=StubEmbedder())
+                # `drain_versions` does not commit: the caller owns the
+                # unit of work, same contract as `drain_ingestion_once` and
+                # `inbox_consumer.drain_once`. Omitting this rolls the whole
+                # pipeline back and leaves the rows at `uploaded` while every
+                # log line reports success.
                 await session.commit()
         finally:
             await engine.dispose()  # type: ignore[attr-defined]
@@ -1025,7 +1142,7 @@ def test_an_ingested_document_is_retrievable_by_hybrid_search(
     """
     from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
     from platform_core.retrieval.hybrid import PrincipalScope, hybrid_search
-    from worker.ingestion_consumer import drain_ingestion_once
+    from worker.ingestion_consumer import drain_versions
 
     monkeypatch.setattr(
         "platform_core.knowledge.service.get_object", lambda key: DOC.encode("utf-8")
@@ -1037,7 +1154,7 @@ def test_an_ingested_document_is_retrievable_by_hybrid_search(
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                await drain_ingestion_once(session, embedder=embedder, batch=5)
+                await drain_versions(session, [uuid.UUID(version_id)], embedder=embedder)
                 await session.commit()
 
             async with factory() as session:  # type: ignore[operator]
@@ -1120,7 +1237,7 @@ def test_another_tenant_cannot_retrieve_the_document(monkeypatch: pytest.MonkeyP
     """
     from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
     from platform_core.retrieval.hybrid import PrincipalScope, hybrid_search
-    from worker.ingestion_consumer import drain_ingestion_once
+    from worker.ingestion_consumer import drain_versions
 
     monkeypatch.setattr(
         "platform_core.knowledge.service.get_object", lambda key: DOC.encode("utf-8")
@@ -1132,7 +1249,7 @@ def test_another_tenant_cannot_retrieve_the_document(monkeypatch: pytest.MonkeyP
         engine, factory = _session_factory(APP_URL)
         try:
             async with factory() as session:  # type: ignore[operator]
-                await drain_ingestion_once(session, embedder=embedder, batch=5)
+                await drain_versions(session, [uuid.UUID(version_id)], embedder=embedder)
                 await session.commit()
 
             async with factory() as session:  # type: ignore[operator]
@@ -1157,3 +1274,350 @@ def test_another_tenant_cannot_retrieve_the_document(monkeypatch: pytest.MonkeyP
 
     hits = _run(_drive_and_search())
     assert version_id not in {str(h.document_version_id) for h in hits}
+
+
+# --- 5. Targeted claim and the drain-until-settled loop -------------------
+
+
+def test_a_targeted_claim_reaches_a_row_the_fifo_would_starve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regression this suite would have caught, had it existed.
+
+    `claim_ingestion_versions` is a global FIFO: it takes the *oldest* N
+    claimable rows anywhere. With a batch smaller than the queue depth, the
+    rows past the batch never get a turn, and every round re-claims from the
+    same head. Measured on a live queue: 13 claimable rows, `claim(10)`
+    returned 9, and the oldest row was absent - the signature of
+    `FOR UPDATE SKIP LOCKED` skipping a row another transaction holds.
+
+    For this test to mean anything the marker must be **outside the claim
+    window** the un-narrowed call can reach. `created_at` is whole seconds
+    (migration 0017's INSERT trigger), so every row seeded here shares one
+    ordering key and the FIFO order within it is decided by the tiebreaker,
+    not by insertion order - which makes "make the marker land past the
+    window" a property of the ids rather than of the insertion sequence.
+
+    The fixture now inserts UUIDv7, matching production (`PkMixin.default_uuid`
+    -> `uuid7`), so the `ORDER BY created_at, id` tiebreaker really is FIFO
+    here too and "oldest first" is well defined. The marker is still re-seeded
+    until it genuinely sits outside the window, because *which* seven rows the
+    fixture created is a property of the test's own execution order, not
+    something this assertion should assume.
+
+    The assertion is therefore built so it holds without assuming which row the
+    tiebreaker picks: the queue is made deeper than the batch, and the test
+    asserts the marker is **not** in the un-narrowed window - re-seeding until
+    that precondition is true - rather than asserting on a window that happens
+    to contain it. What is being tested is the *narrowing*, and that is
+    deterministic: a targeted claim returns its row whatever the tie order is.
+
+    Without the fix `scripts/run_eval.py` fails with
+
+        RuntimeError: ingesting <key> left ingestion_status='uploaded'
+
+    for a document that is uploaded, stored and perfectly ingestable.
+    """
+    from worker.ingestion_consumer import claim_versions
+
+    async def _seed_and_window() -> tuple[str, list[str]]:
+        """Seed fillers + marker, return (marker, un-narrowed window).
+
+        Retried because the precondition is a property of the tie order, which
+        is arbitrary under `gen_random_uuid()`. A run that cannot produce an
+        out-of-window marker is a run that cannot test anything, so it must
+        fail loudly rather than assert on a window that happens to contain it.
+        """
+        for _attempt in range(8):
+            marker = _make_version()
+            fillers = [_make_version() for _ in range(6)]
+            engine, factory = _session_factory(APP_URL)
+            try:
+                async with factory() as session:  # type: ignore[operator]
+                    # batch=2 against a 7-deep queue: most of the queue is out
+                    # of reach. NOTE: six filler rows minimum, not three -
+                    # with `batch=2` and a naive three the window still reaches
+                    # the marker often enough to flake.
+                    un_narrowed = await claim_versions(session, batch=2)
+                    await session.rollback()
+            finally:
+                await engine.dispose()  # type: ignore[attr-defined]
+            ids = [str(v.version_id) for v in un_narrowed]
+            if marker not in ids and set(fillers).isdisjoint(ids):
+                return marker, ids
+        raise AssertionError(
+            "could not seed a queue where the marker sits outside a batch=2 "
+            "window; the test cannot distinguish the two selectors"
+        )
+
+    marker, un_narrowed = _run(_seed_and_window())
+    assert len(un_narrowed) == 2, f"expected a 2-row FIFO window, got {len(un_narrowed)}"
+
+    async def _targeted() -> list[str]:
+        engine, factory = _session_factory(APP_URL)
+        try:
+            async with factory() as session:  # type: ignore[operator]
+                targeted = await claim_versions(session, batch=2, version_ids=[uuid.UUID(marker)])
+                await session.commit()
+                return [str(v.version_id) for v in targeted]
+        finally:
+            await engine.dispose()  # type: ignore[attr-defined]
+
+    targeted = _run(_targeted())
+    assert targeted == [marker], (
+        f"a targeted claim must reach its row regardless of FIFO position, got {targeted}"
+    )
+    assert _read_version(marker)["status"] == "parsing"
+
+
+def test_a_targeted_claim_cannot_reach_a_row_that_is_not_claimable() -> None:
+    """Narrowing the candidate set must not widen the state filter.
+
+    The claim function is SECURITY DEFINER, so the reviewer's question is
+    always "what can this now be pointed at that it could not before". The
+    answer must remain: only rows in a claimable state. Targeting a `ready`
+    or `expired` version asks for it by id and must still get nothing.
+    """
+    from worker.ingestion_consumer import claim_versions
+
+    version_id = _make_version()
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text("UPDATE document_versions SET ingestion_status = 'expired' WHERE id = :v"),
+            {"v": version_id},
+        )
+    admin.dispose()
+
+    async def _claim() -> bool:
+        engine, factory = _session_factory(APP_URL)
+        try:
+            async with factory() as session:  # type: ignore[operator]
+                got = await claim_versions(session, batch=5, version_ids=[uuid.UUID(version_id)])
+                await session.commit()
+            return bool(got)
+        finally:
+            await engine.dispose()  # type: ignore[attr-defined]
+
+    assert not _run(_claim()), "targeting must not make a non-claimable row claimable"
+
+
+def test_drain_versions_settles_every_requested_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller's own rows are ingested, not whatever was oldest.
+
+    `drain_ingestion_once` answers "the oldest N rows in the database", which
+    is right for the worker and wrong for a caller holding specific documents.
+    `drain_versions` claims repeatedly until none of the requested ids remain
+    claimable, and raises rather than returning quietly if one never settles.
+    """
+    from worker.ingestion_consumer import drain_versions
+
+    monkeypatch.setattr(
+        "platform_core.knowledge.service.get_object",
+        lambda _key: DOC.encode("utf-8"),
+    )
+
+    ids = [uuid.UUID(_make_version()) for _ in range(3)]
+
+    async def _drain() -> int:
+        engine, factory = _session_factory(APP_URL)
+        try:
+            async with factory() as session:  # type: ignore[operator]
+                stats = await drain_versions(session, ids, embedder=StubEmbedder())
+                await session.commit()
+            return stats.ready
+        finally:
+            await engine.dispose()  # type: ignore[attr-defined]
+
+    ready = _run(_drain())
+    assert ready == 3, f"expected all three requested versions ingested, got {ready}"
+    for version_id in ids:
+        state = _read_version(str(version_id))
+        assert state["status"] == "ready", f"{version_id} did not settle: {state}"
+        assert state["chunks"] > 0
+
+
+def test_drain_versions_narrows_the_claim_it_issues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The narrowing must survive the trip through `drain_ingestion_once`.
+
+    Found by an end-to-end run, not by the unit-level tests: `drain_versions`
+    called `drain_ingestion_once`, which called `claim_versions` **without**
+    the id set, so the claim stayed un-narrowed and the starvation persisted.
+    The direct `claim_versions(version_ids=...)` tests all passed while the
+    caller was still broken, which is exactly the gap this test closes.
+
+    Asserting on the ids `claim_versions` actually receives is deliberate: the
+    observable end state ("eventually READY") can be reached by a lucky FIFO
+    ordering, so a test that only checks the outcome would pass on a machine
+    with an empty queue and fail in production.
+    """
+    from worker import ingestion_consumer
+
+    monkeypatch.setattr(
+        "platform_core.knowledge.service.get_object",
+        lambda _key: DOC.encode("utf-8"),
+    )
+
+    # A queue deeper than the batch, with the requested rows at the tail.
+    for _ in range(4):
+        _make_version()
+    wanted = [uuid.UUID(_make_version()) for _ in range(2)]
+
+    seen: list[list[uuid.UUID] | None] = []
+    real_claim = ingestion_consumer.claim_versions
+
+    async def _spy(session: object, *, batch: int = 5, version_ids=None):  # type: ignore[no-untyped-def]
+        seen.append(list(version_ids) if version_ids else None)
+        return await real_claim(session, batch=batch, version_ids=version_ids)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ingestion_consumer, "claim_versions", _spy)
+
+    async def _drain() -> None:
+        engine, factory = _session_factory(APP_URL)
+        try:
+            async with factory() as session:  # type: ignore[operator]
+                await ingestion_consumer.drain_versions(session, wanted, embedder=StubEmbedder())
+                await session.commit()
+        finally:
+            await engine.dispose()  # type: ignore[attr-defined]
+
+    _run(_drain())
+
+    assert seen, "the drain issued no claim at all"
+    assert all(ids is not None for ids in seen), (
+        f"every claim the drain issues must carry the requested ids, got {seen}"
+    )
+    assert all(set(ids) <= set(wanted) for ids in seen if ids), (  # type: ignore[arg-type]
+        f"the claim must be narrowed to the requested rows, got {seen}"
+    )
+    for version_id in wanted:
+        assert _read_version(str(version_id))["status"] == "ready"
+
+
+def test_drain_versions_raises_rather_than_returning_partial_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that asked for specific documents must not be told "fine".
+
+    `drain_ingestion_once` reports a batch summary, and a summary is exactly
+    what let the original bug through: `ready=8` says nothing about the row
+    the caller wanted. A requested version that could not be ingested has to
+    be visible, not absorbed into a smaller number.
+
+    Two things this test had to learn, both of which are real contracts:
+
+    1. **An unreachable dependency defers, it does not fail.** A storage
+       outage is classified retryable by design (`_Retryable`), so the row goes
+       back to `uploaded` for a later cycle. The outcome to assert is
+       `deferred`, and the row must still be `uploaded` rather than parked in
+       FAILED for a fault that clears itself.
+
+       The fault is injected rather than inherited from the environment. This
+       test used to reach the real storage layer and pass because that layer
+       was *misconfigured and always unreachable* - so it was asserting
+       "deferral" against an outage while the docstring called it a missing
+       object. Once the endpoint was fixed, the same call returned a real 404
+       and the two conditions separated: an outage is transient, a 404 is not
+       (`test_a_missing_object_fails_...` pins the other half).
+    2. **`drain_versions` does not raise for a handled row.** Deferral means
+       the row is *supposed* to stay claimable, so treating it as "never
+       ingested" would make the loop raise on the one path that exists to
+       recover. An error is reserved for an id the loop genuinely never
+       reached after `max_rounds`.
+
+    So the assertion is on the reporting contract: the outcome is attributed
+    to the caller (stats *and* `handled_ids`), and the row agrees. Silence is
+    impossible either way - if a future change makes it raise, the raise must
+    be a real `IngestionError` naming the cause, which the except branch
+    enforces.
+    """
+    from platform_core.knowledge.ingest import IngestionError
+    from platform_core.knowledge.storage import StorageValidationError
+    from worker.ingestion_consumer import drain_versions
+
+    version_id = uuid.UUID(_make_version())
+
+    def _dependency_down(key: str) -> bytes:
+        raise StorageValidationError("get_object failed: 503")
+
+    monkeypatch.setattr("platform_core.knowledge.service.get_object", _dependency_down)
+
+    async def _drain() -> object:
+        engine, factory = _session_factory(APP_URL)
+        try:
+            async with factory() as session:  # type: ignore[operator]
+                out = await drain_versions(session, [version_id], embedder=StubEmbedder())
+                await session.commit()
+                return out
+        finally:
+            await engine.dispose()  # type: ignore[attr-defined]
+
+    try:
+        stats = _run(_drain())
+    except Exception as exc:  # noqa: BLE001 - the other acceptable outcome
+        assert isinstance(exc, IngestionError), (
+            f"a non-settling drain must raise IngestionError, got {type(exc).__name__}: {exc}"
+        )
+        assert "never ingested" in str(exc), f"the raise must name the cause, got {exc}"
+        return
+
+    assert stats.claimed == 1, f"the requested row must be claimed, got {stats}"
+    assert stats.deferred == 1, f"a storage fault must defer, not fail: {stats}"
+    assert stats.ready == 0, f"an unreadable document must not be reported ready: {stats}"
+    assert version_id in set(stats.handled_ids), (
+        f"the outcome must be attributed to the requested id, got {stats.handled_ids}"
+    )
+    assert _read_version(str(version_id))["status"] == "uploaded", (
+        "a retryable fault must leave the row claimable for a later cycle"
+    )
+
+
+def test_a_missing_object_fails_instead_of_retrying_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 404 is permanent; an outage is not, and they used to be one thing.
+
+    An upload whose bytes never landed leaves exactly this row behind: the API
+    registers the document, then the storage write fails, and the version row
+    stays claimable. Every cycle re-read the key, got a 404, called it
+    retryable and released the claim - measured at roughly six attempts per
+    second, per stuck document, with no end. Nothing about a 404 clears on its
+    own.
+
+    `failed` is the honest terminal state, and it is visible: the document list
+    shows it, where the loop only ever showed up in a log nobody reads.
+    """
+    from platform_core.knowledge.storage import ObjectNotFound
+    from worker.ingestion_consumer import drain_versions
+
+    version_id = _make_version()
+
+    def _gone(key: str) -> bytes:
+        raise ObjectNotFound(f"get_object failed: 404 for {key}")
+
+    monkeypatch.setattr("platform_core.knowledge.service.get_object", _gone)
+    embedder = StubEmbedder()
+
+    async def _drive() -> object:
+        engine, factory = _session_factory(APP_URL)
+        try:
+            async with factory() as session:  # type: ignore[operator]
+                stats = await drain_versions(session, [uuid.UUID(version_id)], embedder=embedder)
+                await session.commit()
+                return stats
+        finally:
+            await engine.dispose()  # type: ignore[attr-defined]
+
+    stats = _run(_drive())
+    assert stats.deferred == 0, f"a 404 must not be deferred, got {stats}"
+    assert stats.failed == 1, f"a 404 must be a terminal failure, got {stats}"
+    assert embedder.batches == [], "nothing should be embedded without content"
+
+    row = _read_version(version_id)
+    assert row["status"] == "failed", (
+        "a missing object cannot clear itself; the row must not stay claimable"
+    )

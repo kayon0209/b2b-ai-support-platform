@@ -37,7 +37,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0033_retrieval_multipath"
-down_revision: str | None = "0032_chatwoot_tenant_resolver"
+down_revision: str | None = "0031_billing_ledger"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

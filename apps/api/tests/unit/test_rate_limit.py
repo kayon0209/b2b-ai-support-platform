@@ -18,6 +18,7 @@ from platform_core.rate_limit import (
     RateLimitPolicy,
     TokenBucket,
     bucket_key,
+    visitor_key,
 )
 
 # --- policy ---------------------------------------------------------------
@@ -35,6 +36,63 @@ def test_window_must_be_positive() -> None:
 
 def test_refill_rate_is_capacity_over_window() -> None:
     assert RateLimitPolicy(capacity=60, window_seconds=60).refill_per_second == 1.0
+
+
+def test_workbench_read_budget_is_configurable_and_independent_of_api_writes() -> None:
+    from types import SimpleNamespace
+
+    from platform_core.rate_limit import policies_from_settings
+
+    policies = policies_from_settings(
+        SimpleNamespace(
+            rate_limit_window_seconds=60,
+            rate_limit_requests=600,
+            rate_limit_workbench_requests=24000,
+            rate_limit_anonymous_requests=300,
+            rate_limit_webhook_requests=1200,
+            rate_limit_visitor_requests=60,
+        )
+    )
+    assert policies["api"].capacity == 600
+    assert policies["workbench"].capacity == 24000
+    assert policies["visitor"].capacity == 60
+
+
+def test_the_visitor_budget_is_configurable() -> None:
+    from types import SimpleNamespace
+
+    from platform_core.rate_limit import policies_from_settings
+
+    policies = policies_from_settings(
+        SimpleNamespace(
+            rate_limit_window_seconds=60,
+            rate_limit_requests=600,
+            rate_limit_workbench_requests=24000,
+            rate_limit_anonymous_requests=300,
+            rate_limit_webhook_requests=1200,
+            rate_limit_visitor_requests=15,
+        )
+    )
+    assert policies["visitor"].capacity == 15
+
+
+def test_trusted_proxies_are_parsed_from_a_comma_separated_list() -> None:
+    from types import SimpleNamespace
+
+    from platform_core.rate_limit import trusted_proxies_from_settings
+
+    parsed = trusted_proxies_from_settings(
+        SimpleNamespace(rate_limit_trusted_proxies="10.0.0.0/8, 192.168.1.5 ,")
+    )
+    assert parsed == ("10.0.0.0/8", "192.168.1.5")
+
+
+def test_no_configured_proxies_means_none_are_trusted() -> None:
+    from types import SimpleNamespace
+
+    from platform_core.rate_limit import trusted_proxies_from_settings
+
+    assert trusted_proxies_from_settings(SimpleNamespace(rate_limit_trusted_proxies="")) == ()
 
 
 # --- token bucket ---------------------------------------------------------
@@ -156,9 +214,9 @@ def test_the_bucket_map_is_bounded() -> None:
 # --- key derivation -------------------------------------------------------
 
 
-def _request(path: str, host: str | None = "10.0.0.9") -> Request:
+def _request(path: str, host: str | None = "10.0.0.9", *, method: str = "GET") -> Request:
     client = (host, 12345) if host else None
-    scope = {"type": "http", "path": path, "headers": [], "client": client, "method": "GET"}
+    scope = {"type": "http", "path": path, "headers": [], "client": client, "method": method}
     return Request(scope)
 
 
@@ -179,6 +237,18 @@ def test_webhook_traffic_gets_its_own_scope() -> None:
     assert key == "ratelimit:webhook:addr:10.0.0.9"
 
 
+def test_workbench_read_traffic_gets_a_separate_tenant_scope() -> None:
+    key = bucket_key(_request("/v1/workbench/conversations"), tenant_id="t-1")
+    assert key == "ratelimit:workbench:tenant:t-1"
+
+
+def test_workbench_writes_stay_in_the_general_api_scope() -> None:
+    key = bucket_key(
+        _request("/v1/workbench/conversations/id/actions", method="POST"), tenant_id="t-1"
+    )
+    assert key == "ratelimit:api:tenant:t-1"
+
+
 def test_a_missing_client_address_is_handled() -> None:
     """`request.client` is None under some ASGI transports; a crash here would
     be a 500 on every request."""
@@ -189,7 +259,11 @@ def test_a_missing_client_address_is_handled() -> None:
 
 
 def _app(
-    *, capacity: int, window: int = 60, unlimited: frozenset[str] = UNLIMITED_PATHS
+    *,
+    capacity: int,
+    workbench_capacity: int | None = None,
+    window: int = 60,
+    unlimited: frozenset[str] = UNLIMITED_PATHS,
 ) -> FastAPI:
     app = FastAPI()
 
@@ -201,10 +275,22 @@ def _app(
     def healthz() -> dict:
         return {"ok": True}
 
+    @app.get("/v1/workbench/conversations")
+    def workbench_read() -> dict:
+        return {"ok": True}
+
+    @app.post("/v1/workbench/conversations/id/actions")
+    def workbench_write() -> dict:
+        return {"ok": True}
+
     app.add_middleware(
         RateLimitMiddleware,
         limiter=InMemoryRateLimiter(),
         api_policy=RateLimitPolicy(capacity=capacity, window_seconds=window),
+        workbench_policy=RateLimitPolicy(
+            capacity=workbench_capacity if workbench_capacity is not None else capacity,
+            window_seconds=window,
+        ),
         anonymous_policy=RateLimitPolicy(capacity=capacity, window_seconds=window),
         webhook_policy=RateLimitPolicy(capacity=capacity * 2, window_seconds=window),
         unlimited_paths=unlimited,
@@ -267,6 +353,17 @@ def test_a_larger_policy_is_honoured_for_webhooks() -> None:
     assert client.get("/v1/webhooks/connectors/abc").status_code == 200
 
 
+def test_workbench_reads_have_a_separate_budget_and_writes_keep_the_api_budget() -> None:
+    client = TestClient(_app(capacity=1, workbench_capacity=2), raise_server_exceptions=False)
+
+    assert client.get("/thing").status_code == 200
+    assert client.get("/thing").status_code == 429
+    assert client.get("/v1/workbench/conversations").status_code == 200
+    assert client.get("/v1/workbench/conversations").status_code == 200
+    assert client.get("/v1/workbench/conversations").status_code == 429
+    assert client.post("/v1/workbench/conversations/id/actions").status_code == 429
+
+
 # --- wiring on the real app ----------------------------------------------
 
 
@@ -280,3 +377,172 @@ def test_the_real_app_exempts_health_and_metrics() -> None:
         for _ in range(30):
             assert client.get("/healthz").status_code == 200
         assert client.get("/metrics").status_code == 200
+
+
+# --- trusted proxies and per-visitor keys ----------------------------------
+#
+# Everything below exists because of one measured fact: behind the ingress
+# every request presented the ingress pod's address, so Redis held exactly one
+# bucket - `ratelimit:api:addr:<peer>` - and 200 concurrent visitors produced
+# 39 rate-limit rejections between them. The fix has two halves, and neither is
+# sufficient alone: a real client address, and a key that does not collapse
+# every customer behind one NAT into a single budget.
+
+
+def _with_headers(path: str, headers: dict[str, str], host: str = "10.0.0.9") -> Request:
+    client = (host, 12345)
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    scope = {
+        "type": "http",
+        "path": path,
+        "headers": raw,
+        "client": client,
+        "method": "POST",
+    }
+    return Request(scope)
+
+
+def test_a_trusted_proxy_makes_the_forwarded_address_the_client() -> None:
+    key = bucket_key(
+        _with_headers("/v1/support/sessions", {"x-forwarded-for": "203.0.113.7, 10.0.0.1"}),
+        tenant_id=None,
+        trusted_proxies=("10.0.0.0/8",),
+    )
+    # The left-most entry is the original client; the rest are proxies we
+    # already know about, since the peer itself is trusted.
+    assert key == "ratelimit:api:addr:203.0.113.7"
+
+
+def test_an_untrusted_peer_cannot_choose_its_own_bucket() -> None:
+    """The reason the header was ignored in the first place, and the reason a
+    bare `X-Forwarded-For` must never be honoured unconditionally."""
+    key = bucket_key(
+        _with_headers("/v1/support/sessions", {"x-forwarded-for": "203.0.113.7"}),
+        tenant_id=None,
+        trusted_proxies=(),
+    )
+    assert key == "ratelimit:api:addr:10.0.0.9"
+
+
+def test_a_trusted_proxy_also_trusts_a_bare_address() -> None:
+    key = bucket_key(
+        _with_headers("/v1/support/sessions", {"x-forwarded-for": "203.0.113.7"}),
+        tenant_id=None,
+        trusted_proxies=("10.0.0.9",),
+    )
+    assert key == "ratelimit:api:addr:203.0.113.7"
+
+
+def test_an_unparseable_forwarded_header_falls_back_to_the_peer() -> None:
+    key = bucket_key(
+        _with_headers("/v1/support/sessions", {"x-forwarded-for": "not-an-ip"}),
+        tenant_id=None,
+        trusted_proxies=("10.0.0.0/8",),
+    )
+    assert key == "ratelimit:api:addr:10.0.0.9"
+
+
+def test_a_forged_forwarded_chain_from_a_trusted_peer_still_resolves() -> None:
+    """A trusted proxy sets the header, so the first hop is taken as given -
+    but a chain of addresses that is obviously not a client list is ignored
+    rather than trusted."""
+    key = bucket_key(
+        _with_headers("/v1/support/sessions", {"x-forwarded-for": "bogus, 203.0.113.7"}),
+        tenant_id=None,
+        trusted_proxies=("10.0.0.0/8",),
+    )
+    assert key == "ratelimit:api:addr:10.0.0.9"
+
+
+def test_two_visitors_behind_one_address_get_different_buckets() -> None:
+    """The corporate-NAT case: one egress address, many customers, and no
+    shared budget between them."""
+    a = _with_headers("/v1/support/messages", {"authorization": "Bearer vs_aaa"})
+    b = _with_headers("/v1/support/messages", {"authorization": "Bearer vs_bbb"})
+    assert visitor_key(a) != visitor_key(b)
+    assert visitor_key(a).startswith("ratelimit:visitor:")
+
+
+def test_the_visitor_key_never_contains_the_token() -> None:
+    """The token is a credential. It may be a bucketing input; it may not be
+    written into a key that ends up in metrics or Redis."""
+    request = _with_headers("/v1/support/messages", {"authorization": "Bearer vs_secret"})
+    key = visitor_key(request)
+    assert "secret" not in key
+    assert len(key) < 64
+
+
+def test_an_anonymous_caller_has_no_visitor_key() -> None:
+    assert visitor_key(_with_headers("/v1/support/messages", {})) is None
+
+
+def test_a_non_support_path_has_no_visitor_key() -> None:
+    """The visitor credential only exists on the customer surface; treating an
+    operator bearer token as a visitor key would put two unrelated budgets on
+    one account."""
+    request = _with_headers("/v1/cases", {"authorization": "Bearer pt_tenant_user"})
+    assert visitor_key(request) is None
+
+
+def test_a_visitor_token_and_a_bearer_token_are_not_interchangeable() -> None:
+    support = _with_headers("/v1/support/messages", {"authorization": "Bearer vs_abc"})
+    operator = _with_headers("/v1/cases", {"authorization": "Bearer vs_abc"})
+    assert visitor_key(support) is not None
+    assert visitor_key(operator) is None
+
+
+def _support_app(*, address_capacity: int, visitor_capacity: int) -> FastAPI:
+    """The customer surface with both budgets wired, as `main.py` wires them.
+
+    `visitor_key` returning the right string proves nothing about enforcement;
+    only a request actually being refused does.
+    """
+    app = FastAPI()
+
+    @app.post("/v1/support/messages")
+    def messages() -> dict:
+        return {"ok": True}
+
+    app.add_middleware(
+        RateLimitMiddleware,
+        limiter=InMemoryRateLimiter(),
+        api_policy=RateLimitPolicy(capacity=address_capacity, window_seconds=60),
+        workbench_policy=RateLimitPolicy(capacity=address_capacity, window_seconds=60),
+        anonymous_policy=RateLimitPolicy(capacity=address_capacity, window_seconds=60),
+        webhook_policy=RateLimitPolicy(capacity=address_capacity, window_seconds=60),
+        visitor_policy=RateLimitPolicy(capacity=visitor_capacity, window_seconds=60),
+    )
+    return app
+
+
+def test_a_single_visitor_is_capped_by_the_visitor_budget() -> None:
+    client = TestClient(
+        _support_app(address_capacity=100, visitor_capacity=3), raise_server_exceptions=False
+    )
+    headers = {"Authorization": "Bearer vs_token_a"}
+    codes = [client.post("/v1/support/messages", headers=headers).status_code for _ in range(5)]
+    assert codes == [200, 200, 200, 429, 429], codes
+
+
+def test_one_visitor_exhausting_does_not_block_the_next_one() -> None:
+    """The corporate-NAT case that the address bucket alone could not fix."""
+    client = TestClient(
+        _support_app(address_capacity=100, visitor_capacity=2), raise_server_exceptions=False
+    )
+    a = {"Authorization": "Bearer vs_token_a"}
+    b = {"Authorization": "Bearer vs_token_b"}
+    assert client.post("/v1/support/messages", headers=a).status_code == 200
+    assert client.post("/v1/support/messages", headers=a).status_code == 200
+    assert client.post("/v1/support/messages", headers=a).status_code == 429
+    # Same address, same test client, different customer: unaffected.
+    assert client.post("/v1/support/messages", headers=b).status_code == 200
+
+
+def test_an_anonymous_caller_is_not_charged_to_any_visitor_bucket() -> None:
+    """No visitor credential means no visitor bucket - otherwise anonymous
+    traffic would drain a stranger's allowance."""
+    client = TestClient(
+        _support_app(address_capacity=100, visitor_capacity=1), raise_server_exceptions=False
+    )
+    codes = [client.post("/v1/support/messages").status_code for _ in range(3)]
+    assert codes == [200, 200, 200], codes

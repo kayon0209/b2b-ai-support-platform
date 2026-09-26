@@ -55,6 +55,16 @@ structlog>=24.4
 # Imported by platform_core.http_metrics at module import, so the API cannot
 # start without it. This is the package the Dockerfile was missing.
 prometheus-client>=0.21
+# Imported by `observability_tracing.build_tracer` as soon as
+# `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and the module handles the resulting
+# `ImportError` by falling back to an in-process ring buffer. That fallback is
+# why the omission was invisible: with neither package declared, setting the
+# endpoint logged a warning and no span was ever exported, in every deployment.
+#
+# The floor is the first release whose `OTLPSpanExporter` and `Resource` import
+# paths this module uses; the four imports were verified against 1.44.0.
+opentelemetry-sdk>=1.27
+opentelemetry-exporter-otlp>=1.27
 
 # --- Contracts and utilities -----------------------------------------------
 jsonschema>=4.23

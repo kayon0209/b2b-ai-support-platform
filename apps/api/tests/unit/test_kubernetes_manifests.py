@@ -64,9 +64,19 @@ def _app_containers(pod_spec: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _all_pod_specs() -> list[tuple[str, dict[str, Any]]]:
     out: list[tuple[str, dict[str, Any]]] = []
-    for kind in ("Deployment", "Job"):
+    # CronJob was missing until the backup schedules were added, and its pod
+    # template is nested one level deeper (`jobTemplate.spec.template.spec`).
+    # Excluding it would have left the one workload holding the database owner
+    # credential and a bucket write key as the only thing in the cluster not
+    # held to the restricted profile - the backup job would have been the least
+    # constrained workload precisely because it was the newest.
+    for kind in ("Deployment", "Job", "CronJob"):
         for doc in _by_kind(kind):
-            out.append((f"{kind}/{doc['metadata']['name']}", doc["spec"]["template"]["spec"]))
+            if kind == "CronJob":
+                pod_spec = doc["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+            else:
+                pod_spec = doc["spec"]["template"]["spec"]
+            out.append((f"{kind}/{doc['metadata']['name']}", pod_spec))
     return out
 
 
@@ -147,9 +157,77 @@ def test_the_application_connects_as_the_non_bypass_role() -> None:
     """The migration owner is a superuser and bypasses row-level security. If
     the API's URL used it, every isolation guarantee at the application layer
     would be the only one left."""
+    secret_doc = next(
+        yaml.safe_load_all((K8S / "11-secret.example.yaml").read_text(encoding="utf-8"))
+    )
+    secret = secret_doc["stringData"]
+    assert "platform_app:" in secret["APP_DATABASE_URL"]
+    assert secret["APP_DATABASE_URL"] == secret["APP_DATABASE_APP_URL"]
     config = _by_kind("ConfigMap")[0]["data"]
-    assert "platform_app:" in config["APP_DATABASE_URL"]
+    assert "APP_DATABASE_URL" not in config
     assert "app.tenant_id" not in config  # nothing pins a tenant cluster-wide
+
+
+def test_every_api_worker_receives_both_app_database_url_settings_from_secret() -> None:
+    """The application connects as the non-bypass role; the scheduled jobs do not.
+
+    The exclusion list is not a convenience. `platform-migrate` and the two
+    backup schedules legitimately need the owner role - migrations create
+    tables and policies, and `pg_dump` must read every table including the
+    RLS-protected ones. Folding them into the app-role rule would either force
+    the backup to run as a role that cannot see tenant data (producing a dump
+    that restores to an empty database) or quietly hand the API the superuser.
+
+    So the rule is: the *application* uses `platform-secrets`; the *scheduled
+    jobs that dump or migrate* use `platform-migration-owner`; and the owner
+    role is never handed to anything that serves traffic.
+    """
+    owner_role_jobs = {
+        "Job/platform-migrate",
+        "CronJob/platform-backup",
+        "CronJob/platform-backup-drill",
+    }
+    for name, spec in _all_pod_specs():
+        containers = _app_containers(spec)
+        if not containers:
+            continue
+        env = {entry["name"]: entry for entry in containers[0].get("env", [])}
+        if name in owner_role_jobs:
+            # Asserted positively rather than skipped: "not covered here" is
+            # exactly how a backup job ends up on the app role by accident.
+            url = env["APP_DATABASE_URL"]
+            assert url["valueFrom"]["secretKeyRef"]["name"] == "platform-migration-owner", name
+            continue
+        for variable in ("APP_DATABASE_URL", "APP_DATABASE_APP_URL"):
+            assert env[variable]["valueFrom"]["secretKeyRef"]["name"] == "platform-secrets", (
+                name,
+                variable,
+            )
+
+
+def test_kubernetes_connection_pools_leave_postgres_admin_headroom() -> None:
+    """Three API replicas plus every worker must stay below the DB budget."""
+    config = _by_kind("ConfigMap")[0]["data"]
+    api = _named("Deployment", "platform-api")
+    api_container = _app_containers(api["spec"]["template"]["spec"])[0]
+    api_env = {entry["name"]: entry.get("value") for entry in api_container.get("env", [])}
+    api_pool_per_pod = int(api_env["APP_DATABASE_POOL_SIZE"]) + int(
+        api_env["APP_DATABASE_APP_POOL_SIZE"]
+    )
+    worker_pool_per_pod = int(config["APP_DATABASE_POOL_SIZE"]) + int(
+        config["APP_DATABASE_APP_POOL_SIZE"]
+    )
+    worker_replicas = sum(
+        int(deployment["spec"].get("replicas", 1)) for deployment in _worker_deployments().values()
+    )
+    max_connections = 100  # PostgreSQL's default; production must substitute its actual cap.
+    planned = (
+        int(api["spec"]["replicas"]) * api_pool_per_pod + worker_replicas * worker_pool_per_pod
+    )
+    assert planned <= max_connections - 10, (
+        f"planned connection cap {planned} leaves fewer than 10 of {max_connections} "
+        "PostgreSQL connections for migrations and administration"
+    )
 
 
 def test_bootstrap_tokens_are_not_enabled_anywhere() -> None:
@@ -341,3 +419,82 @@ def test_metrics_are_not_routed_through_the_ingress() -> None:
     assert paths == ["/"]
     names = {s["metadata"]["name"] for s in _by_kind("Service")}
     assert "platform-api-metrics" in names
+
+
+# --- backup and restore drill ----------------------------------------------
+
+
+def test_the_backup_schedules_exist() -> None:
+    """A backup nobody schedules is not a backup.
+
+    Both are asserted separately because they answer different questions: one
+    is "do we take dumps", the other is "can we restore them". Shipping only
+    the first produces a system that looks protected and has never been
+    recovered.
+    """
+    backup = _named("CronJob", "platform-backup")
+    drill = _named("CronJob", "platform-backup-drill")
+
+    assert backup["spec"]["schedule"].strip()
+    assert drill["spec"]["schedule"].strip()
+
+
+def test_scheduled_work_never_overlaps_itself() -> None:
+    """A backup that overlaps the next one wastes a pool and interleaves dumps.
+
+    `Forbid` rather than `Replace` specifically: a killed backup should be
+    retried by the next scheduled run, not replaced by a fresh attempt that may
+    fail for the same reason. The drill creates and drops a scratch database,
+    so two at once would race on its name.
+    """
+    for name in ("platform-backup", "platform-backup-drill"):
+        assert _named("CronJob", name)["spec"]["concurrencyPolicy"] == "Forbid", name
+
+
+def test_the_backup_writes_to_a_different_bucket_than_the_platform_serves() -> None:
+    """The two requirements pull in opposite directions, and the split is the point.
+
+    Object versioning on the documents bucket would turn retention's erasure
+    into a delete marker: the current version 404s while earlier versions stay
+    readable by `version_id` (measured against MinIO - see
+    `MinioStorage.bucket_versioning_enabled`). Versioning is therefore enabled
+    on the *backup* bucket, where a previous dump surviving an overwrite is the
+    behaviour you want.
+
+    This is asserted structurally - the backup reads its bucket from its own
+    Secret key - because the thing that would break is a later edit quietly
+    pointing both at one bucket.
+    """
+    backup = _named("CronJob", "platform-backup")
+    env = backup["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["env"]
+    bucket = next(e for e in env if e["name"] == "APP_BACKUP_BUCKET")
+    assert bucket["valueFrom"]["secretKeyRef"]["key"] == "APP_BACKUP_BUCKET"
+    # And the live documents bucket is not referenced by the backup at all.
+    assert all("OBJECT_STORAGE_BUCKET" not in e["name"] for e in env)
+
+
+def test_the_backup_and_drill_read_the_database_owner_url_from_a_secret() -> None:
+    """`pg_dump` has to read RLS-protected tables, which the app role cannot.
+
+    Asserted for both because the drill restoring as `platform_app` would
+    produce a database that looks restorable and is missing every tenant's
+    rows.
+    """
+    for name in ("platform-backup", "platform-backup-drill"):
+        spec = _named("CronJob", name)["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+        env = spec["containers"][0]["env"]
+        url = next(e for e in env if e["name"] == "APP_DATABASE_URL")
+        assert url["valueFrom"]["secretKeyRef"]["name"] == "platform-migration-owner", name
+
+
+def test_the_restore_drill_is_told_which_database_to_use() -> None:
+    """Without `--dsn` the drill targets a local docker container name.
+
+    In a cluster that name does not exist, and the resulting failure is a
+    connection error that reads like PostgreSQL being down rather than a flag
+    that was forgotten - so the quarterly evidence would be a failed job
+    someone learned to ignore.
+    """
+    drill = _named("CronJob", "platform-backup-drill")
+    args = drill["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["args"]
+    assert any("--dsn" in a for a in args), args

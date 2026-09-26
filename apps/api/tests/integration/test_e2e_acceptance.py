@@ -7,10 +7,12 @@ real services (Postgres RLS, pgvector):
 3. Human takeover during generation -> AI pre-send CAS aborts.
 4. Insufficient evidence -> abstention with handoff reason.
 5. Full knowledge QA: ingest -> retrieve -> cite -> validate.
+
+Journey 1 used to be driven through the Chatwoot webhook. It runs over the
+email channel now (ADR 0012/0013): the same signed-HTTP shape, the same
+`uq_inbox_delivery` guarantee, and the channel is the one that survived.
 """
 
-import hashlib
-import hmac
 import json
 import os
 import time
@@ -22,6 +24,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from platform_core.agent_runtime.prompts import KNOWLEDGE_QA_PROMPT
+from platform_core.channels.outbound import ChannelSender, SendResult
+from platform_core.support_bridge.webhook_security import sign_payload
 
 pytestmark = pytest.mark.integration
 
@@ -30,8 +34,9 @@ ADMIN_URL = os.environ.get(
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
 APP_URL = "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform"
-SECRET = os.environ.get("E2E_WEBHOOK_SECRET", "e2e-webhook-secret")
-CHATWOOT_ACCOUNT = "7001"
+SECRET_ENV = "E2E_CHANNEL_WEBHOOK_SECRET"
+SECRET = os.environ.get(SECRET_ENV, "e2e-channel-secret")
+EMAIL_FROM = "buyer@example.test"
 
 
 def _run(coro):
@@ -42,8 +47,6 @@ def _run(coro):
 
 @pytest.fixture(scope="module", autouse=True)
 def e2e_env() -> dict:
-    from platform_core.config import Settings
-
     tid = str(uuid.uuid5(uuid.NAMESPACE_URL, "tenant:e2e-main"))
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
@@ -55,21 +58,6 @@ def e2e_env() -> dict:
             ),
             {"id": tid},
         )
-        conn.execute(
-            text(
-                "DELETE FROM external_resource_refs WHERE system='chatwoot' "
-                "AND resource_type='account' AND external_id = :aid"
-            ),
-            {"aid": CHATWOOT_ACCOUNT},
-        )
-        conn.execute(
-            text(
-                "INSERT INTO external_resource_refs "
-                "(id, tenant_id, system, resource_type, external_id) VALUES "
-                "(:id, :tid, 'chatwoot', 'account', :aid)"
-            ),
-            {"id": uuid.uuid4(), "tid": tid, "aid": CHATWOOT_ACCOUNT},
-        )
     with admin.begin() as conn:
         # Seed is deterministic-by-tenant; clear any leftovers from an
         # aborted previous run so re-seeding cannot violate unique keys.
@@ -78,6 +66,8 @@ def e2e_env() -> dict:
         conn.execute(text("DELETE FROM documents WHERE tenant_id = :t"), {"t": tid})
         conn.execute(text("DELETE FROM knowledge_spaces WHERE tenant_id = :t"), {"t": tid})
         conn.execute(text("DELETE FROM inbox_events WHERE tenant_id = :t"), {"t": tid})
+        conn.execute(text("DELETE FROM conversation_turns WHERE tenant_id = :t"), {"t": tid})
+        conn.execute(text("DELETE FROM connectors WHERE tenant_id = :t"), {"t": tid})
     with admin.begin() as conn:
         # Seed one active document version with two chunks + embeddings
         space = uuid.uuid4()
@@ -121,18 +111,25 @@ def e2e_env() -> dict:
                 text("UPDATE chunks SET embedding = CAST(:v AS vector) WHERE id = :i"),
                 {"v": _vector_literal(embed_deterministic(chunk_text)), "i": cid},
             )
+    # The email channel: a `connectors` row, which is what gives the route its
+    # tenant and its signing secret without reading either from a payload.
+    connector_id = str(uuid.uuid4())
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO connectors (id, tenant_id, provider, name, status, "
+                "capabilities, configuration, credential_ref, webhook_secret_ref) VALUES "
+                "(:id, :tid, 'email', 'e2e-email', 'active', CAST('[]' AS jsonb), "
+                "CAST('{}' AS jsonb), NULL, :ref)"
+            ),
+            {"id": connector_id, "tid": tid, "ref": f"env://{SECRET_ENV}"},
+        )
     admin.dispose()
 
+    os.environ[SECRET_ENV] = SECRET
     from platform_core.main import app
-    from platform_core.support_bridge import router as bridge_router
 
-    fake = Settings(environment="local", chatwoot_webhook_secret=SECRET)
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(bridge_router, "get_settings", lambda: fake)
-        yield {"tenant_id": tid, "app": app}
-        return
-
-    yield {"tenant_id": tid, "app": app}
+    yield {"tenant_id": tid, "app": app, "connector_id": connector_id}
 
     cleanup = create_engine(ADMIN_URL)
     with cleanup.begin() as conn:
@@ -141,10 +138,8 @@ def e2e_env() -> dict:
         conn.execute(text("DELETE FROM documents WHERE tenant_id = :t"), {"t": tid})
         conn.execute(text("DELETE FROM knowledge_spaces WHERE tenant_id = :t"), {"t": tid})
         conn.execute(text("DELETE FROM inbox_events WHERE tenant_id = :t"), {"t": tid})
-        conn.execute(
-            text("DELETE FROM external_resource_refs WHERE tenant_id = :t AND system='chatwoot'"),
-            {"t": tid},
-        )
+        conn.execute(text("DELETE FROM conversation_turns WHERE tenant_id = :t"), {"t": tid})
+        conn.execute(text("DELETE FROM connectors WHERE tenant_id = :t"), {"t": tid})
         conn.execute(
             text("DELETE FROM conversation_control_leases WHERE tenant_id = :t"),
             {"t": tid},
@@ -154,33 +149,43 @@ def e2e_env() -> dict:
     cleanup.dispose()
 
 
-def _post_webhook(client: TestClient, body: bytes, delivery_id: str) -> object:
-    ts = str(int(time.time()))
-    sig = hmac.new(SECRET.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+def _email_body(message_id: str) -> bytes:
+    return json.dumps(
+        {
+            "message_id": message_id,
+            "from": EMAIL_FROM,
+            "to": "support@acme.test",
+            "subject": "Order question",
+            "text": "customer asks about refunds",
+        }
+    ).encode()
+
+
+def _post_webhook(client: TestClient, connector_id: str, body: bytes) -> object:
+    stamp = str(int(time.time()))
     return client.post(
-        "/v1/webhooks/chatwoot",
+        f"/v1/webhooks/channels/{connector_id}",
         content=body,
-        headers={"X-Signature": sig, "X-Timestamp": ts, "X-Delivery-Id": delivery_id},
+        headers={
+            "Content-Type": "application/json",
+            "X-Webhook-Signature": f"sha256={sign_payload(SECRET.encode(), stamp, body)}",
+            "X-Webhook-Timestamp": stamp,
+        },
     )
 
 
 @pytest.mark.zero_tolerance("duplicate_replies")
 def test_scenario_duplicate_webhook_single_ingest(e2e_env: dict) -> None:
-    client = TestClient(e2e_env["app"], raise_server_exceptions=False)
-    body = json.dumps(
-        {
-            "event": "message_created",
-            "id": 500,
-            "content": "customer asks about refunds",
-            "message_type": "incoming",
-            "conversation": {"id": 77, "inbox_id": 1},
-            "account": {"id": int(CHATWOOT_ACCOUNT)},
-        }
-    ).encode()
-    delivery = str(uuid.uuid4())
+    """A provider retry is not a second question.
 
-    first = _post_webhook(client, body, delivery)
-    second = _post_webhook(client, body, delivery)
+    The delivery id is the channel's own message id, so `uq_inbox_delivery`
+    collapses the retry onto the first row. One customer question, one run.
+    """
+    client = TestClient(e2e_env["app"], raise_server_exceptions=False)
+    body = _email_body("<dup-500@acme.test>")
+
+    first = _post_webhook(client, e2e_env["connector_id"], body)
+    second = _post_webhook(client, e2e_env["connector_id"], body)
 
     assert first.status_code == 202
     assert second.status_code == 200 and second.json()["status"] == "duplicate"
@@ -189,7 +194,7 @@ def test_scenario_duplicate_webhook_single_ingest(e2e_env: dict) -> None:
     with admin.begin() as conn:
         n = conn.execute(
             text("SELECT count(*) FROM inbox_events WHERE delivery_id = :d"),
-            {"d": delivery},
+            {"d": "<dup-500@acme.test>"},
         ).scalar()
     admin.dispose()
     assert n == 1
@@ -344,26 +349,24 @@ def test_scenario_full_knowledge_qa_with_citations(e2e_env: dict) -> None:
     assert validate_citations(phantom_draft, evidence).ok is False
 
 
-class _RecordingSender:
-    """ChatwootClient-compatible transport double that records every send."""
+class _RecordingTransport:
+    """Channel transport double that records every send."""
+
+    system = "email"
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def send_message(self, *, account_id, conversation_id, content, command_id):
+    async def send(self, *, address, conversation_key, content, command_id):
         self.calls.append(
             {
-                "account_id": account_id,
-                "conversation_id": conversation_id,
+                "address": address,
+                "conversation_key": conversation_key,
                 "content": content,
                 "command_id": command_id,
             }
         )
-
-        class _Result:
-            ambiguous = False
-
-        return _Result()
+        return SendResult()
 
 
 class _UnusedGenerator:
@@ -392,8 +395,9 @@ def test_scenario_insufficient_evidence_answers_the_customer(e2e_env: dict) -> N
     common thing a customer could experience.
 
     The assertion is on the *transport*, not on the outcome object: the outcome
-    carried the right text the whole time. Only a live Chatwoot - or this
-    recording double - can tell you whether it was ever sent.
+    carried the right text the whole time. Only a live channel - or this
+    recording double - can tell you whether it was ever sent. It ran against a
+    Chatwoot double before; the channel path is the one that still delivers.
     """
     from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
     from platform_core.db import create_engine
@@ -405,10 +409,10 @@ def test_scenario_insufficient_evidence_answers_the_customer(e2e_env: dict) -> N
     # evidence and the gate must abstain.
     question = "What is the airspeed velocity of an unladen swallow?"
 
-    async def scenario() -> tuple[object, _RecordingSender]:
+    async def scenario() -> tuple[object, _RecordingTransport]:
         engine = create_engine(APP_URL)
         factory = async_sessionmaker(engine, expire_on_commit=False)
-        sender = _RecordingSender()
+        sender = _RecordingTransport()
         async with factory() as session:
             await session.execute(
                 text("SELECT set_config('app.tenant_id', :t, true)"),
@@ -416,7 +420,10 @@ def test_scenario_insufficient_evidence_answers_the_customer(e2e_env: dict) -> N
             )
             orchestrator = AgentOrchestrator(
                 session,
-                OrchestratorDeps(generator=_UnusedGenerator(), sender=sender),
+                OrchestratorDeps(
+                    generator=_UnusedGenerator(),
+                    channel_sender=ChannelSender({"email": sender}),
+                ),
             )
             outcome = await orchestrator.run(
                 tenant_id=tid,
@@ -425,8 +432,9 @@ def test_scenario_insufficient_evidence_answers_the_customer(e2e_env: dict) -> N
                 principal=PrincipalScope(
                     principal_types=("role",), principal_ids=("support_agent",)
                 ),
-                chatwoot_account_id=CHATWOOT_ACCOUNT,
-                chatwoot_conversation_id=str(conv),
+                channel_system="email",
+                channel_address=EMAIL_FROM,
+                channel_conversation_key=str(conv),
             )
             await session.commit()
         await engine.dispose()
@@ -441,8 +449,8 @@ def test_scenario_insufficient_evidence_answers_the_customer(e2e_env: dict) -> N
         "reaches nobody leaves the customer waiting on a reply that never comes"
     )
     sent = sender.calls[0]
-    assert sent["conversation_id"] == str(conv)
-    assert sent["account_id"] == CHATWOOT_ACCOUNT
+    assert sent["address"] == EMAIL_FROM
+    assert sent["conversation_key"] == str(conv)
     assert sent["content"] == outcome.answer_text
     assert "connect you with a human" in sent["content"].lower()
     assert sent["command_id"] == f"run:{outcome.run_id}", (

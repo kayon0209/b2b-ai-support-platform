@@ -69,6 +69,13 @@ class DeadLetterItem(Base, PkMixin, TenantMixin):
         ForeignKey("connectors.id"), nullable=True
     )
     resource_type: Mapped[str] = mapped_column(String(63), nullable=False)
+    # What the failure is about (migration 0061). Not a foreign key: the column
+    # already points at several kinds of thing by string, and a foreign key
+    # would have to name one. A dangling id is a dead letter about something
+    # since deleted, which is harmless and better than blocking that delete.
+    # NULL for connector rows written before this - those are identified by
+    # `operation_digest`, which is a different and equally deliberate answer.
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True, index=True)
     operation: Mapped[str] = mapped_column(String(63), nullable=False)
     # Redacted operation summary; raw payloads never stored here.
     operation_digest: Mapped[str] = mapped_column(String(127), nullable=False)

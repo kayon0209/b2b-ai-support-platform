@@ -270,6 +270,45 @@ class EnterpriseAccount(Base, PkMixin, TenantMixin):
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
 
 
+class EnterpriseAccountContact(Base, PkMixin, TenantMixin):
+    """Binds a Chatwoot contact to the tenant's account, so routing can see tier.
+
+    The report's 难点 5 wants tier to drive 转人工优先级, and the SLA half
+    (`sla_policy_for_tier`) was already in place - but the route had no way to
+    learn *which* account a conversation belongs to, so tier never reached
+    routing. This is the missing fact.
+
+    Deliberately keyed on the **contact**, not the inbox: an inbox is a channel
+    (see architecture.md) shared by every customer who walks in through it, so
+    binding an inbox to an account would make all of them key accounts.
+
+    The contact id is the Chatwoot-side identifier only - no customer content
+    is stored here, consistent with the minimization policy.
+    """
+
+    __tablename__ = "enterprise_account_contacts"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "external_contact_id", name="uq_account_contact_external"),
+        # Composite, like `cases.enterprise_account_id`: a single-column FK
+        # would accept another tenant's account and RLS would hide it, leaving
+        # the binding to resolve to nothing rather than to fail.
+        ForeignKeyConstraint(
+            ["enterprise_account_id", "tenant_id"],
+            ["enterprise_accounts.id", "enterprise_accounts.tenant_id"],
+            name="fk_account_contact_same_tenant",
+        ),
+    )
+
+    enterprise_account_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    external_contact_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Which door this contact came in through (web|email|wechat|phone|...).
+    # Nullable on purpose: a CRM sync often cannot name one, and a guessed
+    # channel is worse than a blank - it would be believed.
+    channel: Mapped[str | None] = mapped_column(String(31), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
 class Department(Base, PkMixin, TenantMixin):
     """An internal org unit, used to route work and to scope ABAC conditions.
 

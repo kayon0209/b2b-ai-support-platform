@@ -1,0 +1,42 @@
+# ServiceMonitor: something has to scrape /metrics before any rule can fire.
+#
+# The API already published a metrics Service and the exposition annotations
+# (`prometheus.io/scrape` on `platform-api-metrics`) were already there, but no
+# ServiceMonitor existed. Annotation-based scraping only works if the cluster's
+# Prometheus is configured for it, and this repository does not own that
+# configuration - so the 39 metric families the product-readiness audit measured
+# had no guaranteed consumer. Every rule in `70-alerts.yaml` would have been a
+# rule that could not fire.
+#
+# `job_name` is load-bearing: it is the `job` label Prometheus puts on every
+# scraped series, and `PlatformApiDown`'s expression selects on it. The unit
+# test asserts the two agree, because an availability alert that filters on the
+# wrong job name is silent forever while looking entirely correct.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: platform-api-metrics
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - b2b-support
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform
+      app.kubernetes.io/component: api
+  endpoints:
+    - port: metrics
+      path: /metrics
+      # 30s matches the alert groups' evaluation interval. Scrape faster and
+      # the rules see a finer-grained series than they act on; scrape slower
+      # and a 2-minute `for:` window resolves to one data point.
+      interval: 30s
+      # /metrics is exempt from bearer resolution and carries no tenant
+      # labels, so a scrape needs no credential. It is a ClusterIP service
+      # that the ingress does not route, so it is reachable only from inside
+      # the namespace.
+      honorLabels: false

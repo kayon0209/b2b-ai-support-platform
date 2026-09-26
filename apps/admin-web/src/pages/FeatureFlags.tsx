@@ -140,19 +140,38 @@ export function FeatureFlags() {
                   <td className="row-actions">
                     <button
                       className="btn"
-                      onClick={() =>
+                      onClick={async () => {
+                        // Switching a flag back on is not always the harmless
+                        // inverse of switching it off. `enabled` is a kill
+                        // switch that overrides rollout, so the rollout
+                        // percentage survives a disable: a flag that was
+                        // carrying 100% comes back at 100% the instant it is
+                        // switched on, changing what every user gets from one
+                        // unconfirmed click. At 0% (a freshly defined flag)
+                        // nothing changes, so no confirmation is asked for -
+                        // the prompt would be noise.
+                        if (!f.enabled && f.rollout_percent > 0) {
+                          const values = await prompt.ask({
+                            title: t("flags.reenableTitle", { key: f.key }),
+                            confirmLabel: t("flags.enable"),
+                            detail: t("flags.reenableDetail", {
+                              percent: String(f.rollout_percent),
+                            }),
+                          });
+                          if (!values) return;
+                        }
                         // Encoded: the key is interpolated into the path, and
                         // one containing `#`, `?` or `/` silently produced a
                         // request to the wrong endpoint.
-                        void act(
+                        await act(
                           `/v1/flags/${encodeURIComponent(f.key)}/enabled`,
                           { enabled: !f.enabled },
                           t("flags.stateChanged", {
                             key: f.key,
                             state: f.enabled ? t("common.disabled") : t("common.enabled"),
                           }),
-                        )
-                      }
+                        );
+                      }}
                     >
                       {f.enabled ? t("flags.disable") : t("flags.enable")}
                     </button>
