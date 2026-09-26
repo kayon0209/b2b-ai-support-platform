@@ -494,7 +494,7 @@ async def _persist_memory(
     event: ClaimedEvent,
     question: str,
     outcome: Any,
-) -> None:
+) -> uuid.UUID | None:
     """Persist the redacted turns and any durable facts (plan 2.1/2.5).
 
     Rides the same transaction as the run: a crash mid-run rolls the turns
@@ -512,7 +512,7 @@ async def _persist_memory(
 
     conversation_ref_id = _conversation_ref(event)
     if conversation_ref_id is None:
-        return
+        return None
     now = int(time.time())
     customer_turn = Turn(role=TurnRole.CUSTOMER, text=question, ts=now)
     # `source` names where the turn actually came from. Every turn is the
@@ -570,7 +570,7 @@ async def _persist_memory(
 
     contact_id = event.minimized_payload.get("contact_id")
     if not contact_id:
-        return
+        return turn_id
     facts = extract_durable_facts([customer_turn])
     await conversation_store.upsert_facts(
         session,
@@ -580,6 +580,7 @@ async def _persist_memory(
         source_turn_id=turn_id,
         now=now,
     )
+    return turn_id
 
 
 async def _resolve_contact_id(event: ClaimedEvent, deps: OrchestratorDeps) -> str | None:
@@ -756,7 +757,16 @@ async def process_event(
         # The channel route stores it as `contact_id`.
         channel_address=str(contact_id_early) if contact_id_early else None,
     )
-    await _persist_memory(session, event=event, question=question, outcome=outcome)
+    stored_turn_id = await _persist_memory(session, event=event, question=question, outcome=outcome)
+    if stored_turn_id is None:
+        logger.warning(
+            "semantic_followup_skipped_no_turn",
+            delivery_id=event.delivery_id,
+            conversation_ref_id=str(conversation_ref_id),
+        )
+        stored_turn_ref = ""
+    else:
+        stored_turn_ref = str(stored_turn_id)
 
     # Shadow classification is *enqueued*, not performed.
     #
@@ -774,33 +784,16 @@ async def process_event(
         session,
         tenant_id=event.tenant_id,
         conversation_ref_id=conversation_ref_id,
-        turn_id=str(event.minimized_payload.get("message_id") or event.delivery_id),
-        question=question,
-        history=[(t.ref, t.text) for t in history[-8:] if getattr(t, "ref", None)],
-        turn_created_at=int(event.received_at or time.time()),
+        turn_id=stored_turn_ref,
     )
 
-    # Conversation tasks, from a real assessment.
-    #
-    # B1-02: `plan_tasks` and `create_or_get` had no caller, so a customer
-    # message produced no tasks and the workbench panel had nothing to show.
-    #
-    # This runs *after* the run is persisted and the answer dispatched, and
-    # only when `agent.conversation_tasks` is on. With the flag off it reads
-    # one flag row and returns; the customer's path is byte-for-byte what it
-    # was before R1. Unlike the shadow work it is synchronous, because a task
-    # the agent is expected to act on has to exist by the time they open the
-    # conversation - deferring it would make the panel empty on first render
-    # and the feature would look broken rather than slow.
-    tasks_created = await _plan_conversation_tasks(
+    # Task analysis gets its own durable request. The payload carries only
+    # tenant-scoped references; the semantic worker loads redacted turns later.
+    task_planning_enqueued = await _enqueue_task_planning(
         session,
         tenant_id=event.tenant_id,
         conversation_ref_id=conversation_ref_id,
-        question=question,
-        history=[(t.ref, t.text) for t in history[-8:] if getattr(t, "ref", None)],
-        lease_owner_type="ai",
-        deps=deps,
-        turn_created_at=int(event.received_at or time.time()),
+        turn_id=stored_turn_ref,
     )
 
     metrics.inbox_events_total.labels(result=outcome.status.value).inc()
@@ -812,15 +805,11 @@ async def process_event(
         status=outcome.status.value,
         route=outcome.route,
         latency_ms=outcome.latency_ms,
-        # Counts only. The task rows carry the detail, and a log line that
-        # quoted a task would be a copy of customer content in a place with
-        # weaker access control. `count` is the allowlisted name; a new field
-        # would have to be added to the redaction boundary's schema, and this
-        # does not justify widening it.
-        count=tasks_created,
     )
     if shadow_enqueued:
         get_metrics().inbox_events_total.labels(result="shadow_enqueued").inc()
+    if task_planning_enqueued:
+        get_metrics().inbox_events_total.labels(result="task_planning_enqueued").inc()
     return outcome.status
 
 
@@ -834,15 +823,17 @@ async def _plan_conversation_tasks(
     lease_owner_type: str,
     deps: OrchestratorDeps,
     turn_created_at: int,
+    turn_id: str | None = None,
+    raise_errors: bool = False,
 ) -> int:
     """Analyse the turn and persist whatever tasks it implies. Returns a count.
 
     Gated twice: `agent.conversation_tasks` must be on, and the process kill
     switch must be up. With either off this returns before touching a table.
 
-    Every failure is swallowed. The customer's answer is already committed by
-    the time this runs, and a planner error must not mark their message failed
-    and trigger a retry that re-answers them.
+    Planner failures do not fail the customer's inbox event. The semantic
+    outbox consumer can opt into re-raising so it can mark that job failed and
+    make the failure visible without re-running the customer answer.
     """
     from platform_core.agent_runtime.semantic.context import build_context
     from platform_core.agent_runtime.semantic.contracts import SemanticMode
@@ -890,7 +881,7 @@ async def _plan_conversation_tasks(
         capabilities = capabilities_for_shadow(await _tenant_tool_names(session, tenant_id))
 
         ctx = build_context(
-            current_turn_id=str(turn_created_at),
+            current_turn_id=turn_id or str(turn_created_at),
             current_text=question,
             history=history,
             mode=SemanticMode.ASSIST,
@@ -900,8 +891,8 @@ async def _plan_conversation_tasks(
             AnalysisRequest(context=ctx, lease_owner_type=lease_owner_type),
             provider=provider,
             capabilities=capabilities,
-            # Longer than the shadow budget: this one is on the request path
-            # and its result is meant to be visible to the agent immediately.
+            # Bounded model time. This work runs in its own semantic queue and
+            # cannot delay the customer-facing inbox completion.
             budget=SemanticBudget(deadline_seconds=3.0, max_retries=0),
         )
         outcome = await run_task_planning(
@@ -920,7 +911,69 @@ async def _plan_conversation_tasks(
             conversation_ref_id=str(conversation_ref_id),
             error_code=type(exc).__name__,
         )
+        if raise_errors:
+            raise
         return 0
+
+
+async def _enqueue_task_planning(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_ref_id: uuid.UUID,
+    turn_id: str,
+) -> bool:
+    """Enqueue task analysis by reference, with no message text in the outbox."""
+    if not turn_id:
+        return False
+
+    from platform_core.agent_runtime.semantic.contracts import SemanticMode
+    from platform_core.agent_runtime.semantic.modes import FLAG_ASSIST, FLAG_TASKS, resolve_mode
+    from platform_core.agent_runtime.tasks.planning_seam import TASK_PLANNING_EVENT_TYPE
+    from platform_core.config import get_settings
+    from platform_core.knowledge import flag_service
+    from platform_core.outbox_service import enqueue
+
+    try:
+        decisions = await flag_service.evaluate_many(
+            session,
+            flag_keys=[FLAG_TASKS, FLAG_ASSIST],
+            tenant_id=tenant_id,
+            defaults={FLAG_TASKS: False, FLAG_ASSIST: False},
+        )
+        enabled = {key: decision.enabled for key, decision in decisions.items()}
+        if not enabled.get(FLAG_TASKS) or not enabled.get(FLAG_ASSIST):
+            return False
+        if resolve_mode(get_settings(), enabled).mode not in (
+            SemanticMode.ASSIST,
+            SemanticMode.SEMANTIC_READ,
+        ):
+            return False
+
+        event_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"task-planning:{tenant_id}:{conversation_ref_id}:{turn_id}",
+        )
+        await enqueue(
+            session,
+            tenant_id=tenant_id,
+            event_type=TASK_PLANNING_EVENT_TYPE,
+            aggregate_type="conversation",
+            aggregate_id=str(conversation_ref_id),
+            event_id=event_id,
+            payload={
+                "conversation_ref": str(conversation_ref_id),
+                "turn_id": turn_id,
+            },
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 - task planning cannot fail a customer run
+        logger.warning(
+            "task_planning_enqueue_failed",
+            conversation_ref_id=str(conversation_ref_id),
+            error_code=type(exc).__name__,
+        )
+        return False
 
 
 async def _enqueue_shadow(
@@ -929,9 +982,6 @@ async def _enqueue_shadow(
     tenant_id: uuid.UUID,
     conversation_ref_id: uuid.UUID,
     turn_id: str,
-    question: str,
-    history: list[tuple[str, str]],
-    turn_created_at: int,
 ) -> bool:
     """Queue a shadow classification if this tenant has shadow mode on.
 
@@ -939,17 +989,18 @@ async def _enqueue_shadow(
     failure propagates: a shadow enqueue that cannot be written must not fail
     an event whose customer answer is already committed.
 
-    The outbox row is the *request*. It carries the turn text because the
-    consumer needs it and the consumer is asynchronous; it is written inside
-    the tenant transaction, so it is as protected as the run itself, and the
-    consumer re-reads the turn from `conversation_turns` rather than trusting a
-    long-lived copy in a queue payload.
+    The outbox row contains only references. The worker resolves the redacted
+    turn after binding RLS for that tenant, so customer text is not copied into
+    a queue payload.
     """
     from platform_core.agent_runtime.semantic.modes import FLAG_SHADOW, resolve_mode
     from platform_core.agent_runtime.semantic.shadow import SHADOW_EVENT_TYPE
     from platform_core.config import get_settings
     from platform_core.knowledge import flag_service
     from platform_core.outbox_service import enqueue
+
+    if not turn_id:
+        return False
 
     try:
         decisions = await flag_service.evaluate_many(
@@ -968,16 +1019,13 @@ async def _enqueue_shadow(
             event_type=SHADOW_EVENT_TYPE,
             aggregate_type="conversation",
             aggregate_id=str(conversation_ref_id),
+            event_id=uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"shadow:{tenant_id}:{conversation_ref_id}:{turn_id}",
+            ),
             payload={
                 "conversation_ref": str(conversation_ref_id),
                 "turn_id": turn_id,
-                "turn_created_at": turn_created_at,
-                # Carried so the consumer can run without re-reading a
-                # minimised inbox payload, and so a turn that has since been
-                # pruned is still explainable. Bounded by the same truncation
-                # the synchronous path would have applied.
-                "question": question[:2000],
-                "history": history,
             },
         )
         return True

@@ -54,6 +54,10 @@ REASON_SHADOW_NO_TASKS = "SEMANTIC_SHADOW_WRITES_NO_TASKS"
 REASON_NO_INTENTS = "SEMANTIC_NO_INTENTS"
 REASON_NO_MODEL_OUTPUT = "SEMANTIC_NO_MODEL_OUTPUT"
 
+# Durable outbox request that a tenant-bound semantic worker analyzes after
+# the customer's inbox run has completed.
+TASK_PLANNING_EVENT_TYPE = "conversation.task_planning_requested"
+
 
 @dataclass(frozen=True)
 class PlanningOutcome:
@@ -249,6 +253,7 @@ __all__ = [
     "REASON_NO_MODEL_OUTPUT",
     "REASON_SHADOW_NO_TASKS",
     "REASON_TASKS_DISABLED",
+    "TASK_PLANNING_EVENT_TYPE",
     "TASK_CREATING_DECISIONS",
     "PlanningOutcome",
     "plan_and_persist",

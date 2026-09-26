@@ -45,7 +45,7 @@ ADMIN_URL = os.environ.get(
 )
 # The maintenance DB, used only to create/drop the throwaway test database.
 MAINTENANCE_URL = ADMIN_URL.rsplit("/", 1)[0] + "/postgres"
-MIG_DB_NAME = "platform_migtest"
+MIG_DB_NAME = f"platform_migtest_{os.getpid()}"
 MIG_DB_URL = ADMIN_URL.rsplit("/", 1)[0] + "/" + MIG_DB_NAME
 # The workspace path is `.../b2b-ai-support-plan/b2b-ai-support-plan/apps/...`,
 # so the repo root is parents[4] (parents[3] is the inner `apps/` dir).
@@ -130,7 +130,7 @@ TENANT_TABLES = (
 # revision (R1 conversation tasks, tasks events, copilot drafts and semantic
 # assessments); keep this synchronized with the tracked revision set, excluding
 # `.gitkeep` and any local-only migration files.
-EXPECTED_MIGRATIONS = 62
+EXPECTED_MIGRATIONS = 63
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

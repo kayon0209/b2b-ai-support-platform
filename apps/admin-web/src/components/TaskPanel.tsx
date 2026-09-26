@@ -36,11 +36,13 @@ import {
 
 export interface TaskSlot {
   name: string;
-  origin: "customer_stated" | "verified_receipt" | "inferred";
+  origin: "customer_stated" | "verified_receipt" | "inferred" | "agent_collected";
   confirmed: boolean;
   value?: unknown;
   value_withheld?: boolean;
   inferred?: boolean;
+  collected_by?: string;
+  collected_at?: number;
 }
 
 export interface ConversationTask {
@@ -120,6 +122,7 @@ const KIND_LABEL: Record<string, string> = {
 
 const ORIGIN_LABEL: Record<string, string> = {
   customer_stated: "客户自述",
+  agent_collected: "坐席录入",
   verified_receipt: "已核验回执",
   inferred: "推断（不可直接采信）",
 };
@@ -154,6 +157,7 @@ export function TaskPanel({
   const [collecting, setCollecting] = useState<Record<string, string>>({});
   const [announcement, setAnnouncement] = useState("");
   const collectRef = useRef<Record<string, HTMLInputElement | null>>({});
+  const emptyRefreshes = useRef(0);
   // The request counter, held in a ref because advancing it must not
   // re-render. `mayApply` decides whether a response may still land: a
   // sequence number alone does not catch a response that was already in
@@ -185,8 +189,18 @@ export function TaskPanel({
     setTasks(null);
     setCollecting({});
     setAnnouncement("");
+    emptyRefreshes.current = 0;
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (tasks === null || tasks.length > 0 || emptyRefreshes.current >= 3) return;
+    const timer = window.setTimeout(() => {
+      emptyRefreshes.current += 1;
+      void load();
+    }, 2000);
+    return () => window.clearTimeout(timer);
+  }, [load, tasks]);
 
   const run = useCallback(
     async (task: ConversationTask, command: TaskCommand, fields?: Record<string, string>) => {
@@ -248,8 +262,18 @@ export function TaskPanel({
     return (
       <div className="wb-tasks" role="group" aria-label="会话任务">
         <p className="wb-tasks-empty">
-          该会话没有待处理任务。客户的需求被识别后会在此列出。
+          暂无待处理任务。新消息的需求识别在后台运行，稍后会自动刷新。
         </p>
+        <button
+          type="button"
+          className="wb-btn wb-btn-ghost"
+          onClick={() => {
+            emptyRefreshes.current = 0;
+            void load();
+          }}
+        >
+          刷新任务
+        </button>
       </div>
     );
   }
@@ -371,7 +395,11 @@ function TaskRow({
               <dd>
                 {slot.value_withheld ? (
                   <span className="wb-task-withheld">
-                    {slot.inferred ? "推断值，未采信" : "已记录于会话，未在任务中展示"}
+                    {slot.inferred
+                      ? "推断值，未采信"
+                      : slot.origin === "agent_collected"
+                        ? "坐席录入的敏感值未保存"
+                        : "已记录于会话，未在任务中展示"}
                   </span>
                 ) : (
                   <span>{String(slot.value ?? "—")}</span>

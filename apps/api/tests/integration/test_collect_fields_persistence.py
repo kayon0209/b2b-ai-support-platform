@@ -7,7 +7,7 @@ nothing.
 
 These tests assert the three things that were false:
 
-1. The value is persisted, as a slot with an `origin` and a `turn_id`.
+1. The value is persisted on the task with operator provenance.
 2. A sensitive field's value is withheld while the fact of collection is kept.
 3. A field the task is not waiting for is refused, not silently dropped - and
    in neither case may the task reach `ready` without persisted evidence.
@@ -214,16 +214,18 @@ def test_the_collected_value_is_stored_with_a_source() -> None:
     row = _task_row()
     slot = next(s for s in row["slots"] if s["name"] == "order_no")
     assert slot["value"] == "SO-240918"
-    assert slot["origin"] == "customer_stated"
-    # And it points at a turn that exists, so it is not an unsourced value.
-    assert slot["turn_id"]
+    assert slot["origin"] == "agent_collected"
+    assert slot["collected_by"] == str(uuid.uuid5(uuid.NAMESPACE_URL, AGENT_REF))
+    assert slot["collected_at"] > 0
+    assert "turn_id" not in slot
 
 
-def test_the_collected_value_also_lands_in_the_conversation() -> None:
-    """The slot needs a transcript entry behind it, or it is an assertion."""
+def test_operator_collection_does_not_forge_a_customer_turn() -> None:
+    """A field typed by the agent must not appear as customer-authored text."""
     before = _turn_count()
-    _collect({"street": "上海南京西路 100 号"})
-    assert _turn_count() == before + 1
+    resp = _collect({"street": "上海南京西路 100 号"})
+    assert resp.status_code == 200, resp.text
+    assert _turn_count() == before
 
 
 def test_the_pre_existing_slot_is_preserved() -> None:

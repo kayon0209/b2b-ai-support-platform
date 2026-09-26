@@ -28,6 +28,7 @@ returned to a `CASE_READ` principal on a conversation they can already see.
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any, Literal
 
@@ -36,7 +37,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select as sa_select
 from sqlalchemy.exc import IntegrityError
 
-from platform_core.agent_runtime import chat_service
 from platform_core.agent_runtime.copilot import (
     COPILOT_EVENT_TYPE,
     CopilotError,
@@ -338,58 +338,29 @@ def _merge_slots(
 
 
 async def _persist_collected(
-    session: Any,
-    *,
     ctx: TenantContext,
-    conversation_ref: uuid.UUID,
-    task: Any,
     fields: dict[str, str],
-    trace_id: str,
 ) -> list[dict[str, Any]]:
-    """Write the operator's words to the conversation and return the slots.
+    """Persist operator-collected values with their actual provenance.
 
-    Two writes, in this order and for this reason:
-
-    1. A `human` turn carrying the collected values, so the value has an
-       author and a timestamp in the transcript - the same place the customer's
-       own words live. A slot pointing at a value with no transcript entry is a
-       fact with no source, which is what EVAL-02 counts as a failure.
-    2. The slot rows, with `origin: customer_stated` for a non-sensitive field
-       the customer typed, and `value_withheld` for a sensitive one. The task
-       then records that the field was answered and by whom, without becoming
-       a second copy of an address.
-
-    A task is only moved to `ready` when both writes succeed. If the turn write
-    fails, the exception propagates and the transition does not happen - which
-    is the point of B1-04: "no persisted evidence" must never read as
-    "collected".
+    The task's append-only transition records the operator actor and trace.
+    These values are not customer-authored turns, so no customer message is
+    manufactured. Sensitive values remain withheld; ordinary values can be
+    reviewed in the subsequent Tool Gateway proposal.
     """
 
-    text = "\n".join(f"{name}: {value}" for name, value in fields.items())
-    # `append_customer_turn`, not a hand-rolled insert: the collected text is
-    # the customer's words relayed by an agent, so it belongs in the
-    # conversation under the customer's role, and it must go through the same
-    # redactor every other customer turn does. A new insert path here would be
-    # a way to store unredacted PII.
-    turn, _duplicate = await chat_service.append_customer_turn(
-        session,
-        tenant_id=ctx.tenant_id,
-        ref_id=conversation_ref,
-        text=text,
-    )
+    if ctx.actor_id is None:
+        raise ValueError("an identified agent is required to collect task fields")
 
     slots: list[dict[str, Any]] = []
     for name, value in fields.items():
         sensitive = name.lower() in SENSITIVE_FIELD_NAMES
         slot: dict[str, Any] = {
             "name": name,
-            # The customer stated it, relayed by an agent. Not
-            # `verified_receipt`: nobody read it back from a system of record.
-            "origin": "customer_stated",
+            "origin": "agent_collected",
             "confirmed": False,
-            # The turn this value now exists in. Without it a slot is an
-            # assertion with nothing behind it.
-            "turn_id": str(turn.id),
+            "collected_by": str(ctx.actor_id),
+            "collected_at": int(time.time()),
         }
         if sensitive:
             slot["value_withheld"] = True
@@ -452,16 +423,11 @@ async def _build_command(
                 f"this task is not waiting for: {', '.join(unknown)}",
             )
 
-        # Append the operator's own words to the conversation first, so the
-        # value has a transcript entry with an author. The slot then points at
-        # a turn that exists.
+        # Keep operator-provided data on the task with explicit provenance.
+        # It is not a customer-authored transcript turn.
         collected = await _persist_collected(
-            session,
             ctx=ctx,
-            conversation_ref=conversation_ref,
-            task=task,
             fields=body.fields,
-            trace_id=trace_id,
         )
 
         remaining = [m for m in task.missing_slots if m not in requested]

@@ -30,7 +30,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
@@ -68,13 +68,18 @@ SHADOW_BATCH = 10
 
 @dataclass(frozen=True)
 class ClaimedShadow:
+    """Queue reference claimed without reading tenant payload as the owner role."""
+
+    event_id: uuid.UUID
+    tenant_id: uuid.UUID
+
+
+@dataclass(frozen=True)
+class ShadowWorkItem:
     event_id: uuid.UUID
     tenant_id: uuid.UUID
     conversation_ref_id: uuid.UUID
     turn_id: str
-    question: str
-    history: list[tuple[str, str]]
-    turn_created_at: int
 
 
 def chat_provider(deps: Any) -> Any | None:
@@ -102,52 +107,25 @@ async def claim_shadow_events(
     input.
     """
     rows = (
-        (
-            await session.execute(
-                select(OutboxEvent)
-                .where(
-                    OutboxEvent.event_type == SHADOW_EVENT_TYPE,
-                    OutboxEvent.status == OutboxStatus.QUEUED.value,
-                )
-                .order_by(OutboxEvent.created_at, OutboxEvent.id)
-                .limit(batch)
-                .with_for_update(skip_locked=True)
+        await session.execute(
+            select(OutboxEvent.id, OutboxEvent.event_id, OutboxEvent.tenant_id)
+            .where(
+                OutboxEvent.event_type == SHADOW_EVENT_TYPE,
+                OutboxEvent.status == OutboxStatus.QUEUED.value,
             )
+            .order_by(OutboxEvent.created_at, OutboxEvent.id)
+            .limit(batch)
+            .with_for_update(skip_locked=True)
         )
-        .scalars()
-        .all()
-    )
+    ).all()
     claimed: list[ClaimedShadow] = []
     for row in rows:
-        payload = dict(row.payload or {})
         await session.execute(
-            update(OutboxEvent).where(OutboxEvent.id == row.id).values(status=SHADOW_IN_FLIGHT)
+            update(OutboxEvent)
+            .where(OutboxEvent.id == row.id)
+            .values(status=SHADOW_IN_FLIGHT, processing_started_at=int(time.time()))
         )
-        try:
-            conversation_ref = uuid.UUID(str(payload.get("conversation_ref")))
-        except (TypeError, ValueError):
-            # A row whose aggregate cannot be read is terminal, not retryable:
-            # the same payload will fail identically forever.
-            await session.execute(
-                update(OutboxEvent)
-                .where(OutboxEvent.id == row.id)
-                .values(
-                    status=OutboxStatus.FAILED.value,
-                    last_error="shadow_conversation_ref_unreadable",
-                )
-            )
-            continue
-        claimed.append(
-            ClaimedShadow(
-                event_id=row.event_id,
-                tenant_id=row.tenant_id,
-                conversation_ref_id=conversation_ref,
-                turn_id=str(payload.get("turn_id") or ""),
-                question=str(payload.get("question") or ""),
-                history=[(str(h[0]), str(h[1])) for h in (payload.get("history") or [])],
-                turn_created_at=int(payload.get("turn_created_at") or 0),
-            )
-        )
+        claimed.append(ClaimedShadow(event_id=row.event_id, tenant_id=row.tenant_id))
     return claimed
 
 
@@ -164,9 +142,9 @@ async def reclaim_stale_shadow(session: AsyncSession) -> int:
         .where(
             OutboxEvent.event_type == SHADOW_EVENT_TYPE,
             OutboxEvent.status == SHADOW_IN_FLIGHT,
-            OutboxEvent.created_at < cutoff,
+            OutboxEvent.processing_started_at < cutoff,
         )
-        .values(status=OutboxStatus.QUEUED.value)
+        .values(status=OutboxStatus.QUEUED.value, processing_started_at=None)
     )
     return int(getattr(result, "rowcount", 0) or 0)
 
@@ -197,20 +175,79 @@ async def process_shadow_event(
         return "failed"
 
     try:
-        await registry.ensure_tool_definitions(session, tenant_id=claimed.tenant_id)
-        available = capabilities_for_shadow(await _tenant_tool_names(session, claimed.tenant_id))
+        # Queue claims run before a tenant is known and therefore select only
+        # queue metadata. Read the message-bearing payload after the worker has
+        # opened this tenant-bound app-role session.
+        event = (
+            await session.execute(
+                select(OutboxEvent).where(
+                    OutboxEvent.tenant_id == claimed.tenant_id,
+                    OutboxEvent.event_id == claimed.event_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if event is None:
+            return "missing"
+        payload = dict(event.payload or {})
+        work = _work_item(claimed, payload)
+        if work is None:
+            await _finish(
+                session,
+                claimed,
+                status=OutboxStatus.FAILED.value,
+                error="shadow_payload_unreadable",
+            )
+            return "failed"
+
+        from platform_core.agent_runtime.models import ConversationTurn
+
+        turn = (
+            await session.execute(
+                select(ConversationTurn).where(
+                    ConversationTurn.tenant_id == work.tenant_id,
+                    ConversationTurn.id == uuid.UUID(work.turn_id),
+                    ConversationTurn.conversation_ref_id == work.conversation_ref_id,
+                    ConversationTurn.role == "customer",
+                )
+            )
+        ).scalar_one_or_none()
+        if turn is None:
+            await _finish(
+                session,
+                claimed,
+                status=OutboxStatus.FAILED.value,
+                error="shadow_source_turn_missing",
+            )
+            return "failed"
+
+        history_rows = (
+            await session.execute(
+                select(ConversationTurn.id, ConversationTurn.text_redacted)
+                .where(
+                    ConversationTurn.tenant_id == work.tenant_id,
+                    ConversationTurn.conversation_ref_id == work.conversation_ref_id,
+                    tuple_(ConversationTurn.ts, ConversationTurn.id) < tuple_(turn.ts, turn.id),
+                )
+                .order_by(ConversationTurn.ts.desc(), ConversationTurn.id.desc())
+                .limit(8)
+            )
+        ).all()
+        history = [(str(row.id), row.text_redacted) for row in reversed(history_rows)]
+
+        await registry.ensure_tool_definitions(session, tenant_id=work.tenant_id)
+        available = capabilities_for_shadow(await _tenant_tool_names(session, work.tenant_id))
 
         outcome = await record_shadow(
             session,
             ShadowRequest(
-                tenant_id=claimed.tenant_id,
-                conversation_ref_id=claimed.conversation_ref_id,
-                turn_id=claimed.turn_id,
-                turn_text=claimed.question,
-                history=claimed.history,
+                tenant_id=work.tenant_id,
+                conversation_ref_id=work.conversation_ref_id,
+                turn_id=work.turn_id,
+                turn_text=turn.text_redacted,
+                history=history,
                 lease_owner_type="ai",
                 capabilities=available,
-                turn_created_at=claimed.turn_created_at or int(time.time()),
+                turn_created_at=int(turn.ts or time.time()),
             ),
             provider=provider,
             budget=SemanticBudget(
@@ -223,7 +260,7 @@ async def process_shadow_event(
         metrics.inbox_events_total.labels(result="shadow_error").inc()
         logger.warning(
             "shadow_process_failed",
-            conversation_ref_id=str(claimed.conversation_ref_id),
+            event_id=str(claimed.event_id),
             error_code=type(exc).__name__,
         )
         return "failed"
@@ -240,6 +277,20 @@ async def process_shadow_event(
     return "recorded"
 
 
+def _work_item(claimed: ClaimedShadow, payload: dict[str, Any]) -> ShadowWorkItem | None:
+    try:
+        conversation_ref = uuid.UUID(str(payload.get("conversation_ref")))
+        turn_id = str(uuid.UUID(str(payload.get("turn_id"))))
+    except (TypeError, ValueError):
+        return None
+    return ShadowWorkItem(
+        event_id=claimed.event_id,
+        tenant_id=claimed.tenant_id,
+        conversation_ref_id=conversation_ref,
+        turn_id=turn_id,
+    )
+
+
 async def _finish(
     session: AsyncSession, claimed: ClaimedShadow, *, status: str, error: str
 ) -> None:
@@ -249,6 +300,7 @@ async def _finish(
         .values(
             status=status,
             published_at=int(time.time()) if status == OutboxStatus.SENT.value else None,
+            processing_started_at=None,
             last_error=error[:255] if error else None,
         )
     )

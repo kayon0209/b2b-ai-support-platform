@@ -121,11 +121,6 @@ def test_the_consumer_context_is_system_scoped() -> None:
     claimed = ClaimedShadow(
         event_id=uuid.uuid4(),
         tenant_id=uuid.uuid4(),
-        conversation_ref_id=uuid.uuid4(),
-        turn_id="t-1",
-        question="查单",
-        history=[],
-        turn_created_at=0,
     )
     ctx = context_for(claimed)
     assert ctx.tenant_id == claimed.tenant_id
@@ -147,11 +142,6 @@ async def test_a_missing_provider_is_a_failure_not_a_record() -> None:
     claimed = ClaimedShadow(
         event_id=uuid.uuid4(),
         tenant_id=uuid.uuid4(),
-        conversation_ref_id=uuid.uuid4(),
-        turn_id="t-1",
-        question="查单",
-        history=[],
-        turn_created_at=0,
     )
     session = _CountingSession()
     outcome = await process_shadow_event(session, claimed, provider=None)  # type: ignore[arg-type]

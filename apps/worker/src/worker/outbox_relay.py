@@ -41,6 +41,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
 from observability_metrics import get_metrics
+from platform_core.agent_runtime.copilot import COPILOT_EVENT_TYPE
+from platform_core.agent_runtime.semantic.shadow import SHADOW_EVENT_TYPE
+from platform_core.agent_runtime.tasks.planning_seam import TASK_PLANNING_EVENT_TYPE
 from platform_core.billing.service import handle_usage_recorded
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
 from platform_core.outbox import OutboxEvent
@@ -94,6 +97,7 @@ class OutboxRelay:
     handlers: dict[str, OutboxHandler] = field(default_factory=dict)
     batch: int = DEFAULT_BATCH
     max_attempts: int = MAX_ATTEMPTS
+    excluded_event_types: tuple[str, ...] = ()
 
     def register(self, event_type: str, handler: OutboxHandler) -> None:
         self.handlers[event_type] = handler
@@ -135,7 +139,11 @@ class OutboxRelay:
         test saw `sent=1` and an empty rollup.
         """
         stats = RelayStats()
-        rows = await claim_pending(session, batch=self.batch)
+        rows = await claim_pending(
+            session,
+            batch=self.batch,
+            exclude_event_types=self.excluded_event_types,
+        )
         stats.claimed = len(rows)
         if not rows:
             return stats
@@ -307,7 +315,14 @@ def build_default_relay(batch: int = DEFAULT_BATCH) -> OutboxRelay:
     handler - so "usage quotas and billing events" (docs/development-plan.md
     Phase 5) had an emitter and no aggregator.
     """
-    relay = OutboxRelay(batch=batch)
+    relay = OutboxRelay(
+        batch=batch,
+        excluded_event_types=(
+            SHADOW_EVENT_TYPE,
+            COPILOT_EVENT_TYPE,
+            TASK_PLANNING_EVENT_TYPE,
+        ),
+    )
     relay.register("case.created", log_only_handler)
     relay.register("case.updated", log_only_handler)
     relay.register("usage.recorded", handle_usage_recorded)

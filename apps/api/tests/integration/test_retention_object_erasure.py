@@ -53,7 +53,10 @@ def _run(coro):
     return asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)
 
 
-APP_URL = "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform"
+APP_URL = os.environ.get(
+    "APP_TEST_DATABASE_URL",
+    "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
+)
 
 
 async def _with_rls(fn):

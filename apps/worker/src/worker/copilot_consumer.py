@@ -71,6 +71,12 @@ REPLY_SYSTEM_PROMPT = (
 class ClaimedCopilot:
     event_id: uuid.UUID
     tenant_id: uuid.UUID
+
+
+@dataclass(frozen=True)
+class CopilotWorkItem:
+    event_id: uuid.UUID
+    tenant_id: uuid.UUID
     job_id: uuid.UUID
     conversation_ref_id: uuid.UUID
     kind: CopilotKind
@@ -96,48 +102,25 @@ async def claim_copilot_jobs(
 ) -> list[ClaimedCopilot]:
     """Claim queued generation requests with SKIP LOCKED."""
     rows = (
-        (
-            await session.execute(
-                select(OutboxEvent)
-                .where(
-                    OutboxEvent.event_type == COPILOT_EVENT_TYPE,
-                    OutboxEvent.status == OutboxStatus.QUEUED.value,
-                )
-                .order_by(OutboxEvent.created_at, OutboxEvent.id)
-                .limit(batch)
-                .with_for_update(skip_locked=True)
+        await session.execute(
+            select(OutboxEvent.id, OutboxEvent.event_id, OutboxEvent.tenant_id)
+            .where(
+                OutboxEvent.event_type == COPILOT_EVENT_TYPE,
+                OutboxEvent.status == OutboxStatus.QUEUED.value,
             )
+            .order_by(OutboxEvent.created_at, OutboxEvent.id)
+            .limit(batch)
+            .with_for_update(skip_locked=True)
         )
-        .scalars()
-        .all()
-    )
+    ).all()
     claimed: list[ClaimedCopilot] = []
     for row in rows:
-        payload = dict(row.payload or {})
         await session.execute(
-            update(OutboxEvent).where(OutboxEvent.id == row.id).values(status=COPILOT_IN_FLIGHT)
+            update(OutboxEvent)
+            .where(OutboxEvent.id == row.id)
+            .values(status=COPILOT_IN_FLIGHT, processing_started_at=int(time.time()))
         )
-        try:
-            job_id = uuid.UUID(str(payload.get("job_id")))
-            conversation_ref = uuid.UUID(str(payload.get("conversation_ref")))
-        except (TypeError, ValueError):
-            await session.execute(
-                update(OutboxEvent)
-                .where(OutboxEvent.id == row.id)
-                .values(status=OutboxStatus.FAILED.value, last_error="copilot_payload_unreadable")
-            )
-            continue
-        claimed.append(
-            ClaimedCopilot(
-                event_id=row.event_id,
-                tenant_id=row.tenant_id,
-                job_id=job_id,
-                conversation_ref_id=conversation_ref,
-                kind=CopilotKind(str(payload.get("kind") or "summary")),
-                timeline_revision=int(payload.get("timeline_revision") or 0),
-                lease_version=int(payload.get("lease_version") or 0),
-            )
-        )
+        claimed.append(ClaimedCopilot(event_id=row.event_id, tenant_id=row.tenant_id))
     return claimed
 
 
@@ -149,9 +132,9 @@ async def reclaim_stale_copilot(session: AsyncSession) -> int:
         .where(
             OutboxEvent.event_type == COPILOT_EVENT_TYPE,
             OutboxEvent.status == COPILOT_IN_FLIGHT,
-            OutboxEvent.created_at < cutoff,
+            OutboxEvent.processing_started_at < cutoff,
         )
-        .values(status=OutboxStatus.QUEUED.value)
+        .values(status=OutboxStatus.QUEUED.value, processing_started_at=None)
     )
     return int(getattr(result, "rowcount", 0) or 0)
 
@@ -169,7 +152,26 @@ async def process_copilot_job(
     why the spinner stopped, rather than a job stuck in `queued` forever.
     """
     metrics = get_metrics()
-    draft = await _load_draft(session, claimed)
+    # Queue claims select only metadata on the owner connection. Read the
+    # customer-bearing payload after tenant_session has applied FORCE-RLS.
+    event = (
+        await session.execute(
+            select(OutboxEvent).where(
+                OutboxEvent.tenant_id == claimed.tenant_id,
+                OutboxEvent.event_id == claimed.event_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if event is None:
+        return "missing"
+    work = _work_item(claimed, dict(event.payload or {}))
+    if work is None:
+        await _finish_event(
+            session, claimed, status=OutboxStatus.FAILED.value, error="copilot_payload_unreadable"
+        )
+        return "failed"
+
+    draft = await _load_draft(session, work)
     if draft is None:
         await _finish_event(
             session, claimed, status=OutboxStatus.FAILED.value, error="draft_missing"
@@ -182,18 +184,18 @@ async def process_copilot_job(
         # discarded rather than merged, because merging generated text into a
         # half-typed reply is neither of the two things anyone wanted.
         await _mark_draft(
-            session, claimed, status=CopilotJobStatus.STALE.value, error="COPILOT_DRAFT_EDITED"
+            session, work, status=CopilotJobStatus.STALE.value, error="COPILOT_DRAFT_EDITED"
         )
-        await _finish_event(session, claimed, status=OutboxStatus.SENT.value, error="")
+        await _finish_event(session, work, status=OutboxStatus.SENT.value, error="")
         metrics.inbox_events_total.labels(result="copilot_edited").inc()
         return "edited"
 
     if provider is None:
         await _mark_draft(
-            session, claimed, status=CopilotJobStatus.FAILED.value, error="no_chat_provider"
+            session, work, status=CopilotJobStatus.FAILED.value, error="no_chat_provider"
         )
         await _finish_event(
-            session, claimed, status=OutboxStatus.FAILED.value, error="no_chat_provider"
+            session, work, status=OutboxStatus.FAILED.value, error="no_chat_provider"
         )
         metrics.inbox_events_total.labels(result="copilot_no_provider").inc()
         return "failed"
@@ -201,16 +203,16 @@ async def process_copilot_job(
     from platform_core.agent_runtime.chat_service import read_timeline_page
     from platform_core.llm.provider import ChatMessage, ProviderRole
 
-    turns, _older = await read_timeline_page(session, ref_id=claimed.conversation_ref_id, limit=40)
+    turns, _older = await read_timeline_page(session, ref_id=work.conversation_ref_id, limit=40)
     if not turns:
         await _mark_draft(
-            session, claimed, status=CopilotJobStatus.FAILED.value, error="COPILOT_NO_CONTEXT"
+            session, work, status=CopilotJobStatus.FAILED.value, error="COPILOT_NO_CONTEXT"
         )
-        await _finish_event(session, claimed, status=OutboxStatus.FAILED.value, error="no_context")
+        await _finish_event(session, work, status=OutboxStatus.FAILED.value, error="no_context")
         metrics.inbox_events_total.labels(result="copilot_no_context").inc()
         return "failed"
 
-    system = SUMMARY_SYSTEM_PROMPT if claimed.kind is CopilotKind.SUMMARY else REPLY_SYSTEM_PROMPT
+    system = SUMMARY_SYSTEM_PROMPT if work.kind is CopilotKind.SUMMARY else REPLY_SYSTEM_PROMPT
     transcript = "\n".join(f"[{t.get('role')}] {t.get('text')}" for t in turns if t.get("text"))
     try:
         completion = await provider.complete(
@@ -223,8 +225,8 @@ async def process_copilot_job(
         )
     except Exception as exc:  # noqa: BLE001 - recorded on the row, not raised
         code = type(exc).__name__
-        await _mark_draft(session, claimed, status=CopilotJobStatus.FAILED.value, error=code)
-        await _finish_event(session, claimed, status=OutboxStatus.FAILED.value, error=code)
+        await _mark_draft(session, work, status=CopilotJobStatus.FAILED.value, error=code)
+        await _finish_event(session, work, status=OutboxStatus.FAILED.value, error=code)
         metrics.inbox_events_total.labels(result="copilot_error").inc()
         logger.warning("copilot_generation_failed", error_code=code)
         return "failed"
@@ -232,38 +234,61 @@ async def process_copilot_job(
     body = (completion.text or "").strip()
     if not body:
         await _mark_draft(
-            session, claimed, status=CopilotJobStatus.FAILED.value, error="COPILOT_EMPTY_OUTPUT"
+            session, work, status=CopilotJobStatus.FAILED.value, error="COPILOT_EMPTY_OUTPUT"
         )
-        await _finish_event(
-            session, claimed, status=OutboxStatus.FAILED.value, error="empty_output"
-        )
+        await _finish_event(session, work, status=OutboxStatus.FAILED.value, error="empty_output")
         metrics.inbox_events_total.labels(result="copilot_empty").inc()
         return "failed"
 
     # Staleness decided here rather than only on read: a result that is stale
     # on arrival should not be recorded as `succeeded` and then flip, because a
     # poller that saw `succeeded` may already have rendered it.
-    job = _row_to_copilot(draft, body=body, now=int(time.time()))
+    job = _row_to_copilot(
+        draft,
+        body=body,
+        now=int(time.time()),
+        status=CopilotJobStatus.SUCCEEDED,
+    )
     refreshed = apply_staleness(
         job,
-        current_timeline_revision=claimed.timeline_revision,
-        current_lease_version=claimed.lease_version,
+        current_timeline_revision=work.timeline_revision,
+        current_lease_version=work.lease_version,
         current_actor_id=draft.actor_id,
         now=int(time.time()),
     )
     await _mark_draft(
         session,
-        claimed,
+        work,
         status=refreshed.status.value,
         error=refreshed.error_code,
         body=body,
     )
-    await _finish_event(session, claimed, status=OutboxStatus.SENT.value, error="")
+    await _finish_event(session, work, status=OutboxStatus.SENT.value, error="")
     metrics.inbox_events_total.labels(result=f"copilot_{refreshed.status.value}").inc()
     return refreshed.status.value
 
 
-async def _load_draft(session: AsyncSession, claimed: ClaimedCopilot) -> Any | None:
+def _work_item(claimed: ClaimedCopilot, payload: dict[str, Any]) -> CopilotWorkItem | None:
+    try:
+        job_id = uuid.UUID(str(payload.get("job_id")))
+        conversation_ref = uuid.UUID(str(payload.get("conversation_ref")))
+        kind = CopilotKind(str(payload.get("kind") or "summary"))
+        timeline_revision = int(payload.get("timeline_revision") or 0)
+        lease_version = int(payload.get("lease_version") or 0)
+    except (TypeError, ValueError):
+        return None
+    return CopilotWorkItem(
+        event_id=claimed.event_id,
+        tenant_id=claimed.tenant_id,
+        job_id=job_id,
+        conversation_ref_id=conversation_ref,
+        kind=kind,
+        timeline_revision=timeline_revision,
+        lease_version=lease_version,
+    )
+
+
+async def _load_draft(session: AsyncSession, claimed: CopilotWorkItem) -> Any | None:
     from platform_core.agent_runtime.tasks.models import CopilotDraft
 
     return (
@@ -278,7 +303,7 @@ async def _load_draft(session: AsyncSession, claimed: ClaimedCopilot) -> Any | N
 
 async def _mark_draft(
     session: AsyncSession,
-    claimed: ClaimedCopilot,
+    claimed: CopilotWorkItem,
     *,
     status: str,
     error: str | None = None,
@@ -302,7 +327,11 @@ async def _mark_draft(
 
 
 async def _finish_event(
-    session: AsyncSession, claimed: ClaimedCopilot, *, status: str, error: str
+    session: AsyncSession,
+    claimed: ClaimedCopilot | CopilotWorkItem,
+    *,
+    status: str,
+    error: str,
 ) -> None:
     await session.execute(
         update(OutboxEvent)
@@ -310,19 +339,26 @@ async def _finish_event(
         .values(
             status=status,
             published_at=int(time.time()) if status == OutboxStatus.SENT.value else None,
+            processing_started_at=None,
             last_error=error[:255] if error else None,
         )
     )
 
 
-def _row_to_copilot(draft: Any, *, body: str, now: int) -> CopilotJob:
+def _row_to_copilot(
+    draft: Any,
+    *,
+    body: str,
+    now: int,
+    status: CopilotJobStatus | None = None,
+) -> CopilotJob:
     return CopilotJob(
         job_id=draft.job_id,
         tenant_id=draft.tenant_id,
         conversation_ref_id=draft.conversation_ref_id,
         actor_id=draft.actor_id,
         kind=CopilotKind(draft.kind),
-        status=CopilotJobStatus(draft.status),
+        status=status or CopilotJobStatus(draft.status),
         timeline_revision=draft.timeline_revision,
         lease_version=draft.lease_version,
         task_id=draft.task_id,

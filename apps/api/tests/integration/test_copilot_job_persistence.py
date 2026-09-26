@@ -19,6 +19,7 @@ These tests assert:
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import os
 import pathlib
@@ -147,6 +148,10 @@ def _post(**overrides):
         headers={"Authorization": "Bearer pt_bootstrap_test", "Idempotency-Key": "k1"},
         json=payload,
     )
+
+
+def _run(coro: object) -> object:
+    return asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)  # type: ignore[arg-type]
 
 
 def _row_count() -> int:
@@ -321,3 +326,40 @@ def test_the_consumer_takes_the_chat_provider_not_the_generator() -> None:
         assert pick(_Deps(chat=chat)) is chat
         assert pick(_Deps(chat=_Generator())) is None
         assert pick(_Deps()) is None
+
+
+def test_semantic_worker_consumes_a_queued_copilot_job() -> None:
+    """The production poller must turn the durable request into a draft body."""
+    from platform_core.agent_runtime.orchestrator import OrchestratorDeps
+    from worker.runner import SemanticWorker
+
+    class _Chat:
+        async def complete(self, *args: object, **kwargs: object) -> object:
+            from platform_core.llm.provider import ChatResult
+
+            return ChatResult(text="订单正在核实中。", model="stub")
+
+    created = _post()
+    assert created.status_code == 200, created.text
+    job_id = created.json()["job_id"]
+    worker = SemanticWorker(OrchestratorDeps(extra={"chat": _Chat()}))
+
+    processed = _run(worker.run_once())
+
+    assert isinstance(processed, int) and processed >= 1
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        row = conn.execute(
+            text("SELECT status, body FROM copilot_drafts WHERE tenant_id = :t AND job_id = :j"),
+            {"t": TENANT, "j": job_id},
+        ).one()
+        event = conn.execute(
+            text(
+                "SELECT status, processing_started_at FROM outbox_events "
+                "WHERE tenant_id = :t AND event_type = 'copilot.generate_requested'"
+            ),
+            {"t": TENANT},
+        ).one()
+    admin.dispose()
+    assert row == ("succeeded", "订单正在核实中。")
+    assert event == ("sent", None)

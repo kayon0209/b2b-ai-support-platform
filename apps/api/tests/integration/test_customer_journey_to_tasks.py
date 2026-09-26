@@ -199,31 +199,35 @@ def _seed(*, with_tools: bool = True) -> None:
         if with_tools:
             from platform_core.tool_gateway.registry import TOOL_CATALOG
 
-            for name, (risk, schema, perms, conf) in TOOL_CATALOG.items():
-                conn.execute(
-                    text(
-                        "INSERT INTO tool_definitions (id, tenant_id, name, version, risk, "
-                        "input_schema, output_schema, required_permissions, timeout_ms, "
-                        "idempotent, requires_confirmation) "
-                        "VALUES (:id, NULL, :name, 1, :risk, CAST(:schema AS jsonb), "
-                        "'{}'::jsonb, CAST(:perms AS jsonb), 5000, true, :conf) "
-                        "ON CONFLICT DO NOTHING"
-                    ),
-                    {
-                        "id": uuid.uuid4(),
-                        "name": name,
-                        "risk": risk,
-                        "schema": json.dumps(schema),
-                        "perms": json.dumps(perms),
-                        "conf": conf,
-                    },
-                )
+            for tenant_id in (TENANT, OTHER):
+                for name, (risk, schema, perms, conf) in TOOL_CATALOG.items():
+                    conn.execute(
+                        text(
+                            "INSERT INTO tool_definitions (id, tenant_id, name, version, risk, "
+                            "input_schema, output_schema, required_permissions, timeout_ms, "
+                            "idempotent, requires_confirmation) "
+                            "VALUES (:id, :tenant_id, :name, 1, :risk, CAST(:schema AS jsonb), "
+                            "'{}'::jsonb, CAST(:perms AS jsonb), 5000, true, :conf) "
+                            "ON CONFLICT DO NOTHING"
+                        ),
+                        {
+                            "id": uuid.uuid4(),
+                            "tenant_id": tenant_id,
+                            "name": name,
+                            "risk": risk,
+                            "schema": json.dumps(schema),
+                            "perms": json.dumps(perms),
+                            "conf": conf,
+                        },
+                    )
     admin.dispose()
 
 
 def _clear() -> None:
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
+        from platform_core.tool_gateway.registry import TOOL_CATALOG
+
         for tenant in (TENANT, OTHER):
             conn.execute(
                 text("DELETE FROM conversation_task_events WHERE tenant_id = :t"), {"t": tenant}
@@ -232,10 +236,16 @@ def _clear() -> None:
             conn.execute(
                 text("DELETE FROM semantic_assessments WHERE tenant_id = :t"), {"t": tenant}
             )
+            conn.execute(text("DELETE FROM conversation_turns WHERE tenant_id = :t"), {"t": tenant})
             conn.execute(text("DELETE FROM outbox_events WHERE tenant_id = :t"), {"t": tenant})
             conn.execute(
                 text("DELETE FROM conversation_control_leases WHERE tenant_id = :t"), {"t": tenant}
             )
+            for name in TOOL_CATALOG:
+                conn.execute(
+                    text("DELETE FROM tool_definitions WHERE tenant_id = :t AND name = :name"),
+                    {"t": tenant, "name": name},
+                )
     admin.dispose()
 
 
@@ -449,6 +459,58 @@ def test_another_tenant_sees_no_tasks() -> None:
     )
     assert len(_tasks()) == 3
     assert _tasks(conversation=OTHER_CONV, tenant=OTHER) == []
+
+
+def test_semantic_worker_consumes_the_deferred_task_event() -> None:
+    """The production worker claims the id-only event and plans from RLS turns."""
+    from platform_core.agent_runtime.chat_service import append_customer_turn
+    from platform_core.agent_runtime.orchestrator import OrchestratorDeps
+    from platform_core.identity.tenant_context import TenantContext, tenant_session
+    from worker.inbox_consumer import _enqueue_task_planning
+    from worker.runner import SemanticWorker
+
+    _set_flags(TENANT, ["agent.conversation_tasks", "agent.semantic_assist"])
+    ctx = TenantContext(
+        tenant_id=uuid.UUID(TENANT), actor_id=None, actor_kind="system", role="integration_service"
+    )
+
+    async def enqueue_job() -> str:
+        async with tenant_session(ctx) as session:
+            turn, _duplicate = await append_customer_turn(
+                session,
+                tenant_id=uuid.UUID(TENANT),
+                ref_id=uuid.UUID(CONV),
+                text=CUSTOMER_TEXT,
+            )
+            enqueued = await _enqueue_task_planning(
+                session,
+                tenant_id=uuid.UUID(TENANT),
+                conversation_ref_id=uuid.UUID(CONV),
+                turn_id=str(turn.id),
+            )
+            assert enqueued
+            return str(turn.id)
+
+    turn_id = _run(enqueue_job())
+    provider = _StubProvider(MODEL_OUTPUT.replace('"t-1"', f'"{turn_id}"'))
+    worker = SemanticWorker(OrchestratorDeps(extra={"chat": provider}))
+    assert _run(worker.run_once()) >= 1
+    assert provider.calls == 1
+    assert len(_tasks()) == 3
+
+    admin = create_engine(ADMIN_URL)
+    with admin.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT status, processing_started_at, payload FROM outbox_events "
+                "WHERE tenant_id = :t AND event_type = 'conversation.task_planning_requested'"
+            ),
+            {"t": TENANT},
+        ).one()
+    admin.dispose()
+    assert row[0] == "sent"
+    assert row[1] is None
+    assert "question" not in row[2]
 
 
 # --- the seam ----------------------------------------------------------------
