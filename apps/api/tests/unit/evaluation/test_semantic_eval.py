@@ -131,17 +131,30 @@ def test_the_hash_is_stable_across_input_order() -> None:
     assert dataset_hash(a) == dataset_hash(b)
 
 
-def test_the_hash_ignores_wording() -> None:
-    """Two datasets differing only in prose are the same evaluation; a hash
-    that moved with the wording would reset every comparison."""
+def test_the_hash_changes_when_wording_changes() -> None:
+    """The exact holdout input is part of the experiment being measured."""
     a = [_case("c1", "f", "查一下 SO-1", ("business_query",), ("single_intent",))]
     b = [_case("c1", "f", "请问订单 SO-1 状态", ("business_query",), ("single_intent",))]
-    assert dataset_hash(a) == dataset_hash(b)
+    assert dataset_hash(a) != dataset_hash(b)
 
 
 def test_the_hash_moves_when_a_label_changes() -> None:
     a = [_case("c1", "f", "x", ("business_query",), ("single_intent",))]
     b = [_case("c1", "f", "x", ("business_action",), ("single_intent",))]
+    assert dataset_hash(a) != dataset_hash(b)
+
+
+def test_the_hash_moves_when_an_expected_slot_changes() -> None:
+    a = [
+        _case(
+            "c1", "f", "查 SO-1", ("business_query",), _SINGLE, expected_slots={"order_id": "SO-1"}
+        )
+    ]
+    b = [
+        _case(
+            "c1", "f", "查 SO-1", ("business_query",), _SINGLE, expected_slots={"order_id": "SO-2"}
+        )
+    ]
     assert dataset_hash(a) != dataset_hash(b)
 
 
@@ -286,11 +299,13 @@ def test_the_rules_baseline_is_measured_even_when_the_model_is_blocked() -> None
     assert report.blocked is True
     assert report.case_count == len(holdout)
     if holdout:
-        assert report.rules["macro_f1_proxy"] == 1.0
+        assert report.rules["macro_f1"] == 1.0
+        assert report.rules["exact_match_rate"] == 1.0
     else:
         # A 1-case-per-family dataset can leave a split empty; the report must
         # say so rather than divide by zero.
-        assert report.rules["macro_f1_proxy"] == 0.0
+        assert report.rules["macro_f1"] == 0.0
+        assert report.rules["exact_match_rate"] == 0.0
 
 
 def test_a_measured_run_reports_per_slice_numbers() -> None:
@@ -312,7 +327,13 @@ def test_a_measured_run_reports_per_slice_numbers() -> None:
     )
     assert report.blocked is False
     assert report.case_count == 2
-    assert report.model["macro_f1_proxy"] == 0.5
+    assert report.model["macro_f1"] == 0.3333
+    assert report.model["micro_f1"] == 0.5
+    assert report.model["exact_match_rate"] == 0.5
+    by_intent = {score.intent: score for score in report.model_intents}
+    assert by_intent["business_query"].true_positive == 1
+    assert by_intent["human_request"].false_negative == 1
+    assert by_intent["business_action"].false_positive == 1
     by_slice = {s.slice_name: s for s in report.model_slices}
     assert by_slice["chinese"].total == 2
     assert by_slice["chinese"].correct == 1
@@ -333,6 +354,26 @@ def test_failures_carry_no_customer_text() -> None:
     blob = json.dumps(report.failures, ensure_ascii=False)
     assert "SO-1" not in blob
     assert "我的订单" not in blob
+
+
+def test_macro_f1_is_per_class_and_exact_match_is_reported_separately() -> None:
+    families = [_family_in(Split.HOLDOUT, ordinal) for ordinal in range(4)]
+    cases = [
+        _case("c1", families[0], "a1", ("a",), _SINGLE),
+        _case("c2", families[1], "a2", ("a",), _SINGLE),
+        _case("c3", families[2], "a3", ("a",), _SINGLE),
+        _case("c4", families[3], "b1", ("b",), _SINGLE),
+    ]
+    report = compare(
+        cases,
+        split=Split.HOLDOUT,
+        rules_predictions={},
+        model_predictions={"c1": ["a"], "c2": ["a"], "c3": ["b"], "c4": ["b"]},
+    )
+
+    assert report.model["macro_f1"] == 0.7333
+    assert report.model["micro_f1"] == 0.75
+    assert report.model["exact_match_rate"] == 0.75
 
 
 def test_the_report_is_json_serialisable() -> None:
@@ -384,4 +425,4 @@ def test_the_rules_baseline_can_be_run_without_a_model() -> None:
     )
     assert report.blocked is True
     assert report.case_count == 2
-    assert report.rules["macro_f1_proxy"] == 1.0
+    assert report.rules["macro_f1"] == 1.0

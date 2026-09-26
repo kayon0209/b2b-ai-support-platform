@@ -110,10 +110,9 @@ EVAL_PROVENANCE = {
 def dataset_hash(cases: Iterable[EvalCase]) -> str:
     """A stable hash of the dataset.
 
-    Over the case ids and labels only - not the text. Two datasets that differ
-    only in wording are the same evaluation, and a hash that changed with the
-    prose would mark every reworded dataset as a new experiment and quietly
-    reset the comparison.
+    The exact wording is part of the measured input: changing a paraphrase can
+    change model behavior even when its labels stay fixed. The report stores
+    only this digest, never the source text.
     """
     canonical = json.dumps(
         sorted(
@@ -121,10 +120,13 @@ def dataset_hash(cases: Iterable[EvalCase]) -> str:
                 {
                     "case_id": c.case_id,
                     "family": c.family,
+                    "text": c.text,
                     "intents": sorted(c.expected_intents),
                     "scene": c.expected_scene,
+                    "slots": c.expected_slots,
                     "missing": sorted(c.missing_slots),
                     "slices": sorted(c.slices),
+                    "provenance": c.provenance,
                 }
                 for c in cases
             ),
@@ -132,6 +134,7 @@ def dataset_hash(cases: Iterable[EvalCase]) -> str:
         ),
         sort_keys=True,
         ensure_ascii=False,
+        separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -246,6 +249,46 @@ class SliceScore:
 
 
 @dataclass
+class IntentClassScore:
+    """One-vs-rest class counts for a multilabel intent evaluation."""
+
+    intent: str
+    true_positive: int = 0
+    false_positive: int = 0
+    false_negative: int = 0
+
+    @property
+    def support(self) -> int:
+        return self.true_positive + self.false_negative
+
+    @property
+    def precision(self) -> float:
+        denominator = self.true_positive + self.false_positive
+        return self.true_positive / denominator if denominator else 0.0
+
+    @property
+    def recall(self) -> float:
+        return self.true_positive / self.support if self.support else 0.0
+
+    @property
+    def f1(self) -> float:
+        denominator = self.precision + self.recall
+        return 2 * self.precision * self.recall / denominator if denominator else 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "intent": self.intent,
+            "support": self.support,
+            "true_positive": self.true_positive,
+            "false_positive": self.false_positive,
+            "false_negative": self.false_negative,
+            "precision": round(self.precision, 4),
+            "recall": round(self.recall, 4),
+            "f1": round(self.f1, 4),
+        }
+
+
+@dataclass
 class ComparisonReport:
     """The result of one rules-vs-model comparison.
 
@@ -262,6 +305,8 @@ class ComparisonReport:
     prompt_version: str = ""
     rules: dict[str, float] = field(default_factory=dict)
     model: dict[str, float] = field(default_factory=dict)
+    rules_intents: list[IntentClassScore] = field(default_factory=list)
+    model_intents: list[IntentClassScore] = field(default_factory=list)
     rules_slices: list[SliceScore] = field(default_factory=list)
     model_slices: list[SliceScore] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)
@@ -282,6 +327,8 @@ class ComparisonReport:
             "status": "blocked" if self.blocked else "measured",
             "rules": self.rules,
             "model": self.model,
+            "rules_intents": [score.as_dict() for score in self.rules_intents],
+            "model_intents": [score.as_dict() for score in self.model_intents],
             "rules_slices": [s.as_dict() for s in self.rules_slices],
             "model_slices": [s.as_dict() for s in self.model_slices],
             "failure_count": len(self.failures),
@@ -301,6 +348,51 @@ def score_intent_set(expected: tuple[str, ...], predicted: Iterable[str]) -> boo
     customer who asked three things did not get two of them dropped.
     """
     return set(expected) == set(predicted)
+
+
+def score_intents(
+    cases: list[EvalCase], predictions: dict[str, list[str]]
+) -> tuple[dict[str, float], list[IntentClassScore]]:
+    """Return multilabel micro/macro F1, exact-set match, and per-intent counts.
+
+    F1 is calculated one-vs-rest for each label in the gold/prediction union;
+    exact-set match remains separate because missing a secondary intent is a
+    full-case failure even when the per-class F1 stays high.
+    """
+    labels = sorted(
+        {label for case in cases for label in case.expected_intents}
+        | {label for case in cases for label in predictions.get(case.case_id, [])}
+    )
+    scores: list[IntentClassScore] = []
+    for label in labels:
+        score = IntentClassScore(intent=label)
+        for case in cases:
+            expected = set(case.expected_intents)
+            predicted = set(predictions.get(case.case_id, []))
+            if label in expected and label in predicted:
+                score.true_positive += 1
+            elif label in predicted:
+                score.false_positive += 1
+            elif label in expected:
+                score.false_negative += 1
+        scores.append(score)
+
+    total_tp = sum(score.true_positive for score in scores)
+    total_fp = sum(score.false_positive for score in scores)
+    total_fn = sum(score.false_negative for score in scores)
+    micro_denominator = 2 * total_tp + total_fp + total_fn
+    exact_matches = sum(
+        score_intent_set(case.expected_intents, predictions.get(case.case_id, [])) for case in cases
+    )
+    macro_f1 = sum(score.f1 for score in scores) / len(scores) if scores else 0.0
+    return (
+        {
+            "macro_f1": round(macro_f1, 4),
+            "micro_f1": round(2 * total_tp / micro_denominator, 4) if micro_denominator else 0.0,
+            "exact_match_rate": round(exact_matches / len(cases), 4) if cases else 0.0,
+        },
+        scores,
+    )
 
 
 def compare(
@@ -348,7 +440,7 @@ def compare(
             rules_slices[slice_name].total += 1
             rules_slices[slice_name].correct += int(hit)
 
-    report.rules = {"macro_f1_proxy": round(overall_rules.accuracy, 4)}
+    report.rules, report.rules_intents = score_intents(subset, rules)
     report.rules_slices = sorted(rules_slices.values(), key=lambda s: s.slice_name)
 
     if model is None:
@@ -384,7 +476,7 @@ def compare(
                 }
             )
 
-    report.model = {"macro_f1_proxy": round(overall_model.accuracy, 4)}
+    report.model, report.model_intents = score_intents(subset, model)
     report.model_slices = sorted(model_slices.values(), key=lambda s: s.slice_name)
     return report
 
@@ -396,6 +488,7 @@ __all__ = [
     "VALIDATION_FRACTION",
     "ComparisonReport",
     "EvalCase",
+    "IntentClassScore",
     "SliceScore",
     "Split",
     "assign_split",
@@ -403,6 +496,7 @@ __all__ = [
     "dataset_hash",
     "missing_slice_problems",
     "score_intent_set",
+    "score_intents",
     "split_dataset",
     "validate_dataset",
 ]
