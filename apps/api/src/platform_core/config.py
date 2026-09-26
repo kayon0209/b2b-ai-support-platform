@@ -96,7 +96,7 @@ class Settings(BaseSettings):
     # LLM provider (Gitee AI / 模力方舟, OpenAI-compatible surface).
     # Credentials are resolved server-side and never reach the model or logs
     # (docs/security.md). Unset api_key means the model boundary fails closed.
-    llm_base_url: str = "https://ai.gitee.com/v1"
+    llm_base_url: str = "https://api.moark.com/v1"
     llm_api_key: SecretStr | None = None
     llm_model: str = "qwen3.8-flash"
     # Feature list 11.2: per-task model routing. Classification and answer
