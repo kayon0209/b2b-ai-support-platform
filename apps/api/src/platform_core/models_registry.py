@@ -31,6 +31,9 @@ session has complete metadata. None of the mapped modules import `db` (checked),
 so there is no cycle.
 """
 
+from platform_core.agent_runtime import (
+    emotion_advice_models as _emotion_advice_models,  # noqa: F401
+)
 from platform_core.agent_runtime import models as _agent_runtime_models  # noqa: F401
 from platform_core.agent_runtime.tasks import models as _task_models  # noqa: F401
 from platform_core.audit import models as _audit_models  # noqa: F401

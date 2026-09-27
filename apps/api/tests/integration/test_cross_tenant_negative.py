@@ -110,6 +110,7 @@ TENANT_TABLES = (
     "conversation_tasks",
     "conversation_task_events",
     "copilot_drafts",
+    "emotion_advice_reviews",
 )
 
 _seed_ids: dict[str, str] = {}
@@ -534,6 +535,13 @@ def seed_all_tables() -> None:
                 "INSERT INTO copilot_drafts (id, tenant_id, conversation_ref_id, actor_id, "
                 "job_id, kind, status, created_at, updated_at) VALUES (:i, :t, :conversation, "
                 "gen_random_uuid(), gen_random_uuid(), 'summary', 'queued', 1000, 1000)",
+            ),
+            (
+                "emotion_advice_reviews",
+                "INSERT INTO emotion_advice_reviews (id, tenant_id, conversation_ref_id, "
+                "advice_id, suggested_level, corrected_level, reason_code, reviewer_id, "
+                "idempotency_key, created_at) VALUES (:i, :t, :conversation, :hash, "
+                "'angry', 'frustrated', 'overstated', gen_random_uuid(), :slug, 1000)",
             ),
         ]
         for _table, stmt in stmts:

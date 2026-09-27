@@ -1,5 +1,18 @@
 """Shared event schemas and contract validation for the platform."""
 
+from .business_systems import (
+    AuthorityBinding,
+    AuthorityDomain,
+    BusinessSystemKind,
+    BusinessWriteReason,
+    BusinessWriteStatus,
+    CanonicalInventorySnapshot,
+    CanonicalProductSpecification,
+    CanonicalQuote,
+    ExternalWriteReceipt,
+    OwnershipProof,
+    SourceMetadata,
+)
 from .events import (
     EVENT_VERSION,
     PAYLOAD_SCHEMAS,
@@ -14,18 +27,43 @@ from .events import (
     is_known_inbound_event_type,
     validate_event,
 )
+from .knowledge_release import (
+    MAX_ALLOWED_REGRESSION,
+    KnowledgeEvalMetrics,
+    KnowledgeEvalRun,
+    KnowledgeReleaseApproval,
+    KnowledgeReleaseGateResult,
+    evaluate_knowledge_release,
+)
 
 __all__ = [
     "EVENT_VERSION",
+    "AuthorityBinding",
+    "AuthorityDomain",
     "AggregateType",
+    "BusinessSystemKind",
+    "BusinessWriteReason",
+    "BusinessWriteStatus",
     "CaseCreatedPayload",
     "CaseUpdatedPayload",
+    "CanonicalInventorySnapshot",
+    "CanonicalProductSpecification",
+    "CanonicalQuote",
     "ContractError",
+    "ExternalWriteReceipt",
     "EventEnvelope",
     "EventType",
     "InboundEventType",
+    "KnowledgeEvalMetrics",
+    "KnowledgeEvalRun",
+    "KnowledgeReleaseApproval",
+    "KnowledgeReleaseGateResult",
+    "MAX_ALLOWED_REGRESSION",
+    "OwnershipProof",
     "PAYLOAD_SCHEMAS",
+    "SourceMetadata",
     "is_known_event_type",
     "is_known_inbound_event_type",
     "validate_event",
+    "evaluate_knowledge_release",
 ]

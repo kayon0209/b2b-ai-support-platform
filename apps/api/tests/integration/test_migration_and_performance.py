@@ -50,7 +50,12 @@ MIG_DB_URL = ADMIN_URL.rsplit("/", 1)[0] + "/" + MIG_DB_NAME
 # The workspace path is `.../b2b-ai-support-plan/b2b-ai-support-plan/apps/...`,
 # so the repo root is parents[4] (parents[3] is the inner `apps/` dir).
 ALEMBIC_INI = Path(__file__).resolve().parents[4] / "apps" / "api" / "migrations" / "alembic.ini"
-ARTIFACT_DIR = Path(__file__).resolve().parents[4] / "tests" / "artifacts"
+ARTIFACT_DIR = Path(
+    os.environ.get(
+        "APP_TEST_ARTIFACT_DIR",
+        str(Path(__file__).resolve().parents[4] / "tests" / "artifacts"),
+    )
+)
 
 # Every tenant-owned table that must carry FORCE ROW LEVEL SECURITY after
 # migration. This is the authoritative list pulled from the live schema; if a
@@ -81,6 +86,7 @@ TENANT_TABLES = (
     "departments",
     "document_versions",
     "documents",
+    "emotion_advice_reviews",
     "enterprise_account_contacts",
     "enterprise_accounts",
     "external_identities",
@@ -126,11 +132,10 @@ TENANT_TABLES = (
 # "how many revisions are registered", and a stray untracked file on one
 # machine must not be able to satisfy it.
 #
-# 62 as of 2026-09-26. `0063_conversation_tasks` is the newest registered
-# revision (R1 conversation tasks, tasks events, copilot drafts and semantic
-# assessments); keep this synchronized with the tracked revision set, excluding
-# `.gitkeep` and any local-only migration files.
-EXPECTED_MIGRATIONS = 64
+# 65 as of 2026-09-27. `0066_emotion_advice_reviews` is the newest registered
+# revision (R2-01 append-only supervisor corrections); keep this synchronized
+# with the tracked revision set, excluding `.gitkeep` and local-only files.
+EXPECTED_MIGRATIONS = 65
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

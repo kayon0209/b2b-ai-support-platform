@@ -28,6 +28,22 @@ const ALL_TABS = ["queue", "mine", "waiting"] as const satisfies readonly Tab[];
 type Action = "claim" | "release" | "transfer" | "close";
 type Origin = "free" | "canned" | "ai_suggestion";
 type CopilotKind = "summary" | "reply";
+type EmotionLevel = "calm" | "frustrated" | "angry" | "escalation_risk";
+type EmotionReason = "overstated" | "understated" | "quoted_or_negated" | "sarcasm_or_mixed_tone" | "context_missing" | "other";
+
+interface EmotionAdvice {
+  advice_id: string;
+  current_level: EmotionLevel;
+  trend: "rising" | "stable" | "falling" | "unknown";
+  attention: "none" | "monitor" | "review" | "urgent_review";
+  suggested_case_priority: "p0" | "p1" | "p2" | null;
+  reason_codes: string[];
+  evidence: Array<{ turn_id: string; start: number; end: number; level: EmotionLevel; reason_code: string }>;
+  suppressed_evidence_count: number;
+  ambiguous_tone: boolean;
+  analyzed_customer_turns: number;
+  advisory_only: true;
+}
 
 interface Lease {
   owner: string;
@@ -70,6 +86,7 @@ interface QueueItem {
   contact_ref: string | null;
   case: CaseInfo | null;
   lease: Lease;
+  emotion_advice?: EmotionAdvice | null;
 }
 interface QueueResponse {
   items: QueueItem[];
@@ -80,6 +97,9 @@ interface QueueResponse {
   actor_ref: string | null;
   agent_name: string | null;
   agent_status: string | null;
+  sort_mode: "activity" | "emotion";
+  sort_scope: "queue" | "current_page";
+  emotion_advice_enabled: boolean;
 }
 interface AccountInfo {
   name: string;
@@ -100,6 +120,8 @@ interface Detail {
   turns: Turn[];
   older_before: string | null;
   ai_suggestion: { text: string; sources: string[] } | null;
+  emotion_advice: EmotionAdvice | null;
+  can_review_emotion_advice: boolean;
 }
 interface CopilotSourceRef {
   turn_id: string;
@@ -169,6 +191,32 @@ const RIGHT_TAB_LABEL: Record<WorkbenchRightTab, string> = {
   tools: "工具",
   tasks: "任务",
 };
+const EMOTION_LABEL: Record<EmotionLevel, string> = {
+  calm: "平稳", frustrated: "不满", angry: "愤怒", escalation_risk: "升级风险",
+};
+const EMOTION_ATTENTION_LABEL: Record<EmotionAdvice["attention"], string> = {
+  none: "无需额外关注", monitor: "建议观察", review: "建议人工复核", urgent_review: "建议优先复核",
+};
+const EMOTION_TREND_LABEL: Record<EmotionAdvice["trend"], string> = {
+  rising: "升高", stable: "稳定", falling: "缓和", unknown: "趋势不确定",
+};
+const EMOTION_REASON_LABEL: Record<string, string> = {
+  external_escalation_language: "出现外部投诉或升级表达",
+  direct_anger_language: "出现明确愤怒表达",
+  direct_frustration_language: "出现不满或催促表达",
+  emotion_trend_rising: "最近表达趋于强烈",
+  emotion_sustained_across_turns: "连续多轮出现不满信号",
+  emotion_context_needs_human_review: "语气可能包含反讽或混合情绪",
+  quoted_or_negated_terms_not_ranked: "引用或否定词未作为当前情绪计分",
+};
+const EMOTION_REVIEW_REASONS: Array<{ value: EmotionReason; label: string }> = [
+  { value: "overstated", label: "建议偏高" },
+  { value: "understated", label: "建议偏低" },
+  { value: "quoted_or_negated", label: "引用或否定语境" },
+  { value: "sarcasm_or_mixed_tone", label: "反讽或混合语气" },
+  { value: "context_missing", label: "缺少上下文" },
+  { value: "other", label: "其他原因" },
+];
 const EMOJIS = ["🙂", "😊", "👍", "🙏", "✅", "📦", "🔧", "💡"];
 
 function clock(seconds: number | null | undefined): string {
@@ -243,6 +291,8 @@ export function Workbench() {
   const [tabParam, setTabParam] = useUrlState("tab", "queue");
   const tab: Tab = isOneOf(tabParam, ALL_TABS) ? tabParam : "queue";
   const setTab = (next: Tab) => setTabParam(next);
+  const [sortParam, setSortParam] = useUrlState("sort", "activity");
+  const sortMode: "activity" | "emotion" = sortParam === "emotion" ? "emotion" : "activity";
   const [query, setQuery] = useUrlState("q", "");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [offset, setOffset] = useState(0);
@@ -278,6 +328,9 @@ export function Workbench() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [canned, setCanned] = useState<CannedReply[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [emotionCorrectionLevel, setEmotionCorrectionLevel] = useState<EmotionLevel>("calm");
+  const [emotionCorrectionReason, setEmotionCorrectionReason] = useState<EmotionReason>("context_missing");
+  const [emotionReviewPending, setEmotionReviewPending] = useState(false);
   const [related, setRelated] = useState<RelatedCase[]>([]);
   const [now, setNow] = useState(Math.floor(Date.now() / 1000));
   const transcriptRef = useRef<HTMLDivElement | null>(null);
@@ -287,6 +340,8 @@ export function Workbench() {
   const queueRequest = useRef(0);
   const copilotRequest = useRef(0);
   const copilotIdempotency = useRef<{ conversationRef: string; kind: CopilotKind; key: string } | null>(null);
+  const emotionReviewIdempotency = useRef<{ signature: string; key: string } | null>(null);
+  const emotionAdviceId = useRef<string | null>(null);
   const selectedRef = conversationRef ?? null;
 
   useEffect(() => {
@@ -326,7 +381,7 @@ export function Workbench() {
     const request = ++queueRequest.current;
     if (!silent) setLoadingQueue(true);
     try {
-      const params = new URLSearchParams({ tab, limit: "50", offset: String(offset) });
+      const params = new URLSearchParams({ tab, limit: "50", offset: String(offset), sort: sortMode });
       if (debouncedQuery) params.set("q", debouncedQuery);
       const result = await apiGet<QueueResponse>(`/v1/workbench/conversations?${params}`);
       if (queueRequest.current === request) {
@@ -334,13 +389,17 @@ export function Workbench() {
         if (!silent) setError(null);
       }
     } catch (reason) {
-      if (!silent && queueRequest.current === request) {
+      if (queueRequest.current === request && reason instanceof ApiError && reason.code === "FEATURE_DISABLED" && sortMode === "emotion") {
+        setSortParam("activity");
+        setNotice("情绪建议功能已关闭，队列已恢复按最近活动排序。");
+        setError(null);
+      } else if (!silent && queueRequest.current === request) {
         setError(reason instanceof Error ? reason.message : String(reason));
       }
     } finally {
       if (!silent && queueRequest.current === request) setLoadingQueue(false);
     }
-  }, [tab, offset, debouncedQuery]);
+  }, [tab, offset, debouncedQuery, sortMode, setSortParam]);
 
   useEffect(() => {
     void loadQueue();
@@ -361,6 +420,12 @@ export function Workbench() {
     try {
       const result = await apiGet<Detail>(`/v1/workbench/conversations/${ref}`);
       if (detailRequest.current !== request) return;
+      if (!silent || emotionAdviceId.current !== (result.emotion_advice?.advice_id ?? null)) {
+        setEmotionCorrectionLevel(result.emotion_advice?.current_level ?? "calm");
+        setEmotionCorrectionReason("context_missing");
+        emotionReviewIdempotency.current = null;
+        emotionAdviceId.current = result.emotion_advice?.advice_id ?? null;
+      }
       setDetail(result);
       if (!silent) setOlderBefore(result.older_before);
       if (!silent) setError(null);
@@ -654,6 +719,42 @@ export function Workbench() {
     setOffset(0);
     setMobileQueue(true);
   }
+  async function submitEmotionCorrection() {
+    const advice = detail?.emotion_advice;
+    if (!detail || !advice || !detail.can_review_emotion_advice || emotionReviewPending) return;
+    const signature = JSON.stringify([advice.advice_id, emotionCorrectionLevel, emotionCorrectionReason]);
+    const attempt = emotionReviewIdempotency.current?.signature === signature
+      ? emotionReviewIdempotency.current
+      : { signature, key: newIdempotencyKey() };
+    emotionReviewIdempotency.current = attempt;
+    setEmotionReviewPending(true);
+    setError(null);
+    try {
+      await apiPost(
+        `/v1/workbench/conversations/${detail.conversation_ref}/emotion-advice/reviews`,
+        {
+          advice_id: advice.advice_id,
+          corrected_level: emotionCorrectionLevel,
+          reason_code: emotionCorrectionReason,
+        },
+        attempt.key,
+      );
+      emotionReviewIdempotency.current = null;
+      setNotice("主管更正已写入审计记录；工单优先级、SLA 和会话归属未被修改。");
+      await Promise.all([loadQueue(true), loadDetail(detail.conversation_ref, true)]);
+    } catch (reason) {
+      const code = reason instanceof ApiError ? reason.code : "";
+      if (code === "EMOTION_ADVICE_STALE") {
+        emotionReviewIdempotency.current = null;
+        setError("会话内容已更新，建议已刷新；请基于最新证据重新复核。");
+        await loadDetail(detail.conversation_ref, true);
+      } else {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
+    } finally {
+      setEmotionReviewPending(false);
+    }
+  }
   async function loadOlder() {
     if (!selectedRef || !olderBefore || busy) return;
     setBusy(true);
@@ -827,6 +928,12 @@ export function Workbench() {
               </button>
             ))}
           </div>
+          {queue?.emotion_advice_enabled ? <div className="wb-emotion-sort" aria-label="会话排序">
+            <span>队列排序</span>
+            <button type="button" aria-pressed={sortMode === "activity"} className={sortMode === "activity" ? "active" : ""} onClick={() => { setSortParam("activity"); setOffset(0); }}>最近活动</button>
+            <button type="button" aria-pressed={sortMode === "emotion"} className={sortMode === "emotion" ? "active" : ""} onClick={() => { setSortParam("emotion"); setOffset(0); }}>优先关注</button>
+            <small>{sortMode === "emotion" ? "仅重排当前页 · 不改工单优先级" : "情绪建议仅供人工参考"}</small>
+          </div> : null}
           <label className="wb-queue-search">
             <Search size={16} aria-hidden="true" />
             <span className="sr-only">搜索当前队列</span>
@@ -847,6 +954,9 @@ export function Workbench() {
                     <span className="wb-queue-row-top"><strong>{item.title}</strong><time>{clock(item.last_at)}</time></span>
                     <span className="wb-queue-row-meta"><span className={urgent ? "is-urgent" : ""}>{item.lease.owner === "queue" ? "待回复" : item.lease.mode === "HUMAN_WAITING_CUSTOMER" ? "等待客户" : "进行中"}</span>{item.contact_ref ? ` · ${item.contact_ref}` : ""}</span>
                     <span className="wb-queue-row-preview">{item.preview || "等待客户消息"}</span>
+                    {item.emotion_advice ? <span className={`wb-emotion-queue is-${item.emotion_advice.attention}`}>
+                      {EMOTION_ATTENTION_LABEL[item.emotion_advice.attention]} · {EMOTION_LABEL[item.emotion_advice.current_level]}{item.emotion_advice.reason_codes[0] ? ` · ${EMOTION_REASON_LABEL[item.emotion_advice.reason_codes[0]] ?? "结合消息内容判断"}` : " · 未见明确风险信号"}
+                    </span> : null}
                     <span className="wb-queue-row-foot"><span>{channelName(item.channel)}</span>{sla ? <span className={sla.startsWith("超时") ? "is-urgent" : ""}>{sla}</span> : null}</span>
                   </span>
                 </button>
@@ -927,6 +1037,40 @@ export function Workbench() {
           <div className="wb-right-header"><Sparkles size={20} /><strong>AI 副驾</strong><button type="button" className="wb-right-close" aria-label="收起 AI 副驾" onClick={() => setRightOpen(false)}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label="副驾内容">{WORKBENCH_RIGHT_TABS.map((key) => <button type="button" role="tab" id={`wb-right-tab-${key}`} aria-controls="wb-right-panel" aria-selected={rightTab === key} tabIndex={rightTab === key ? 0 : -1} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)} onKeyDown={(event) => { const next = nextWorkbenchRightTab(key, event.key); if (!next) return; event.preventDefault(); setRightTab(next); document.getElementById(`wb-right-tab-${next}`)?.focus(); }}>{RIGHT_TAB_LABEL[key]}</button>)}</div></div>
           <div className="wb-right-scroll" id="wb-right-panel" role="tabpanel" aria-labelledby={`wb-right-tab-${rightTab}`} tabIndex={0}>
             {rightTab === "reply" ? <>
+              {detail.emotion_advice ? <section className={`wb-panel wb-emotion-panel is-${detail.emotion_advice.attention}`} aria-labelledby="wb-emotion-heading">
+                <h3 id="wb-emotion-heading"><Sparkles size={18} />情绪趋势建议<span className="wb-advisory-tag">人工参考</span></h3>
+                <p className="wb-muted">基于最近 {detail.emotion_advice.analyzed_customer_turns} 条客户消息。不会自动修改工单优先级、SLA、会话归属或客户回复。</p>
+                <div className="wb-emotion-summary">
+                  <span>当前信号 <strong>{EMOTION_LABEL[detail.emotion_advice.current_level]}</strong></span>
+                  <span>趋势 <strong>{EMOTION_TREND_LABEL[detail.emotion_advice.trend]}</strong></span>
+                  <span className={`wb-emotion-attention is-${detail.emotion_advice.attention}`}>{EMOTION_ATTENTION_LABEL[detail.emotion_advice.attention]}</span>
+                </div>
+                {detail.emotion_advice.reason_codes.length ? <ul className="wb-emotion-reasons">
+                  {detail.emotion_advice.reason_codes.map((code) => <li key={code}>{EMOTION_REASON_LABEL[code] ?? "建议坐席结合上下文判断"}</li>)}
+                </ul> : <p className="wb-emotion-no-signal">当前规则未发现明确情绪信号。</p>}
+                {detail.emotion_advice.evidence.length ? <div className="wb-emotion-evidence">
+                  <strong>证据消息</strong>
+                  {detail.emotion_advice.evidence.map((evidence, index) => <button key={`${evidence.turn_id}-${evidence.start}-${index}`} type="button" onClick={() => jumpToTurn(evidence.turn_id)}>
+                    定位客户消息 · {EMOTION_LABEL[evidence.level]} · 片段 {evidence.start + 1}–{evidence.end}
+                  </button>)}
+                </div> : null}
+                {detail.emotion_advice.suppressed_evidence_count > 0 ? <p className="wb-emotion-footnote">已排除 {detail.emotion_advice.suppressed_evidence_count} 处引用、否定或不确定表达。</p> : null}
+                {detail.can_review_emotion_advice ? <div className="wb-emotion-review">
+                  <h4>主管分类复核</h4>
+                  <label>复核后的级别
+                    <select value={emotionCorrectionLevel} onChange={(event) => setEmotionCorrectionLevel(event.target.value as EmotionLevel)}>
+                      {(Object.keys(EMOTION_LABEL) as EmotionLevel[]).map((level) => <option key={level} value={level}>{EMOTION_LABEL[level]}</option>)}
+                    </select>
+                  </label>
+                  <label>复核原因
+                    <select value={emotionCorrectionReason} onChange={(event) => setEmotionCorrectionReason(event.target.value as EmotionReason)}>
+                      {EMOTION_REVIEW_REASONS.map((reason) => <option key={reason.value} value={reason.value}>{reason.label}</option>)}
+                    </select>
+                  </label>
+                  <button className="wb-secondary-small" type="button" disabled={emotionReviewPending} onClick={() => void submitEmotionCorrection()}>{emotionReviewPending ? "正在记录…" : "记录复核结果"}</button>
+                  <small>仅保存分类、原因和建议版本，不复制客户原话，也不参与自动训练。</small>
+                </div> : null}
+              </section> : null}
               <section className="wb-panel wb-copilot-panel">
                 <h3><Sparkles size={18} />副驾草稿</h3>
                 <p className="wb-muted">仅生成工作草稿，不会自动发送。请核验事实和来源后再回复。</p>

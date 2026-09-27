@@ -20,6 +20,11 @@
 4. [最终验收协议](acceptance.md)
 5. [可直接复制的 WorkBuddy 交接指令](workbuddy-handoff.md)
 6. [R1 语义评测集与人工标注规范](semantic-evaluation.md)
+7. [R2/R3 实施状态与外部门禁](r2-r3-execution-plan.md)
+8. [R2-01 情绪建议接口与验收契约](r2-01-emotion-advice-contract.md)
+9. [R2-02 标准服务流程目录](r2-02-standard-flow-catalog.md)
+10. [R2-03 知识发布评测门禁契约](r2-03-knowledge-release-contract.md)
+11. [R3 自研业务系统数据契约](r3-business-data-contract.md)
 
 ## 发布边界
 

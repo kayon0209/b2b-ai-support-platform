@@ -24,6 +24,7 @@ from platform_core.agent_runtime.emotion import (
 
 MAX_TREND_TURNS = 5
 ADVICE_VERSION = "emotion-advice-v1"
+FLAG_EMOTION_PRIORITY_ADVICE = "agent.emotion_priority_advice"
 
 EmotionTrend = Literal["rising", "stable", "falling", "unknown"]
 AttentionAdvice = Literal["none", "monitor", "review", "urgent_review"]
@@ -231,6 +232,7 @@ def recommend_emotion_priority(
 
 __all__ = [
     "ADVICE_VERSION",
+    "FLAG_EMOTION_PRIORITY_ADVICE",
     "MAX_TREND_TURNS",
     "EmotionEvidenceRef",
     "EmotionPriorityAdvice",

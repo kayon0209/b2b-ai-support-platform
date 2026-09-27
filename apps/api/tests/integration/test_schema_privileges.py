@@ -75,6 +75,10 @@ RESTRICTED_BY_DESIGN: dict[str, tuple[frozenset[str], str]] = {
         "was consumed. Corrections are new rows (`record_adjustment`), and the "
         "rollup applies the sign, so no UPDATE is ever needed",
     ),
+    "emotion_advice_reviews": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only supervisor feedback: corrections are new audited rows",
+    ),
 }
 
 PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")

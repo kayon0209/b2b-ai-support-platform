@@ -155,6 +155,12 @@ class PlatformMetrics:
             "and the generated answer was withheld.",
             registry=r,
         )
+        self.workbench_emotion_advice_total = Counter(
+            "platform_workbench_emotion_advice_total",
+            "Evidence-bound emotion advice and supervisor correction outcomes.",
+            labelnames=("action", "outcome"),
+            registry=r,
+        )
 
         # --- Retrieval ---
         self.retrieval_latency_seconds = Histogram(
