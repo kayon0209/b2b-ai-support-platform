@@ -8,7 +8,7 @@
 
 本文件逐项报告**实际**状态。Codex 的验收报告未被修改，也未被合入本分支。
 
-> 当前状态以文末 §8「Codex follow-up：工作台副驾闭环与最终本地复验」为准；§1–§6 保留 WorkBuddy 原交付时的记录，§7 保留上一轮 follow-up 记录。
+> 当前状态以文末 §9「Codex follow-up：剩余 R1 实施与再验收」及 [验收表](acceptance.md) 为准；§1–§6 保留 WorkBuddy 原交付时的记录，§7–§8 保留先前 follow-up 记录。
 
 ## Codex 后续修复（2026-09-26）
 
