@@ -37,7 +37,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 当前租户没有对应工具或业务负责人时，模板显示 `unsupported`/`needs_human`，不显示假成功。
 - 多意图按子任务推进；已完成部分不重复执行，依赖阻塞时不跳过前置条件。
 - 验收：模板 schema 合同测试、每模板状态机测试、权限负例、同键重放/不同 payload 冲突，以及浏览器补参/取消/人工接续。
-- 当前：四种有界领域模板及能力/负责人判定器已实现并加单测，继续只引用现有 `order.get_status`、`shipment.track`、`billing.get_invoice`、`case.create`。没有新增 invoice issue 或 ERP 写能力；目录尚未接入 Workbench UI、语义 planner 和每流程状态机。详细范围见 `r2-02-standard-flow-catalog.md`。
+- 当前：四种有界领域模板已接入只读 Workbench API 和 Tasks 面板，按当前坐席权限、active Connector 和有坐席成员的负责人组判断基础可用性；仍只引用现有工具。没有新增 invoice issue 或 ERP 写能力。流程实例化、与 task DAG 绑定和每流程状态图仍未实现。详细范围见 `r2-02-standard-flow-catalog.md`。
 
 ### R2-03 知识改进追踪
 
@@ -45,7 +45,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 评测绑定数据哈希、知识版本、检索配置和 commit；新知识导致核心切片退化时禁止推广，并能恢复上一版活动版本。
 - 只允许审核后的知识文档参与检索；任何未审核会话都不得自动生成或发布知识。
 - 验收：发布前后相同授权语料、tenant RLS、可回滚版本、指标审计，以及并发发布冲突。
-- 当前：固定评测 run fingerprint、数据/检索配置/evaluator/commit 对齐、双人批准、unsafe 结果拒绝和默认 2pp 回归门槛的共享 gate 已实现并有契约测试；尚未接入数据库持久化、知识发布 API、并发保护、灰度和回滚 UI。2pp 需知识/安全负责人签字。见 `r2-03-knowledge-release-contract.md`。
+- 当前：评测记录/批准/post-test/event 已持久化并强制 RLS；flag 开启时知识草稿发布要求固定评测证据与双人审批，Workbench 支持查证据、审批和在失败后测时回滚。可信 evaluator worker、正式固定数据集、staging 灰度/多实例发布演练仍未完成，flag 默认关闭。2pp 阈值需知识/安全负责人签字。见 `r2-03-knowledge-release-contract.md`。
 
 ## R3：行业业务联通
 
@@ -54,7 +54,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 统一 adapter contract：tenant connector、credential_ref、目标记录归属验证、字段 allowlist、超时与 bounded retry、breaker、稳定 idempotency key、受控 confirmation 和读回 postcondition。
 - 对超时/断连返回 `unknown` 并提供对账流程；不得把“请求已发出”写成“业务成功”。外部 payload 只在 adapter 边界做 canonical projection。
 - 先实现 fake contract tests 与协议文档；真正 provider adapter 需有用户授权的 sandbox、版本化 REST schema、归属证明和重放预算。
-- 当前：已新增供应商中立的 authority、来源时效、产品/库存/报价、归属证明和外部写入回执契约与纯契约测试。各业务域的权威系统仍待企业负责人定版；具体 ERP/CRM API、授权 sandbox、归属证明流程和生产验收仍未提供。
+- 当前：已新增供应商中立的 authority/来源/时效/归属契约、canonical adapter Protocol 和假 provider 边界测试。各业务域的权威系统仍待企业负责人定版；具体 ERP/CRM API、授权 sandbox、归属证明流程和生产验收仍未提供。
 
 ### R3-02 售前选型与商机交接
 

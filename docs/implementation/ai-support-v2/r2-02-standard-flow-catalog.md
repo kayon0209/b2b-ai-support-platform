@@ -1,6 +1,6 @@
 # R2-02 四种标准服务流程目录
 
-状态：领域目录与能力判定器、单测已实现；尚未接入 Workbench 流程卡片或生成式 planner。流程目录只做声明和可用性判断，不发起工具调用。
+状态：领域目录、租户/坐席能力判定、只读 Workbench API 和 Tasks 面板流程卡片已接入；流程模板实例化、与多意图 task 绑定及每个流程的执行状态图仍待实现。目录不直接发起工具调用。
 
 ## 当前目录
 
@@ -17,7 +17,9 @@
 
 每个版本内置模板声明业务线、intent code、必填/选填槽位、槽位来源、敏感字段、只读工具白名单、受控写白名单、负责人组、确认要求、部分完成、超时、取消和人工退出条件。槽位值仍走现有语义验证、PII withholding、任务存储和 Tool Gateway；该目录不保存客户字段值。
 
-`resolve_flow_availability()` 根据当前租户/坐席过滤后的 `CapabilityView` 判定 `available` 或 `needs_human`，并验证只读工具仍为 `read`、内部写入仍为 `confirmed_write`。可选只读能力缺失时能展示缺失原因，不会阻断基础订单查询。模板声明的工具名只能来自现有 registry，不能靠模板新增连接器能力。
+`GET /v1/workbench/standard-flows` 要求 `case.read`，返回四个模板及当前租户/坐席的可用状态。`resolve_flow_availability()` 验证只读工具为 `read`、内部写入为 `confirmed_write`、所需 Connector 处于 active，并且质量/财务/工程负责人组至少有一位 active 的坐席、支持管理员或租户负责人。可选只读能力缺失时展示缺失原因，不阻断基础订单查询。模板声明的工具名只能来自现有 registry，不能靠模板新增连接器能力。
+
+Workbench「任务」页展示可展开的流程卡片，包括所需信息来源、工具白名单、确认要求、部分完成/超时/取消规则和转人工条件。状态“配置具备”代表当前租户/坐席具备基础配置；每次真实执行仍需 Tool Gateway 再检查权限、连接器、凭据、参数和读回结果。卡片当前是只读流程说明，没有“开始流程”按钮。
 
 ## 安全边界
 
@@ -29,4 +31,4 @@
 
 ## 本地验收
 
-`test_standard_flows.py` 覆盖四模板完整性、registry 白名单、订单只读和可选物流、风险分类篡改拒绝、质量受理负责人/确认门禁、发票写能力缺失，以及技术升级不伪称完成。模板还未通过浏览器 UI 验收，端到端自动填槽与每种流程状态机仍待实现。
+`test_standard_flows.py` 与 `test_standard_flow_catalog.py` 覆盖四模板完整性、registry 白名单、坐席权限、租户 RLS、active Connector、活跃负责人组、订单只读和可选物流、发票写能力缺失，以及技术升级不伪称完成。TypeScript/Vite production build 通过；真人浏览器/辅助技术验收、端到端自动填槽和每种流程状态图仍待实现。

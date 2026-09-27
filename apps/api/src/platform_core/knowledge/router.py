@@ -432,7 +432,7 @@ async def mark_version_ready(request: Request, version_id: str, body: ReadyIn | 
 
     async with tenant_session(ctx) as session:
         try:
-            row = await service.mark_ready(session, tenant_id=ctx.tenant_id, version_id=vid)
+            row = await service.mark_ready(session, ctx=ctx, version_id=vid)
         except service.KnowledgeError as exc:
             return _error(exc)
         except Exception as exc:

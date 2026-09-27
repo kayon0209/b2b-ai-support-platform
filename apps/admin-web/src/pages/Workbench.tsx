@@ -8,6 +8,7 @@ import {
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { isOneOf, useUrlState } from "../lib/urlState";
 import { Dialog } from "../components/ui";
+import { StandardFlowCatalog } from "../components/StandardFlowCatalog";
 import { TaskPanel } from "../components/TaskPanel";
 import { ToolCard, type ToolCardData } from "../components/ToolCard";
 import { apiGet, apiPost, apiUpload } from "../lib/api";
@@ -1106,7 +1107,8 @@ export function Workbench() {
               <Sources sources={detail.ai_suggestion?.sources ?? []} />
               <CustomerPanel detail={detail} />
             </> : null}
-            {rightTab === "tasks" ? (
+            {rightTab === "tasks" ? <>
+              <StandardFlowCatalog />
               <TaskPanel
                 conversationRef={detail.conversation_ref}
                 leaseVersion={detail.lease.version}
@@ -1114,7 +1116,7 @@ export function Workbench() {
                 leaseOwnerRef={detail.lease.owner_ref}
                 onChanged={() => void loadDetail(detail.conversation_ref)}
               />
-            ) : null}
+            </> : null}
             {rightTab === "knowledge" ? <><Sources sources={detail.ai_suggestion?.sources ?? []} /><section className="wb-panel"><h3><Ticket size={18} />相似工单</h3>{related.length ? related.map((item) => <Link className="wb-resource-row" key={item.case_id} to={`/admin/cases?case=${item.case_id}`}><span><strong>{item.subject}</strong><small>{item.match === "subject" ? "标题相似" : "同类目"} · {STATUS[item.status] ?? item.status}</small></span><ChevronRight size={16} /></Link>) : <p className="wb-muted">暂无相似工单。</p>}</section></> : null}
             {rightTab === "tools" ? <><section className="wb-panel"><h3><CircleHelp size={18} />已查业务数据</h3>{turns.some((turn) => turn.card) ? turns.filter((turn) => turn.card).map((turn) => <div className="wb-right-tool" key={turn.turn_id}><ToolCard card={turn.card!} /></div>) : <p className="wb-muted">当前会话没有业务数据卡片。</p>}</section><section className="wb-panel"><h3><Paperclip size={18} />工单证据</h3>{attachments.length ? attachments.map((item) => item.url ? <a className="wb-resource-row" href={item.url} target="_blank" rel="noreferrer" key={item.attachment_id}><span>{item.filename}</span><ChevronRight size={16} /></a> : <p key={item.attachment_id}>{item.filename}</p>) : <p className="wb-muted">暂无附件。上传文件只保存为工单证据。</p>}</section><Link className="wb-panel-link" to="/admin/approvals">查看待审批操作 <ChevronRight size={16} /></Link></> : null}
           </div>

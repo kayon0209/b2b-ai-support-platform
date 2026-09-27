@@ -13,6 +13,11 @@ REGISTERED_TOOL_NAMES = {
     "billing.get_invoice",
     "case.create",
 }
+REGISTERED_CONNECTOR_CAPABILITIES = {
+    "orders_read",
+    "shipments_read",
+    "invoices_read",
+}
 
 
 def _cap(tool_name: str, risk: str) -> CapabilityView:
@@ -35,6 +40,12 @@ def test_catalog_declares_four_bounded_flows_and_no_unknown_tools() -> None:
             REGISTERED_TOOL_NAMES
         )
         assert set(flow.allowed_confirmed_write_tools).issubset(REGISTERED_TOOL_NAMES)
+        connector_requirements = (
+            flow.required_connector_capabilities + flow.optional_connector_capabilities
+        )
+        assert {item.connector_capability for item in connector_requirements}.issubset(
+            REGISTERED_CONNECTOR_CAPABILITIES
+        )
         assert flow.partial_completion_rule
         assert flow.timeout_rule
         assert flow.cancellation_rule
@@ -48,11 +59,28 @@ def test_order_status_can_run_read_only_and_treats_shipping_as_optional() -> Non
         flow,
         capabilities={"order.get_status": _cap("order.get_status", "read")},
         configured_owner_groups=frozenset(),
+        active_connector_capabilities=frozenset({"orders_read"}),
     )
 
     assert availability.status == "available"
     assert availability.available_tools == ("order.get_status",)
     assert availability.optional_unavailable_tools == ("shipment.track",)
+    assert availability.optional_unavailable_connector_capabilities == ("shipments_read",)
+
+
+def test_declared_read_tool_without_an_active_connector_is_not_available() -> None:
+    flow = get_standard_flow("order_status")
+    assert flow is not None
+    availability = resolve_flow_availability(
+        flow,
+        capabilities={"order.get_status": _cap("order.get_status", "read")},
+        configured_owner_groups=frozenset(),
+    )
+
+    assert availability.status == "needs_human"
+    assert availability.reason_code == "FLOW_CONNECTOR_CAPABILITY_MISSING"
+    assert availability.unavailable_tools == ("order.get_status",)
+    assert availability.unavailable_connector_capabilities == ("orders_read",)
 
 
 def test_capability_risk_mismatch_is_never_promoted_to_available() -> None:

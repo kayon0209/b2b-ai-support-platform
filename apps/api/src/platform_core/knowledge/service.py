@@ -308,7 +308,7 @@ async def list_versions(
 
 
 async def mark_ready(
-    session: AsyncSession, *, tenant_id: uuid.UUID, version_id: uuid.UUID
+    session: AsyncSession, *, ctx: TenantContext, version_id: uuid.UUID
 ) -> DocumentVersion:
     """Drive the version to READY through the validated state machine.
 
@@ -316,7 +316,7 @@ async def mark_ready(
     place that decides which moves are legal - the router must not set
     `ingestion_status` directly, or the state machine becomes advisory.
     """
-    version = await get_version(session, tenant_id=tenant_id, version_id=version_id)
+    version = await get_version(session, tenant_id=ctx.tenant_id, version_id=version_id)
     current = str(version.ingestion_status)
     for target in (
         IngestionStatus.PARSING,
@@ -329,6 +329,9 @@ async def mark_ready(
     version.ingestion_status = current
     version.status = "active"
     await session.flush()
+    from platform_core.knowledge import release_service
+
+    await release_service.record_activation(session, ctx=ctx, version_id=version.id)
     return version
 
 

@@ -10,6 +10,7 @@ from platform_contracts.knowledge_release import (
     KnowledgeEvalMetrics,
     KnowledgeEvalRun,
     KnowledgeReleaseApproval,
+    evaluate_knowledge_post_test,
     evaluate_knowledge_release,
 )
 
@@ -33,6 +34,8 @@ def _run(
         "knowledge_space_id": SPACE,
         "document_version_id": UUID(f"01900000-0000-7000-8000-{version:012d}"),
         "knowledge_content_sha256": content_hash * 64,
+        "knowledge_snapshot_sha256": ("f" if version == 1 else "e") * 64,
+        "parent_snapshot_sha256": None if version == 1 else "f" * 64,
         "dataset_sha256": "b" * 64,
         "retrieval_config_sha256": "c" * 64,
         "evaluator_version": "knowledge-eval-v1",
@@ -255,3 +258,47 @@ def test_same_content_cannot_be_released_as_a_new_version_and_time_must_be_utc()
 
     with pytest.raises(ValidationError, match="timezone-aware UTC"):
         _run(evaluated_at=datetime(2026, 9, 27, 12, 0))
+
+
+def test_post_publish_run_must_measure_the_exact_candidate_and_pass_the_same_gates() -> None:
+    candidate = _run(content_hash="e", version=2)
+    post_run = _run(
+        content_hash="e",
+        version=2,
+        evaluated_at=NOW + timedelta(hours=1),
+        metrics=KnowledgeEvalMetrics(
+            case_count=100,
+            grounded_answer_rate=0.92,
+            citation_support_rate=0.96,
+            retrieval_recall_at_k=0.87,
+            unsafe_answer_count=0,
+        ),
+    )
+    result = evaluate_knowledge_post_test(candidate, post_run)
+    assert result.status == "eligible"
+    assert result.reason_code == "KNOWLEDGE_POST_TEST_PASSED"
+
+    changed_build = _run(
+        content_hash="f",
+        version=3,
+        evaluated_at=NOW + timedelta(hours=1),
+    )
+    assert evaluate_knowledge_post_test(candidate, changed_build).reason_code == (
+        "POST_TEST_INPUT_MISMATCH"
+    )
+
+    unsafe = _run(
+        content_hash="e",
+        version=2,
+        evaluated_at=NOW + timedelta(hours=1),
+        metrics=KnowledgeEvalMetrics(
+            case_count=100,
+            grounded_answer_rate=0.93,
+            citation_support_rate=0.97,
+            retrieval_recall_at_k=0.88,
+            unsafe_answer_count=1,
+        ),
+    )
+    assert evaluate_knowledge_post_test(candidate, unsafe).reason_code == (
+        "POST_TEST_UNSAFE_ANSWER"
+    )

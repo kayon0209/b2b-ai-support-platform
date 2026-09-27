@@ -275,6 +275,7 @@ async def create_draft(
         conversation_ref_id=conversation_ref_id,
         title=title.strip()[:512],
         body=body,
+        author_id=ctx.actor_id,
         status=DraftStatus.PENDING.value,
         author_kind="human",
     )
@@ -304,7 +305,7 @@ async def review_draft(
     notes: str = "",
 ) -> KnowledgeDraft:
     """Approve or reject a draft. Approval alone does not publish."""
-    draft = await _load_draft(session, ctx=ctx, draft_id=draft_id)
+    draft = await _load_draft(session, ctx=ctx, draft_id=draft_id, for_update=True)
     if draft.status != DraftStatus.PENDING.value:
         raise GapError("ALREADY_REVIEWED", "this draft already has a review decision")
 
@@ -341,6 +342,9 @@ async def publish_draft(
     draft_id: uuid.UUID,
     space_id: uuid.UUID,
     version_label: str = "v1",
+    release_gate_enabled: bool = False,
+    release_evaluation_id: uuid.UUID | None = None,
+    idempotency_key: str | None = None,
 ) -> DocumentVersion:
     """Publish an approved draft as real, retrievable knowledge.
 
@@ -349,16 +353,51 @@ async def publish_draft(
     to the usual parsing, chunking, and versioning rules. The gap is marked
     resolved only once the document exists.
     """
-    draft = await _load_draft(session, ctx=ctx, draft_id=draft_id)
+    draft = await _load_draft(session, ctx=ctx, draft_id=draft_id, for_update=True)
+
+    from platform_core.knowledge import release_service
+
+    if draft.published_document_id is not None:
+        if release_evaluation_id is not None:
+            published = await release_service.find_published_release_version(
+                session,
+                ctx=ctx,
+                draft=draft,
+                evaluation_id=release_evaluation_id,
+            )
+            if published is not None:
+                return published
+        raise GapError("ALREADY_PUBLISHED", "this draft was already published")
+
+    release_evaluation = None
+    if release_gate_enabled:
+        if release_evaluation_id is None:
+            raise GapError(
+                "RELEASE_EVALUATION_REQUIRED",
+                "a passing knowledge release evaluation is required",
+            )
+        if idempotency_key is None:
+            raise GapError("IDEMPOTENCY_KEY_REQUIRED", "publish requires an idempotency key")
+        try:
+            release_evaluation = await release_service.require_publish_evaluation(
+                session,
+                ctx=ctx,
+                draft_id=draft.id,
+                space_id=space_id,
+                evaluation_id=release_evaluation_id,
+            )
+        except release_service.KnowledgeReleaseError as exc:
+            raise GapError(exc.code, exc.detail) from exc
+    elif release_evaluation_id is not None:
+        raise GapError(
+            "RELEASE_GATE_DISABLED", "enable the tenant release gate before using evidence"
+        )
 
     if draft.status != DraftStatus.APPROVED.value:
         raise GapError(
             "DRAFT_NOT_APPROVED",
             "only an approved draft may be published",
         )
-    if draft.published_document_id is not None:
-        raise GapError("ALREADY_PUBLISHED", "this draft was already published")
-
     # Four-eyes: an author cannot approve-and-publish their own answer
     # unnoticed. Checking here as well as at review time covers the path
     # where a reviewer approves and a different actor publishes.
@@ -389,13 +428,30 @@ async def publish_draft(
     session.add(document)
     await session.flush()
 
-    content_hash = hashlib.sha256(draft.body.encode("utf-8")).hexdigest()
+    draft_bytes = draft.body.encode("utf-8")
+    from platform_core.knowledge.scanning import ContentScanner, ScanVerdict, run_scan
+
+    scan_verdict = run_scan(
+        ContentScanner(),
+        key=f"gap-draft:{draft.id}",
+        data=draft_bytes,
+        declared_type="text/markdown",
+    )
+    if scan_verdict is ScanVerdict.INFECTED:
+        raise GapError("DRAFT_CONTENT_REJECTED", "draft content does not match text/markdown")
+    content_hash = hashlib.sha256(draft_bytes).hexdigest()
     version = DocumentVersion(
+        id=(
+            release_evaluation.candidate_version_id
+            if release_evaluation is not None
+            else uuid.uuid4()
+        ),
         tenant_id=ctx.tenant_id,
         document_id=document.id,
         version_label=version_label,
         content_hash=content_hash,
         status=IngestionStatus.PROCESSING.value,
+        scan_status=scan_verdict.as_status().value,
         object_uri="",  # filled in after the key is derived from version.id
         parser_version="gap-draft-v1",
         ingestion_status=IngestionStatus.UPLOADED.value,
@@ -431,7 +487,7 @@ async def publish_draft(
     # knowledge router uploads before returning, but publish_draft lives in
     # the service layer where a storage outage must not be fatal.)
     try:
-        upload_object(key, draft.body.encode("utf-8"), "text/markdown")
+        upload_object(key, draft_bytes, "text/markdown")
     except Exception as exc:
         logger.warning(
             "gap_draft_upload_pending gap_id=%s version_id=%s error=%s",
@@ -449,6 +505,14 @@ async def publish_draft(
     gap.status = GapStatus.RESOLVED.value
     gap.target_space_id = space_id
     await session.flush()
+
+    if release_evaluation is not None and idempotency_key is not None:
+        await release_service.record_publish_requested(
+            session,
+            ctx=ctx,
+            evaluation=release_evaluation,
+            idempotency_key=idempotency_key,
+        )
 
     await audit_service.record(
         session,
@@ -550,12 +614,18 @@ async def _load_gap(
 
 
 async def _load_draft(
-    session: AsyncSession, *, ctx: TenantContext, draft_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    ctx: TenantContext,
+    draft_id: uuid.UUID,
+    for_update: bool = False,
 ) -> KnowledgeDraft:
     stmt = select(KnowledgeDraft).where(
         KnowledgeDraft.id == draft_id,
         KnowledgeDraft.tenant_id == ctx.tenant_id,
     )
+    if for_update:
+        stmt = stmt.with_for_update()
     row = (await session.execute(stmt)).scalars().first()
     if row is None:
         raise GapError("NOT_FOUND", "no such knowledge draft for this tenant")

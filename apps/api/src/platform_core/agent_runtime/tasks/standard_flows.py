@@ -12,6 +12,7 @@ FlowStatus = Literal["available", "needs_human"]
 FlowReason = Literal[
     "FLOW_CAPABILITY_MISSING",
     "FLOW_CAPABILITY_RISK_MISMATCH",
+    "FLOW_CONNECTOR_CAPABILITY_MISSING",
     "FLOW_OWNER_UNASSIGNED",
     "FLOW_EXTERNAL_WRITE_UNAVAILABLE",
     "FLOW_READY",
@@ -27,6 +28,13 @@ class FlowField(BaseModel):
     required: bool = True
 
 
+class ConnectorRequirement(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tool_name: str = Field(min_length=1, max_length=127)
+    connector_capability: str = Field(min_length=1, max_length=63)
+
+
 class FlowTemplate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -38,6 +46,8 @@ class FlowTemplate(BaseModel):
     optional_fields: tuple[FlowField, ...] = ()
     required_read_tools: tuple[str, ...] = ()
     optional_read_tools: tuple[str, ...] = ()
+    required_connector_capabilities: tuple[ConnectorRequirement, ...] = ()
+    optional_connector_capabilities: tuple[ConnectorRequirement, ...] = ()
     allowed_confirmed_write_tools: tuple[str, ...] = ()
     blocked_external_write: bool = False
     owner_group: str | None = None
@@ -57,6 +67,8 @@ class FlowAvailability(BaseModel):
     available_tools: tuple[str, ...] = ()
     unavailable_tools: tuple[str, ...] = ()
     optional_unavailable_tools: tuple[str, ...] = ()
+    unavailable_connector_capabilities: tuple[str, ...] = ()
+    optional_unavailable_connector_capabilities: tuple[str, ...] = ()
     owner_group_configured: bool
 
 
@@ -75,6 +87,12 @@ STANDARD_FLOW_TEMPLATES: tuple[FlowTemplate, ...] = (
         ),
         required_read_tools=("order.get_status",),
         optional_read_tools=("shipment.track",),
+        required_connector_capabilities=(
+            ConnectorRequirement(tool_name="order.get_status", connector_capability="orders_read"),
+        ),
+        optional_connector_capabilities=(
+            ConnectorRequirement(tool_name="shipment.track", connector_capability="shipments_read"),
+        ),
         partial_completion_rule="已核实订单状态可先展示；缺少物流数据时不得推断发货或签收。",
         timeout_rule="外部查询超时标记 unknown 并转人工核查，不复用陈旧缓存冒充当前状态。",
         cancellation_rule="取消未提交的后续只读查询；已返回的事实保留来源和读取时间。",
@@ -116,6 +134,11 @@ STANDARD_FLOW_TEMPLATES: tuple[FlowTemplate, ...] = (
             FlowField(name="tax_id", source="customer", sensitive=True, required=False),
         ),
         optional_read_tools=("billing.get_invoice",),
+        optional_connector_capabilities=(
+            ConnectorRequirement(
+                tool_name="billing.get_invoice", connector_capability="invoices_read"
+            ),
+        ),
         allowed_confirmed_write_tools=("case.create",),
         blocked_external_write=True,
         owner_group="finance",
@@ -159,30 +182,57 @@ def resolve_flow_availability(
     *,
     capabilities: dict[str, CapabilityView],
     configured_owner_groups: frozenset[str],
+    active_connector_capabilities: frozenset[str] = frozenset(),
 ) -> FlowAvailability:
-    """Report only tenant/actor capabilities explicitly present in the registry."""
+    """Check policy-filtered tools, active connectors, and staffed owner groups."""
     required_tools = set(template.required_read_tools) | set(template.allowed_confirmed_write_tools)
     optional_tools = set(template.optional_read_tools)
+    required_connectors = {
+        requirement.tool_name: requirement.connector_capability
+        for requirement in template.required_connector_capabilities
+    }
+    optional_connectors = {
+        requirement.tool_name: requirement.connector_capability
+        for requirement in template.optional_connector_capabilities
+    }
     available: list[str] = []
     unavailable: list[str] = []
     optional_unavailable: list[str] = []
+    unavailable_connectors: set[str] = set()
+    optional_unavailable_connectors: set[str] = set()
     risk_mismatch = False
     for name in sorted(required_tools):
         cap = capabilities.get(name)
         expected = "read" if name in template.required_read_tools else "confirmed_write"
+        connector_missing = (
+            name in required_connectors
+            and required_connectors[name] not in active_connector_capabilities
+        )
+        if connector_missing:
+            unavailable_connectors.add(required_connectors[name])
         if cap is None:
             unavailable.append(name)
         elif cap.risk_class != expected:
             unavailable.append(name)
             risk_mismatch = True
+        elif connector_missing:
+            unavailable.append(name)
         else:
             available.append(name)
 
     for name in sorted(optional_tools):
         cap = capabilities.get(name)
+        connector_missing = (
+            name in optional_connectors
+            and optional_connectors[name] not in active_connector_capabilities
+        )
+        if connector_missing:
+            optional_unavailable_connectors.add(optional_connectors[name])
         if cap is None:
             optional_unavailable.append(name)
         elif cap.risk_class != "read":
+            optional_unavailable.append(name)
+        elif connector_missing:
             optional_unavailable.append(name)
         else:
             available.append(name)
@@ -195,7 +245,12 @@ def resolve_flow_availability(
     if risk_mismatch:
         status, reason = "needs_human", "FLOW_CAPABILITY_RISK_MISMATCH"
     elif unavailable:
-        status, reason = "needs_human", "FLOW_CAPABILITY_MISSING"
+        status = "needs_human"
+        reason = (
+            "FLOW_CONNECTOR_CAPABILITY_MISSING"
+            if unavailable_connectors
+            else "FLOW_CAPABILITY_MISSING"
+        )
     elif template.blocked_external_write:
         status, reason = "needs_human", "FLOW_EXTERNAL_WRITE_UNAVAILABLE"
     elif not owner_configured:
@@ -209,6 +264,8 @@ def resolve_flow_availability(
         available_tools=tuple(available),
         unavailable_tools=tuple(unavailable),
         optional_unavailable_tools=tuple(optional_unavailable),
+        unavailable_connector_capabilities=tuple(sorted(unavailable_connectors)),
+        optional_unavailable_connector_capabilities=tuple(sorted(optional_unavailable_connectors)),
         owner_group_configured=owner_configured,
     )
 
@@ -220,6 +277,7 @@ def get_standard_flow(flow_key: str) -> FlowTemplate | None:
 
 __all__ = [
     "STANDARD_FLOW_TEMPLATES",
+    "ConnectorRequirement",
     "FlowAvailability",
     "FlowField",
     "FlowTemplate",

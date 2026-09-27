@@ -463,3 +463,37 @@
 [data-theme="dark"] .wb-emotion-attention.is-monitor { background: #493b20; color: #f0d28a; }
 [data-theme="dark"] .wb-emotion-evidence button { color: #83cfca; }
 [data-theme="dark"] .wb-emotion-review select { background: #243747; }
+
+.wb-flow-catalog { display: grid; gap: 7px; }
+.wb-flow-catalog > p { margin: 0; font-size: 11px; line-height: 1.45; }
+.wb-flow-list { display: grid; gap: 7px; }
+.wb-flow-item { border: 1px solid var(--wb-line); border-radius: 8px; background: #fbfcfd; }
+.wb-flow-item > summary {
+  min-height: 54px; padding: 8px 10px; display: grid; grid-template-columns: minmax(0, 1fr) auto 16px;
+  align-items: center; gap: 8px; list-style: none; cursor: pointer;
+}
+.wb-flow-item > summary::-webkit-details-marker { display: none; }
+.wb-flow-item > summary:focus-visible { outline: 3px solid #59cfc7; outline-offset: -2px; border-radius: 7px; }
+.wb-flow-summary-copy { min-width: 0; display: grid; gap: 3px; }
+.wb-flow-summary-copy strong { font-size: 12px; color: var(--wb-ink); }
+.wb-flow-summary-copy small { overflow: hidden; color: var(--wb-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.wb-flow-status { padding: 3px 6px; border-radius: 6px; background: #fff2df; color: #855c18; font-size: 10px; white-space: nowrap; }
+.wb-flow-status.is-available { background: #e5f5ee; color: #1e7255; }
+.wb-flow-chevron { color: var(--wb-muted); transition: transform 120ms ease; }
+.wb-flow-item[open] .wb-flow-chevron { transform: rotate(180deg); }
+.wb-flow-details { display: grid; gap: 6px; padding: 0 10px 10px; color: #586b7d; font-size: 10.5px; line-height: 1.45; }
+.wb-flow-details p { margin: 0; }
+.wb-flow-details strong { color: var(--wb-ink); }
+.wb-flow-readiness { padding: 7px; border-radius: 6px; background: #f0f4f7; }
+.wb-flow-field-group { display: grid; gap: 3px; }
+.wb-flow-field-group ul { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.wb-flow-field-group li { padding: 3px 6px; border: 1px solid var(--wb-line); border-radius: 5px; }
+.wb-flow-caution { display: flex; align-items: flex-start; gap: 5px; color: #97551e; }
+.wb-flow-caution svg { flex: none; margin-top: 1px; }
+.wb-flow-error { display: flex; gap: 6px; align-items: flex-start; color: #a43f36; font-size: 11px; }
+.wb-flow-error svg { flex: none; }
+[data-theme="dark"] .wb-flow-item { background: #243747; border-color: #405568; }
+[data-theme="dark"] .wb-flow-status { background: #493b20; color: #f0d28a; }
+[data-theme="dark"] .wb-flow-status.is-available { background: #1c4238; color: #91d4b6; }
+[data-theme="dark"] .wb-flow-readiness { background: #2b4050; }
+[data-theme="dark"] .wb-flow-caution { color: #e8b77b; }

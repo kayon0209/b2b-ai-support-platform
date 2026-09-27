@@ -22,6 +22,24 @@ import { dateFromEpochSeconds, int } from "../lib/format";
 
 const STATUSES = ["open", "acknowledged", "drafted", "resolved", "dismissed"];
 
+interface ReleaseEvaluationSummary {
+  evaluation_id: string;
+  candidate_version_id: string;
+  candidate_fingerprint: string;
+  status: "eligible" | "blocked";
+  reason_code: string;
+  approval_count: number;
+  current_user_approved: boolean;
+  post_test_status: "passed" | "blocked" | null;
+  created_at: number;
+}
+
+interface ReleaseEvaluationsResponse {
+  items: ReleaseEvaluationSummary[];
+  release_gate_enabled: boolean;
+  can_approve: boolean;
+}
+
 function toneForStatus(status: string): "neutral" | "info" | "warn" | "good" | "bad" {
   switch (status) {
     case "open":
@@ -55,6 +73,7 @@ export function GapQueue() {
     setSearchParams(params);
   }
   const [status, setStatus] = useState<string>("open");
+  const [releaseDraftId, setReleaseDraftId] = useState<string | null>(null);
 
   const gaps = useAsync<{ items: Gap[]; total: number }>(
     () =>
@@ -63,9 +82,19 @@ export function GapQueue() {
       ),
     [status],
   );
-  const drafts = useAsync<{ items: Draft[]; total: number }>(
-    () => apiGet<{ items: Draft[]; total: number }>(`/v1/knowledge/gaps/drafts?limit=100`),
+  const drafts = useAsync<{
+    items: Draft[];
+    total: number;
+    release_gate_enabled: boolean;
+  }>(
+    () => apiGet(`/v1/knowledge/gaps/drafts?limit=100`),
     [],
+  );
+  const releaseEvaluations = useAsync<ReleaseEvaluationsResponse>(
+    () => releaseDraftId
+      ? apiGet(`/v1/knowledge/drafts/${releaseDraftId}/release-evaluations`)
+      : Promise.resolve({ items: [], release_gate_enabled: false, can_approve: false }),
+    [releaseDraftId],
   );
   const stats = useAsync<GapStats>(() => apiGet<GapStats>(`/v1/knowledge/gaps/stats`), []);
   const spaces = useAsync<{ items: { id: string; name: string }[]; total: number }>(
@@ -89,6 +118,7 @@ export function GapQueue() {
       gaps.reload();
       drafts.reload();
       stats.reload();
+      releaseEvaluations.reload();
     }
     return ok;
   }
@@ -288,8 +318,8 @@ export function GapQueue() {
                   <tr key={d.id}>
                     <td className="cell-strong">{d.title}</td>
                     <td>
-                      <Badge tone={d.status === "approved" ? "good" : "info"}>
-                        {t(`gaps.status.${d.status}` as DictKey)}
+                      <Badge tone={d.published_document_id || d.status === "approved" ? "good" : "info"}>
+                        {t((d.published_document_id ? "gaps.status.published" : `gaps.status.${d.status}`) as DictKey)}
                       </Badge>
                     </td>
                     <td className="muted">{d.reviewed_by ?? "—"}</td>
@@ -343,9 +373,31 @@ export function GapQueue() {
                       </button>
                       <button
                         className="btn"
-                        disabled={action.busy || d.status !== "approved"}
+                        disabled={action.busy || d.status !== "approved" || d.published_document_id !== null}
                         onClick={async () => {
                           const spaceItems = spaces.data?.items ?? [];
+                          const releaseGateEnabled = drafts.data?.release_gate_enabled ?? false;
+                          let evaluationOptions: ReleaseEvaluationSummary[] = [];
+                          if (releaseGateEnabled) {
+                            try {
+                              const evidence = await apiGet<ReleaseEvaluationsResponse>(
+                                `/v1/knowledge/drafts/${d.id}/release-evaluations`,
+                              );
+                              evaluationOptions = evidence.items.filter(
+                                (item) => item.status === "eligible" && item.approval_count >= 2,
+                              );
+                            } catch (reason) {
+                              await action.run(() => Promise.reject(reason));
+                              return;
+                            }
+                            if (evaluationOptions.length === 0) {
+                              setReleaseDraftId(d.id);
+                              await action.run(
+                                () => Promise.reject(new Error(t("gaps.releaseEvalRequired"))),
+                              );
+                              return;
+                            }
+                          }
                           const values = await prompt.ask({
                             title: t("gaps.publishTitle", { title: d.title }),
                             confirmLabel: t("gaps.publish"),
@@ -367,18 +419,42 @@ export function GapQueue() {
                                 })),
                                 required: true,
                               },
+                              ...(releaseGateEnabled ? [{
+                                name: "release_evaluation_id",
+                                label: t("gaps.releaseEvaluationLabel"),
+                                options: evaluationOptions.map((item) => ({
+                                  value: item.evaluation_id,
+                                  label: `${item.candidate_fingerprint.slice(0, 12)} · ${item.approval_count}/2`,
+                                })),
+                                required: true,
+                              }] : []),
                             ],
                           });
                           if (values?.space_id) {
+                            const body: Record<string, string> = {
+                              space_id: values.space_id,
+                              version_label: "v1",
+                            };
+                            if (releaseGateEnabled) {
+                              body.release_evaluation_id = values.release_evaluation_id;
+                            }
                             act(
                               `/v1/knowledge/drafts/${d.id}/publish`,
-                              { space_id: values.space_id, version_label: "v1" },
+                              body,
                               t("gaps.published"),
                             );
                           }
                         }}
                       >
-                        {t("gaps.publish")}
+                        {t(d.published_document_id ? "gaps.alreadyPublished" : "gaps.publish")}
+                      </button>
+                      <button
+                        className="btn"
+                        disabled={d.status !== "approved"}
+                        aria-pressed={releaseDraftId === d.id}
+                        onClick={() => setReleaseDraftId(d.id)}
+                      >
+                        {t("gaps.releaseEvidence")}
                       </button>
                     </td>
                   </tr>
@@ -387,6 +463,72 @@ export function GapQueue() {
             </table>
             </div>
           ) : null}
+          {releaseDraftId ? <Card>
+            <div className="release-evidence-head">
+              <div>
+                <strong>{t("gaps.releaseEvidence")}</strong>
+                <p className="muted">
+                  {drafts.data?.items.find((item) => item.id === releaseDraftId)?.title ?? releaseDraftId}
+                </p>
+              </div>
+              <button className="btn" type="button" onClick={() => setReleaseDraftId(null)}>
+                {t("common.close")}
+              </button>
+            </div>
+            <p className="muted">
+              {t(releaseEvaluations.data?.release_gate_enabled ? "gaps.releaseGateEnabled" : "gaps.releaseGateDisabled")}
+            </p>
+            <LoadError
+              error={releaseEvaluations.error}
+              status={releaseEvaluations.errorStatus}
+              onRetry={releaseEvaluations.reload}
+            />
+            {releaseEvaluations.loading ? <Spinner label={t("gaps.loadingReleaseEvidence")} /> : null}
+            {releaseEvaluations.data?.items.length === 0 ? <p className="muted">{t("gaps.noReleaseEvidence")}</p> : null}
+            {releaseEvaluations.data?.items.map((item) => (
+              <div className="release-evidence-row" key={item.evaluation_id}>
+                <div>
+                  <strong>{item.status === "eligible" ? t("gaps.releaseCandidateEligible") : t("gaps.releaseCandidateBlocked")}</strong>
+                  <p className="muted">{item.reason_code} · {item.candidate_fingerprint.slice(0, 16)}</p>
+                  <p className="muted">{t("gaps.releaseApprovedCount", { count: item.approval_count })}</p>
+                  {item.post_test_status ? <p className="muted">{t(item.post_test_status === "passed" ? "gaps.releasePostTestPassed" : "gaps.releasePostTestBlocked")}</p> : null}
+                </div>
+                <div className="release-evidence-actions">
+                  <button
+                    className="btn"
+                    disabled={action.busy || !releaseEvaluations.data?.release_gate_enabled || !releaseEvaluations.data?.can_approve || item.status !== "eligible" || item.current_user_approved || item.approval_count >= 2}
+                    onClick={() => act(
+                      `/v1/knowledge/drafts/${releaseDraftId}/release-evaluations/${item.evaluation_id}/approve`,
+                      undefined,
+                      t("gaps.releaseApproved"),
+                    )}
+                  >
+                    {item.current_user_approved ? t("gaps.releaseAlreadyApproved") : t("gaps.releaseApprove")}
+                  </button>
+                  {item.post_test_status === "blocked" ? <button
+                    className="btn"
+                    disabled={action.busy || !releaseEvaluations.data?.can_approve}
+                    onClick={async () => {
+                      const confirmed = await prompt.ask({
+                        title: t("gaps.rollbackReleaseTitle"),
+                        confirmLabel: t("gaps.rollbackRelease"),
+                        detail: t("gaps.rollbackReleaseDetail"),
+                      });
+                      if (confirmed) {
+                        act(
+                          `/v1/knowledge/releases/${item.evaluation_id}/rollback`,
+                          { reason_code: "post_test_failed" },
+                          t("gaps.rollbackReleaseDone"),
+                        );
+                      }
+                    }}
+                  >
+                    {t("gaps.rollbackRelease")}
+                  </button> : null}
+                </div>
+              </div>
+            ))}
+          </Card> : null}
           {/* Publishing needs the space list. If that read failed, say so
               rather than opening a picker that is empty for the wrong
               reason — an empty list and a failed list look identical. */}

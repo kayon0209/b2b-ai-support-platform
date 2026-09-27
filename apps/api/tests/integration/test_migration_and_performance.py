@@ -101,6 +101,10 @@ TENANT_TABLES = (
     "knowledge_gaps",
     "knowledge_sources",
     "knowledge_spaces",
+    "knowledge_release_evaluations",
+    "knowledge_release_approvals",
+    "knowledge_release_post_tests",
+    "knowledge_release_events",
     "membership_invitations",
     "memberships",
     "outbox_events",
@@ -132,10 +136,10 @@ TENANT_TABLES = (
 # "how many revisions are registered", and a stray untracked file on one
 # machine must not be able to satisfy it.
 #
-# 65 as of 2026-09-27. `0066_emotion_advice_reviews` is the newest registered
-# revision (R2-01 append-only supervisor corrections); keep this synchronized
+# 66 as of 2026-09-27. `0067_knowledge_release_gate` is the newest registered
+# revision (R2-03 immutable evaluations, approvals, and release transitions); keep this synchronized
 # with the tracked revision set, excluding `.gitkeep` and local-only files.
-EXPECTED_MIGRATIONS = 65
+EXPECTED_MIGRATIONS = 66
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

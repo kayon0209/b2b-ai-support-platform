@@ -28,6 +28,12 @@ from platform_core.agent_runtime.emotion_review_service import (
     record_correction,
     replay_correction,
 )
+from platform_core.agent_runtime.semantic.contracts import SemanticTaskKind
+from platform_core.agent_runtime.tasks.capability import tenant_capabilities
+from platform_core.agent_runtime.tasks.standard_flows import (
+    STANDARD_FLOW_TEMPLATES,
+    resolve_flow_availability,
+)
 from platform_core.api import (
     AUTH_UNRESOLVED,
     CASE_NOT_FOUND,
@@ -51,10 +57,11 @@ from platform_core.cases.service import (
 from platform_core.identity import lease_service, org
 from platform_core.identity.control_lease import LeaseConflict
 from platform_core.identity.profile import account_profile
+from platform_core.integrations.readiness import active_connector_capabilities
 from platform_core.knowledge import flag_service
 from platform_core.outbox_service import enqueue
 from platform_core.support_bridge.continuity import conversation_channels
-from platform_policy import Action
+from platform_policy import Action, PolicyEngine
 
 router = APIRouter(prefix="/v1/workbench", tags=["workbench"])
 
@@ -167,6 +174,57 @@ def _auth(request: Request, action: Action) -> tuple[Any | None, Any | None]:
     if ctx is None:
         return None, error_response(AUTH_UNRESOLVED, "tenant context not resolved", status_code=401)
     return ctx, require_policy(ctx, action)
+
+
+@router.get("/standard-flows")
+async def list_standard_flows(request: Request) -> Any:
+    """List operator flow templates with current tenant/role readiness.
+
+    This endpoint is a read-only guide. It does not create a task, call a
+    connector, or promise that an external action will succeed. The Tool
+    Gateway re-checks every tool at execution time.
+    """
+    ctx, denied = _auth(request, Action.CASE_READ)
+    if denied is not None:
+        return denied
+    assert ctx is not None
+    actor_role = ctx.role or "support_viewer"
+    principal_id = str(ctx.actor_id) if ctx.actor_id else "unidentified"
+    policy = PolicyEngine()
+    async with tenant_session(ctx) as session:
+        read_filter = await tenant_capabilities(
+            session,
+            tenant_id=ctx.tenant_id,
+            kind=SemanticTaskKind.READ,
+            actor_role=actor_role,
+            principal_id=principal_id,
+            policy=policy,
+        )
+        write_filter = await tenant_capabilities(
+            session,
+            tenant_id=ctx.tenant_id,
+            kind=SemanticTaskKind.WRITE,
+            actor_role=actor_role,
+            principal_id=principal_id,
+            policy=policy,
+            allow_semantic_write=True,
+        )
+        capabilities = {**read_filter.available, **write_filter.available}
+        connector_caps = await active_connector_capabilities(session, tenant_id=ctx.tenant_id)
+        owner_groups = await org.routable_support_department_slugs(session, tenant_id=ctx.tenant_id)
+        items = [
+            {
+                "template": template.model_dump(mode="json"),
+                "availability": resolve_flow_availability(
+                    template,
+                    capabilities=capabilities,
+                    active_connector_capabilities=connector_caps,
+                    configured_owner_groups=owner_groups,
+                ).model_dump(mode="json"),
+            }
+            for template in STANDARD_FLOW_TEMPLATES
+        ]
+    return ok_response({"items": items, "execution_requires_tool_gateway": True})
 
 
 @router.get("/conversations")

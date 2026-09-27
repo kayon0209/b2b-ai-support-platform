@@ -33,6 +33,8 @@ from .knowledge_release import (
     KnowledgeEvalRun,
     KnowledgeReleaseApproval,
     KnowledgeReleaseGateResult,
+    evaluate_knowledge_candidate,
+    evaluate_knowledge_post_test,
     evaluate_knowledge_release,
 )
 
@@ -58,6 +60,8 @@ __all__ = [
     "KnowledgeEvalRun",
     "KnowledgeReleaseApproval",
     "KnowledgeReleaseGateResult",
+    "evaluate_knowledge_post_test",
+    "evaluate_knowledge_candidate",
     "MAX_ALLOWED_REGRESSION",
     "OwnershipProof",
     "PAYLOAD_SCHEMAS",

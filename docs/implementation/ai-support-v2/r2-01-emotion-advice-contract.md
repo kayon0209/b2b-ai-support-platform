@@ -46,11 +46,10 @@
 
 ## 验收记录
 
-在 `r2r3_restart_accept_20260927` 隔离 PostgreSQL 数据库上迁移到 `0066_emotion_advice_reviews`，测试结束后该库按清理计划销毁。
+在 `r2r3_continue_accept_20260927` 隔离 PostgreSQL 数据库上迁移到 `0067_knowledge_release_gate`；测试结束后该专用库将销毁。
 
-- 最近一次组合复验中，74 项 R2 API/策略/情绪、R2-02 流程目录和 shared-contract 测试通过；覆盖默认关闭、功能开启、当前页排序、主管权限、重放冲突、过期建议拒绝及合同边界。
-- 14 项跨租户、数据库权限、迁移回滚/重放和入站性能验收通过；完整迁移从 0065 到 0066、downgrade/re-upgrade 与全链回滚/重建通过。
+- 最近一次组合复验中，139 项 R2/R3 API、策略、情绪、流程目录、知识发布、canonical adapter 和 shared-contract 测试通过；覆盖租户隔离、幂等重放、审批门禁、发布回滚和连接器缺失时的人工退出。
 - 管理端 TypeScript/Vite production build、36 项现有前端行为检查和 runtime guards 通过。
-- Ruff 与目标模块 Mypy 通过。
+- Ruff、目标模块 Mypy、全链 migration downgrade/re-upgrade/rebuild、FORCE RLS 和应用角色 append-only privilege 检查通过。
 
 尚未覆盖：CI 对本分支运行、浏览器尺寸/截图验收、200% 缩放与屏幕阅读器走查，以及任何真实生产租户的数据质量评估。以上不改变默认关闭和“仅供人工参考”的产品边界。

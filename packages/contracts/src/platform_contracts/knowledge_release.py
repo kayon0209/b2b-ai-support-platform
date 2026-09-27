@@ -33,6 +33,8 @@ class KnowledgeEvalRun(StrictReleaseModel):
     knowledge_space_id: UUID
     document_version_id: UUID
     knowledge_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    knowledge_snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    parent_snapshot_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     retrieval_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     evaluator_version: str = Field(min_length=1, max_length=63)
@@ -68,11 +70,16 @@ class KnowledgeReleaseGateResult(StrictReleaseModel):
     status: Literal["eligible", "blocked"]
     reason_code: Literal[
         "KNOWLEDGE_RELEASE_ELIGIBLE",
+        "KNOWLEDGE_CANDIDATE_ELIGIBLE",
         "EVAL_INPUT_MISMATCH",
         "KNOWLEDGE_VERSION_UNCHANGED",
         "FOUR_EYES_REVIEW_REQUIRED",
         "UNSAFE_ANSWER_FOUND",
         "KNOWLEDGE_QUALITY_REGRESSION",
+        "KNOWLEDGE_POST_TEST_PASSED",
+        "POST_TEST_INPUT_MISMATCH",
+        "POST_TEST_UNSAFE_ANSWER",
+        "POST_TEST_QUALITY_REGRESSION",
     ]
     candidate_fingerprint: str
     max_allowed_regression: float
@@ -88,14 +95,10 @@ def evaluate_knowledge_release(
 ) -> KnowledgeReleaseGateResult:
     """Fail closed unless the same authorized eval proves a safe knowledge delta."""
     fingerprint = candidate.fingerprint()
-    deltas = _metric_deltas(baseline.metrics, candidate.metrics)
-    if not _same_evaluation_basis(baseline, candidate):
-        return _gate("blocked", "EVAL_INPUT_MISMATCH", fingerprint, deltas)
-    if (
-        baseline.document_version_id == candidate.document_version_id
-        or baseline.knowledge_content_sha256 == candidate.knowledge_content_sha256
-    ):
-        return _gate("blocked", "KNOWLEDGE_VERSION_UNCHANGED", fingerprint, deltas)
+    candidate_gate = evaluate_knowledge_candidate(baseline, candidate)
+    deltas = candidate_gate.metric_deltas
+    if candidate_gate.status != "eligible":
+        return candidate_gate
     approved_by = {
         approval.reviewer_id
         for approval in approvals
@@ -105,11 +108,65 @@ def evaluate_knowledge_release(
     }
     if len(approved_by) < 2:
         return _gate("blocked", "FOUR_EYES_REVIEW_REQUIRED", fingerprint, deltas)
+    return _gate("eligible", "KNOWLEDGE_RELEASE_ELIGIBLE", fingerprint, deltas)
+
+
+def evaluate_knowledge_candidate(
+    baseline: KnowledgeEvalRun,
+    candidate: KnowledgeEvalRun,
+) -> KnowledgeReleaseGateResult:
+    """Check evidence comparability and metrics before any human approval."""
+    fingerprint = candidate.fingerprint()
+    deltas = _metric_deltas(baseline.metrics, candidate.metrics)
+    if not _same_evaluation_basis(baseline, candidate):
+        return _gate("blocked", "EVAL_INPUT_MISMATCH", fingerprint, deltas)
+    if (
+        baseline.parent_snapshot_sha256 is not None
+        or candidate.parent_snapshot_sha256 != baseline.knowledge_snapshot_sha256
+        or candidate.knowledge_snapshot_sha256 == baseline.knowledge_snapshot_sha256
+    ):
+        return _gate("blocked", "EVAL_INPUT_MISMATCH", fingerprint, deltas)
+    if (
+        baseline.document_version_id == candidate.document_version_id
+        or baseline.knowledge_content_sha256 == candidate.knowledge_content_sha256
+    ):
+        return _gate("blocked", "KNOWLEDGE_VERSION_UNCHANGED", fingerprint, deltas)
     if candidate.metrics.unsafe_answer_count > 0:
         return _gate("blocked", "UNSAFE_ANSWER_FOUND", fingerprint, deltas)
     if any(value < -(MAX_ALLOWED_REGRESSION + _FLOAT_EPSILON) for value in deltas.values()):
         return _gate("blocked", "KNOWLEDGE_QUALITY_REGRESSION", fingerprint, deltas)
-    return _gate("eligible", "KNOWLEDGE_RELEASE_ELIGIBLE", fingerprint, deltas)
+    return _gate("eligible", "KNOWLEDGE_CANDIDATE_ELIGIBLE", fingerprint, deltas)
+
+
+def evaluate_knowledge_post_test(
+    candidate_pre_publish: KnowledgeEvalRun,
+    post_publish: KnowledgeEvalRun,
+) -> KnowledgeReleaseGateResult:
+    """Compare the live post-test against the exact candidate build reviewed."""
+    fingerprint = post_publish.fingerprint()
+    deltas = _metric_deltas(candidate_pre_publish.metrics, post_publish.metrics)
+    same_candidate = (
+        candidate_pre_publish.tenant_id == post_publish.tenant_id
+        and candidate_pre_publish.knowledge_space_id == post_publish.knowledge_space_id
+        and candidate_pre_publish.document_version_id == post_publish.document_version_id
+        and candidate_pre_publish.knowledge_content_sha256 == post_publish.knowledge_content_sha256
+        and candidate_pre_publish.knowledge_snapshot_sha256
+        == post_publish.knowledge_snapshot_sha256
+        and candidate_pre_publish.parent_snapshot_sha256 == post_publish.parent_snapshot_sha256
+        and candidate_pre_publish.dataset_sha256 == post_publish.dataset_sha256
+        and candidate_pre_publish.retrieval_config_sha256 == post_publish.retrieval_config_sha256
+        and candidate_pre_publish.evaluator_version == post_publish.evaluator_version
+        and candidate_pre_publish.commit_sha == post_publish.commit_sha
+        and candidate_pre_publish.metrics.case_count == post_publish.metrics.case_count
+        and post_publish.evaluated_at > candidate_pre_publish.evaluated_at
+    )
+    if not same_candidate:
+        return _gate("blocked", "POST_TEST_INPUT_MISMATCH", fingerprint, deltas)
+    if post_publish.metrics.unsafe_answer_count > 0:
+        return _gate("blocked", "POST_TEST_UNSAFE_ANSWER", fingerprint, deltas)
+    if any(value < -(MAX_ALLOWED_REGRESSION + _FLOAT_EPSILON) for value in deltas.values()):
+        return _gate("blocked", "POST_TEST_QUALITY_REGRESSION", fingerprint, deltas)
+    return _gate("eligible", "KNOWLEDGE_POST_TEST_PASSED", fingerprint, deltas)
 
 
 def _same_evaluation_basis(baseline: KnowledgeEvalRun, candidate: KnowledgeEvalRun) -> bool:
@@ -138,11 +195,16 @@ def _gate(
     status: Literal["eligible", "blocked"],
     reason_code: Literal[
         "KNOWLEDGE_RELEASE_ELIGIBLE",
+        "KNOWLEDGE_CANDIDATE_ELIGIBLE",
         "EVAL_INPUT_MISMATCH",
         "KNOWLEDGE_VERSION_UNCHANGED",
         "FOUR_EYES_REVIEW_REQUIRED",
         "UNSAFE_ANSWER_FOUND",
         "KNOWLEDGE_QUALITY_REGRESSION",
+        "KNOWLEDGE_POST_TEST_PASSED",
+        "POST_TEST_INPUT_MISMATCH",
+        "POST_TEST_UNSAFE_ANSWER",
+        "POST_TEST_QUALITY_REGRESSION",
     ],
     fingerprint: str,
     deltas: dict[str, float],
@@ -167,5 +229,7 @@ __all__ = [
     "KnowledgeEvalRun",
     "KnowledgeReleaseApproval",
     "KnowledgeReleaseGateResult",
+    "evaluate_knowledge_candidate",
+    "evaluate_knowledge_post_test",
     "evaluate_knowledge_release",
 ]

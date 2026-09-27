@@ -79,6 +79,22 @@ RESTRICTED_BY_DESIGN: dict[str, tuple[frozenset[str], str]] = {
         frozenset({"UPDATE", "DELETE"}),
         "append-only supervisor feedback: corrections are new audited rows",
     ),
+    "knowledge_release_evaluations": (
+        frozenset({"UPDATE", "DELETE"}),
+        "immutable evaluation evidence; a rerun creates a new row",
+    ),
+    "knowledge_release_approvals": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only human approval bound to an evaluation fingerprint",
+    ),
+    "knowledge_release_post_tests": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only post-publication measurements",
+    ),
+    "knowledge_release_events": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only publication and rollback history",
+    ),
 }
 
 PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")

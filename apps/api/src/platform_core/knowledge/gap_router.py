@@ -26,21 +26,23 @@ enforced in `gap_service` so the HTTP path cannot bypass them.
 """
 
 import uuid
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from platform_contracts.knowledge_release import KnowledgeEvalRun
 from platform_core.api import (
     domain_error_response,
     error_response,
+    require_idempotency_key,
     require_write_idempotency,
     tenant_session,
 )
 from platform_core.identity import tenant_context
 from platform_core.identity.tenant_context import TenantContext
-from platform_core.knowledge import gap_service
+from platform_core.knowledge import flag_service, gap_service, release_service
 from platform_core.knowledge.gap_models import GapStatus
 from platform_policy import Action, Decision, PolicyEngine, Principal
 
@@ -74,6 +76,21 @@ class ReviewIn(BaseModel):
 class PublishIn(BaseModel):
     space_id: str
     version_label: str = Field(default="v1", min_length=1, max_length=63)
+    release_evaluation_id: uuid.UUID | None = None
+
+
+class InternalReleaseEvaluationIn(BaseModel):
+    knowledge_space_id: uuid.UUID
+    baseline_run: KnowledgeEvalRun
+    candidate_run: KnowledgeEvalRun
+
+
+class InternalReleasePostTestIn(BaseModel):
+    run: KnowledgeEvalRun
+
+
+class ReleaseRollbackIn(BaseModel):
+    reason_code: Literal["post_test_failed", "manual_quality_issue"]
 
 
 def _principal_from_ctx(ctx: TenantContext) -> Principal:
@@ -102,6 +119,15 @@ def _gap_error(exc: gap_service.GapError) -> JSONResponse:
     platform_core.api.domain_error_response).
     """
     return domain_error_response(exc.code, exc.detail)
+
+
+def _release_error(exc: release_service.KnowledgeReleaseError) -> JSONResponse:
+    status = 409
+    if exc.code.endswith("NOT_FOUND"):
+        status = 404
+    elif exc.code.endswith("DENIED") or exc.code.endswith("REQUIRED"):
+        status = 403
+    return error_response(exc.code, exc.detail, status_code=status)
 
 
 def _ctx_of(request: Request) -> TenantContext:
@@ -159,6 +185,7 @@ def _draft_out(row: Any) -> dict[str, Any]:
         "body": row.body,
         "status": row.status,
         "author_kind": row.author_kind,
+        "author_id": str(row.author_id) if row.author_id else None,
         "reviewed_by": str(row.reviewed_by) if row.reviewed_by else None,
         "reviewed_at": row.reviewed_at,
         "review_notes": row.review_notes,
@@ -232,7 +259,17 @@ async def list_knowledge_drafts(
         rows = await gap_service.list_drafts(
             session, tenant_id=ctx.tenant_id, status=status, limit=limit
         )
-        return {"items": [_draft_out(r) for r in rows], "total": len(rows)}
+        release_gate = await flag_service.evaluate(
+            session,
+            flag_key=release_service.FLAG_KNOWLEDGE_RELEASE_GATE,
+            tenant_id=ctx.tenant_id,
+            default=False,
+        )
+        return {
+            "items": [_draft_out(r) for r in rows],
+            "total": len(rows),
+            "release_gate_enabled": release_gate.enabled,
+        }
 
 
 @router.post("/gaps/{gap_id}/acknowledge")
@@ -351,7 +388,17 @@ async def publish_gap_draft(
     if denial is not None:
         return denial
 
+    idempotency_key = require_idempotency_key(request)
+    if idempotency_key is None:
+        return error_response("IDEMPOTENCY_KEY_REQUIRED", status_code=400)
+
     async with tenant_session(ctx) as session:
+        decision = await flag_service.evaluate(
+            session,
+            flag_key=release_service.FLAG_KNOWLEDGE_RELEASE_GATE,
+            tenant_id=ctx.tenant_id,
+            default=False,
+        )
         try:
             version = await gap_service.publish_draft(
                 session,
@@ -359,9 +406,14 @@ async def publish_gap_draft(
                 draft_id=_uuid(draft_id, "knowledge draft"),
                 space_id=_uuid(payload.space_id, "knowledge space"),
                 version_label=payload.version_label,
+                release_gate_enabled=decision.enabled,
+                release_evaluation_id=payload.release_evaluation_id,
+                idempotency_key=idempotency_key,
             )
         except gap_service.GapError as exc:
             return _gap_error(exc)
+        except release_service.KnowledgeReleaseError as exc:
+            return _release_error(exc)
         await session.commit()
         return {
             "document_version_id": str(version.id),
@@ -369,6 +421,213 @@ async def publish_gap_draft(
             "status": version.status,
             "version_label": version.version_label,
         }
+
+
+@router.get("/drafts/{draft_id}/release-evaluations")
+async def list_draft_release_evaluations(request: Request, draft_id: str) -> Any:
+    ctx = _ctx_of(request)
+    denial = _gate(request, ctx, Action.KNOWLEDGE_READ, "knowledge.read")
+    if denial is not None:
+        return denial
+    assert ctx is not None
+    async with tenant_session(ctx) as session:
+        try:
+            draft_uuid = _uuid(draft_id, "knowledge draft")
+            items = await release_service.list_release_evaluations(
+                session,
+                tenant_id=ctx.tenant_id,
+                draft_id=draft_uuid,
+                reviewer_id=ctx.actor_id,
+            )
+            decision = await flag_service.evaluate(
+                session,
+                flag_key=release_service.FLAG_KNOWLEDGE_RELEASE_GATE,
+                tenant_id=ctx.tenant_id,
+                default=False,
+            )
+        except gap_service.GapError as exc:
+            return _gap_error(exc)
+        return {
+            "items": items,
+            "release_gate_enabled": decision.enabled,
+            "can_approve": ctx.role in {"knowledge_manager", "tenant_owner"}
+            and ctx.actor_id is not None,
+        }
+
+
+@router.post("/drafts/{draft_id}/release-evaluations/{evaluation_id}/approve")
+async def approve_knowledge_release(request: Request, draft_id: str, evaluation_id: str) -> Any:
+    ctx = _ctx_of(request)
+    denial = _gate(request, ctx, Action.KNOWLEDGE_PUBLISH, "knowledge.publish")
+    if denial is not None:
+        return denial
+    assert ctx is not None
+    if ctx.role not in {"knowledge_manager", "tenant_owner"}:
+        return _denied("knowledge.release.approve", "reviewer role is not permitted")
+    idempotency_key = require_idempotency_key(request)
+    if idempotency_key is None:
+        return error_response("IDEMPOTENCY_KEY_REQUIRED", status_code=400)
+    try:
+        draft_uuid = _uuid(draft_id, "knowledge draft")
+        evaluation_uuid = _uuid(evaluation_id, "knowledge release evaluation")
+    except gap_service.GapError as exc:
+        return _gap_error(exc)
+
+    async with tenant_session(ctx) as session:
+        enabled = await flag_service.evaluate(
+            session,
+            flag_key=release_service.FLAG_KNOWLEDGE_RELEASE_GATE,
+            tenant_id=ctx.tenant_id,
+            default=False,
+        )
+        if not enabled.enabled:
+            return error_response(
+                "FEATURE_DISABLED", "knowledge release gate is not enabled", status_code=409
+            )
+        try:
+            approval, replayed = await release_service.approve_evaluation(
+                session,
+                ctx=ctx,
+                evaluation_id=evaluation_uuid,
+                draft_id=draft_uuid,
+                idempotency_key=idempotency_key,
+            )
+        except release_service.KnowledgeReleaseError as exc:
+            return _release_error(exc)
+        await session.commit()
+    return {
+        "approval_id": str(approval.id),
+        "evaluation_id": str(approval.evaluation_id),
+        "candidate_fingerprint": approval.candidate_fingerprint,
+        "replayed": replayed,
+    }
+
+
+@router.post("/internal/drafts/{draft_id}/release-evaluations")
+async def record_internal_knowledge_evaluation(
+    request: Request,
+    draft_id: str,
+    payload: Annotated[InternalReleaseEvaluationIn, Body()],
+) -> Any:
+    ctx = _ctx_of(request)
+    if ctx.actor_kind not in {"system", "service"}:
+        return error_response("EVALUATOR_SERVICE_REQUIRED", status_code=403)
+    idempotency_key = require_idempotency_key(request)
+    if idempotency_key is None:
+        return error_response("IDEMPOTENCY_KEY_REQUIRED", status_code=400)
+    try:
+        draft_uuid = _uuid(draft_id, "knowledge draft")
+    except gap_service.GapError as exc:
+        return _gap_error(exc)
+    async with tenant_session(ctx) as session:
+        enabled = await flag_service.evaluate(
+            session,
+            flag_key=release_service.FLAG_KNOWLEDGE_RELEASE_GATE,
+            tenant_id=ctx.tenant_id,
+            default=False,
+        )
+        if not enabled.enabled:
+            return error_response(
+                "FEATURE_DISABLED", "knowledge release gate is not enabled", status_code=409
+            )
+        try:
+            row, replayed = await release_service.record_evaluation(
+                session,
+                ctx=ctx,
+                draft_id=draft_uuid,
+                knowledge_space_id=payload.knowledge_space_id,
+                baseline_run=payload.baseline_run,
+                candidate_run=payload.candidate_run,
+                idempotency_key=idempotency_key,
+            )
+        except release_service.KnowledgeReleaseError as exc:
+            return _release_error(exc)
+        await session.commit()
+    return {
+        "evaluation_id": str(row.id),
+        "candidate_version_id": str(row.candidate_version_id),
+        "candidate_fingerprint": row.candidate_fingerprint,
+        "status": row.status,
+        "reason_code": row.reason_code,
+        "replayed": replayed,
+    }
+
+
+@router.post("/internal/releases/{evaluation_id}/post-test")
+async def record_internal_knowledge_post_test(
+    request: Request,
+    evaluation_id: str,
+    payload: Annotated[InternalReleasePostTestIn, Body()],
+) -> Any:
+    ctx = _ctx_of(request)
+    if ctx.actor_kind not in {"system", "service"}:
+        return error_response("EVALUATOR_SERVICE_REQUIRED", status_code=403)
+    idempotency_key = require_idempotency_key(request)
+    if idempotency_key is None:
+        return error_response("IDEMPOTENCY_KEY_REQUIRED", status_code=400)
+    try:
+        evaluation_uuid = _uuid(evaluation_id, "knowledge release evaluation")
+    except gap_service.GapError as exc:
+        return _gap_error(exc)
+    async with tenant_session(ctx) as session:
+        try:
+            row, replayed = await release_service.record_post_test(
+                session,
+                ctx=ctx,
+                evaluation_id=evaluation_uuid,
+                post_run=payload.run,
+                idempotency_key=idempotency_key,
+            )
+        except release_service.KnowledgeReleaseError as exc:
+            return _release_error(exc)
+        await session.commit()
+    return {
+        "post_test_id": str(row.id),
+        "evaluation_id": str(row.evaluation_id),
+        "status": row.status,
+        "reason_code": row.reason_code,
+        "replayed": replayed,
+    }
+
+
+@router.post("/releases/{evaluation_id}/rollback")
+async def rollback_knowledge_release(
+    request: Request,
+    evaluation_id: str,
+    payload: Annotated[ReleaseRollbackIn, Body()],
+) -> Any:
+    ctx = _ctx_of(request)
+    denial = _gate(request, ctx, Action.KNOWLEDGE_PUBLISH, "knowledge.publish")
+    if denial is not None:
+        return denial
+    assert ctx is not None
+    if ctx.role not in {"knowledge_manager", "tenant_owner"}:
+        return _denied("knowledge.release.rollback", "publisher role is not permitted")
+    idempotency_key = require_idempotency_key(request)
+    if idempotency_key is None:
+        return error_response("IDEMPOTENCY_KEY_REQUIRED", status_code=400)
+    try:
+        evaluation_uuid = _uuid(evaluation_id, "knowledge release evaluation")
+    except gap_service.GapError as exc:
+        return _gap_error(exc)
+    async with tenant_session(ctx) as session:
+        try:
+            candidate_id, baseline_id, replayed = await release_service.rollback_release(
+                session,
+                ctx=ctx,
+                evaluation_id=evaluation_uuid,
+                idempotency_key=idempotency_key,
+                reason_code=payload.reason_code,
+            )
+        except release_service.KnowledgeReleaseError as exc:
+            return _release_error(exc)
+        await session.commit()
+    return {
+        "evaluation_id": str(evaluation_uuid),
+        "superseded_version_id": str(candidate_id),
+        "restored_version_id": str(baseline_id),
+        "replayed": replayed,
+    }
 
 
 __all__ = ["router"]

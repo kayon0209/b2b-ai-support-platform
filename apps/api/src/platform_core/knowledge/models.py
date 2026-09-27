@@ -58,6 +58,7 @@ class Vector(UserDefinedType[str]):
 
 class KnowledgeSpace(Base, PkMixin, TenantMixin):
     __tablename__ = "knowledge_spaces"
+    __table_args__ = (UniqueConstraint("tenant_id", "id", name="uq_knowledge_spaces_tenant_id"),)
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(31), nullable=False, default="active")
@@ -103,6 +104,7 @@ class Document(Base, PkMixin, TenantMixin):
 class DocumentVersion(Base, PkMixin, TenantMixin):
     __tablename__ = "document_versions"
     __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_document_versions_tenant_id"),
         UniqueConstraint("document_id", "version_label", name="uq_version_label"),
         Index("ix_docversion_status_dates", "status", "effective_at", "expires_at"),
     )

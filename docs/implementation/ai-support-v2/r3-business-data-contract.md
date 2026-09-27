@@ -1,6 +1,6 @@
 # R3 自研业务系统接入与权威数据契约
 
-状态：已实现供应商中立的共享 Pydantic 契约和纯契约测试；尚无真实 provider adapter、sandbox 或业务系统写入。
+状态：已实现供应商中立的共享 Pydantic 契约、canonical adapter Protocol 和假 provider 边界测试；尚无真实 provider adapter、sandbox 或业务系统写入。
 
 ## 已确定的产品决策
 
@@ -25,7 +25,7 @@ ERP、MES、WMS、CRM 以企业自研为主。标准 ERP 的对象和流程不�
 
 ## Canonical schema
 
-实现位置：`packages/contracts/src/platform_contracts/business_systems.py`。
+实现位置：`packages/contracts/src/platform_contracts/business_systems.py`、`apps/api/src/platform_core/integrations/canonical_business.py`。
 
 - `AuthorityBinding` 记录 tenant、数据域、连接器、系统类型、contract/schema 版本、数据最大时效和审批人。
 - `SourceMetadata` 随每个规范化产品、库存、报价事实返回：tenant、binding id/version、connector id、系统类型、外部记录引用/版本、读取时刻和失效时刻。
@@ -61,4 +61,4 @@ ERP、MES、WMS、CRM 以企业自研为主。标准 ERP 的对象和流程不�
 
 ## 当前验收
 
-当前 `packages/contracts` 共 34 项测试通过，覆盖 UTC 与时效、TTL 截断、租户来源一致性、未知字段拒绝、报价币种/金额单位、外部归属证明、`unknown` 与成功读回的状态约束，以及知识评测证据。它们证明 canonical schema 的行为，不代表真实业务 API 已连通，也不代表端到端写入已验收。
+当前共享 contracts、canonical adapter 与 R3 fake-boundary 测试覆盖 UTC/TTL、版本绑定、tenant/connector/owner 归属、陈旧信息拒绝、未知字段、报价币种/金额、超时 unknown 与读回成功约束。假 adapter 只测试平台边界，不模拟真实 ERP 行为；没有真实业务 API 或端到端写入验收结论。
