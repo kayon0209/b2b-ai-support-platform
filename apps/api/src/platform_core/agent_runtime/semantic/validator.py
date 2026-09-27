@@ -145,6 +145,10 @@ class CapabilityView:
     tool_name: str
     risk_class: str
     allowed_task_kinds: frozenset[str] = frozenset()
+    # Names only; values and authorization remain server-owned. Exact parameter
+    # names keep model slot proposals aligned with the registered tool schema.
+    parameter_names: tuple[str, ...] = ()
+    required_parameters: tuple[str, ...] = ()
 
 
 @dataclass

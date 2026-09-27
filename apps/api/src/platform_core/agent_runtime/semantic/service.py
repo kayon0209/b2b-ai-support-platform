@@ -103,13 +103,22 @@ SEMANTIC_SYSTEM_PROMPT = (
     "rename it to intent, route, or another alias. Do not add keys.\n\n"
     f"Allowed primary_intent and secondary_intents values: {_INTENT_VALUES}.\n"
     f"Allowed scene values: {_SCENE_VALUES}.\n"
+    'Use an exact enum value and never invent a scene label; use "unspecified" '
+    "when no scene fits.\n"
     f"Allowed business_line values: {_BUSINESS_LINE_VALUES}.\n"
+    "Use an exact enum value and never invent a product-line label.\n"
+    "scene describes the business domain, not the requested action. business_line describes "
+    "the product family: PCB board fabrication=pcb, assembly=smt, electronic parts=component, "
+    "design-for-manufacturing review=dfm.\n"
     f"Allowed confidence_band values: {_CONFIDENCE_VALUES}.\n"
     "needs_clarification must be a JSON boolean. emotion_signal must be a "
     "short string or null. Use empty arrays when there are no secondary "
     "intents, tasks, evidence spans, or tool candidates.\n\n"
     "Each intents[] object has: task_kind, source_turn_id, evidence, slots, "
-    "missing_slots, depends_on, condition. task_kind must be one of "
+    "missing_slots, depends_on, condition. depends_on contains zero-based "
+    'positions in intents[], encoded as strings such as ["0"]; use an '
+    "empty array when there is no dependency and never use task names. "
+    "task_kind must be one of "
     f"{_TASK_KIND_VALUES}. source_turn_id must exactly match a turn id in the "
     "input. Each evidence[] item has turn_id, start, end; offsets are "
     "zero-based character positions and end is exclusive. Use an empty "
@@ -117,12 +126,18 @@ SEMANTIC_SYSTEM_PROMPT = (
     "name, value, origin, confirmed; origin must be one of "
     f"{_SLOT_ORIGIN_VALUES}. Never guess a slot value. If it is absent from "
     "customer text and verified facts, put its name in missing_slots. "
+    "When an offered tool has a relevant parameter, reuse its exact parameter "
+    "name for the slot and missing_slots entry; do not rename it. For human "
+    "follow-up, use the exact standard names in CANONICAL_SLOT_NAMES from the input; "
+    "never invent aliases. "
     "condition must be null or an object with field, operator, value; "
     f"operator must be one of {_CONDITION_OPERATOR_VALUES}, and field must "
     "be a registered field shown in the input.\n\n"
     "Each evidence_spans[] item has turn_id, start, end with the same offset "
     "rules. Each tool_candidates[] item has tool_name and reason; only name "
-    "tools listed under AVAILABLE_CAPABILITIES. Never invent a tool.\n\n"
+    "tools listed under AVAILABLE_CAPABILITIES. When that list is empty, return "
+    "tool_candidates=[]. Each candidate must be an object with tool_name and reason, "
+    "not a string. Never invent a tool.\n\n"
     "Use this shape, replacing example values with the actual input values: "
     '{"primary_intent":"business_query","secondary_intents":[],"scene":"order_fulfilment",'
     '"business_line":"unspecified","intents":[{"task_kind":"read","source_turn_id":"t-1",'
@@ -226,7 +241,7 @@ async def analyze(
     assert provider is not None  # narrowed by the guard above
 
     model_name = chat_model_for(ChatTask.CLASSIFY)
-    prompt = render_prompt(ctx)
+    prompt = render_prompt(ctx, condition_fields=REGISTERED_CONDITION_FIELDS)
     messages = [
         ChatMessage(role=ProviderRole.SYSTEM, content=SEMANTIC_SYSTEM_PROMPT),
         ChatMessage(role=ProviderRole.USER, content=prompt),

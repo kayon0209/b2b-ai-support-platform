@@ -158,6 +158,10 @@ async def tenant_capabilities(
                 # write is `read` cannot downgrade it here.
                 risk_class=risk,
                 allowed_task_kinds=frozenset({kind.value}),
+                parameter_names=tuple(
+                    sorted((row.input_schema or {}).get("properties", {}).keys())
+                ),
+                required_parameters=tuple(sorted((row.input_schema or {}).get("required", []))),
             )
 
     return result

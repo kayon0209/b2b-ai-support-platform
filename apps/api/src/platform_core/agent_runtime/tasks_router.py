@@ -68,6 +68,7 @@ from platform_core.api import (
     require_write_idempotency,
     tenant_session,
 )
+from platform_core.evaluation.pii import should_withhold_value
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
 from platform_core.identity.tenant_context import TenantContext
@@ -358,7 +359,7 @@ async def _persist_collected(
 
     slots: list[dict[str, Any]] = []
     for name, value in fields.items():
-        sensitive = name.lower() in SENSITIVE_FIELD_NAMES
+        sensitive = name.lower() in SENSITIVE_FIELD_NAMES or should_withhold_value(name)
         slot: dict[str, Any] = {
             "name": name,
             "origin": "agent_collected",

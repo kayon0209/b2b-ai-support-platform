@@ -19,6 +19,7 @@
 3. [开发任务与执行顺序](tasks.md)
 4. [最终验收协议](acceptance.md)
 5. [可直接复制的 WorkBuddy 交接指令](workbuddy-handoff.md)
+6. [R1 语义评测集与人工标注规范](semantic-evaluation.md)
 
 ## 发布边界
 

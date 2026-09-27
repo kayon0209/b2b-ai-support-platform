@@ -231,6 +231,21 @@ def test_classify_field_levels() -> None:
     assert classify_field("email") == Sensitivity.RESTRICTED
     assert classify_field("customer_name") == Sensitivity.CONFIDENTIAL
     assert classify_field("case_status") == Sensitivity.INTERNAL
+    assert classify_field("new_address") == Sensitivity.CONFIDENTIAL
+    assert classify_field("destination_city") == Sensitivity.CONFIDENTIAL
+    assert classify_field("shippingAddresses") == Sensitivity.CONFIDENTIAL
+    assert classify_field("recipientName") == Sensitivity.CONFIDENTIAL
+    assert classify_field("收件人姓名") == Sensitivity.CONFIDENTIAL
+    assert classify_field("contactEmails") == Sensitivity.RESTRICTED
+    assert classify_field("邮箱") == Sensitivity.RESTRICTED
+    assert classify_field("手机号") == Sensitivity.RESTRICTED
+    assert classify_field("tokens") == Sensitivity.RESTRICTED
+    assert classify_field("tokens_used") == Sensitivity.INTERNAL
+    assert classify_field("bankAccountNumber") == Sensitivity.RESTRICTED
+    assert classify_field("credit_card_number") == Sensitivity.RESTRICTED
+    assert classify_field("收货地址") == Sensitivity.CONFIDENTIAL
+    assert classify_field("银行卡号") == Sensitivity.RESTRICTED
+    assert classify_field("order_id") == Sensitivity.INTERNAL
 
 
 def test_redact_text_patterns() -> None:

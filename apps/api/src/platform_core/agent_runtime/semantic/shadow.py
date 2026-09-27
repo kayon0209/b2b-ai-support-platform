@@ -195,10 +195,17 @@ def capabilities_for_shadow(
     out: dict[str, CapabilityView] = {}
     for name, cap in available.items():
         risk = getattr(cap, "risk", None) or getattr(cap, "risk_class", "read")
+        schema = getattr(cap, "input_schema", None) or {}
+        if isinstance(cap, dict):
+            schema = cap.get("input_schema") or schema
+        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        required = schema.get("required", []) if isinstance(schema, dict) else []
         out[name] = CapabilityView(
             tool_name=name,
             risk_class=str(risk),
             allowed_task_kinds=frozenset({"read", "write", "clarify"}),
+            parameter_names=tuple(sorted(properties)) if isinstance(properties, dict) else (),
+            required_parameters=tuple(sorted(required)) if isinstance(required, list) else (),
         )
     return out
 

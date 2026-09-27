@@ -74,6 +74,9 @@ class EvalCase:
     text: str
     expected_intents: tuple[str, ...]
     expected_scene: str | None = None
+    expected_business_line: str | None = None
+    available_tools: tuple[str, ...] = ()
+    expected_tools: tuple[str, ...] = ()
     expected_slots: dict[str, Any] = field(default_factory=dict)
     missing_slots: tuple[str, ...] = ()
     slices: tuple[str, ...] = ()
@@ -94,6 +97,9 @@ class EvalCase:
             "text": self.text,
             "expected_intents": list(self.expected_intents),
             "expected_scene": self.expected_scene,
+            "expected_business_line": self.expected_business_line,
+            "available_tools": list(self.available_tools),
+            "expected_tools": list(self.expected_tools),
             "expected_slots": self.expected_slots,
             "missing_slots": list(self.missing_slots),
             "slices": list(self.slices),
@@ -129,6 +135,9 @@ def dataset_hash(cases: Iterable[EvalCase]) -> str:
                     "history": c.history,
                     "intents": sorted(c.expected_intents),
                     "scene": c.expected_scene,
+                    "business_line": c.expected_business_line,
+                    "available_tools": sorted(c.available_tools),
+                    "expected_tools": sorted(c.expected_tools),
                     "slots": c.expected_slots,
                     "missing": sorted(c.missing_slots),
                     "slices": sorted(c.slices),
@@ -199,6 +208,8 @@ def validate_dataset(cases: list[EvalCase]) -> list[str]:
             problems.append(f"{case.case_id}: empty text")
         if not case.expected_intents:
             problems.append(f"{case.case_id}: no expected intent")
+        if not set(case.expected_tools).issubset(case.available_tools):
+            problems.append(f"{case.case_id}: expected tool is not available in its scenario")
         if not case.family:
             problems.append(f"{case.case_id}: no conversation family")
 
@@ -248,6 +259,27 @@ class SliceScore:
     def as_dict(self) -> dict[str, Any]:
         return {
             "slice": self.slice_name,
+            "total": self.total,
+            "correct": self.correct,
+            "accuracy": round(self.accuracy, 4),
+        }
+
+
+@dataclass
+class ClassAccuracyScore:
+    """Accuracy support for one expected scene or business-line label."""
+
+    label: str
+    total: int = 0
+    correct: int = 0
+
+    @property
+    def accuracy(self) -> float:
+        return self.correct / self.total if self.total else 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
             "total": self.total,
             "correct": self.correct,
             "accuracy": round(self.accuracy, 4),
@@ -353,11 +385,19 @@ class ComparisonReport:
     model_slot_case_count: int = 0
     model_missing_slots: dict[str, Any] = field(default_factory=dict)
     model_missing_slot_scores: list[SlotNameScore] = field(default_factory=list)
+    rules_scenes: dict[str, Any] = field(default_factory=dict)
+    model_scenes: dict[str, Any] = field(default_factory=dict)
+    rules_business_lines: dict[str, Any] = field(default_factory=dict)
+    model_business_lines: dict[str, Any] = field(default_factory=dict)
     rules_slices: list[SliceScore] = field(default_factory=list)
     model_slices: list[SliceScore] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)
     slot_failures: list[dict[str, Any]] = field(default_factory=list)
     missing_slot_failures: list[dict[str, Any]] = field(default_factory=list)
+    rules_scene_failures: list[dict[str, Any]] = field(default_factory=list)
+    model_scene_failures: list[dict[str, Any]] = field(default_factory=list)
+    rules_business_line_failures: list[dict[str, Any]] = field(default_factory=list)
+    model_business_line_failures: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -383,16 +423,28 @@ class ComparisonReport:
             "model_missing_slot_scores": [
                 score.as_dict() for score in self.model_missing_slot_scores
             ],
+            "rules_scenes": self.rules_scenes,
+            "model_scenes": self.model_scenes,
+            "rules_business_lines": self.rules_business_lines,
+            "model_business_lines": self.model_business_lines,
             "rules_slices": [s.as_dict() for s in self.rules_slices],
             "model_slices": [s.as_dict() for s in self.model_slices],
             "failure_count": len(self.failures),
             "slot_failure_count": len(self.slot_failures),
             "missing_slot_failure_count": len(self.missing_slot_failures),
+            "rules_scene_failure_count": len(self.rules_scene_failures),
+            "model_scene_failure_count": len(self.model_scene_failures),
+            "rules_business_line_failure_count": len(self.rules_business_line_failures),
+            "model_business_line_failure_count": len(self.model_business_line_failures),
             # Case ids and reason codes only. A failure row carrying the text
             # would put customer-shaped content in a report that gets shared.
             "failures": self.failures,
             "slot_failures": self.slot_failures,
             "missing_slot_failures": self.missing_slot_failures,
+            "rules_scene_failures": self.rules_scene_failures,
+            "model_scene_failures": self.model_scene_failures,
+            "rules_business_line_failures": self.rules_business_line_failures,
+            "model_business_line_failures": self.model_business_line_failures,
             "notes": self.notes,
         }
 
@@ -493,12 +545,75 @@ def score_missing_slots(
     )
 
 
+def score_categorical(
+    cases: list[EvalCase],
+    predictions: dict[str, str],
+    *,
+    field_name: str,
+) -> tuple[dict[str, Any], list[ClassAccuracyScore], list[dict[str, Any]]]:
+    """Score a closed categorical field such as scene or business line."""
+    expected_field = {
+        "scene": "expected_scene",
+        "business_line": "expected_business_line",
+    }.get(field_name)
+    if expected_field is None:
+        raise ValueError(f"unsupported categorical field {field_name!r}")
+
+    by_label: dict[str, ClassAccuracyScore] = {}
+    failures: list[dict[str, Any]] = []
+    correct = 0
+    total = 0
+    for case in cases:
+        expected = getattr(case, expected_field)
+        if expected is None:
+            continue
+        predicted = predictions.get(case.case_id)
+        total += 1
+        hit = predicted == expected
+        correct += int(hit)
+        score = by_label.setdefault(expected, ClassAccuracyScore(label=expected))
+        score.total += 1
+        score.correct += int(hit)
+        if not hit:
+            failures.append(
+                {
+                    "case_id": case.case_id,
+                    "family": case.family,
+                    "slices": list(case.slices),
+                    "expected": expected,
+                    "predicted": predicted,
+                    "field": field_name,
+                    "reason": f"{field_name}_mismatch",
+                }
+            )
+
+    class_scores = sorted(by_label.values(), key=lambda item: item.label)
+    macro_accuracy = (
+        sum(score.accuracy for score in class_scores) / len(class_scores) if class_scores else 0.0
+    )
+    return (
+        {
+            "case_count": total,
+            "accuracy": round(correct / total, 4) if total else 0.0,
+            "macro_accuracy": round(macro_accuracy, 4),
+            "by_label": [score.as_dict() for score in class_scores],
+        },
+        class_scores,
+        failures,
+    )
+
+
 def compare(
     cases: list[EvalCase],
     *,
     split: Split,
+    case_ids: Iterable[str] | None = None,
     rules_predictions: dict[str, list[str]] | None = None,
     model_predictions: dict[str, list[str]] | None = None,
+    rules_scene_predictions: dict[str, str] | None = None,
+    model_scene_predictions: dict[str, str] | None = None,
+    rules_business_line_predictions: dict[str, str] | None = None,
+    model_business_line_predictions: dict[str, str] | None = None,
     model_slot_predictions: dict[str, dict[str, Any]] | None = None,
     model_missing_slot_predictions: dict[str, list[str]] | None = None,
     model_name: str = "",
@@ -510,7 +625,12 @@ def compare(
     budget, an open circuit. That is a blocked gate, and the report says
     `model_available: false` with empty model scores rather than zeros.
     """
-    subset = [c for c in cases if assign_split(c.family) is split]
+    selected_ids = set(case_ids) if case_ids is not None else None
+    subset = [
+        c
+        for c in cases
+        if assign_split(c.family) is split and (selected_ids is None or c.case_id in selected_ids)
+    ]
     digest = dataset_hash(cases)
     rules = rules_predictions or {}
     model = model_predictions
@@ -541,6 +661,14 @@ def compare(
             rules_slices[slice_name].correct += int(hit)
 
     report.rules, report.rules_intents = score_intents(subset, rules)
+    if rules_scene_predictions is not None:
+        report.rules_scenes, _scores, report.rules_scene_failures = score_categorical(
+            subset, rules_scene_predictions, field_name="scene"
+        )
+    if rules_business_line_predictions is not None:
+        report.rules_business_lines, _scores, report.rules_business_line_failures = (
+            score_categorical(subset, rules_business_line_predictions, field_name="business_line")
+        )
     report.rules_slices = sorted(rules_slices.values(), key=lambda s: s.slice_name)
 
     if model is None:
@@ -553,6 +681,9 @@ def compare(
     model_slices = {s: SliceScore(s) for s in REQUIRED_SLICES}
     overall_model = SliceScore("overall")
     for case in subset:
+        for slice_name in case.slices:
+            if slice_name not in model_slices:
+                model_slices[slice_name] = SliceScore(slice_name)
         predicted = model.get(case.case_id)
         hit = predicted is not None and score_intent_set(case.expected_intents, predicted)
         overall_model.total += 1
@@ -577,6 +708,14 @@ def compare(
             )
 
     report.model, report.model_intents = score_intents(subset, model)
+    if model_scene_predictions is not None:
+        report.model_scenes, _scores, report.model_scene_failures = score_categorical(
+            subset, model_scene_predictions, field_name="scene"
+        )
+    if model_business_line_predictions is not None:
+        report.model_business_lines, _scores, report.model_business_line_failures = (
+            score_categorical(subset, model_business_line_predictions, field_name="business_line")
+        )
     if model_slot_predictions is not None:
         report.model_slot_case_count = len(subset)
         slot_exact = 0
@@ -626,6 +765,7 @@ __all__ = [
     "REQUIRED_SLICES",
     "VALIDATION_FRACTION",
     "ComparisonReport",
+    "ClassAccuracyScore",
     "EvalCase",
     "IntentClassScore",
     "SliceScore",
@@ -638,6 +778,7 @@ __all__ = [
     "score_intent_set",
     "score_intents",
     "score_missing_slots",
+    "score_categorical",
     "split_dataset",
     "validate_dataset",
 ]

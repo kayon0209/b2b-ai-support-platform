@@ -37,7 +37,7 @@ def _seed() -> None:
         for tid in (TENANT, TENANT2):
             for table in ("conversation_turns", "contact_facts", "knowledge_aliases"):
                 conn.execute(
-                    # noqa-style note: table names come from the fixed tuple
+                    # Security note: table names come from the fixed tuple
                     # above, never from test input.
                     text("DELETE FROM " + table + " WHERE tenant_id = :t"),  # noqa: S608
                     {"t": tid},

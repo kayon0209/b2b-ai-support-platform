@@ -274,6 +274,17 @@ def test_a_sensitive_value_is_withheld_but_the_collection_is_recorded() -> None:
     assert "value" not in street
 
 
+@pytest.mark.parametrize("field_name", ["new_address", "bank_account_number"])
+def test_alias_sensitive_values_are_withheld_when_collected(field_name: str) -> None:
+    _seed_waiting_for(field_name)
+    value = "synthetic-sensitive-value"
+    resp = _collect({field_name: value})
+    assert resp.status_code == 200, resp.text
+    slot = next(s for s in _task_row()["slots"] if s["name"] == field_name)
+    assert slot.get("value_withheld") is True
+    assert "value" not in slot
+
+
 # --- field names are constrained -------------------------------------------
 
 

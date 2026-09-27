@@ -169,6 +169,44 @@ def test_the_hash_moves_when_authorized_history_changes() -> None:
     assert dataset_hash(a) != dataset_hash(b)
 
 
+def test_the_hash_moves_when_scene_or_business_line_changes() -> None:
+    a = [
+        _case(
+            "scene-case",
+            "family-a",
+            "这块 PCB 支持高温吗？",
+            ("knowledge_question",),
+            _SINGLE,
+            expected_scene="technical_support",
+            expected_business_line="pcb",
+        )
+    ]
+    b = [
+        _case(
+            "scene-case",
+            "family-a",
+            "这块 PCB 支持高温吗？",
+            ("knowledge_question",),
+            _SINGLE,
+            expected_scene="billing",
+            expected_business_line="pcb",
+        )
+    ]
+    c = [
+        _case(
+            "scene-case",
+            "family-a",
+            "这块 PCB 支持高温吗？",
+            ("knowledge_question",),
+            _SINGLE,
+            expected_scene="technical_support",
+            expected_business_line="smt",
+        )
+    ]
+    assert dataset_hash(a) != dataset_hash(b)
+    assert dataset_hash(a) != dataset_hash(c)
+
+
 def test_the_hash_moves_when_a_case_is_added() -> None:
     a = _tiny_dataset()
     b = [*a, _case("c3", "fam-x", "y", ("social",), ("single_intent",))]
@@ -416,6 +454,47 @@ def test_slot_reports_compare_values_without_emitting_them() -> None:
     assert "SECRET-ORDER-VALUE-7f203d" not in report_json
     assert "PRIVATE-QUANTITY-a2de7" not in report_json
     assert "WRONG-QUANTITY-f09c3" not in report_json
+
+
+def test_scene_and_business_line_accuracy_report_safe_class_failures() -> None:
+    family_a = _family_in(Split.HOLDOUT, 20)
+    family_b = _family_in(Split.HOLDOUT, 21)
+    cases = [
+        _case(
+            "scene-a",
+            family_a,
+            "PCB_REF_8200",
+            ("business_query",),
+            ("single_intent", "chinese", "pcb"),
+            expected_scene="order_fulfilment",
+            expected_business_line="pcb",
+        ),
+        _case(
+            "scene-b",
+            family_b,
+            "SMT_REF_1840",
+            ("business_query",),
+            ("single_intent", "english", "smt"),
+            expected_scene="technical_support",
+            expected_business_line="smt",
+        ),
+    ]
+    report = compare(
+        cases,
+        split=Split.HOLDOUT,
+        model_predictions={"scene-a": ["business_query"], "scene-b": ["business_query"]},
+        model_scene_predictions={"scene-a": "order_fulfilment", "scene-b": "billing"},
+        model_business_line_predictions={"scene-a": "pcb", "scene-b": "component"},
+    )
+
+    assert report.model_scenes["accuracy"] == 0.5
+    assert report.model_scenes["macro_accuracy"] == 0.5
+    assert report.model_business_lines["accuracy"] == 0.5
+    assert [failure["case_id"] for failure in report.model_scene_failures] == ["scene-b"]
+    assert [failure["case_id"] for failure in report.model_business_line_failures] == ["scene-b"]
+    serialized = json.dumps(report.as_dict())
+    assert "PCB_REF_8200" not in serialized
+    assert "SMT_REF_1840" not in serialized
 
 
 def test_macro_f1_is_per_class_and_exact_match_is_reported_separately() -> None:

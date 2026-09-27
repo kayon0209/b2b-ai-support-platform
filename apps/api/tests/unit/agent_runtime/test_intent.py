@@ -69,6 +69,9 @@ def test_a_noun_phrase_is_not_a_write() -> None:
         "What is the CEO's home address?",
         "Can you tell me which customers are planning to churn?",
         "I forgot my password, can you reset it?",
+        "把银行账号改一下",
+        "请提供银行卡号用于退款",
+        "重置账户密码",
     ],
 )
 def test_sensitive_requests_are_never_reclassified(question: str) -> None:

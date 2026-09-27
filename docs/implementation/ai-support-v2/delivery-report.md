@@ -331,3 +331,41 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 - T03 的离线比较报告现在支持槽位 exact-match、缺参槽位逐类/宏微 F1、失败样例只记录槽位名而不记录槽位值；数据集哈希包含精确输入文本、授权历史、预期标签、槽位和 provenance，确保输入或标注变化都会改变 digest。
 - 修复评测测试文件中既有的重复 `_family_in` 定义，使本次变更的 Mypy 检查通过。评测模块单测 29 项通过，Ruff、格式检查、Mypy 和 `git diff --check` 通过。
 - 这只是指标与报告能力，不是模型测评结果：600 条独立且复核的固定语义集尚未冻结，未执行真实模型 holdout、p95 或负载试验；没有新增线上模型调用。生产开关保持关闭。head `ade1bf0` 的 GitHub Actions 全部通过，包含 Release Evidence。
+
+---
+
+## 9. Codex follow-up：剩余 R1 实施与再验收（2026-09-27）
+
+### 实施补全
+
+1. **隐私字段别名防护**：`classify_field` 统一识别 camelCase、地址别名、银行卡/证件/凭据字段和中文姓名/地址标签。会话任务规划及坐席补录使用同一裁定器，只保留字段名、来源、actor 和补录时间，不把地址或受限字段值复制进任务记录。Tool Gateway 的脱敏递归覆盖嵌套对象与数组。
+2. **中文受限意图**：规则分类器现将银行账号、银行卡号、信用卡号、密码、凭证和 API 密钥请求归为 `sensitive_request`；模型输出不能覆盖此规则。原先“把银行账号改一下”落入普通写操作的缺口已由单测覆盖。
+3. **语义语料补平衡**：当前 manifest 固定 `semantic-v2-r1-balanced-highrisk-synthetic-2026-09-27`，1,700 条、150 个 phrase families，按 family 分为 1,020/340/340。八类主意图各至少 24 条 holdout；额外 500 条安全边界样本中，holdout 有 100 条，跨租户、索赔、提示注入、虚假审批声明和受限数据各至少 20 条。哈希：`200cb1fa0a42da8c59083cbb150e8303b4eb4f379420dbed1e9029a532c13608`。
+4. **标注规范**：新增 `semantic-evaluation.md`，定义意图/场景/产品线/槽位/证据/能力白名单的标注边界，列出双人独立复核与裁决流程、holdout 解封条件和报告隐私规则。样本仍是模板编写的合成数据；第二位领域标注人、裁决和签字未完成，生产质量门禁继续阻塞。
+5. **Prompt 版本绑定**：此前 runner 报告写 `semantic-v7`，但发送给模型的 `SCHEMA_VERSION` 当时是 `semantic-v6`。上下文与评估报告现都从同一个 `SYSTEM_PROMPT_VERSION` 读取；完整性测试确认 manifest 绑定 `semantic-v7`。修复前的模型数据仅保留作历史排障材料，不作为当前 v7 质量证据。本轮未追加真实模型调用。
+6. **任务恢复边界**：新增集成测试把 outbox 事件保留为过期 `processing` claim，由全新 `SemanticWorker` 实例恢复并创建唯一任务集；第二个新实例不重复建任务。它验证持久状态恢复，尚不是 OS 级 kill/restart 或多主机生产演练。
+7. **工作台无障碍**：右侧副驾 tabs 加入 roving focus、左右方向键、Home/End 和关联的 tabpanel ARIA；转接/结束会话复用共享 Dialog 的焦点管理、Escape 和恢复焦点。键盘导航测试、现有 Dialog 焦点测试及本地合成会话浏览器走查均通过。完整屏幕阅读器走查和真实 200% 缩放仍待做。
+8. **上版兼容回滚 smoke**：用 `master` 应用（基线 `96c81ad`）连接隔离验收数据库（含迁移 `0065`），读取会话队列，并对一条合成会话完成“领取→释放”；两个 API 操作均返回 200。该结果验证上版应用在扩展 schema 上可读写，不等于 staging/生产回滚或数据库降级演练。
+
+### 复验与任务状态
+
+本轮浏览器检查还确认副驾 tab 的方向键、Home 和 End 导航更新焦点及选中项；移动宽度下会话内容可加载。尺寸矩阵沿用上一节的 1536/1280/768/390 CSS px DOM 测量结论。测试数据库为 `r1_ui_accept_20260927`，仅含合成数据。
+
+本地复验：完整 `pytest` **2782 passed, 2 skipped**（73.60 秒）；Ruff 检查和 562 个文件格式检查通过；Mypy **236 个源文件通过**；`kubectl kustomize infra/kubernetes` 通过。Admin Web `npm test`、typecheck、production build 均通过，tab 键盘导航新增 7 项检查。Python 输出有 12 条非失败警告（Starlette/httpx 弃用、SQLAlchemy DISTINCT ON 弃用、既有 OpenAPI operation ID 重复）；未改变门禁或跳过失败项。
+
+| 任务 | 当前状态 | 尚需外部条件或后续验收 |
+|---|---|---|
+| T00 | 完成（差异、契约、脱敏和标注文件可审） | ADR 仍为 Proposed；语义路由变更前须正式接受 |
+| T01 | 完成（控制逻辑与中文安全规则） | 当前版本真实模型质量归 EVAL-02 |
+| T02 | 完成（shadow/off 代码边界） | 多主机 worker、真实 provider 故障和成本容量演练 |
+| T03 | 部分完成（指标、hash、1,700 条语料、运行器、标注规范） | 双人独立标注与裁决；当前 prompt 的模型 holdout 和延迟门禁 |
+| T04 | 完成（RLS、状态机、幂等、恢复实现） | OS 进程重启及生产消费者竞争 |
+| T05 | 完成（能力过滤、提案/确认/回执边界） | 真实 ERP/CRM connector sandbox |
+| T06 | 完成（异步副驾、来源、stale/idempotency/人工发送） | 真实模型质量与租户允许自定义指令的数据目的地决策 |
+| T07 | 部分完成（真实 API 页面、响应式与键盘修复） | 真实 200% 浏览器缩放、逐规格截图、完整屏幕阅读器验收 |
+| T08 | 部分完成（合成用户旅程、lease/worker 竞态测试） | 两坐席在途接管、provider/connector 故障注入、生产负载 |
+| T09 | 部分完成（本地上版兼容 smoke、交付和标注文档） | 本轮 head 的 GitHub CI/Release Evidence；staging 回滚与生产证据 |
+
+**生产启用仍阻塞**：EVAL-02、PERF-01/02、双坐席真实接管、OS/多主机 Worker 故障演练、生产身份/连接器、独立人工标注及完整无障碍验收。所有新功能开关保持关闭，`semantic_read` 不启用。本轮不执行合并或生产发布。
+
+**Jev 使用记录**：Jev 只对脱敏的合成模型汇总数据给出“抽取 12 条 dev-only 样本诊断 schema 失败、保持 holdout 封存”的建议；未发送密钥或样本原文。Codex 完成评测设计、代码、复验和门禁结论。

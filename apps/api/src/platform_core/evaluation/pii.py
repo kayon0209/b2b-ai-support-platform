@@ -33,9 +33,43 @@ FIELD_CLASSIFICATION: dict[str, Sensitivity] = {
     "password": Sensitivity.RESTRICTED,
     "secret": Sensitivity.RESTRICTED,
     "authorization": Sensitivity.RESTRICTED,
+    "name": Sensitivity.CONFIDENTIAL,
     "customer_name": Sensitivity.CONFIDENTIAL,
+    "contact_name": Sensitivity.CONFIDENTIAL,
+    "recipient_name": Sensitivity.CONFIDENTIAL,
+    "consignee_name": Sensitivity.CONFIDENTIAL,
+    "full_name": Sensitivity.CONFIDENTIAL,
+    "person_name": Sensitivity.CONFIDENTIAL,
+    "shipping_name": Sensitivity.CONFIDENTIAL,
+    "product_name": Sensitivity.INTERNAL,
+    "tool_name": Sensitivity.INTERNAL,
+    "model_name": Sensitivity.INTERNAL,
+    "file_name": Sensitivity.INTERNAL,
     "address": Sensitivity.CONFIDENTIAL,
+    "full_address": Sensitivity.CONFIDENTIAL,
+    "street_address": Sensitivity.CONFIDENTIAL,
+    "shipping_address": Sensitivity.CONFIDENTIAL,
+    "delivery_address": Sensitivity.CONFIDENTIAL,
+    "destination_address": Sensitivity.CONFIDENTIAL,
+    "address_line": Sensitivity.CONFIDENTIAL,
+    "city": Sensitivity.CONFIDENTIAL,
+    "destination_city": Sensitivity.CONFIDENTIAL,
+    "postal_code": Sensitivity.CONFIDENTIAL,
+    "zip_code": Sensitivity.CONFIDENTIAL,
     "contract_value": Sensitivity.CONFIDENTIAL,
+    "bank_account": Sensitivity.RESTRICTED,
+    "bank_account_number": Sensitivity.RESTRICTED,
+    "bank_card_number": Sensitivity.RESTRICTED,
+    "credit_card_number": Sensitivity.RESTRICTED,
+    "card_number": Sensitivity.RESTRICTED,
+    "id_card": Sensitivity.RESTRICTED,
+    "id_card_number": Sensitivity.RESTRICTED,
+    "identity_number": Sensitivity.RESTRICTED,
+    "passport_number": Sensitivity.RESTRICTED,
+    "tax_id": Sensitivity.RESTRICTED,
+    "access_token": Sensitivity.RESTRICTED,
+    "refresh_token": Sensitivity.RESTRICTED,
+    "api_secret": Sensitivity.RESTRICTED,
 }
 
 
@@ -63,7 +97,116 @@ def redact_text(text: str) -> tuple[str, int]:
 
 
 def classify_field(name: str) -> Sensitivity:
-    return FIELD_CLASSIFICATION.get(name.lower(), Sensitivity.INTERNAL)
+    raw_lower = name.casefold()
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name).lower()
+    normalized = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    exact = FIELD_CLASSIFICATION.get(normalized)
+    if exact is not None:
+        return exact
+
+    parts = set(normalized.split("_"))
+    compact = normalized.replace("_", "")
+    restricted_names = (
+        "password",
+        "passphrase",
+        "credential",
+        "secret",
+        "authorization",
+        "email",
+        "phone",
+        "mobile",
+        "telephone",
+        "cellphone",
+        "socialsecurity",
+        "nationalid",
+        "creditcard",
+        "cardnumber",
+        "bankaccount",
+        "bankcard",
+        "idcard",
+        "identitynumber",
+        "governmentid",
+        "passportnumber",
+        "apikey",
+        "apitoken",
+        "accesstoken",
+        "refreshtoken",
+        "oauthtoken",
+        "privatekey",
+        "signingkey",
+    )
+    token_is_usage = bool(parts.intersection({"token", "tokens"})) and bool(
+        parts.intersection({"usage", "count", "budget", "used", "estimate", "limit"})
+    )
+    restricted_chinese = (
+        "手机号",
+        "手机号码",
+        "电话",
+        "邮箱",
+        "电子邮箱",
+        "银行卡",
+        "银行卡号码",
+        "银行账号",
+        "银行账户",
+        "信用卡",
+        "身份证",
+        "证件号",
+        "社保号",
+        "api密钥",
+        "密码",
+        "口令",
+        "凭证",
+        "令牌",
+    )
+    if (
+        parts.intersection({"email", "emails", "phone", "phones", "ssn", "jwt"})
+        or (parts.intersection({"token", "tokens"}) and not token_is_usage)
+        or any(marker in compact for marker in restricted_names)
+        or any(marker in raw_lower for marker in restricted_chinese)
+    ):
+        return Sensitivity.RESTRICTED
+
+    confidential_names = ("address", "street", "postal", "postcode", "zipcode", "city")
+    personal_name_parts = {
+        "customer",
+        "contact",
+        "recipient",
+        "consignee",
+        "person",
+        "full",
+        "first",
+        "last",
+        "user",
+        "member",
+        "agent",
+        "employee",
+        "requester",
+        "owner",
+    }
+    if (
+        ("name" in parts and bool(parts.intersection(personal_name_parts)))
+        or any(marker in compact for marker in confidential_names)
+        or any(
+            marker in raw_lower
+            for marker in (
+                "地址",
+                "街道",
+                "邮编",
+                "邮政编码",
+                "城市",
+                "姓名",
+                "联系人",
+                "收件人",
+            )
+        )
+    ):
+        return Sensitivity.CONFIDENTIAL
+    return Sensitivity.INTERNAL
+
+
+def should_withhold_value(name: str) -> bool:
+    """Whether a field value must stay out of ordinary task/audit rows."""
+    return classify_field(name) in {Sensitivity.CONFIDENTIAL, Sensitivity.RESTRICTED}
 
 
 def minimize_payload(

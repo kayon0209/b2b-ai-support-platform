@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 
 import pytest
@@ -511,6 +512,74 @@ def test_semantic_worker_consumes_the_deferred_task_event() -> None:
     assert row[0] == "sent"
     assert row[1] is None
     assert "question" not in row[2]
+
+
+def test_new_worker_reclaims_a_task_event_left_in_flight_by_a_crash() -> None:
+    """A restarted worker reclaims the durable claim and creates one task set."""
+    from platform_core.agent_runtime.chat_service import append_customer_turn
+    from platform_core.agent_runtime.orchestrator import OrchestratorDeps
+    from platform_core.identity.tenant_context import TenantContext, tenant_session
+    from worker.inbox_consumer import _enqueue_task_planning
+    from worker.runner import SemanticWorker
+
+    _set_flags(TENANT, ["agent.conversation_tasks", "agent.semantic_assist"])
+    ctx = TenantContext(
+        tenant_id=uuid.UUID(TENANT), actor_id=None, actor_kind="system", role="integration_service"
+    )
+
+    async def enqueue_job() -> str:
+        async with tenant_session(ctx) as session:
+            turn, _duplicate = await append_customer_turn(
+                session,
+                tenant_id=uuid.UUID(TENANT),
+                ref_id=uuid.UUID(CONV),
+                text=CUSTOMER_TEXT,
+            )
+            assert await _enqueue_task_planning(
+                session,
+                tenant_id=uuid.UUID(TENANT),
+                conversation_ref_id=uuid.UUID(CONV),
+                turn_id=str(turn.id),
+            )
+            return str(turn.id)
+
+    turn_id = _run(enqueue_job())
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        claimed = conn.execute(
+            text(
+                "UPDATE outbox_events SET status = 'processing', processing_started_at = :stale "
+                "WHERE tenant_id = :t AND event_type = 'conversation.task_planning_requested' "
+                "AND status = 'queued'"
+            ),
+            {"t": TENANT, "stale": int(time.time()) - 601},
+        ).rowcount
+    admin.dispose()
+    assert claimed == 1, "the simulated crashed worker must leave one durable stale claim"
+
+    provider = _StubProvider(MODEL_OUTPUT.replace('"t-1"', f'"{turn_id}"'))
+    restarted_worker = SemanticWorker(OrchestratorDeps(extra={"chat": provider}))
+    assert _run(restarted_worker.run_once()) >= 1
+    assert provider.calls == 1
+    assert len(_tasks()) == 3
+
+    admin = create_engine(ADMIN_URL)
+    with admin.connect() as conn:
+        status, claimed_at = conn.execute(
+            text(
+                "SELECT status, processing_started_at FROM outbox_events "
+                "WHERE tenant_id = :t AND event_type = 'conversation.task_planning_requested'"
+            ),
+            {"t": TENANT},
+        ).one()
+    admin.dispose()
+    assert status == "sent"
+    assert claimed_at is None
+
+    # A second fresh process sees a terminal event and cannot create duplicates.
+    another_worker = SemanticWorker(OrchestratorDeps(extra={"chat": _StubProvider(MODEL_OUTPUT)}))
+    assert _run(another_worker.run_once()) == 0
+    assert len(_tasks()) == 3
 
 
 # --- the seam ----------------------------------------------------------------

@@ -226,6 +226,51 @@ def test_a_sensitive_slot_value_is_not_stored() -> None:
     assert "上海办公室" not in json.dumps(tasks[1].slots, ensure_ascii=False)
 
 
+def test_sensitive_slot_aliases_are_withheld_but_order_ids_are_kept() -> None:
+    names = ("full_address", "new_address", "shipping_address", "bank_account_number")
+    for index, name in enumerate(names):
+        intent = SemanticIntent(
+            task_kind=SemanticTaskKind.READ,
+            source_turn_id=f"t-{index}",
+            slots=[
+                SemanticSlot(
+                    name=name,
+                    value="synthetic-private-value",
+                    origin=SlotOrigin.CUSTOMER_STATED,
+                    confirmed=True,
+                )
+            ],
+        )
+        task = plan_tasks(
+            [intent],
+            capabilities=READ_CAPS,
+            accepted_tool_names=["order.get_status"],
+            unsupported={},
+        )[0]
+        assert "value" not in task.slots[0], name
+        assert task.slots[0]["value_withheld"] is True, name
+
+    order = SemanticIntent(
+        task_kind=SemanticTaskKind.READ,
+        source_turn_id="t-order",
+        slots=[
+            SemanticSlot(
+                name="order_id",
+                value="SO-EV00042",
+                origin=SlotOrigin.CUSTOMER_STATED,
+                confirmed=True,
+            )
+        ],
+    )
+    order_task = plan_tasks(
+        [order],
+        capabilities=READ_CAPS,
+        accepted_tool_names=["order.get_status"],
+        unsupported={},
+    )[0]
+    assert order_task.slots[0]["value"] == "SO-EV00042"
+
+
 def test_a_non_sensitive_stated_value_is_kept() -> None:
     tasks = plan_tasks(
         SPEC_INTENTS,

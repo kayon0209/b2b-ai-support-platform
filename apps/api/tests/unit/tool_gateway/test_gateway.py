@@ -157,15 +157,26 @@ def test_sanitize_strips_secrets_and_pii() -> None:
         {
             "account_ref": "a1",
             "api_key": "sk-123",
+            "bankAccountNumber": "123456789",
             "password": "hunter2",
+            "tokens": ["synthetic-secret-token"],
+            "tokens_used": 37,
             "nested": {"token": "x", "note": "hello"},
+            "contacts": [{"bank_account_number": "987654321", "name": "Synthetic Contact"}],
+            "contact_emails": ["synthetic@example.test"],
         }
     )
     assert cleaned["api_key"] == "***"
+    assert cleaned["bankAccountNumber"] == "***"
     assert cleaned["password"] == "***"
+    assert cleaned["tokens"] == "***"
+    assert cleaned["tokens_used"] == 37
     assert cleaned["nested"]["token"] == "***"
     assert cleaned["nested"]["note"] == "hello"
     assert cleaned["account_ref"] == "a1"
+    assert cleaned["contacts"][0]["bank_account_number"] == "***"
+    assert cleaned["contacts"][0]["name"] == "Synthetic Contact"
+    assert cleaned["contact_emails"] == "***"
 
 
 def test_action_hash_changes_with_arguments() -> None:

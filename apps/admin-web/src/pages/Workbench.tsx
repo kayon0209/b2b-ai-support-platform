@@ -7,19 +7,24 @@ import {
 } from "lucide-react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { isOneOf, useUrlState } from "../lib/urlState";
+import { Dialog } from "../components/ui";
 import { TaskPanel } from "../components/TaskPanel";
 import { ToolCard, type ToolCardData } from "../components/ToolCard";
 import { apiGet, apiPost, apiUpload } from "../lib/api";
 import { newIdempotencyKey } from "../lib/idempotency";
 import { useLang } from "../lib/i18n";
 import { ApiError } from "../lib/types";
+import {
+  nextWorkbenchRightTab,
+  WORKBENCH_RIGHT_TABS,
+  type WorkbenchRightTab,
+} from "../lib/workbenchTabs";
 import "../styles-workbench.css";
 
 type Tab = "queue" | "mine" | "waiting";
 /** Every tab the page can render. Kept beside the type so a new tab cannot
  *  be added to the union without also becoming a valid `?tab=` value. */
 const ALL_TABS = ["queue", "mine", "waiting"] as const satisfies readonly Tab[];
-type RightTab = "reply" | "knowledge" | "tools" | "tasks";
 type Action = "claim" | "release" | "transfer" | "close";
 type Origin = "free" | "canned" | "ai_suggestion";
 type CopilotKind = "summary" | "reply";
@@ -158,7 +163,7 @@ const STATUS: Record<string, string> = {
   waiting_vendor: "等待供应商", resolved: "已解决", closed: "已关闭",
   reopened: "重新打开",
 };
-const RIGHT_TAB_LABEL: Record<RightTab, string> = {
+const RIGHT_TAB_LABEL: Record<WorkbenchRightTab, string> = {
   reply: "话术",
   knowledge: "知识",
   tools: "工具",
@@ -253,7 +258,7 @@ export function Workbench() {
   const [draft, setDraft] = useState("");
   const [origin, setOrigin] = useState<Origin>("free");
   const [cannedId, setCannedId] = useState<string | null>(null);
-  const [rightTab, setRightTab] = useState<RightTab>("reply");
+  const [rightTab, setRightTab] = useState<WorkbenchRightTab>("reply");
   const [copilotKind, setCopilotKind] = useState<CopilotKind>("reply");
   const [copilotJob, setCopilotJob] = useState<CopilotJobView | null>(null);
   const [copilotPending, setCopilotPending] = useState(false);
@@ -268,6 +273,8 @@ export function Workbench() {
   const [transferOpen, setTransferOpen] = useState(false);
   const [targetAgent, setTargetAgent] = useState("");
   const [confirmClose, setConfirmClose] = useState(false);
+  const closeTransferDialog = useCallback(() => setTransferOpen(false), []);
+  const closeConversationDialog = useCallback(() => setConfirmClose(false), []);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [canned, setCanned] = useState<CannedReply[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -917,8 +924,8 @@ export function Workbench() {
         </section>
 
         {detail && rightOpen ? <aside className="wb-right" aria-label="AI 副驾与客户上下文">
-          <div className="wb-right-header"><Sparkles size={20} /><strong>AI 副驾</strong><button type="button" className="wb-right-close" aria-label="收起 AI 副驾" onClick={() => setRightOpen(false)}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label="副驾内容">{(["reply", "knowledge", "tools", "tasks"] as const).map((key) => <button type="button" role="tab" aria-selected={rightTab === key} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)}>{RIGHT_TAB_LABEL[key]}</button>)}</div></div>
-          <div className="wb-right-scroll">
+          <div className="wb-right-header"><Sparkles size={20} /><strong>AI 副驾</strong><button type="button" className="wb-right-close" aria-label="收起 AI 副驾" onClick={() => setRightOpen(false)}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label="副驾内容">{WORKBENCH_RIGHT_TABS.map((key) => <button type="button" role="tab" id={`wb-right-tab-${key}`} aria-controls="wb-right-panel" aria-selected={rightTab === key} tabIndex={rightTab === key ? 0 : -1} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)} onKeyDown={(event) => { const next = nextWorkbenchRightTab(key, event.key); if (!next) return; event.preventDefault(); setRightTab(next); document.getElementById(`wb-right-tab-${next}`)?.focus(); }}>{RIGHT_TAB_LABEL[key]}</button>)}</div></div>
+          <div className="wb-right-scroll" id="wb-right-panel" role="tabpanel" aria-labelledby={`wb-right-tab-${rightTab}`} tabIndex={0}>
             {rightTab === "reply" ? <>
               <section className="wb-panel wb-copilot-panel">
                 <h3><Sparkles size={18} />副驾草稿</h3>
@@ -970,8 +977,56 @@ export function Workbench() {
         </aside> : null}
       </div>
 
-      {transferOpen ? <div className="wb-modal-backdrop" role="presentation" onClick={() => setTransferOpen(false)}><div className="wb-modal" role="dialog" aria-modal="true" aria-label="转接会话" onClick={(event) => event.stopPropagation()}><h2>转接会话</h2><p>目标坐席接手后，当前坐席将无法继续回复。</p><label>目标坐席<select value={targetAgent} onChange={(event) => setTargetAgent(event.target.value)}><option value="">选择在线坐席</option>{agents.filter((agent) => agent.user_ref !== myRef && agent.status === "active").map((agent) => <option key={agent.user_ref} value={agent.user_ref}>{agent.display_name}</option>)}</select></label><div className="wb-modal-actions"><button type="button" onClick={() => setTransferOpen(false)}>取消</button><button type="button" className="wb-primary-small" disabled={!targetAgent || busy} onClick={() => void runAction("transfer", targetAgent)}>确认转接</button></div></div></div> : null}
-      {confirmClose ? <div className="wb-modal-backdrop" role="presentation" onClick={() => setConfirmClose(false)}><div className="wb-modal" role="dialog" aria-modal="true" aria-label="结束会话" onClick={(event) => event.stopPropagation()}><h2>结束会话</h2><p>结束且已有人工回复时，客户可以评价本次服务。若有相关工单，请另行确认工单状态。</p><div className="wb-modal-actions"><button type="button" onClick={() => setConfirmClose(false)}>继续接待</button><button type="button" className="wb-primary-small" disabled={busy} onClick={() => void runAction("close")}>确认结束</button></div></div></div> : null}
+      <Dialog
+        open={transferOpen}
+        onClose={closeTransferDialog}
+        label="转接会话"
+        className="wb-modal"
+        backdropClassName="wb-modal-backdrop"
+      >
+        <h2>转接会话</h2>
+        <p>目标坐席接手后，当前坐席将无法继续回复。</p>
+        <label>
+          目标坐席
+          <select value={targetAgent} onChange={(event) => setTargetAgent(event.target.value)}>
+            <option value="">选择在线坐席</option>
+            {agents
+              .filter((agent) => agent.user_ref !== myRef && agent.status === "active")
+              .map((agent) => (
+                <option key={agent.user_ref} value={agent.user_ref}>
+                  {agent.display_name}
+                </option>
+              ))}
+          </select>
+        </label>
+        <div className="wb-modal-actions">
+          <button type="button" onClick={closeTransferDialog}>取消</button>
+          <button
+            type="button"
+            className="wb-primary-small"
+            disabled={!targetAgent || busy}
+            onClick={() => void runAction("transfer", targetAgent)}
+          >
+            确认转接
+          </button>
+        </div>
+      </Dialog>
+      <Dialog
+        open={confirmClose}
+        onClose={closeConversationDialog}
+        label="结束会话"
+        className="wb-modal"
+        backdropClassName="wb-modal-backdrop"
+      >
+        <h2>结束会话</h2>
+        <p>结束且已有人工回复时，客户可以评价本次服务。若有相关工单，请另行确认工单状态。</p>
+        <div className="wb-modal-actions">
+          <button type="button" onClick={closeConversationDialog}>继续接待</button>
+          <button type="button" className="wb-primary-small" disabled={busy} onClick={() => void runAction("close")}>
+            确认结束
+          </button>
+        </div>
+      </Dialog>
     </div>
   );
 }

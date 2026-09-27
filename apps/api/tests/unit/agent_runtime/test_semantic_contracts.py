@@ -11,6 +11,7 @@ model does, not because it is fun to write a test for.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -48,6 +49,7 @@ from platform_core.agent_runtime.semantic.service import (
     SemanticBudget,
     SemanticUnderstandingService,
 )
+from platform_core.agent_runtime.semantic.shadow import capabilities_for_shadow
 from platform_core.agent_runtime.semantic.validator import (
     CapabilityView,
     TurnView,
@@ -414,20 +416,14 @@ def test_explicit_human_request_is_not_overridable_by_the_model() -> None:
 
 
 def test_sensitive_request_is_not_overridable() -> None:
-    """The restricted-term list (`intent.RESTRICTED_TERMS`) is English-only.
-
-    Recorded as a pre-existing gap in T00 §3: `把银行账号改一下` classifies as
-    `business_action`, not `sensitive_request`, because the restricted terms
-    carry no Chinese equivalents. Widening that vocabulary is a rules change
-    with its own evaluation requirement, so R1 does not do it here - but the
-    arbitration test uses a phrase the classifier actually treats as
-    sensitive, so it tests the arbitration invariant rather than the gap.
-    """
-    assert classify("把银行账号改一下").primary_kind is IntentKind.BUSINESS_ACTION
+    """Restricted financial-account requests remain a handoff under the model."""
+    chinese = classify("把银行账号改一下")
+    assert chinese.primary_kind is IntentKind.SENSITIVE_REQUEST
+    assert chinese.action is IntentAction.HANDOFF
 
     result = arbitrate(
         _input(
-            detection=classify("change the bank account"),
+            detection=chinese,
             model_output=_parse(_payload(primary_intent="business_query")),
         )
     )
@@ -550,6 +546,62 @@ def test_prompt_carries_no_tenant_actor_or_credential() -> None:
     prompt = render_prompt(ctx)
     for banned in ("tenant", "actor_id", "api_key", "password", "Authorization"):
         assert banned not in prompt
+
+
+def test_prompt_lists_allowed_conditions_and_evidence_character_bounds() -> None:
+    ctx = build_context(
+        current_turn_id="current-1",
+        current_text="Order A1",
+        history=[("history-1", "订单 SO-2")],
+        mode=SemanticMode.SHADOW,
+        capabilities=READ_CAPS,
+    )
+
+    prompt = render_prompt(ctx, condition_fields={"order.status", "invoice.exists"})
+    assert "## REGISTERED_CONDITION_FIELDS" in prompt
+    assert "- invoice.exists" in prompt
+    assert "- order.status" in prompt
+    assert "## SCENE_AND_PRODUCT_LINE_REFERENCE" in prompt
+    assert "PCB board fabrication is pcb" in prompt
+    assert "full_address" in prompt
+    assert "reuse these exact names" in prompt
+    assert "No condition fields are available" not in prompt
+    assert "turn_id: current-1\nchar_length: 8\nOrder A1" in prompt
+    assert "0 <= start < end <= that turn's char_length" in prompt
+    assert "start 0, end 8" in prompt
+    assert "- [history-1] char_length=7 订单 SO-2" in prompt
+    assert "zero-based positions in intents[]" in prompt
+
+
+def test_prompt_forbids_conditions_when_no_fields_are_registered() -> None:
+    ctx = build_context(
+        current_turn_id="current-1",
+        current_text="请查一下订单",
+        history=[],
+        mode=SemanticMode.SHADOW,
+        capabilities={},
+    )
+    prompt = render_prompt(ctx)
+    assert "No condition fields are available" in prompt
+    assert "No tools are available in this request; tool_candidates must be []." in prompt
+
+
+def test_shadow_capabilities_include_only_registered_parameter_names() -> None:
+    capabilities = capabilities_for_shadow(
+        {
+            "order.get_status": SimpleNamespace(
+                risk="read",
+                input_schema={
+                    "type": "object",
+                    "properties": {"order_id": {"type": "string"}},
+                    "required": ["order_id"],
+                },
+            )
+        }
+    )
+
+    assert capabilities["order.get_status"].parameter_names == ("order_id",)
+    assert capabilities["order.get_status"].required_parameters == ("order_id",)
 
 
 def test_system_prompt_names_the_strict_output_contract() -> None:
