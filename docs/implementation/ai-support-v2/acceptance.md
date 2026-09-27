@@ -22,7 +22,7 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | SHD-01 | 同批输入在 off 与 shadow 下客户消息、owner、业务工具次数和 Case 状态相同；shadow 可新增评估/队列记录 | PostgreSQL 集成负例 | 通过（代码边界） |
 | TASK-01 | 多意图任务拆解保留所有可识别需求；只读成功、缺参、未支持写入均有独立状态与原因 | 旅程 API/DB 集成 | 通过（stub） |
 | TASK-02 | 条件依赖、不满足条件、矛盾参数、重复字段、多轮纠正和取消有确定结果；最多 5 任务、深度 3、拒绝环 | 状态机与边界用例 | 通过 |
-| TASK-03 | 重复点击、消息重放、Worker 崩溃恢复、两个消费者竞争只产生一个逻辑执行；unknown 经对账处理 | 幂等/竞争集成 | 部分完成（隔离库 stale-claim 新 Worker 恢复已通过；未做 OS 进程强杀和生产拓扑演练） |
+| TASK-03 | 重复点击、消息重放、Worker 崩溃恢复、两个消费者竞争只产生一个逻辑执行；unknown 经对账处理 | 幂等/竞争集成与子进程崩溃后新 Worker 恢复 | 部分完成（隔离库子进程 hard-exit 后 stale claim 被新 Worker 回收；多主机生产拓扑与真实外部 write unknown 对账仍待演练） |
 | TOOL-01 | 名称/参数建议必须在租户允许能力内；缺参先问；模型不能把只读任务变成写动作 | 权限过滤与负例 | 通过（stub） |
 | TOOL-02 | 写任务仅提案/人工处理；参数改变使原确认失效；同键不同 payload 冲突；审批人与客户确认角色不混用 | 提案、确认、执行集成 | 通过（stub / 测试数据库） |
 | TOOL-03 | 回执 unknown/失败/记录不属于客户时不展示已办结/已核验；没有 connector 不制造成功卡片 | 回执契约与负例 | 通过（测试边界；无真实连接器沙箱） |
@@ -42,7 +42,7 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | PERF-01 | off/shadow 客户路径与基线对比；shadow 不等待模型，队列可限流、过期与清理，数据库池不超预算 | 生产近似负载与分位数 | 未执行 |
 | PERF-02 | 分类/副驾 p95、超时率、token/费用与预算拦截可量化，响应时间含排队和失败请求 | 真实模型固定配置报告 | 阻塞（仅有合成探测；延迟超标，未测 p95 与生产负载） |
 | MIG-01 | 清洁库升级、带合成业务数据升级、回滚到上版应用可读写、隔离库迁移往返；新表 RLS/索引/外键完整 | 迁移全链回滚/重建、RLS 测试、master API 在 0065 扩展 schema 上读写 smoke | 通过（本机专用合成数据库；非 staging/生产回滚演练） |
-| OPS-01 | 持久任务超时、Worker 重启、provider 429/5xx、连接器断连、重复 outbox 可恢复；无孤儿 executing | stale claim 恢复测试、重复 outbox/过期恢复测试 | 部分完成（新 Worker 实例恢复 stale claim 并避免重复任务；未做 OS 进程强杀和真实 provider/connector 故障演练） |
+| OPS-01 | 持久任务超时、Worker 重启、provider 429/5xx、连接器断连、重复 outbox 可恢复；无孤儿 executing | 子进程 hard-exit 后新 Worker stale-claim 恢复、重复 outbox/过期恢复测试 | 部分完成（本地 OS 子进程故障恢复通过；未做多主机拓扑及真实 provider/connector 故障演练） |
 | OPS-02 | 租户开关/kill switch 生效，旧应用回滚保留数据；待确认动作不被自动执行 | kill switch 测试；扩展 schema 上的上版应用读写 smoke | 部分完成（本地应用回滚 smoke 通过；未做 staging 回滚、降级演练和待确认动作故障注入） |
 | CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | [Release Evidence run #36295891831](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36295891831)，实现 head `247290e5df86c529dde17465efaab64765439764` | 通过（unit、integration、Release Evidence、Web、typecheck、lint、secret/dependency scan 和 concurrency guard 全通过） |
 | DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 更新后的验收/交付报告、语义标注指南、commit 证据包和 Release Evidence run #36295891831 | 部分完成（文档、CI 与本地回滚 smoke 齐备；staging/生产证据待补） |

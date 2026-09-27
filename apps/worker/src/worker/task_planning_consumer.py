@@ -33,17 +33,29 @@ class ClaimedTaskPlanning:
 
 
 async def claim_task_planning_events(
-    session: AsyncSession, *, batch: int = TASK_PLAN_BATCH
+    session: AsyncSession,
+    *,
+    batch: int = TASK_PLAN_BATCH,
+    tenant_id: uuid.UUID | None = None,
+    event_id: uuid.UUID | None = None,
 ) -> list[ClaimedTaskPlanning]:
-    """Claim only outbox metadata before tenant context is known."""
+    """Claim only outbox metadata before tenant context is known.
+
+    Optional tenant/event filters let a controlled replay or failure-injection
+    test claim one known event without touching neighboring tenants' queue
+    entries. The normal poller omits them and claims the bounded global batch.
+    """
+    stmt = select(OutboxEvent.id, OutboxEvent.event_id, OutboxEvent.tenant_id).where(
+        OutboxEvent.event_type == TASK_PLANNING_EVENT_TYPE,
+        OutboxEvent.status == OutboxStatus.QUEUED.value,
+    )
+    if tenant_id is not None:
+        stmt = stmt.where(OutboxEvent.tenant_id == tenant_id)
+    if event_id is not None:
+        stmt = stmt.where(OutboxEvent.event_id == event_id)
     rows = (
         await session.execute(
-            select(OutboxEvent.id, OutboxEvent.event_id, OutboxEvent.tenant_id)
-            .where(
-                OutboxEvent.event_type == TASK_PLANNING_EVENT_TYPE,
-                OutboxEvent.status == OutboxStatus.QUEUED.value,
-            )
-            .order_by(OutboxEvent.created_at, OutboxEvent.id)
+            stmt.order_by(OutboxEvent.created_at, OutboxEvent.id)
             .limit(batch)
             .with_for_update(skip_locked=True)
         )

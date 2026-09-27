@@ -27,8 +27,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
 import os
-import time
 import uuid
 
 import pytest
@@ -138,6 +138,36 @@ class _StubProvider:
 
 def _run(coro: object) -> object:
     return asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)  # type: ignore[arg-type]
+
+
+def _claim_task_event_and_crash(tenant_id: str, event_id: str) -> None:
+    """Use a child OS process to claim one durable outbox event, then die."""
+    import asyncio
+    import os
+    import uuid as uuid_module
+
+    from worker.task_planning_consumer import claim_task_planning_events
+    from worker.wiring import queue_bookkeeping_session
+
+    async def claim() -> int:
+        async with queue_bookkeeping_session() as session:
+            claims = await claim_task_planning_events(
+                session,
+                batch=1,
+                tenant_id=uuid_module.UUID(tenant_id),
+                event_id=uuid_module.UUID(event_id),
+            )
+            await session.commit()
+            return len(claims)
+
+    try:
+        claimed = asyncio.run(claim(), loop_factory=asyncio.SelectorEventLoop)
+    except Exception as exc:  # noqa: BLE001 - parent asserts the process result only
+        os.write(2, f"task-claim child failed: {type(exc).__name__}\n".encode())
+        os._exit(2)
+    # Simulate a hard worker crash after the claim is durable: bypass finally
+    # blocks and interpreter cleanup just as SIGKILL would.
+    os._exit(0 if claimed == 1 else 3)
 
 
 def _set_flags(tenant: str, keys: list[str]) -> None:
@@ -514,8 +544,10 @@ def test_semantic_worker_consumes_the_deferred_task_event() -> None:
     assert "question" not in row[2]
 
 
-def test_new_worker_reclaims_a_task_event_left_in_flight_by_a_crash() -> None:
-    """A restarted worker reclaims the durable claim and creates one task set."""
+def test_new_process_reclaims_a_task_event_after_claiming_worker_crashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh process reclaims a durable claim and creates one task set."""
     from platform_core.agent_runtime.chat_service import append_customer_turn
     from platform_core.agent_runtime.orchestrator import OrchestratorDeps
     from platform_core.identity.tenant_context import TenantContext, tenant_session
@@ -544,19 +576,41 @@ def test_new_worker_reclaims_a_task_event_left_in_flight_by_a_crash() -> None:
             return str(turn.id)
 
     turn_id = _run(enqueue_job())
-    admin = create_engine(ADMIN_URL)
-    with admin.begin() as conn:
-        claimed = conn.execute(
-            text(
-                "UPDATE outbox_events SET status = 'processing', processing_started_at = :stale "
-                "WHERE tenant_id = :t AND event_type = 'conversation.task_planning_requested' "
-                "AND status = 'queued'"
-            ),
-            {"t": TENANT, "stale": int(time.time()) - 601},
-        ).rowcount
-    admin.dispose()
-    assert claimed == 1, "the simulated crashed worker must leave one durable stale claim"
+    event_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"task-planning:{TENANT}:{CONV}:{turn_id}",
+    )
+    process_context = multiprocessing.get_context("spawn")
+    process = process_context.Process(
+        target=_claim_task_event_and_crash,
+        args=(TENANT, str(event_id)),
+    )
+    process.start()
+    process.join(timeout=30)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+        pytest.fail("claiming worker child failed to exit")
+    assert process.exitcode == 0, "crashed worker must commit one processing claim before exit"
 
+    admin = create_engine(ADMIN_URL)
+    with admin.connect() as conn:
+        status, claimed_at = conn.execute(
+            text(
+                "SELECT status, processing_started_at FROM outbox_events "
+                "WHERE tenant_id = :t AND event_id = :event"
+            ),
+            {"t": TENANT, "event": str(event_id)},
+        ).one()
+    admin.dispose()
+    assert status == "processing"
+    assert claimed_at is not None
+
+    from worker import task_planning_consumer
+
+    # Make the durable claim immediately stale; the production path still
+    # uses the default 600-second lease.
+    monkeypatch.setattr(task_planning_consumer, "STALE_TASK_PLAN_SECONDS", -1)
     provider = _StubProvider(MODEL_OUTPUT.replace('"t-1"', f'"{turn_id}"'))
     restarted_worker = SemanticWorker(OrchestratorDeps(extra={"chat": provider}))
     assert _run(restarted_worker.run_once()) >= 1

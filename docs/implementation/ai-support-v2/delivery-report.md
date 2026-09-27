@@ -359,14 +359,14 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 | T01 | 完成（控制逻辑与中文安全规则） | 当前版本真实模型质量归 EVAL-02 |
 | T02 | 完成（shadow/off 代码边界） | 多主机 worker、真实 provider 故障和成本容量演练 |
 | T03 | 部分完成（指标、hash、1,700 条语料、运行器、标注规范） | 双人独立标注与裁决；当前 prompt 的模型 holdout 和延迟门禁 |
-| T04 | 完成（RLS、状态机、幂等、恢复实现） | OS 进程重启及生产消费者竞争 |
+| T04 | 完成（RLS、状态机、幂等、本地进程恢复实现） | 多主机生产消费者竞争与外部写入对账 |
 | T05 | 完成（能力过滤、提案/确认/回执边界） | 真实 ERP/CRM connector sandbox |
 | T06 | 完成（异步副驾、来源、stale/idempotency/人工发送） | 真实模型质量与租户允许自定义指令的数据目的地决策 |
 | T07 | 部分完成（真实 API 页面、响应式与键盘修复） | 真实 200% 浏览器缩放、逐规格截图、完整屏幕阅读器验收 |
 | T08 | 部分完成（合成用户旅程、lease/worker 竞态测试） | 两坐席在途接管、provider/connector 故障注入、生产负载 |
 | T09 | 部分完成（本地上版兼容 smoke、交付和标注文档；GitHub CI/Release Evidence 已通过） | staging 回滚与生产证据 |
 
-**生产启用仍阻塞**：EVAL-02、PERF-01/02、双坐席真实接管、OS/多主机 Worker 故障演练、生产身份/连接器、独立人工标注及完整无障碍验收。所有新功能开关保持关闭，`semantic_read` 不启用。本轮不执行合并或生产发布。
+**生产启用仍阻塞**：EVAL-02、PERF-01/02、双坐席真实接管、多主机 Worker/外部写入对账故障演练、生产身份/连接器、独立人工标注及完整无障碍验收。所有新功能开关保持关闭，`semantic_read` 不启用。本轮不执行合并或生产发布。
 
 GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36295891831) 在实现提交 `247290e5df86c529dde17465efaab64765439764` 上通过所有工作流，包括完整 Integration、Release Evidence、Web、typecheck、lint、secret/dependency scan 和 concurrency guard。对应的本地验收摘要见 [实现提交证据包](evidence/247290e5df86c529dde17465efaab64765439764/local-verification.md)。
 
