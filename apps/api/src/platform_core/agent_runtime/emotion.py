@@ -36,6 +36,26 @@ class Emotion(StrEnum):
     ESCALATION_RISK = "escalation_risk"
 
 
+class EmotionEvidenceDisposition(StrEnum):
+    """How a lexicon hit relates to the customer's current, literal intent."""
+
+    ACTIVE = "active"
+    NEGATED = "negated"
+    QUOTED = "quoted"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True)
+class EmotionMatch:
+    """A text span and a non-text reason; the span stays inside the tenant UI."""
+
+    start: int
+    end: int
+    level: Emotion
+    disposition: EmotionEvidenceDisposition
+    reason_code: str
+
+
 @dataclass(frozen=True)
 class EmotionSignal:
     """The detected level plus the terms that produced it.
@@ -108,6 +128,134 @@ _PATTERN_FOR_LEVEL: dict[Emotion, re.Pattern[str]] = {
     Emotion.ANGRY: _ANGRY,
     Emotion.FRUSTRATED: _FRUSTRATED,
 }
+
+_REFERENCE_QUOTE_CUE = re.compile(
+    r"(?:引用内容|引用|原文|上一条|上次|旧聊天|聊天记录|聊天|邮件|文档|客户说|客服说|对方说|"
+    r"quoted|quote|previous message|old chat|email says|document says|the customer said|they said)"
+    r"\s*[:：,，\u2014-]*\s*$",
+    re.I,
+)
+_NEGATION_CUE = re.compile(
+    r"(?:没有|并没有|并不|不是|并非|不再|从未|未曾|绝不|不|没|未|"
+    r"not|never|no|don't|doesn't|didn't|isn't|wasn't|aren't|weren't|haven't|hasn't)",
+    re.I,
+)
+_NEGATION_SUFFIX = re.compile(
+    r"(?:没有|并没有|并不|不是|并非|不再|从未|未曾|绝不|不|没|未)"
+    r"\s*(?:觉得|认为|感到|感觉|是|很|太|特别|真的)?\s*$"
+    r"|(?:not|never|no|don't|doesn't|didn't|isn't|wasn't|aren't|weren't|haven't|hasn't)"
+    r"\s*(?:really|very|so|that|at all)?\s*$",
+    re.I,
+)
+_DOUBLE_NEGATION_SUFFIX = re.compile(r"(?:不是|并非|not)\s*(?:不|没|un)\w*\s*$", re.I)
+_DOUBLE_NEGATION_BEFORE = re.compile(r"(?:不是|并非|not)\s*$", re.I)
+_CLAUSE_BREAK = re.compile(
+    r"(?:但是|不过|可是|然而|[，,。；;！？?])|\b(?:but|however|though|yet)\b",
+    re.I,
+)
+_IRONY_CUE = re.compile(
+    r"呵呵|真是(?:太)?(?:棒|不错|优秀|讽刺)|可真(?:不错|优秀|厉害)|说得好听|"
+    r"yeah right|sure[, ]+(?:great|wonderful)|just great|what a wonderful",
+    re.I,
+)
+_QUOTE_PAIRS = (
+    ("“", "”"),
+    ("「", "」"),
+    ("『", "』"),
+    ("‘", "’"),
+    ('"', '"'),
+    ("'", "'"),
+    ("`", "`"),
+)
+
+
+def _is_reference_quote(text: str, start: int, end: int) -> bool:
+    """Ignore affect words explicitly attributed to quoted prior content.
+
+    Quotes used for emphasis (for example, ``你们“太差了”``) remain direct
+    evidence. A nearby attribution cue such as ``邮件写着`` or ``客户说`` is
+    required before a quote is treated as untrusted prior speech.
+    """
+    for opening, closing in _QUOTE_PAIRS:
+        open_at = text.rfind(opening, 0, start)
+        close_at = text.find(closing, end)
+        if open_at < 0 or close_at < 0:
+            continue
+        if opening == "'":
+            before = text[open_at - 1 : open_at] if open_at else ""
+            after = text[open_at + 1 : open_at + 2]
+            if before.isalnum() and after.isalnum():
+                continue  # apostrophe in a contraction such as I'm
+        prefix = text[max(0, open_at - 48) : open_at]
+        if _REFERENCE_QUOTE_CUE.search(prefix):
+            return True
+    return False
+
+
+def _negation_disposition(text: str, start: int) -> EmotionEvidenceDisposition | None:
+    prefix = text[max(0, start - 24) : start]
+    break_match = None
+    for match in _CLAUSE_BREAK.finditer(prefix):
+        break_match = match
+    if break_match is not None:
+        prefix = prefix[break_match.end() :]
+    double_negation = _DOUBLE_NEGATION_SUFFIX.search(prefix) or (
+        _DOUBLE_NEGATION_BEFORE.search(prefix)
+        and (text[start:].startswith("不") or text[start:].casefold().startswith("un"))
+    )
+    if double_negation:
+        return EmotionEvidenceDisposition.AMBIGUOUS
+    if _NEGATION_SUFFIX.search(prefix[-12:]):
+        return EmotionEvidenceDisposition.NEGATED
+    if _NEGATION_CUE.search(prefix):
+        # A negation that is too far from the match has an uncertain scope;
+        # keep it out of priority ranking until a human reads the turn.
+        return EmotionEvidenceDisposition.AMBIGUOUS
+    return None
+
+
+def find_emotion_matches(text: str) -> tuple[EmotionMatch, ...]:
+    """Return lexicon spans with quote/negation context, without raw terms.
+
+    This advisory surface is separate from ``detect_emotion`` so R2 can
+    measure false positives without silently changing the existing R1 handoff
+    behavior.
+    """
+    if not text:
+        return ()
+    matches: list[EmotionMatch] = []
+    for level in _LEVEL_ORDER:
+        if level is Emotion.CALM:
+            continue
+        for match in _PATTERN_FOR_LEVEL[level].finditer(text):
+            if _is_reference_quote(text, match.start(), match.end()):
+                disposition = EmotionEvidenceDisposition.QUOTED
+                reason = "quoted_prior_content"
+            else:
+                negation = _negation_disposition(text, match.start())
+                if negation is not None:
+                    disposition = negation
+                    reason = (
+                        "negated_emotion_term"
+                        if negation is EmotionEvidenceDisposition.NEGATED
+                        else "negation_scope_ambiguous"
+                    )
+                elif _IRONY_CUE.search(text):
+                    disposition = EmotionEvidenceDisposition.AMBIGUOUS
+                    reason = "irony_or_mixed_tone"
+                else:
+                    disposition = EmotionEvidenceDisposition.ACTIVE
+                    reason = "direct_emotion_term"
+            matches.append(
+                EmotionMatch(
+                    start=match.start(),
+                    end=match.end(),
+                    level=level,
+                    disposition=disposition,
+                    reason_code=reason,
+                )
+            )
+    return tuple(sorted(matches, key=lambda item: (item.start, item.end, item.level.value)))
 
 
 def detect_emotion(text: str) -> EmotionSignal:
