@@ -364,8 +364,10 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 | T06 | 完成（异步副驾、来源、stale/idempotency/人工发送） | 真实模型质量与租户允许自定义指令的数据目的地决策 |
 | T07 | 部分完成（真实 API 页面、响应式与键盘修复） | 真实 200% 浏览器缩放、逐规格截图、完整屏幕阅读器验收 |
 | T08 | 部分完成（合成用户旅程、lease/worker 竞态测试） | 两坐席在途接管、provider/connector 故障注入、生产负载 |
-| T09 | 部分完成（本地上版兼容 smoke、交付和标注文档） | 本轮 head 的 GitHub CI/Release Evidence；staging 回滚与生产证据 |
+| T09 | 部分完成（本地上版兼容 smoke、交付和标注文档；GitHub CI/Release Evidence 已通过） | staging 回滚与生产证据 |
 
 **生产启用仍阻塞**：EVAL-02、PERF-01/02、双坐席真实接管、OS/多主机 Worker 故障演练、生产身份/连接器、独立人工标注及完整无障碍验收。所有新功能开关保持关闭，`semantic_read` 不启用。本轮不执行合并或生产发布。
+
+GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36295891831) 在实现提交 `247290e5df86c529dde17465efaab64765439764` 上通过所有工作流，包括完整 Integration、Release Evidence、Web、typecheck、lint、secret/dependency scan 和 concurrency guard。对应的本地验收摘要见 [实现提交证据包](evidence/247290e5df86c529dde17465efaab64765439764/local-verification.md)。
 
 **Jev 使用记录**：Jev 只对脱敏的合成模型汇总数据给出“抽取 12 条 dev-only 样本诊断 schema 失败、保持 holdout 封存”的建议；未发送密钥或样本原文。Codex 完成评测设计、代码、复验和门禁结论。

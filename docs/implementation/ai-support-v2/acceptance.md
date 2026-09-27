@@ -44,8 +44,8 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | MIG-01 | 清洁库升级、带合成业务数据升级、回滚到上版应用可读写、隔离库迁移往返；新表 RLS/索引/外键完整 | 迁移全链回滚/重建、RLS 测试、master API 在 0065 扩展 schema 上读写 smoke | 通过（本机专用合成数据库；非 staging/生产回滚演练） |
 | OPS-01 | 持久任务超时、Worker 重启、provider 429/5xx、连接器断连、重复 outbox 可恢复；无孤儿 executing | stale claim 恢复测试、重复 outbox/过期恢复测试 | 部分完成（新 Worker 实例恢复 stale claim 并避免重复任务；未做 OS 进程强杀和真实 provider/connector 故障演练） |
 | OPS-02 | 租户开关/kill switch 生效，旧应用回滚保留数据；待确认动作不被自动执行 | kill switch 测试；扩展 schema 上的上版应用读写 smoke | 部分完成（本地应用回滚 smoke 通过；未做 staging 回滚、降级演练和待确认动作故障注入） |
-| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | 之前 head 的 Release Evidence run #36260478409；本轮改动需推送后运行 | 待执行（本轮改动尚未绑定新 CI head） |
-| DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 更新后的验收/交付报告与语义标注指南 | 部分完成（本地回滚 smoke 已做；CI、staging 与生产证据待补） |
+| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | [Release Evidence run #36295891831](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36295891831)，实现 head `247290e5df86c529dde17465efaab64765439764` | 通过（unit、integration、Release Evidence、Web、typecheck、lint、secret/dependency scan 和 concurrency guard 全通过） |
+| DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 更新后的验收/交付报告、语义标注指南、commit 证据包和 Release Evidence run #36295891831 | 部分完成（文档、CI 与本地回滚 smoke 齐备；staging/生产证据待补） |
 
 ## 3. 质量阈值：R1 提议的启用门槛
 
