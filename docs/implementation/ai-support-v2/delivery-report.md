@@ -509,5 +509,6 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 - 新增统一的 active conversation identity guard：详情不属于当前 URL 时显示加载状态、隐藏副驾和客户内容、禁止从旧详情发起新的回复/任务写入；转接与结束对话框随会话变化关闭。
 - 旧会话的 Copilot 请求、分页历史、快捷话术、回复、附件及分类更正等异步结果在回写前校验 active conversation。待重试回复幂等键按 conversation_ref 分开，避免两个会话的相同文案复用同一 key；旧发送请求完成时，仅当草稿 revision 未变化才清空输入框。
 - 新增 `workbench-conversation.test.mts`，覆盖 4 个 route identity、6 个幂等键和 2 个草稿 revision 保护断言；Admin Web 全部行为测试、typecheck 和 production build 通过。尚未做真实非空会话浏览器矩阵、跨标签草稿同步、断线恢复或 VoiceOver 验收。
+- 实现提交 `56833ae3f91d83cd8492020de8ae58b5bd25ee72` 已推送至 PR #27；GitHub Actions [run #36401909032](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36401909032) 九个 job 全部通过，包括 Admin Web、集成测试、并发门禁及完整 release-evidence/零容忍检查。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 完成路由/异步竞态审查、状态隔离修复、前端复验和验收文档更新。
