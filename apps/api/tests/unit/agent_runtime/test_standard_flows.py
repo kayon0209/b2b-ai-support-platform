@@ -141,3 +141,6 @@ def test_technical_escalation_never_claims_engineering_resolution() -> None:
     assert flow is not None
     assert flow.confirmation_required is True
     assert "不生成未核验" in flow.partial_completion_rule
+    product_ref = next(field for field in flow.required_fields if field.name == "product_ref")
+    assert product_ref.source == "verified_business_record"
+    assert product_ref.lookup_input is True

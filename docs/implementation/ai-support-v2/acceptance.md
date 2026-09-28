@@ -23,7 +23,7 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | TASK-01 | 多意图任务拆解保留所有可识别需求；只读成功、缺参、未支持写入均有独立状态与原因 | 旅程 API/DB 集成 | 通过（stub） |
 | TASK-02 | 条件依赖、不满足条件、矛盾参数、重复字段、多轮纠正和取消有确定结果；最多 5 任务、深度 3、拒绝环 | 状态机与边界用例 | 通过 |
 | TASK-03 | 重复点击、消息重放、Worker 崩溃恢复、两个消费者竞争只产生一个逻辑执行；unknown 经对账处理 | 幂等/竞争集成与子进程崩溃后新 Worker 恢复 | 部分完成（隔离库子进程 hard-exit 后 stale claim 被新 Worker 回收；多主机生产拓扑与真实外部 write unknown 对账仍待演练） |
-| FLOW-01 | 坐席发起 task 绑定 server-resolved turn/tenant/owner/flow version；幂等/RLS；发票内部 Case 提案限有权限角色，撤回与执行串行，verified receipt 回写 task；其它 flow 不能被误调度 | `test_standard_flow_instances.py`、`test_task_state_machine.py`、RLS/cross-tenant suite | 本地通过（发票仅创建内部平台 Case；真实开票、订单读取、质量/技术 executor 仍未实现） |
+| FLOW-01 | 坐席发起 task 绑定 server-resolved turn/tenant/owner/flow version；幂等/RLS；读任务仅用 verified receipt 完成，写提案经人工确认；其它 flow 不误入 scheduler | `test_standard_flow_instances.py`、`test_task_state_machine.py`、RLS/cross-tenant suite；订单 Demo read receipt；质量/技术 Demo 产品归属、PII 脱敏、活跃部门路由、执行时重核 | 本地通过（订单状态只在合成 Demo ERP 可查询；质量/技术只创建平台内部 Case；真实 ERP、质量/工程系统执行仍未实现） |
 | KNOW-01 | 可信 evaluator 必须对发布 candidate version 做 candidate-aware retrieval，并绑定固定期望引用数据集 | 候选发布集成用例 1 passed；合成语义数据集、runner、release gates 与 visitor ownership 共 33 passed。测试使用 fake answerer、确定性 embedder、合成 manifest/文档和测试密钥；未发送真实模型请求 | 合成代码路径和无来源自报拒绝已验证；数据集仍待独立人工复核/批准，真实模型分数和费用证据不存在，自动评测/发布 flag 保持关闭 |
 | TOOL-01 | 名称/参数建议必须在租户允许能力内；缺参先问；模型不能把只读任务变成写动作 | 权限过滤与负例 | 通过（stub） |
 | TOOL-02 | 写任务仅提案/人工处理；参数改变使原确认失效；同键不同 payload 冲突；审批人与客户确认角色不混用 | 提案、确认、执行集成 | 通过（stub / 测试数据库） |

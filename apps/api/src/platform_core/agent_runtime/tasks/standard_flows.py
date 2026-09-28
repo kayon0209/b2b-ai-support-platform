@@ -33,6 +33,9 @@ class FlowField(BaseModel):
     source: Literal["customer", "verified_business_record", "server_context", "human"]
     sensitive: bool = False
     required: bool = True
+    # A customer may supply an identifier that the server must resolve against
+    # a trusted business record before the slot can be marked verified.
+    lookup_input: bool = False
 
 
 class ConnectorRequirement(BaseModel):
@@ -87,7 +90,11 @@ STANDARD_FLOW_TEMPLATES: tuple[FlowTemplate, ...] = (
         business_lines=("component_procurement", "pcb", "pcba", "supply_chain"),
         intent_codes=("order.status", "order.delivery_status"),
         required_fields=(
-            FlowField(name="order_id", source="customer"),
+            FlowField(
+                name="order_id",
+                source="verified_business_record",
+                lookup_input=True,
+            ),
             FlowField(name="customer_account_ref", source="verified_business_record"),
         ),
         optional_fields=(
@@ -113,7 +120,11 @@ STANDARD_FLOW_TEMPLATES: tuple[FlowTemplate, ...] = (
         intent_codes=("quality.repair_request", "quality.defect_report"),
         required_fields=(
             FlowField(name="customer_account_ref", source="verified_business_record"),
-            FlowField(name="product_ref", source="verified_business_record"),
+            FlowField(
+                name="product_ref",
+                source="verified_business_record",
+                lookup_input=True,
+            ),
             FlowField(name="issue_summary", source="customer"),
         ),
         optional_fields=(
@@ -167,7 +178,11 @@ STANDARD_FLOW_TEMPLATES: tuple[FlowTemplate, ...] = (
         intent_codes=("technical.process_question", "technical.escalation"),
         required_fields=(
             FlowField(name="customer_account_ref", source="verified_business_record"),
-            FlowField(name="product_ref", source="verified_business_record"),
+            FlowField(
+                name="product_ref",
+                source="verified_business_record",
+                lookup_input=True,
+            ),
             FlowField(name="question_or_symptom", source="customer"),
         ),
         optional_fields=(

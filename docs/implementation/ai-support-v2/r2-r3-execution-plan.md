@@ -37,7 +37,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 当前租户没有对应工具或业务负责人时，模板显示 `unsupported`/`needs_human`，不显示假成功。
 - 多意图按子任务推进；已完成部分不重复执行，依赖阻塞时不跳过前置条件。
 - 验收：模板 schema 合同测试、每模板状态机测试、权限负例、同键重放/不同 payload 冲突，以及浏览器补参/取消/人工接续。
-- 当前：四种模板可由当前会话 owner 发起真实 task，服务端绑定最新 customer turn、模板 key/version 和 append-only 幂等 receipt；字段采集、取消/转人工写事件并经 lease 复核。实例停在专用 `manual_flow`（不进入 scheduler），默认关闭 flag `agent.standard_flow_instances`。`invoice_application` 有一个受限本地路径：从现有关联 Case 唯一解析 tenant account 后，可经 Tool Gateway 创建需独立确认的内部 `case.create`；撤回、并发执行和 verified receipt 回写已有验收。它不调用开票系统。订单查询、质量和技术升级的 executor、产品字段权威核验与真实连接器仍待完成。详细范围见 `r2-02-standard-flow-catalog.md`。
+- 当前：四种模板可由当前会话 owner 发起 task，服务端绑定最新 customer turn、模板 key/version 和 append-only 幂等 receipt；默认关闭 flag `agent.standard_flow_instances`。`order_status` 在 local/test Demo 模式下经 Tool Gateway 查询并把 verified receipt 回写 task；订单 owner 不匹配时拒绝。`invoice_application` 只能创建需确认的平台内部 Case，不会开票。`repair_quality_intake` / `technical_escalation` 在 Demo authority 下校验账户映射与合成产品 owner，需租户 staffed Department、受控提案/人工确认；执行时重核归属并读回 Case，PII-shaped 联系方式在任务/Case 前脱敏。这不代表连接真实 ERP、质量或工程系统。真实业务 authority、外部连接器及真实 staging 验收仍待完成。详细范围见 `r2-02-standard-flow-catalog.md`。
 
 ### R2-03 知识改进追踪
 

@@ -547,3 +547,30 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 - `acceptance.md` 与执行计划按上述证据同步。本轮没有访问客户/第三方系统，没有调用真实模型，没有合并或生产发布。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 负责实现、合成验证、验收边界判断与文档同步。
+
+---
+
+## 17. Codex follow-up：R2-02 Demo 质量/技术受理闭环与剩余项复核（2026-09-28）
+
+### 对进度评估的复核
+
+- 原评估总体准确：PR #27 在本地 HEAD `b45b846` 时与远端同步、工作区干净、仍是 Draft；那一版最新 CI 9 个 job 全通过。新改动尚待提交，因此该 CI 不能作为本轮代码的 CI 证据。
+- 需要区分“真实订单系统未接入”和“本地流程能力未实现”：通用支持旅程原本已有 Tool Gateway + Demo ERP。此次也把受控查询接入 R2-02 `order_status` task：先核对会话账户与 Demo 订单 owner，再经 Tool Gateway 查询，最小回执带 `source=demo`/`fetched_at` 写入 task。真实订单系统和真实 owner proof 仍未接入。
+- 获批评测集、真实 provider/权威映射、生产近似 staging、多实例运维、真人 VoiceOver 朗读和 PNG 归档仍是外部/人工证据门禁，不能由本地模拟替代。
+
+### 本轮代码与边界
+
+- `repair_quality_intake` 和 `technical_escalation` 的 local/test Demo 路径现可从会话唯一关联的 tenant Account 解析 `business_system_refs.business_api`，核对客户提供的 `product_ref` 是否属于该账户；未核验 ID 不会写为 verified slot。
+- `order_status` 也有显式 local/test 查询动作：订单号先按 Demo 账户归属核验，查询经 `order.get_status` Tool Gateway 执行；只有执行 read receipt、来源标记和 owner 复核通过才把 task 标为 succeeded。未找到/异常/unknown 不生成成功回执，也不会自动发送客户消息。
+- 经过核验的流程可准备 `case.create` 提案，分别创建 `quality_issue` / `technical_escalation` 内部 Case，并路由到同租户 `quality` / `engineering` Department。提案要求 `tool.write.confirmed`，部门须至少有一个 active support owner；Tool Gateway 执行前再次核验账户映射、合成产品归属、Demo 环境和路由部门，之后读回 Case。创建 Case 只代表平台内部登记/分派，不代表质量裁定、维修或外部工程系统已受理。
+- 客户 issue/question 中符合规则的手机号、邮箱会在任务和 Case 持久化前脱敏。Demo verifier 的目录只包含代码内合成记录，部署开关默认关闭，且不允许 staging/production 使用此路径。
+- 文档已同步 `r2-02-standard-flow-catalog.md`、`r2-r3-execution-plan.md` 和 FLOW-01 acceptance。真实 ERP/MES/WMS/CRM、真实质量/工程连接器和发布门禁状态没有被改写为已完成。
+
+### 本地验证与余项
+
+- 隔离 PostgreSQL 数据库 `codex_r2flow_test_20260928` 从空库迁移到 `0070_outbox_processing_fence` 后运行标准流程、状态机与 Case Gateway 定向套件：**94 passed**，含订单 owner 拒绝、Tool Gateway query/read receipt、错误账户产品拒绝、账户映射变更后执行阻断、无 active owner 拒绝、PII 脱敏、人工确认、部门路由和 verified task receipt。该临时数据库在验收后删除；共用 `platform` 数据库未被迁移。
+- Ruff check/format、10 个源文件的 Mypy 均通过；Admin Web 的 `npm test`、typecheck、production build 和 runtime guards 均通过。
+- 剩余主要是外部证据和真实集成：ERP/MES/WMS/CRM sandbox/authority、质量与工程系统 connector、人工批准固定评测集、真实模型/预算、staging 多实例/rollback、VoiceOver 真人走查和受浏览器安全策略阻止的 PNG 归档。Demo 流程只验证平台控制面，不代表外部业务已执行。
+- 本轮 GitHub CI 仍待更新代码提交后重跑；所有 production evaluator/release/standard-flow flag 继续关闭，没有连接客户或第三方系统，也没有调用真实模型。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 核对当前 PR/CI 与代码路径，完成本地 Demo 流程实现、复验和验收边界修订。

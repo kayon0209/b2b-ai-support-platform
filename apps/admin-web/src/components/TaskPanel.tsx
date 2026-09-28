@@ -37,11 +37,18 @@ import {
 
 export interface TaskSlot {
   name: string;
-  origin: "customer_stated" | "verified_receipt" | "inferred" | "agent_collected";
+  origin:
+    | "customer_stated"
+    | "verified_receipt"
+    | "verified_business_record"
+    | "inferred"
+    | "agent_collected";
   confirmed: boolean;
   value?: unknown;
   value_withheld?: boolean;
   inferred?: boolean;
+  verification_source?: string;
+  authority_version?: string;
   collected_by?: string;
   collected_at?: number;
 }
@@ -77,6 +84,7 @@ export interface ConversationTask {
   flow_version: number | null;
   flow_title: string | null;
   flow_can_prepare_proposal: boolean;
+  flow_can_query_order: boolean;
   updated_at: number;
 }
 
@@ -87,7 +95,36 @@ interface TasksResponse {
   offset: number;
 }
 
-export type TaskCommand = "collect_fields" | "cancel" | "handoff" | "prepare_proposal";
+export type TaskCommand =
+  | "collect_fields"
+  | "cancel"
+  | "handoff"
+  | "prepare_proposal"
+  | "query_order_status";
+
+interface DemoOrderStatusReceipt {
+  order_id: string;
+  status: string;
+  nodes: { label: string; status: string; at: string | null }[];
+  eta: string | null;
+  source: "demo";
+  fetched_at: string;
+}
+
+function asDemoOrderStatusReceipt(value: unknown): DemoOrderStatusReceipt | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<DemoOrderStatusReceipt>;
+  if (
+    typeof candidate.order_id !== "string" ||
+    typeof candidate.status !== "string" ||
+    candidate.source !== "demo" ||
+    typeof candidate.fetched_at !== "string" ||
+    !Array.isArray(candidate.nodes)
+  ) {
+    return null;
+  }
+  return candidate as DemoOrderStatusReceipt;
+}
 
 /** Status → label. A closed vocabulary: an unknown status renders as itself. */
 const STATUS_LABEL: Record<string, string> = {
@@ -120,8 +157,9 @@ const BLOCKED_LABEL: Record<string, string> = {
   TASK_HANDED_TO_HUMAN: "已转人工处理。",
   TASK_CONDITION_UNMET: "前置条件不满足，已跳过。",
   FLOW_EXECUTOR_UNAVAILABLE: "该流程已绑定到当前会话并进入人工接续；流程专用执行器尚未接入，不会自动查询或写入业务系统。",
-  FLOW_INTERNAL_CASE_ONLY: "当前只可准备平台内部申请工单；账户需从已关联 Case 唯一核验，且这不代表已开票。",
+  FLOW_INTERNAL_CASE_ONLY: "当前流程只会准备平台内部 Case 提案，不会直接开票、维修、质量判定或调用外部工程系统。",
   FLOW_INTERNAL_CASE_PROPOSAL_UNAVAILABLE: "平台未能准备内部工单提案；请人工核对账户关联和当前工具权限。",
+  FLOW_BUSINESS_RECORD_UNVERIFIED: "Demo 业务记录与当前会话账户不匹配，已阻止流程完成并转人工核对。",
   TOOL_EXECUTION_FAILED: "工具执行失败；请查看关联提案和审计记录后再决定如何处理。",
   TOOL_EXECUTION_UNKNOWN: "执行结果未知，不能视为完成；请先对账，禁止盲目重试。",
 };
@@ -136,6 +174,7 @@ const ORIGIN_LABEL: Record<string, string> = {
   customer_stated: "客户自述",
   agent_collected: "坐席录入",
   verified_receipt: "已核验回执",
+  verified_business_record: "业务记录已核验",
   inferred: "推断（不可直接采信）",
 };
 
@@ -236,7 +275,7 @@ export function TaskPanel({
       setBusyTaskId(task.task_id);
       setError(null);
       try {
-        await apiPost(
+        const response = await apiPost<{ task: ConversationTask }>(
           `/v1/workbench/conversations/${conversationRef}/tasks/${task.task_id}/commands`,
           {
             command,
@@ -253,6 +292,16 @@ export function TaskPanel({
               ? "任务已转人工。"
               : command === "prepare_proposal"
                 ? "任务已进入待确认，等待坐席确认后执行。"
+                : command === "query_order_status"
+                  ? response.task.status === "succeeded"
+                    ? "Demo ERP 订单状态已核验；回执已记录在任务中。"
+                    : response.task.status === "unknown"
+                      ? "订单查询结果未知，已转人工核对。"
+                      : "订单状态未核验，需人工处理。"
+                : fields?.product_ref
+                  ? "产品编号已通过本地 Demo 目录归属核验；内部 Case 提案仍需受控权限和人工确认。"
+                  : fields?.order_id
+                    ? "订单编号已通过 Demo ERP 账户归属核验；请再明确执行只读查询。"
                 : task.flow_key
                   ? "已记录坐席整理的字段；流程仍需人工接续，不会自动执行。"
                   : "已记录客户补充的信息。",
@@ -403,11 +452,19 @@ function TaskRow({
     task.status === "ready" ||
     task.status === "manual_flow" ||
     (task.flow_key === "invoice_application" && task.status === "needs_human");
-  const mayPrepareInvoiceProposal =
-    task.flow_key === "invoice_application" &&
+  const mayPrepareFlowProposal =
+    (task.flow_key === "invoice_application" ||
+      task.flow_key === "repair_quality_intake" ||
+      task.flow_key === "technical_escalation") &&
     (task.status === "manual_flow" || task.status === "needs_human") &&
     missing.length === 0 &&
     task.flow_can_prepare_proposal;
+  const mayQueryOrderStatus =
+    task.flow_key === "order_status" &&
+    task.kind === "read" &&
+    task.status === "manual_flow" &&
+    missing.length === 0 &&
+    task.flow_can_query_order;
   // Both decisions come from `lib/taskPanelState`, which `task-panel-state`
   // executes: per-task field keys, and only the fields this task is waiting
   // for. Inlined here they were correct but untested, and the acceptance
@@ -432,7 +489,9 @@ function TaskRow({
         <dl className="wb-task-slots">
           {task.slots.map((slot) => (
             <div key={slot.name} className="wb-task-slot">
-              <dt>{slot.name}</dt>
+              <dt>
+                {slot.name === "order_status_receipt" ? "订单状态回执" : slot.name}
+              </dt>
               <dd>
                 {slot.value_withheld ? (
                   <span className="wb-task-withheld">
@@ -443,16 +502,53 @@ function TaskRow({
                         : "已记录于会话，未在任务中展示"}
                   </span>
                 ) : (
-                  <span>{String(slot.value ?? "—")}</span>
+                  <span>
+                    {slot.name === "order_status_receipt"
+                      ? "已核验；展开下方 Demo ERP 回执"
+                      : String(slot.value ?? "—")}
+                  </span>
                 )}
                 <em className="wb-task-origin">
-                  {ORIGIN_LABEL[slot.origin] ?? slot.origin}
+                  {slot.verification_source === "demo"
+                    ? slot.origin === "verified_receipt"
+                      ? "Demo ERP 已核验回执"
+                      : "本地 Demo 目录核验"
+                    : ORIGIN_LABEL[slot.origin] ?? slot.origin}
                 </em>
               </dd>
             </div>
           ))}
         </dl>
       ) : null}
+
+      {task.slots
+        .filter((slot) => slot.name === "order_status_receipt")
+        .map((slot) => {
+          const receipt = asDemoOrderStatusReceipt(slot.value);
+          if (!receipt) return null;
+          return (
+            <section
+              key={`${task.task_id}:order-status-receipt`}
+              className="wb-task-slots"
+              aria-label="订单状态查询回执"
+            >
+              <strong>合成 Demo ERP 回执</strong>
+              <p>
+                订单 {receipt.order_id}：{receipt.status}
+              </p>
+              {receipt.eta ? <p>预计时间：{receipt.eta}</p> : null}
+              <ol>
+                {receipt.nodes.map((node, index) => (
+                  <li key={`${node.label}-${index}`}>
+                    {node.label}：{node.status}
+                    {node.at ? ` · ${node.at}` : ""}
+                  </li>
+                ))}
+              </ol>
+              <p>来源：Demo · 查询时间：{receipt.fetched_at}</p>
+            </section>
+          );
+        })}
 
         {task.blocked_reason ? (
         <p className="wb-task-blocked">
@@ -466,7 +562,13 @@ function TaskRow({
           <ul>
             {missing.map((name) => (
               <li key={name}>
-                <label htmlFor={`collect-${task.task_id}-${name}`}>{name}</label>
+                <label htmlFor={`collect-${task.task_id}-${name}`}>
+                  {name === "product_ref"
+                    ? "产品编号（提交后由业务目录核验）"
+                    : name === "order_id"
+                      ? "订单编号（提交后由 Demo ERP 核验）"
+                      : name}
+                </label>
                 <input
                   id={`collect-${task.task_id}-${name}`}
                   ref={(el) => {
@@ -475,7 +577,13 @@ function TaskRow({
                   value={collected[name] ?? ""}
                   disabled={!canCommand || busy}
                   onChange={(e) => onCollect(name, e.target.value)}
-                  placeholder="客户的原话"
+                  placeholder={
+                    name === "product_ref"
+                      ? "例如 PCB-DEMO-100"
+                      : name === "order_id"
+                        ? "例如 SO-9001"
+                        : "客户的原话"
+                  }
                 />
               </li>
             ))}
@@ -510,19 +618,41 @@ function TaskRow({
             {busy ? "提交中…" : "记录补充"}
           </button>
         ) : null}
-      {task.flow_key === "invoice_application" &&
-      (task.status === "manual_flow" || task.status === "needs_human") &&
-      missing.length === 0 &&
-      !task.flow_can_prepare_proposal ? (
-        <p className="wb-task-disabled-reason">
-          需要具备受控写入权限的支持管理员或租户负责人准备内部申请工单提案。
-        </p>
-      ) : null}
+        {canCommand && mayQueryOrderStatus ? (
+          <button
+            type="button"
+            className="wb-btn wb-btn-primary"
+            disabled={busy}
+            onClick={() => void onCommand(task, "query_order_status")}
+            title="通过 Tool Gateway 查询本地合成 Demo 订单；回执会标明 Demo 来源"
+          >
+            {busy ? "查询中…" : "查询 Demo 订单状态"}
+          </button>
+        ) : null}
+        {canCommand &&
+        task.flow_key === "order_status" &&
+        task.status === "manual_flow" &&
+        missing.length === 0 &&
+        !task.flow_can_query_order ? (
+          <p className="wb-task-disabled-reason">
+            标准流程查询仅在 local/test Demo 模式并具备订单读取权限时开放；没有可用的 orders_read connector 时需人工核对。
+          </p>
+        ) : null}
+        {(task.flow_key === "invoice_application" ||
+          task.flow_key === "repair_quality_intake" ||
+          task.flow_key === "technical_escalation") &&
+        (task.status === "manual_flow" || task.status === "needs_human") &&
+        missing.length === 0 &&
+        !task.flow_can_prepare_proposal ? (
+          <p className="wb-task-disabled-reason">
+            需要受控写入权限；质量和技术流程还必须在 local/test Demo 模式并完成产品归属核验。
+          </p>
+        ) : null}
 
         {canCommand && !isTerminal(task.status) ? (
           <>
             {task.kind === "write" &&
-            ((task.status === "ready" && !task.flow_key) || mayPrepareInvoiceProposal) ? (
+            ((task.status === "ready" && !task.flow_key) || mayPrepareFlowProposal) ? (
               <button
                 type="button"
                 className="wb-btn"
@@ -531,10 +661,20 @@ function TaskRow({
                 title={
                   task.flow_key === "invoice_application"
                     ? "准备创建平台内部申请工单的提案；不会开票，也不会自动执行"
-                    : "生成待确认提案；不会自动执行"
+                    : task.flow_key === "repair_quality_intake"
+                      ? "准备由坐席确认的平台内部质量受理 Case；使用本地 Demo 产品目录"
+                      : task.flow_key === "technical_escalation"
+                        ? "准备由坐席确认的平台内部工程 Case；使用本地 Demo 产品目录"
+                        : "生成待确认提案；不会自动执行"
                 }
               >
-                {task.flow_key === "invoice_application" ? "准备内部申请提案" : "准备提案"}
+                {task.flow_key === "invoice_application"
+                  ? "准备内部申请提案"
+                  : task.flow_key === "repair_quality_intake"
+                    ? "准备质量受理提案"
+                    : task.flow_key === "technical_escalation"
+                      ? "准备技术升级提案"
+                      : "准备提案"}
               </button>
             ) : null}
             {task.status !== "needs_human" ? <button

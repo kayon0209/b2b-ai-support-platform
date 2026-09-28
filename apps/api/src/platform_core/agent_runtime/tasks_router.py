@@ -80,10 +80,11 @@ from platform_core.api import (
 )
 from platform_core.audit import service as audit_service
 from platform_core.cases.service import verified_account_for_conversation
-from platform_core.evaluation.pii import should_withhold_value
+from platform_core.evaluation.pii import redact_text, should_withhold_value
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
 from platform_core.identity.tenant_context import TenantContext
+from platform_core.integrations.readiness import active_connector_capabilities
 from platform_core.knowledge import flag_service
 from platform_core.outbox import OutboxEvent
 from platform_core.outbox_service import enqueue
@@ -94,8 +95,21 @@ router = APIRouter(prefix="/v1/workbench", tags=["workbench-tasks"])
 # The complete command vocabulary. Anything else is refused, and the error
 # names these - see the module docstring for why there is no completion
 # command here.
-CommandName = Literal["collect_fields", "cancel", "handoff", "prepare_proposal"]
-ALLOWED_COMMANDS: tuple[str, ...] = ("collect_fields", "cancel", "handoff", "prepare_proposal")
+CommandName = Literal[
+    "collect_fields", "cancel", "handoff", "prepare_proposal", "query_order_status"
+]
+ALLOWED_COMMANDS: tuple[str, ...] = (
+    "collect_fields",
+    "cancel",
+    "handoff",
+    "prepare_proposal",
+    "query_order_status",
+)
+INTERNAL_CASE_FLOWS = frozenset(
+    {"invoice_application", "repair_quality_intake", "technical_escalation"}
+)
+DEMO_PRODUCT_FLOWS = frozenset({"repair_quality_intake", "technical_escalation"})
+DEMO_ORDER_FLOWS = frozenset({"order_status"})
 
 MAX_COLLECTED_FIELDS = 20
 MAX_FIELD_VALUE_CHARS = 200
@@ -133,7 +147,49 @@ def _auth(request: Request, action: Action) -> tuple[Any, Any]:
     return ctx, require_policy(ctx, action)
 
 
-def _task_out(row: Any, *, can_prepare_invoice_proposal: bool = False) -> dict[str, Any]:
+def _demo_business_flows_enabled() -> bool:
+    from platform_core.config import get_settings
+
+    settings = get_settings()
+    return (
+        settings.environment in ("local", "test")
+        and settings.business_api_adapter.strip().lower() == "demo"
+    )
+
+
+def _can_prepare_flow_proposal(flow_key: str | None, ctx: TenantContext) -> bool:
+    if flow_key not in INTERNAL_CASE_FLOWS:
+        return False
+    if flow_key in DEMO_PRODUCT_FLOWS and not _demo_business_flows_enabled():
+        return False
+    return require_policy(ctx, Action.TOOL_WRITE_CONFIRMED) is None
+
+
+def _can_query_order_flow(
+    flow_key: str | None, ctx: TenantContext, *, orders_read_available: bool
+) -> bool:
+    return (
+        flow_key in DEMO_ORDER_FLOWS
+        and _demo_business_flows_enabled()
+        and orders_read_available
+        and require_policy(ctx, Action.TOOL_READ) is None
+    )
+
+
+def _flow_blocked_reason(flow_key: str, *, orders_read_available: bool) -> str | None:
+    if flow_key in INTERNAL_CASE_FLOWS:
+        return FLOW_INTERNAL_CASE_ONLY
+    if flow_key in DEMO_ORDER_FLOWS and _demo_business_flows_enabled() and orders_read_available:
+        return None
+    return FLOW_EXECUTOR_UNAVAILABLE
+
+
+def _task_out(
+    row: Any,
+    *,
+    can_prepare_flow_proposal: bool = False,
+    can_query_order_flow: bool = False,
+) -> dict[str, Any]:
     """The task projection.
 
     `slots` holds names, origins and confirmation flags. The value of a
@@ -162,8 +218,9 @@ def _task_out(row: Any, *, can_prepare_invoice_proposal: bool = False) -> dict[s
         "flow_version": row.flow_version,
         "flow_title": template.title if template else None,
         "flow_can_prepare_proposal": bool(
-            row.flow_key == "invoice_application" and can_prepare_invoice_proposal
+            row.flow_key in INTERNAL_CASE_FLOWS and can_prepare_flow_proposal
         ),
+        "flow_can_query_order": bool(row.flow_key in DEMO_ORDER_FLOWS and can_query_order_flow),
         "updated_at": row.updated_at,
     }
 
@@ -191,14 +248,19 @@ async def list_conversation_tasks(
             limit=limit,
             offset=offset,
         )
+        connector_capabilities = await active_connector_capabilities(
+            session, tenant_id=ctx.tenant_id
+        )
+        orders_read_available = "orders_read" in connector_capabilities
     return ok_response(
         {
             "conversation_ref": str(conversation_ref),
             "items": [
                 _task_out(
                     row,
-                    can_prepare_invoice_proposal=(
-                        require_policy(ctx, Action.TOOL_WRITE_CONFIRMED) is None
+                    can_prepare_flow_proposal=_can_prepare_flow_proposal(row.flow_key, ctx),
+                    can_query_order_flow=_can_query_order_flow(
+                        row.flow_key, ctx, orders_read_available=orders_read_available
                     ),
                 )
                 for row in rows
@@ -269,6 +331,10 @@ async def start_standard_flow(
                 return error_response(
                     "LEASE_EXPIRED", "conversation lease expired", status_code=409
                 )
+            connector_capabilities = await active_connector_capabilities(
+                session, tenant_id=ctx.tenant_id
+            )
+            orders_read_available = "orders_read" in connector_capabilities
             receipt = (
                 await session.execute(
                     sa_select(StandardFlowStartRequest).where(
@@ -298,8 +364,13 @@ async def start_standard_flow(
                     {
                         "task": _task_out(
                             replay,
-                            can_prepare_invoice_proposal=(
-                                require_policy(ctx, Action.TOOL_WRITE_CONFIRMED) is None
+                            can_prepare_flow_proposal=_can_prepare_flow_proposal(
+                                replay.flow_key, ctx
+                            ),
+                            can_query_order_flow=_can_query_order_flow(
+                                replay.flow_key,
+                                ctx,
+                                orders_read_available=orders_read_available,
                             ),
                         ),
                         "replayed": True,
@@ -355,7 +426,9 @@ async def start_standard_flow(
 
             local_key = f"standard-flow:{template.key}:v{template.version}"
             customer_fields = [
-                field.name for field in template.required_fields if field.source == "customer"
+                field.name
+                for field in template.required_fields
+                if field.source == "customer" or field.lookup_input
             ]
             task_kind = (
                 TaskKind.READ
@@ -376,10 +449,9 @@ async def start_standard_flow(
                 status=TaskStatus.MANUAL_FLOW,
                 slots=[],
                 missing_slots=customer_fields,
-                blocked_reason=(
-                    FLOW_INTERNAL_CASE_ONLY
-                    if template.key == "invoice_application"
-                    else FLOW_EXECUTOR_UNAVAILABLE
+                blocked_reason=_flow_blocked_reason(
+                    template.key,
+                    orders_read_available=orders_read_available,
                 ),
                 sequence=0,
                 trace_id=trace_id,
@@ -449,8 +521,11 @@ async def start_standard_flow(
         {
             "task": _task_out(
                 task,
-                can_prepare_invoice_proposal=(
-                    require_policy(ctx, Action.TOOL_WRITE_CONFIRMED) is None
+                can_prepare_flow_proposal=_can_prepare_flow_proposal(task.flow_key, ctx),
+                can_query_order_flow=_can_query_order_flow(
+                    task.flow_key,
+                    ctx,
+                    orders_read_available=orders_read_available,
                 ),
             ),
             "replayed": not _created,
@@ -539,59 +614,77 @@ async def command_conversation_task(
                 # 404 rather than 403: a task id from another conversation must
                 # not be distinguishable from one that does not exist.
                 return error_response(CASE_NOT_FOUND, "task not found", status_code=404)
+            connector_capabilities = await active_connector_capabilities(
+                session, tenant_id=ctx.tenant_id
+            )
+            orders_read_available = "orders_read" in connector_capabilities
 
-            if task.flow_key == "invoice_application" and body.command == "prepare_proposal":
+            if task.flow_key in INTERNAL_CASE_FLOWS and body.command == "prepare_proposal":
                 proposal_denied = require_policy(ctx, Action.TOOL_WRITE_CONFIRMED)
                 if proposal_denied is not None:
                     return proposal_denied
 
-            command = await _build_command(
-                session,
-                ctx=ctx,
-                conversation_ref=conversation_ref,
-                task=task,
-                body=body,
-                actor_ref=actor_ref,
-                trace_id=trace_id,
-            )
-            if command is None:
-                return error_response(
-                    "TASK_COMMAND_REFUSED",
-                    "this command does not apply to the task's current state",
-                    status_code=409,
-                )
-
-            if (
-                task.proposal_id is not None
-                and TaskStatus(task.status) is TaskStatus.AWAITING_CONFIRMATION
-                and command.target in (TaskStatus.CANCELLED, TaskStatus.NEEDS_HUMAN)
-            ):
-                from platform_core.tool_gateway.gateway import ToolGateway, ToolGatewayError
-
-                try:
-                    await ToolGateway(session, {}).withdraw(
-                        tenant_id=ctx.tenant_id,
-                        proposal_id=task.proposal_id,
-                    )
-                except ToolGatewayError as exc:
-                    raise TaskCommandRefused(
-                        "TASK_PROPOSAL_NOT_WITHDRAWABLE",
-                        "the proposal is already executing or has a final result",
-                    ) from exc
-                await audit_service.record(
+            if body.command == "query_order_status":
+                query_denied = require_policy(ctx, Action.TOOL_READ)
+                if query_denied is not None:
+                    return query_denied
+                updated = await _run_demo_order_query(
                     session,
                     ctx=ctx,
-                    action="tool_proposal.withdrawn",
-                    resource_type="tool_proposal",
-                    resource_id=task.proposal_id,
-                    metadata={"task_id": str(task.id), "command": body.command},
+                    conversation_ref=conversation_ref,
+                    task=task,
+                    expected_version=body.expected_version,
+                    actor_ref=actor_ref,
                     trace_id=trace_id,
                 )
-                command = replace(command, proposal_withdrawn=True)
+            else:
+                command = await _build_command(
+                    session,
+                    ctx=ctx,
+                    conversation_ref=conversation_ref,
+                    task=task,
+                    body=body,
+                    actor_ref=actor_ref,
+                    trace_id=trace_id,
+                )
+                if command is None:
+                    return error_response(
+                        "TASK_COMMAND_REFUSED",
+                        "this command does not apply to the task's current state",
+                        status_code=409,
+                    )
 
-            updated = await task_store.transition(
-                session, tenant_id=ctx.tenant_id, task=task, command=command
-            )
+                if (
+                    task.proposal_id is not None
+                    and TaskStatus(task.status) is TaskStatus.AWAITING_CONFIRMATION
+                    and command.target in (TaskStatus.CANCELLED, TaskStatus.NEEDS_HUMAN)
+                ):
+                    from platform_core.tool_gateway.gateway import ToolGateway, ToolGatewayError
+
+                    try:
+                        await ToolGateway(session, {}).withdraw(
+                            tenant_id=ctx.tenant_id,
+                            proposal_id=task.proposal_id,
+                        )
+                    except ToolGatewayError as exc:
+                        raise TaskCommandRefused(
+                            "TASK_PROPOSAL_NOT_WITHDRAWABLE",
+                            "the proposal is already executing or has a final result",
+                        ) from exc
+                    await audit_service.record(
+                        session,
+                        ctx=ctx,
+                        action="tool_proposal.withdrawn",
+                        resource_type="tool_proposal",
+                        resource_id=task.proposal_id,
+                        metadata={"task_id": str(task.id), "command": body.command},
+                        trace_id=trace_id,
+                    )
+                    command = replace(command, proposal_withdrawn=True)
+
+                updated = await task_store.transition(
+                    session, tenant_id=ctx.tenant_id, task=task, command=command
+                )
             await enqueue(
                 session,
                 tenant_id=ctx.tenant_id,
@@ -606,7 +699,7 @@ async def command_conversation_task(
                 },
                 trace_id=trace_id,
             )
-            if task.flow_key:
+            if task.flow_key and body.command != "query_order_status":
                 get_metrics().workbench_standard_flow_actions_total.labels(
                     flow_key=task.flow_key, action=body.command, outcome="updated"
                 ).inc()
@@ -623,8 +716,11 @@ async def command_conversation_task(
         {
             "task": _task_out(
                 updated,
-                can_prepare_invoice_proposal=(
-                    require_policy(ctx, Action.TOOL_WRITE_CONFIRMED) is None
+                can_prepare_flow_proposal=_can_prepare_flow_proposal(updated.flow_key, ctx),
+                can_query_order_flow=_can_query_order_flow(
+                    updated.flow_key,
+                    ctx,
+                    orders_read_available=orders_read_available,
                 ),
             )
         },
@@ -684,6 +780,8 @@ def _merge_slots(
 async def _persist_collected(
     ctx: TenantContext,
     fields: dict[str, str],
+    *,
+    verified_fields: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Persist operator-collected values with their actual provenance.
 
@@ -698,6 +796,21 @@ async def _persist_collected(
 
     slots: list[dict[str, Any]] = []
     for name, value in fields.items():
+        verification = (verified_fields or {}).get(name)
+        if verification is not None:
+            slots.append(
+                {
+                    "name": name,
+                    "value": str(verification["record_ref"]),
+                    "origin": "verified_business_record",
+                    "confirmed": True,
+                    "verification_source": "demo",
+                    "authority_version": str(verification["authority_version"]),
+                    "collected_by": str(ctx.actor_id),
+                    "collected_at": int(time.time()),
+                }
+            )
+            continue
         sensitive = name.lower() in SENSITIVE_FIELD_NAMES or should_withhold_value(name)
         slot: dict[str, Any] = {
             "name": name,
@@ -709,9 +822,333 @@ async def _persist_collected(
         if sensitive:
             slot["value_withheld"] = True
         else:
-            slot["value"] = value
+            safe_value = value
+            if name in {"issue_summary", "question_or_symptom"}:
+                safe_value, _redaction_count = redact_text(safe_value)
+            slot["value"] = safe_value
         slots.append(slot)
     return slots
+
+
+async def _verify_demo_flow_fields(
+    session: Any,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_ref: uuid.UUID,
+    task: Any,
+    fields: dict[str, str],
+    lookup_field_names: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Resolve customer-supplied identifiers through the explicit local demo."""
+    if (
+        task.flow_key not in DEMO_PRODUCT_FLOWS | DEMO_ORDER_FLOWS
+        or not _demo_business_flows_enabled()
+    ):
+        raise TaskCommandRefused(
+            "FLOW_BUSINESS_VERIFICATION_UNAVAILABLE",
+            "this flow needs an authorized business-record adapter",
+        )
+    account_id = await verified_account_for_conversation(
+        session,
+        tenant_id=tenant_id,
+        conversation_ref_id=conversation_ref,
+    )
+    if account_id is None:
+        raise TaskCommandRefused(
+            "FLOW_ACCOUNT_UNVERIFIED",
+            "link this conversation to one tenant account before verifying its product",
+        )
+    from platform_core.identity.profile import business_system_ref_for_account
+    from platform_core.integrations.demo_erp import (
+        verify_demo_order_owner,
+        verify_demo_product_owner,
+    )
+
+    external_account_ref = await business_system_ref_for_account(
+        session,
+        tenant_id=tenant_id,
+        account_id=account_id,
+        system_key="business_api",
+    )
+    if external_account_ref is None:
+        raise TaskCommandRefused(
+            "FLOW_ACCOUNT_AUTHORITY_UNMAPPED",
+            "the linked account has no Demo business-system reference",
+        )
+    verified: dict[str, dict[str, Any]] = {}
+    for name in lookup_field_names:
+        proof = (
+            verify_demo_order_owner(fields.get(name, ""), external_account_ref)
+            if task.flow_key == "order_status"
+            else verify_demo_product_owner(fields.get(name, ""), external_account_ref)
+        )
+        if proof is None:
+            raise TaskCommandRefused(
+                "FLOW_BUSINESS_RECORD_UNVERIFIED",
+                "the Demo authority could not verify this product for the linked account",
+            )
+        verified[name] = proof
+    return verified
+
+
+async def _run_demo_order_query(
+    session: Any,
+    *,
+    ctx: TenantContext,
+    conversation_ref: uuid.UUID,
+    task: Any,
+    expected_version: int,
+    actor_ref: str,
+    trace_id: str,
+) -> Any:
+    """Run one explicit Demo order read through Tool Gateway and record its receipt."""
+    if ctx.actor_id is None:
+        raise TaskCommandRefused(
+            "ACTOR_UNRESOLVED", "order queries require an identified support agent"
+        )
+    flow = get_standard_flow("order_status")
+    if (
+        task.flow_key != "order_status"
+        or flow is None
+        or task.flow_version != flow.version
+        or task.kind != TaskKind.READ.value
+        or TaskStatus(task.status) is not TaskStatus.MANUAL_FLOW
+    ):
+        raise TaskCommandRefused(
+            "FLOW_INSTANCE_NOT_QUERYABLE",
+            "only an open order-status read flow can query an order",
+        )
+    if task.missing_slots:
+        raise TaskCommandRefused(
+            "FLOW_FIELDS_REQUIRED", "record and verify the order ID before querying"
+        )
+    if not _demo_business_flows_enabled():
+        raise TaskCommandRefused(
+            "FLOW_ORDER_QUERY_UNAVAILABLE",
+            "the standard-flow query currently requires the local/test Demo adapter",
+        )
+
+    order_slot = next(
+        (
+            slot
+            for slot in task.slots or []
+            if slot.get("name") == "order_id"
+            and slot.get("origin") == "verified_business_record"
+            and slot.get("verification_source") == "demo"
+        ),
+        None,
+    )
+    if order_slot is None or not str(order_slot.get("value") or "").strip():
+        raise TaskCommandRefused(
+            "FLOW_BUSINESS_RECORD_UNVERIFIED",
+            "verify the order belongs to the linked account before querying",
+        )
+    account_id = await verified_account_for_conversation(
+        session,
+        tenant_id=ctx.tenant_id,
+        conversation_ref_id=conversation_ref,
+    )
+    if account_id is None:
+        raise TaskCommandRefused(
+            "FLOW_ACCOUNT_UNVERIFIED",
+            "link this conversation to one tenant account before querying its order",
+        )
+    from platform_core.identity.profile import business_system_ref_for_account
+    from platform_core.integrations.demo_erp import verify_demo_order_owner
+
+    external_account_ref = await business_system_ref_for_account(
+        session,
+        tenant_id=ctx.tenant_id,
+        account_id=account_id,
+        system_key="business_api",
+    )
+    order_id = str(order_slot["value"])
+    if (
+        external_account_ref is None
+        or verify_demo_order_owner(order_id, external_account_ref) is None
+    ):
+        raise TaskCommandRefused(
+            "FLOW_BUSINESS_RECORD_UNVERIFIED",
+            "the Demo authority no longer verifies this order for the linked account",
+        )
+
+    from platform_core.tool_gateway.gateway import ToolDenied, ToolGateway, ToolGatewayError
+    from platform_core.tool_gateway.models import ToolExecution
+    from platform_core.tool_gateway.registry import resolve_executors
+
+    executors = await resolve_executors(
+        session,
+        tenant_id=ctx.tenant_id,
+        tool_names=["order.get_status"],
+        ctx=ctx,
+        trace_id=trace_id,
+    )
+    if "order.get_status" not in executors:
+        raise TaskCommandRefused(
+            "FLOW_ORDER_CONNECTOR_UNAVAILABLE",
+            "the tenant has no active orders_read connector",
+        )
+
+    proposal_key = f"standard-flow:{task.id}:order-status:r{task.action_revision}"
+    gateway = ToolGateway(session, executors)
+    try:
+        proposal = await gateway.propose(
+            tenant_id=ctx.tenant_id,
+            actor_id=ctx.actor_id,
+            tool_name="order.get_status",
+            arguments={"order_id": order_id},
+            role=ctx.role or "unknown",
+            idempotency_key=proposal_key,
+            permission_allowed=True,
+            required_action=Action.TOOL_READ.value,
+        )
+    except (ToolDenied, ToolGatewayError) as exc:
+        raise TaskCommandRefused(
+            "FLOW_ORDER_QUERY_UNAVAILABLE",
+            "Tool Gateway did not authorize or prepare the read proposal",
+        ) from exc
+    executing = await task_store.transition(
+        session,
+        tenant_id=ctx.tenant_id,
+        task=task,
+        command=task_store.TaskCommand(
+            target=TaskStatus.EXECUTING,
+            reason_code="STANDARD_FLOW_ORDER_READ_STARTED",
+            actor_type="human",
+            actor_ref=actor_ref,
+            trace_id=trace_id,
+            expected_version=expected_version,
+            proposal_id=proposal.id,
+        ),
+    )
+    try:
+        execution = await gateway.execute(
+            tenant_id=ctx.tenant_id,
+            actor_id=ctx.actor_id,
+            proposal_id=proposal.id,
+        )
+    except ToolGatewayError as exc:
+        execution = (
+            await session.execute(
+                sa_select(ToolExecution)
+                .where(
+                    ToolExecution.tenant_id == ctx.tenant_id,
+                    ToolExecution.proposal_id == proposal.id,
+                )
+                .order_by(ToolExecution.started_at.desc(), ToolExecution.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if execution is None:
+            raise TaskCommandRefused(
+                "FLOW_ORDER_QUERY_FAILED",
+                "the Demo order query failed before an execution receipt was recorded",
+            ) from exc
+
+    output = execution.sanitized_output if isinstance(execution.sanitized_output, dict) else {}
+    verified_owner = (
+        execution.status == "executed"
+        and execution.verification_status == "verified"
+        and output.get("source") == "demo"
+        and output.get("account") == external_account_ref
+        and output.get("order_id") == order_id
+        and bool(output.get("fetched_at"))
+    )
+    if execution.status == "unknown" or execution.verification_status == "unknown":
+        target = TaskStatus.UNKNOWN
+        reason_code = "STANDARD_FLOW_ORDER_READ_UNKNOWN"
+        blocked_reason = "TOOL_EXECUTION_UNKNOWN"
+    elif execution.status != "executed" or not verified_owner:
+        target = TaskStatus.FAILED
+        reason_code = "STANDARD_FLOW_ORDER_READ_FAILED"
+        blocked_reason = (
+            "FLOW_BUSINESS_RECORD_UNVERIFIED"
+            if execution.verification_status == "verified"
+            else "TOOL_EXECUTION_FAILED"
+        )
+    else:
+        target = TaskStatus.SUCCEEDED
+        reason_code = "STANDARD_FLOW_ORDER_READ_VERIFIED"
+        blocked_reason = ""
+
+    slots = list(executing.slots or [])
+    if target is TaskStatus.SUCCEEDED:
+        raw_nodes = output.get("nodes")
+        nodes = (
+            [
+                {
+                    "label": str(node.get("label") or ""),
+                    "status": str(node.get("status") or ""),
+                    "at": node.get("at") if isinstance(node.get("at"), str) else None,
+                }
+                for node in raw_nodes
+                if isinstance(node, dict)
+            ]
+            if isinstance(raw_nodes, list)
+            else []
+        )
+        receipt = {
+            "order_id": order_id,
+            "status": str(output.get("status") or "unknown"),
+            "nodes": nodes,
+            "eta": output.get("eta") if isinstance(output.get("eta"), str) else None,
+            "source": "demo",
+            "fetched_at": str(output["fetched_at"]),
+        }
+        slots = _merge_slots(
+            slots,
+            [
+                {
+                    "name": "order_status_receipt",
+                    "value": receipt,
+                    "origin": "verified_receipt",
+                    "confirmed": True,
+                    "verification_source": "demo",
+                }
+            ],
+        )
+
+    updated = await task_store.transition(
+        session,
+        tenant_id=ctx.tenant_id,
+        task=executing,
+        command=task_store.TaskCommand(
+            target=target,
+            reason_code=reason_code,
+            actor_type="human",
+            actor_ref=actor_ref,
+            trace_id=trace_id,
+            expected_version=executing.version,
+            completion_evidence=(
+                f"{task_store.EVIDENCE_VERIFIED_RECEIPT}{execution.id}"
+                if target is TaskStatus.SUCCEEDED
+                else None
+            ),
+            blocked_reason=blocked_reason,
+            slots=slots,
+            execution_id=execution.id,
+        ),
+    )
+    await audit_service.record(
+        session,
+        ctx=ctx,
+        action="conversation.standard_flow_order_read",
+        resource_type="conversation_task",
+        resource_id=task.id,
+        metadata={
+            "tool_name": "order.get_status",
+            "execution_id": str(execution.id),
+            "verification_status": execution.verification_status,
+            "source": "demo",
+        },
+        trace_id=trace_id,
+    )
+    get_metrics().workbench_standard_flow_actions_total.labels(
+        flow_key="order_status",
+        action="query_order_status",
+        outcome=updated.status,
+    ).inc()
+    return updated
 
 
 async def _build_command(
@@ -760,6 +1197,7 @@ async def _build_command(
         requested = list(body.fields)
         if not requested:
             return None
+        lookup_fields: set[str] = set()
         flow_template = get_standard_flow(task.flow_key) if task.flow_key else None
         if task.flow_key:
             flow_status = TaskStatus(task.status)
@@ -776,7 +1214,12 @@ async def _build_command(
                     "this standard flow instance is not in its current manual collection state",
                 )
             customer_fields = {
-                field.name for field in flow_template.required_fields if field.source == "customer"
+                field.name
+                for field in flow_template.required_fields
+                if field.source == "customer" or field.lookup_input
+            }
+            lookup_fields = {
+                field.name for field in flow_template.required_fields if field.lookup_input
             }
             invalid_sources = [name for name in requested if name not in customer_fields]
             if invalid_sources:
@@ -795,14 +1238,28 @@ async def _build_command(
 
         # Keep operator-provided data on the task with explicit provenance.
         # It is not a customer-authored transcript turn.
+        verified_fields: dict[str, dict[str, Any]] = {}
+        if task.flow_key and lookup_fields.intersection(requested):
+            verified_fields = await _verify_demo_flow_fields(
+                session,
+                tenant_id=ctx.tenant_id,
+                conversation_ref=conversation_ref,
+                task=task,
+                fields=body.fields,
+                lookup_field_names=lookup_fields.intersection(requested),
+            )
         collected = await _persist_collected(
             ctx=ctx,
             fields=body.fields,
+            verified_fields=verified_fields,
         )
 
         remaining = [m for m in task.missing_slots if m not in requested]
         new_slots = _merge_slots(task.slots, collected)
         if task.flow_key:
+            connector_capabilities = await active_connector_capabilities(
+                session, tenant_id=ctx.tenant_id
+            )
             return task_store.TaskCommand(
                 target=(
                     TaskStatus.NEEDS_HUMAN
@@ -812,10 +1269,9 @@ async def _build_command(
                 reason_code="STANDARD_FLOW_FIELDS_RECORDED",
                 missing_slots=remaining,
                 slots=new_slots,
-                blocked_reason=(
-                    FLOW_INTERNAL_CASE_ONLY
-                    if task.flow_key == "invoice_application"
-                    else FLOW_EXECUTOR_UNAVAILABLE
+                blocked_reason=_flow_blocked_reason(
+                    task.flow_key,
+                    orders_read_available="orders_read" in connector_capabilities,
                 ),
                 **base,
             )
@@ -856,7 +1312,7 @@ async def _build_command(
         flow = get_standard_flow(task.flow_key)
         flow_status = TaskStatus(task.status)
         allowed_flow_states = {TaskStatus.MANUAL_FLOW}
-        if task.flow_key == "invoice_application":
+        if task.flow_key in INTERNAL_CASE_FLOWS:
             allowed_flow_states.add(TaskStatus.NEEDS_HUMAN)
         if (
             flow is None
@@ -865,15 +1321,11 @@ async def _build_command(
             or flow_status not in allowed_flow_states
         ):
             return None
-        # Invoice application currently supports only an internal platform
-        # case, never invoice issuance. The account comes from an unambiguous
-        # tenant-owned Case link, and the customer fields must have been
-        # collected before this button becomes actionable.
-        if task.flow_key != "invoice_application":
+        if task.flow_key not in INTERNAL_CASE_FLOWS:
             return None
         if task.missing_slots:
             raise TaskCommandRefused(
-                "FLOW_FIELDS_REQUIRED", "collect all customer-sourced invoice fields first"
+                "FLOW_FIELDS_REQUIRED", "collect and verify all required flow fields first"
             )
         account_id = await verified_account_for_conversation(
             session,
@@ -885,6 +1337,54 @@ async def _build_command(
                 "FLOW_ACCOUNT_UNVERIFIED",
                 "link this conversation to a tenant account before preparing the internal case",
             )
+        if task.flow_key in DEMO_PRODUCT_FLOWS:
+            if not _demo_business_flows_enabled():
+                raise TaskCommandRefused(
+                    "FLOW_BUSINESS_VERIFICATION_UNAVAILABLE",
+                    "this flow needs an authorized business-record adapter",
+                )
+            product_slot = next(
+                (
+                    slot
+                    for slot in task.slots or []
+                    if slot.get("name") == "product_ref"
+                    and slot.get("origin") == "verified_business_record"
+                    and slot.get("verification_source") == "demo"
+                ),
+                None,
+            )
+            if product_slot is None or not str(product_slot.get("value") or "").strip():
+                raise TaskCommandRefused(
+                    "FLOW_BUSINESS_RECORD_UNVERIFIED",
+                    "the product must be verified by the configured business authority",
+                )
+            from platform_core.identity.org import routable_support_department_slugs
+            from platform_core.identity.profile import business_system_ref_for_account
+            from platform_core.integrations.demo_erp import verify_demo_product_owner
+
+            external_account_ref = await business_system_ref_for_account(
+                session,
+                tenant_id=ctx.tenant_id,
+                account_id=account_id,
+                system_key="business_api",
+            )
+            if (
+                external_account_ref is None
+                or verify_demo_product_owner(str(product_slot["value"]), external_account_ref)
+                is None
+            ):
+                raise TaskCommandRefused(
+                    "FLOW_BUSINESS_RECORD_UNVERIFIED",
+                    "the Demo authority no longer verifies this product for the linked account",
+                )
+            routable_owners = await routable_support_department_slugs(
+                session, tenant_id=ctx.tenant_id
+            )
+            if not flow.owner_group or flow.owner_group not in routable_owners:
+                raise TaskCommandRefused(
+                    "FLOW_OWNER_UNASSIGNED",
+                    "add an active support owner to the matching tenant department",
+                )
         proposal = await _create_proposal(
             session,
             ctx=ctx,
@@ -901,7 +1401,11 @@ async def _build_command(
             )
         return task_store.TaskCommand(
             target=TaskStatus.AWAITING_CONFIRMATION,
-            reason_code="STANDARD_FLOW_INTERNAL_CASE_PROPOSAL_PREPARED",
+            reason_code=(
+                "STANDARD_FLOW_INTERNAL_CASE_PROPOSAL_PREPARED"
+                if task.flow_key == "invoice_application"
+                else "STANDARD_FLOW_INTERNAL_ROUTED_CASE_PROPOSAL_PREPARED"
+            ),
             blocked_reason="",
             bump_action_revision=True,
             proposal_id=proposal.id,
@@ -1077,7 +1581,7 @@ def _write_tool_for(task: Any) -> str | None:
     deterministic way to choose a write tool from a set of collected fields, and
     choosing wrong would propose a real write against the wrong target.
     """
-    if task.flow_key == "invoice_application":
+    if task.flow_key in INTERNAL_CASE_FLOWS:
         return "case.create"
     for slot in task.slots or []:
         if slot.get("name") == "tool" and slot.get("value"):
@@ -1113,6 +1617,49 @@ def _proposal_arguments(
             "category": "invoice_application",
             "priority": "p2",
             "conversation_ref_id": str(task.conversation_ref_id),
+        }
+
+    if task.flow_key in DEMO_PRODUCT_FLOWS:
+        values = {
+            str(slot.get("name")): slot.get("value")
+            for slot in task.slots or []
+            if slot.get("value") is not None
+            and not slot.get("value_withheld")
+            and not slot.get("inferred")
+        }
+        product_slot = next(
+            (
+                slot
+                for slot in task.slots or []
+                if slot.get("name") == "product_ref"
+                and slot.get("origin") == "verified_business_record"
+                and slot.get("verification_source") == "demo"
+            ),
+            None,
+        )
+        product_ref = str(product_slot.get("value") or "").strip() if product_slot else ""
+        summary_name = (
+            "issue_summary" if task.flow_key == "repair_quality_intake" else "question_or_symptom"
+        )
+        summary = " ".join(str(values.get(summary_name) or "").split())
+        if not verified_account_id or not product_ref or not summary:
+            return None
+        flow = get_standard_flow(task.flow_key)
+        if flow is None or not flow.owner_group:
+            return None
+        quality = task.flow_key == "repair_quality_intake"
+        category = "quality_issue" if quality else "technical_escalation"
+        prefix = "质量问题受理" if quality else "技术问题升级"
+        return {
+            "enterprise_account_id": str(verified_account_id),
+            "subject": f"{prefix}：{product_ref}",
+            "description": (f"产品编号：{product_ref}（本地 Demo 目录核验）\n客户描述：{summary}"),
+            "priority": "p2",
+            "category": category,
+            "conversation_ref_id": str(task.conversation_ref_id),
+            "team_ref": flow.owner_group,
+            "product_ref": product_ref,
+            "product_verification_source": "demo",
         }
 
     arguments: dict[str, Any] = {}

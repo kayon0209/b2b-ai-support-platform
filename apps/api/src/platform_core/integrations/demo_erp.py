@@ -77,6 +77,27 @@ _SHIPMENTS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Fictional account-owned product records for the local/test Demo adapter.
+# They exercise ownership verification only; they are not real specifications,
+# inventory, production status, or customer data.
+_PRODUCTS: dict[str, dict[str, str]] = {
+    "PCB-DEMO-100": {
+        "product_ref": "PCB-DEMO-100",
+        "account": "acme",
+        "label": "Demo control board",
+    },
+    "PCBA-DEMO-200": {
+        "product_ref": "PCBA-DEMO-200",
+        "account": "acme",
+        "label": "Demo assembled board",
+    },
+    "PCB-DEMO-900": {
+        "product_ref": "PCB-DEMO-900",
+        "account": "other-co",
+        "label": "Other demo control board",
+    },
+}
+
 # Last four digits of the contact phone on file - the weakest
 # demonstration-grade proof, and labelled as such by the verify endpoint.
 _CONTACT_TAILS: dict[str, str] = {"SO-9001": "8888", "SO-9002": "7777"}
@@ -123,6 +144,30 @@ class DemoBusinessAdapter:
             "source": "demo",
             "fetched_at": "2026-09-21T00:00:00Z",
         }
+
+
+def verify_demo_product_owner(product_ref: str, account_ref: str) -> dict[str, str] | None:
+    """Return a minimal proof only when a demo product belongs to the account."""
+    candidate = _PRODUCTS.get(product_ref.strip().upper())
+    if candidate is None or candidate["account"] != account_ref.strip():
+        return None
+    return {
+        "record_ref": candidate["product_ref"],
+        "source": "demo",
+        "authority_version": "demo-product-catalog-v1",
+    }
+
+
+def verify_demo_order_owner(order_id: str, account_ref: str) -> dict[str, str] | None:
+    """Return a minimal ownership proof for one synthetic order record."""
+    candidate = _ORDERS.get(order_id.strip().upper())
+    if candidate is None or candidate["account"] != account_ref.strip():
+        return None
+    return {
+        "record_ref": candidate["order_id"],
+        "source": "demo",
+        "authority_version": "demo-order-status-v1",
+    }
 
 
 class DemoBusinessToolExecutor:

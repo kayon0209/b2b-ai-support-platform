@@ -466,6 +466,22 @@ async def get_account(
     ).scalar_one_or_none()
 
 
+async def department_slug_exists(session: AsyncSession, *, tenant_id: uuid.UUID, slug: str) -> bool:
+    """Check that a routing target exists inside the current tenant."""
+    try:
+        normalised = normalise_slug(slug)
+    except OrgError:
+        return False
+    return (
+        await session.execute(
+            select(Department.id).where(
+                Department.tenant_id == tenant_id,
+                Department.slug == normalised,
+            )
+        )
+    ).scalar_one_or_none() is not None
+
+
 async def update_account(
     session: AsyncSession,
     *,

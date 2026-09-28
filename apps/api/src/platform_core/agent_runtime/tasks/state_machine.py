@@ -11,10 +11,10 @@ rather than at the call sites that happen to remember them today:
    cannot tell" - resolving it after reconciliation is the whole point of
    having the state.
 
-2. **`ready -> executing` is for reads only.** A write task goes
-   `ready -> awaiting_confirmation` and cannot skip the confirmation. This is
-   checked here against the task's `kind`, so a new call site cannot reach
-   execution by passing a different status.
+2. **Execution is for reads only.** A normal read goes `ready -> executing`;
+   the one operator-started `manual_flow` read path may also enter execution
+   through its explicit flow executor. A write task cannot skip confirmation.
+   This is checked here against the task's `kind`.
 
 3. **Nothing writes `succeeded`.** There is deliberately no transition into
    `succeeded` from `executing` in this table's *caller* contract - the store
@@ -125,6 +125,7 @@ _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.MANUAL_FLOW: frozenset(
         {
             TaskStatus.MANUAL_FLOW,
+            TaskStatus.EXECUTING,
             TaskStatus.AWAITING_CONFIRMATION,
             TaskStatus.NEEDS_HUMAN,
             TaskStatus.CANCELLED,
@@ -183,7 +184,10 @@ def check_transition(
     if target not in allowed:
         raise TaskTransitionError("TASK_TRANSITION_NOT_ALLOWED", f"{current.value}->{target.value}")
 
-    if target is TaskStatus.EXECUTING and current is TaskStatus.READY:
+    if target is TaskStatus.EXECUTING and current in {
+        TaskStatus.READY,
+        TaskStatus.MANUAL_FLOW,
+    }:
         if kind is not TaskKind.READ:
             raise TaskTransitionError(
                 "TASK_WRITE_REQUIRES_CONFIRMATION",

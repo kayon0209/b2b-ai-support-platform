@@ -61,13 +61,15 @@ def test_a_task_cannot_move_to_its_own_state() -> None:
     assert exc.value.code == "TASK_ALREADY_IN_STATE"
 
 
-def test_manual_flow_is_not_schedulable_but_can_be_edited_or_cancelled() -> None:
+def test_manual_flow_is_not_schedulable_but_allows_explicit_read_execution() -> None:
     assert can_progress(TaskStatus.MANUAL_FLOW) is False
     check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.MANUAL_FLOW, WRITE)
     check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.CANCELLED, WRITE)
     check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.AWAITING_CONFIRMATION, WRITE)
-    with pytest.raises(TaskTransitionError):
-        check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.EXECUTING, READ)
+    check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.EXECUTING, READ)
+    with pytest.raises(TaskTransitionError) as execution_error:
+        check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.EXECUTING, WRITE)
+    assert execution_error.value.code == "TASK_WRITE_REQUIRES_CONFIRMATION"
     with pytest.raises(TaskTransitionError) as exc:
         check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.AWAITING_CONFIRMATION, READ)
     assert exc.value.code == "TASK_CONFIRMATION_REQUIRES_WRITE"
