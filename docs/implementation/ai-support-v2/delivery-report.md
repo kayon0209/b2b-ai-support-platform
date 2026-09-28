@@ -542,7 +542,7 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 ### 本地复验与仍未关闭项
 
 - Admin Web：`npm test` 通过（URL 12、dialog 7、task panel 10、workbench tabs 21、conversation/draft guards 25 项）；`npm run typecheck`、`npm run build`、`npm run check:runtime` 均通过。
-- 本地 pytest：demo ERP/failure 与 visitor ownership/eval dataset/runner/release gates 共 35 项通过；候选知识发布门禁集成另 1 项通过。Ruff/完整全仓 CI 尚待本轮代码提交后运行。
+- 本地 pytest：demo ERP/failure 与 visitor ownership/eval dataset/runner/release gates 共 35 项通过；候选知识发布门禁集成另 1 项通过。GitHub Actions [run #36413261026](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36413261026) 在实现提交 `8f47c34` 上 9 个 job 全部通过，包含 unit、integration、Release Evidence/零容忍、Admin Web、typecheck、lint、dependency scan、secret scan 和 concurrency guard。该运行验证本节实现提交；后续文档同步的 PR CI 以 Actions 最新状态为准。
 - UI-02 仍为部分完成：非空页面 AX/键盘与功能路径已核查，完整原生 VoiceOver 朗读/弹层浏览未被本自动化接口可靠验证。R3 真实 ERP/CRM、人工批准固定评测集、真实模型 holdout/费用、企业身份、生产 staging/多实例 rollback 均未提供；任何模拟结果都不替代这些证据，所有生产 release flags 保持关闭。
 - `acceptance.md` 与执行计划按上述证据同步。本轮没有访问客户/第三方系统，没有调用真实模型，没有合并或生产发布。
 
