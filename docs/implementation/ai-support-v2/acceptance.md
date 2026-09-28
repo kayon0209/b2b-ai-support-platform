@@ -35,7 +35,7 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | SEC-03 | AI 派发前与回复前复核 lease；在途外部调用有明确结果/unknown，接管后无新 AI 派发 | stale worker、回复前 lease 校验；上述集成测试用另一个应用角色数据库会话在 AI 生成仍挂起时接管，恢复生成后断言零 transport send | 部分完成（真实 PostgreSQL 并发接管路径通过；不同坐席身份的浏览器旅程和真实外部 transport 故障对账仍未执行） |
 | SEC-04 | 日志、追踪、指标、评测报告无原始提示/客户文本/槽位值/凭据；失败 provider 输出同样受限 | 日志/PII 测试 | 通过（合成数据） |
 | UI-01 | 1536×1024/1280×800/390×844/200% 缩放无页面横向溢出；桌面对话仍为最大工作区域，输入区可见 | Chrome authenticated branch UI 在 1280×800、640×400（200% 等效 CSS 宽度）、390×844、320×640 下读取 `documentElement.scrollWidth`；另以 Chrome 菜单实际设为 200%，viewport/document 宽度均为 756px、无横向溢出 | 部分完成（真实 200% 与上述宽度无溢出；1536/1280/390 逐规格截图归档仍待做） |
-| UI-02 | 任务、状态、来源、失败原因可读；键盘路径完整、焦点恢复、动态状态可访问；无仅颜色编码 | 右侧副驾与会话队列 tablist 的 AX 关系；Chrome authenticated branch UI 实测 ArrowRight/Home/End、选中 tab roving focus、Tab 到队列搜索及关联 tabpanel | 部分完成（标签键盘路径在 Chrome/AX 中通过；VoiceOver 及全页面键盘走查待做） |
+| UI-02 | 任务、状态、来源、失败原因可读；键盘路径完整、焦点恢复、动态状态可访问；无仅颜色编码 | Chrome authenticated branch UI 实测队列 tab 的 ArrowRight/Home/End、roving focus/tabpanel；空会话页 Tab 遍历 13 个可聚焦控件且均有可访问名称 | 部分完成（空状态键盘路径与标签 AX 通过；VoiceOver、非空会话内容及弹层的完整键盘走查待做） |
 | UX-01 | 缺字段一次问必要内容，已核验值不重复问；矛盾值需确认；部分任务完成时不误关整个会话 | 合成坐席旅程与任务 API | 部分完成（非全业务连接器旅程） |
 | UX-02 | 模型/连接器不可用、拒绝与重试均保留草稿；提案确认与聊天发送清楚区分 | stale 失败态/草稿保留浏览器检查 | 部分完成（未测真实 provider/连接器故障） |
 | UX-03 | 会话切换、刷新、多标签页并发无串稿/串任务；断线恢复读服务端状态 | 浏览器切换、刷新恢复 job、query 保留 | 部分完成（未做双浏览器并发） |

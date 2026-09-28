@@ -451,6 +451,7 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 - 会话队列现在把 `queue / mine / waiting` 的同一组 tab 契约用于 URL 状态、渲染和键盘导航。添加选中项 roving `tabIndex`、`aria-controls`/`aria-labelledby`、`tabpanel`，并实现左右方向键循环、Home/End；方向键切换同步焦点、选中项与 `?tab=`。未选中的标签不再占用额外 Tab 停靠点。
 - `workbench-tabs.test.mts` 增加 6 个队列标签规则断言，现共 13 项导航断言。Admin Web 测试、typecheck 与 production build 通过。
 - 使用当前分支前端和 API、隔离 PostgreSQL、随机生成的本地合成管理员身份核对认证态工作台。Chrome 视口 1280×800、640×400（200% 等效 CSS 宽度）、390×844 和 320×640 均测得 `documentElement.scrollWidth == clientWidth`；640 和 390 下查看了实际渲染。另通过 Chrome 显示菜单将此 localhost 页实际缩放到 200%，Chrome 报告 CSS viewport/document 宽度均为 756px、无横向溢出；复验后缩放已重置为 100%。浏览器 AX 树显示 tab/panel 关系。ArrowRight、Home、End 更新 tab、焦点和 URL；Tab 从选中 tab 到队列搜索，跳过未选中 tab。未接入真实坐席/会话、模型或业务连接器。
+- 同一认证态空会话页完整 Tab 遍历记录 13 个可聚焦控件，逐一读取标签/placeholder/文本后没有发现缺少可访问名称的控件。该次没有队列会话数据，非空会话、菜单/对话框展开后的完整键盘路径和 VoiceOver 朗读仍未验收。
 - 隔离库升级至 `0070_outbox_processing_fence`，本地 API 和 Vite 仅绑定回环地址。验收后已停止服务、关闭浏览器标签、删除临时库与临时身份/令牌文件；未访问共享开发库。
 
 ### 当前分支证据
@@ -459,11 +460,11 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 
 | 验收项 | 当前状态 | 尚需后续验收 |
 |---|---|---|
-| UI-02 | 部分完成（队列与副驾 tab 键盘/AX 关系、对话框焦点和 Escape 已核对） | 全页面键盘走查、VoiceOver 屏幕阅读器验收 |
+| UI-02 | 部分完成（空态 Tab 遍历 13 个控件名称齐全；队列与副驾 tab 键盘/AX 关系、对话框焦点和 Escape 已核对） | 非空会话/弹层全路径键盘走查、VoiceOver 屏幕阅读器验收 |
 | UI-01 | 部分完成（Chrome 实际 200% 缩放及 1280/640/390/320 CSS px 均无横向溢出） | 1536/1280/390 逐规格截图归档 |
 | T07 | 部分完成（认证态工作台队列导航已补齐） | 完整辅助技术和缩放验收 |
 
-真实 Chrome 200% 缩放已通过无横向溢出核查；视口覆盖补充了窄屏重排验证。逐规格截图仍未归档。生产发布仍需完成 VoiceOver、真实评测集、性能、OIDC/外部连接器和 staging 回滚门槛；本轮未合并或部署 PR #27。
+真实 Chrome 200% 缩放已通过无横向溢出核查；视口覆盖补充了窄屏重排验证。逐规格截图仍未归档。生产发布仍需完成 VoiceOver、非空坐席旅程、真实评测集、性能、OIDC/外部连接器和 staging 回滚门槛；本轮未合并或部署 PR #27。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 完成可访问性缺口核查、实现、浏览器复验与 CI 核验。
 
