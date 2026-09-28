@@ -16,16 +16,18 @@ import { newIdempotencyKey } from "../lib/idempotency";
 import { useLang } from "../lib/i18n";
 import { ApiError } from "../lib/types";
 import {
+  nextWorkbenchQueueTab,
   nextWorkbenchRightTab,
+  WORKBENCH_QUEUE_TABS,
   WORKBENCH_RIGHT_TABS,
+  type WorkbenchQueueTab,
   type WorkbenchRightTab,
 } from "../lib/workbenchTabs";
 import "../styles-workbench.css";
 
-type Tab = "queue" | "mine" | "waiting";
-/** Every tab the page can render. Kept beside the type so a new tab cannot
- *  be added to the union without also becoming a valid `?tab=` value. */
-const ALL_TABS = ["queue", "mine", "waiting"] as const satisfies readonly Tab[];
+type Tab = WorkbenchQueueTab;
+/** Use the shared queue-tab contract for URL validation and rendering. */
+const ALL_TABS = WORKBENCH_QUEUE_TABS;
 type Action = "claim" | "release" | "transfer" | "close";
 type Origin = "free" | "canned" | "ai_suggestion";
 type CopilotKind = "summary" | "reply";
@@ -922,8 +924,25 @@ export function Workbench() {
         <section className="wb-queue" aria-label="会话队列">
           <div className="wb-queue-heading"><h2>会话队列</h2><Filter size={18} aria-hidden="true" /></div>
           <div className="wb-queue-tabs" role="tablist" aria-label="会话分类">
-            {(["queue", "mine", "waiting"] as const).map((key) => (
-              <button key={key} type="button" role="tab" aria-selected={tab === key} className={tab === key ? "active" : ""} onClick={() => selectTab(key)}>
+            {WORKBENCH_QUEUE_TABS.map((key) => (
+              <button
+                key={key}
+                id={`wb-queue-tab-${key}`}
+                type="button"
+                role="tab"
+                aria-controls="wb-queue-panel"
+                aria-selected={tab === key}
+                tabIndex={tab === key ? 0 : -1}
+                className={tab === key ? "active" : ""}
+                onClick={() => selectTab(key)}
+                onKeyDown={(event) => {
+                  const next = nextWorkbenchQueueTab(key, event.key);
+                  if (!next) return;
+                  event.preventDefault();
+                  selectTab(next);
+                  document.getElementById(`wb-queue-tab-${next}`)?.focus();
+                }}
+              >
                 {key === "queue" ? "待认领" : key === "mine" ? "我的会话" : "等待中"}
                 <span>{queue?.counts[key] ?? 0}</span>
               </button>
@@ -940,7 +959,13 @@ export function Workbench() {
             <span className="sr-only">搜索当前队列</span>
             <input value={query} onChange={(event) => { setQuery(event.target.value); setOffset(0); }} placeholder="搜索会话、客户或订单号…" />
           </label>
-          <div className="wb-queue-scroll">
+          <div
+            id="wb-queue-panel"
+            className="wb-queue-scroll"
+            role="tabpanel"
+            aria-labelledby={`wb-queue-tab-${tab}`}
+            tabIndex={0}
+          >
             {loadingQueue && !queue ? <p className="wb-muted wb-padding">正在加载会话…</p> : null}
             {!loadingQueue && queue?.items.length === 0 ? <div className="wb-queue-empty"><MessageCircle size={25} /><p>{query ? "没有匹配的会话" : "当前队列暂无会话"}</p></div> : null}
             {queue?.items.map((item) => {
