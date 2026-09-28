@@ -14,7 +14,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 | EVAL-01 / EVAL-02 | 阻塞 | 两位独立领域/安全审阅人复核语料、分歧裁决；锁定后运行当前 `semantic-v7` holdout |
 | PERF-01 / PERF-02 | 未执行/阻塞 | 批准的生产近似拓扑、负载目标、真实模型延迟与成本观测 |
 | SEC-02 / SEC-03 | 部分完成 | `test_orchestrator_lease_race.py` 已在隔离 PostgreSQL 中用独立应用会话验证“生成挂起时人工接管、恢复后无 AI 外发”；真实 OIDC 撤权、不同坐席身份的浏览器旅程和外部 transport 故障对账仍待演练 |
-| OPS-01 / OPS-02 | 部分完成 | 多主机 Worker/外部写入对账故障、staging 应用回滚和待确认动作故障注入；隔离库子进程 hard-exit 后恢复已通过 |
+| OPS-01 / OPS-02 | 部分完成 | 旧 R1 API `dc1c0a8` 在隔离 PostgreSQL head `0070` 上 usage/agents/queue 读取、claim/release 和读回通过；多主机 Worker/外部写入对账故障、staging 应用回滚和待确认动作故障注入仍待演练 |
 | UI-01 / UI-02 / UX-03 | 部分完成 | 当前分支已在 Chrome 合成认证态验证队列 tab 的 roving focus/方向键/Home/End/tabpanel；1280、640（200% 等效 CSS 宽度）、390、320 CSS px 无横向溢出。真实 200% 缩放、屏幕阅读器、逐规格截图归档和双窗口走查仍待做 |
 | TOOL-03 / R3 | 无真实业务连接器 | 由用户提供授权的 ERP/CRM sandbox、字段契约和归属证明 |
 

@@ -466,3 +466,13 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 视口覆盖验证了相同 CSS 宽度下的响应式重排，但没有把它记作真实浏览器 200% 缩放通过；逐规格截图也未归档。生产发布仍需完成该验收及真实评测集、性能、OIDC/外部连接器和 staging 回滚门槛；本轮未合并或部署 PR #27。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 完成可访问性缺口核查、实现、浏览器复验与 CI 核验。
+
+---
+
+## 12. Codex follow-up：R1 基线 API 在扩展 schema 上的读写兼容 smoke（2026-09-28）
+
+- 在隔离 PostgreSQL 新建干净库并用当前 R2/R3 migrations 升级到 `0070_outbox_processing_fence`；用随机合成 tenant、support agent、agent profile 和 queued conversation 准备仅供测试的数据。
+- 从 R1 基线 checkout `dc1c0a8` 启动旧 API（只监听 `127.0.0.1:8002`），使用本地合成 token 验证 `GET /v1/tenant/usage`、`GET /v1/agents`、workbench queue read 均返回 200；随后 claim 与 release 两次 mutation 均返回 200，并确认对话分别进入 agent queue、再回到待认领队列。
+- 旧应用代码在 R2/R3 扩展 schema 上保留了本地读写兼容。这不是 staging/生产 rollback、数据库 downgrade 或 Worker/待确认动作故障演练。API 停止、隔离数据库及临时 token/seed 文件均已清理；没有读写共享开发库。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 完成隔离环境准备、旧版本兼容 smoke 与清理核验。
