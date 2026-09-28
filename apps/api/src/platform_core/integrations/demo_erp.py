@@ -77,6 +77,15 @@ _SHIPMENTS: dict[str, dict[str, Any]] = {
     },
 }
 
+_INVENTORY: dict[str, dict[str, Any]] = {
+    "PCB-DEMO-100": {
+        "part_number": "PCB-DEMO-100",
+        "available_quantity": 120,
+        "unit_code": "pcs",
+        "location_ref": "WH-DEMO-1",
+    },
+}
+
 # Fictional account-owned product records for the local/test Demo adapter.
 # They exercise ownership verification only; they are not real specifications,
 # inventory, production status, or customer data.
@@ -106,7 +115,7 @@ _RESOURCES: dict[str, dict[str, dict[str, Any]]] = {
     "orders": _ORDERS,
     "shipments": _SHIPMENTS,
     "invoices": {},
-    "inventory": {},
+    "inventory": _INVENTORY,
 }
 
 

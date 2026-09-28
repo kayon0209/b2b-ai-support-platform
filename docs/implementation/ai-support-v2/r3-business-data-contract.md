@@ -1,6 +1,6 @@
 # R3 自研业务系统接入与权威数据契约
 
-状态：已实现供应商中立的共享 Pydantic 契约、canonical adapter Protocol 和假 provider 边界测试；尚无真实 provider adapter、sandbox 或业务系统写入。
+状态：已实现供应商中立的共享 Pydantic 契约、canonical adapter Protocol、fake provider 边界测试，以及 local/test 专用的九域 `DemoCanonicalBusinessAdapter` 合成读实现；尚无真实 provider adapter、sandbox 或业务系统写入。Demo facts 带 `source_version=demo-fixture-v1`，只用于控制面演示与契约验证，不能作为获批 authority 或客户事实。
 
 ## 已确定的产品决策
 
@@ -39,6 +39,8 @@ ERP、MES、WMS、CRM 以企业自研为主。标准 ERP 的对象和流程不�
 - `CanonicalBusinessAdapter.read_fact()` 返回 `CanonicalBusinessReadResult`，把规范事实与可选 ownership proof 放在同一结果中。调用方使用 `read_verified_fact()`；只有 authority、TTL 和账户归属校验通过时才会拿到事实，且返回的 `source_record_ref` 必须等于本次请求的 `record_ref`。带 `customer_account_ref` 的事实必须提供服务端期望账户和匹配 proof；漏传账户范围或 proof、返回另一个外部记录均 fail closed。
 - 全部 canonical 模型拒绝未知字段；原始 provider payload 和密钥不属于共享契约。
 - 每个 tenant 字段必须和 `SourceMetadata.tenant_id` 一致。租户实际身份由服务端 connector/context 解析，不能接受客户端 tenant id 作为授权依据。
+- `platform_core.integrations.demo_canonical_business.DemoCanonicalBusinessAdapter` 只在 `APP_ENVIRONMENT=local|test` 且 `APP_BUSINESS_API_ADAPTER=demo` 时构造；它为客户、订单、发票、工单、物流、商机、产品、库存和报价返回固定合成样本，仍必须经过相同的 binding/version/freshness/ownership 校验。`demo_presales.build_demo_presales_evidence()` 组合产品规格、账户库存与客户报价样例，并硬性标记 `synthetic=true`、`customer_quote_allowed=false`、`handoff_required=true`。这些 helper 不创建 authority binding、审批记录、真实 connector 或外部写入。
+- 可从仓库根目录运行 `APP_ENVIRONMENT=test APP_BUSINESS_API_ADAPTER=demo APP_ALLOW_BOOTSTRAP_TOKENS=true python scripts/demo_r3_authorities.py` 查看九域 synthetic facts 与预售证据包。命令只在内存构造 fixture bindings，不连接数据库/网络；输出中的 `approved_by` 是明确标记的临时 fixture actor，不是组织审批。
 
 ## 受控外部写入
 

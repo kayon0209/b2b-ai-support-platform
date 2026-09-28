@@ -542,6 +542,69 @@ def test_demo_order_flow_verifies_ownership_runs_tool_gateway_and_records_receip
     assert execution == ("executed", "verified")
 
 
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_status"),
+    [("unknown", "unknown"), ("timeout", "failed")],
+)
+def test_demo_order_query_unknown_or_timeout_never_creates_a_success_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+    expected_status: str,
+) -> None:
+    _seed_invoice_context()
+    _seed_demo_order_reader()
+    started = _start(key=f"order-query-{failure_mode}-start", flow_key="order_status")
+    task = _collect_flow_fields(
+        started.json()["task"],
+        key=f"order-query-{failure_mode}-fields",
+        fields={"order_id": "SO-9001"},
+    )
+
+    class _UncertainOrderExecutor:
+        async def execute(
+            self, tool_name: str, parameters: dict[str, Any], idempotency_key: str
+        ) -> dict[str, Any]:
+            if failure_mode == "timeout":
+                raise TimeoutError("synthetic connector timeout")
+            return {
+                "found": True,
+                "order_id": parameters["order_id"],
+                "status": "in_production",
+                "account": "acme",
+                "source": "demo",
+                "fetched_at": "2026-09-28T00:00:00Z",
+                "nodes": [],
+                "eta": None,
+            }
+
+        async def verify_postcondition(
+            self, tool_name: str, parameters: dict[str, Any], output: dict[str, Any] | None
+        ) -> bool | None:
+            return None if failure_mode == "unknown" else isinstance(output, dict)
+
+    async def resolve_test_executor(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"order.get_status": _UncertainOrderExecutor()}
+
+    monkeypatch.setattr(
+        "platform_core.tool_gateway.registry.resolve_executors", resolve_test_executor
+    )
+    queried = _client().post(
+        f"/v1/workbench/conversations/{CONVERSATION}/tasks/{task['task_id']}/commands",
+        headers=_headers(f"order-query-{failure_mode}-run"),
+        json={
+            "command": "query_order_status",
+            "expected_version": task["version"],
+            "expected_lease_version": LEASE_VERSION,
+        },
+    )
+
+    assert queried.status_code == 200, queried.text
+    result_task = queried.json()["task"]
+    assert result_task["status"] == expected_status
+    assert result_task["blocked_reason"] in {"TOOL_EXECUTION_FAILED", "TOOL_EXECUTION_UNKNOWN"}
+    assert not any(slot["name"] == "order_status_receipt" for slot in result_task["slots"])
+
+
 def test_tenant_cannot_start_against_another_tenants_conversation() -> None:
     response = _client(tenant=OTHER_TENANT).post(
         f"/v1/workbench/conversations/{CONVERSATION}/standard-flows/tasks",

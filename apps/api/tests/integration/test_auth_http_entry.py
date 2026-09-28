@@ -427,6 +427,47 @@ def test_oidc_token_maps_to_a_membership_through_external_identities(
     assert "auth-http case B" not in subjects, "OIDC path leaked another tenant's rows"
 
 
+def test_oidc_membership_deactivation_revokes_the_next_request(oidc_client: TestClient) -> None:
+    """A live OIDC identity loses platform access when tenant membership is disabled."""
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO external_identities (id, tenant_id, user_id, system, subject) "
+                "VALUES (gen_random_uuid(), :t, :u, :sys, :s) "
+                "ON CONFLICT (system, subject) DO NOTHING"
+            ),
+            {"t": TENANT, "u": USER, "s": "kc|auth-http-revocation", "sys": ISSUER},
+        )
+    admin.dispose()
+
+    headers = {"Authorization": "Bearer auth-http-revocation"}
+    before = oidc_client.get("/v1/cases", headers=headers)
+    assert before.status_code == 200, before.text
+
+    admin = create_engine(ADMIN_URL)
+    try:
+        with admin.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE memberships SET status = 'suspended' "
+                    "WHERE tenant_id = :t AND user_id = :u"
+                ),
+                {"t": TENANT, "u": USER},
+            )
+        after = oidc_client.get("/v1/cases", headers=headers)
+        assert after.status_code == 401, after.text
+    finally:
+        with admin.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE memberships SET status = 'active' WHERE tenant_id = :t AND user_id = :u"
+                ),
+                {"t": TENANT, "u": USER},
+            )
+        admin.dispose()
+
+
 def test_oidc_membership_mapping_requires_tenant_binding(oidc_client: TestClient) -> None:
     """A subject known to another tenant must not resolve under this one.
 

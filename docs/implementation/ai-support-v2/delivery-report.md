@@ -574,3 +574,19 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 - 本轮 GitHub CI 仍待更新代码提交后重跑；所有 production evaluator/release/standard-flow flag 继续关闭，没有连接客户或第三方系统，也没有调用真实模型。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 核对当前 PR/CI 与代码路径，完成本地 Demo 流程实现、复验和验收边界修订。
+
+---
+
+## 18. Codex follow-up：九域 synthetic canonical authority 复核（2026-09-28）
+
+- 新增 local/test-only `DemoCanonicalBusinessAdapter`，为 customer account、order、invoice、work order、shipment、opportunity、product specification、inventory、quote 返回代码内固定样本。每个结果带 `source_version=demo-fixture-v1`，并继续经 `read_verified_fact()` 核对 tenant、binding/version、connector、record ref、freshness TTL 和 account ownership proof。
+- Adapter 只读取合成数据；不会创建或批准 `AuthorityBinding`，不会访问数据库、网络或外部系统，也不会触发写入。它拒绝 staging/production 配置和 domain/system-kind 不匹配。Demo ERP 的 `inventory.check_stock` 另有 `PCB-DEMO-100` 合成 stock record，回执标记 `source=demo`。
+- `scripts/demo_r3_authorities.py` 可本地运行并列出九域事实及售前证据包；输出明确标记 synthetic、客户报价禁止和没有 CRM write，临时 fixture actor 不代表审批人。
+- `test_demo_canonical_business.py` 覆盖九域读取、身份/时效证明、跨账户拒绝、不兼容 system-kind 拒绝、环境 fail-closed、Demo ERP 库存回执，以及一个必须提供产品规格/客户库存/有效报价三份证据的合成售前复核包。输出明确禁止作为客户报价并要求人工 handoff。该测试验证协议与模拟器，不构成人工批准数据集或真实 authority 验收。
+- 新增合成 OIDC 边界测试：有效测试 identity 在 tenant membership 从 active 改为 suspended 后，下一次平台 API 请求返回 401。它证明应用每次请求重解 membership；不模拟或证明 Keycloak/外部 IdP 的 refresh/access token 吊销。
+- 本地 performance smoke：100 条合成 webhook 并发写入、warm pool 10，P50 36.2ms/P95 54.9ms/P99 55.0ms，100 rows 持久化且 duplicate replay 命中。此结果只度量单机 webhook ACK 的 warm-pool 路径；不代表模型、队列、shadow/off 对照或生产容量门禁通过。
+- 最终组合复验：local/test isolated database 上 **149 passed**，包括 R2 标准流程、OIDC membership deactivation、R3 九域 canonical fake、pre-sales evidence guard 与 migration-independent webhook perf smoke；Ruff/Mypy 检查通过。最新一次 webhook smoke（100 concurrent, pool 10）为 P50 31.2ms/P95 49.0ms/P99 49.1ms、100 rows、duplicate replay detected。该数据不能替代 off/shadow、多轮负载、模型 p95 或生产拓扑验收。
+- 新增回归/模拟合计 **149 passed**（包含标准流程、R3 canonical adapter、九域 demo facts、OIDC membership deactivation 和单机 webhook smoke）；Ruff/Mypy 目标检查通过。仍需完整 HEAD CI。
+- R3-02 仍无面向坐席的产品适配推荐流程，也无 CRM opportunity 写入；真实产品/库存/客户报价 source、CRM sandbox 和外部 owner proof 仍待确定。真实评测审核、生产性能、企业 OIDC 撤权、真人 VoiceOver 和浏览器安全策略阻止的 PNG 归档仍是独立验收门禁。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 编写并验证了 local/test synthetic canonical provider 和 R3 边界文档。

@@ -13,7 +13,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 | DOC-01 / ADR | Proposed | 产品/安全负责人正式接受或修改 ADR |
 | EVAL-01 / EVAL-02 | 阻塞 | 两位独立领域/安全审阅人复核语料、分歧裁决；锁定后运行当前 `semantic-v7` holdout |
 | PERF-01 / PERF-02 | 未执行/阻塞 | 批准的生产近似拓扑、负载目标、真实模型延迟与成本观测 |
-| SEC-02 / SEC-03 | 部分完成 | `test_orchestrator_lease_race.py` 验证“生成挂起时人工接管、恢复后无 AI 外发”；另有两个 Chrome origin/token 并发认领 smoke，一席成功、一席冲突，lease 唯一归属与 version 递增。真实 OIDC 撤权和外部 transport timeout/unknown 对账仍待演练 |
+| SEC-02 / SEC-03 | 部分完成 | `test_auth_http_entry.py` 模拟 OIDC identity 请求，tenant membership 从 active 改为 suspended 后下一请求立即 401；`test_orchestrator_lease_race.py` 验证“生成挂起时人工接管、恢复后无 AI 外发”；另有两个 Chrome origin/token 并发认领 smoke，一席成功、一席冲突，lease 唯一归属与 version 递增。真实 IdP token/session 撤销与外部 transport timeout/unknown 对账仍待演练 |
 | OPS-01 / OPS-02 | 部分完成 | 新增本地 staging 模拟：候选 UI 与 `68de17e` 基线 UI 指向同一隔离 API/数据库；基线读取 2 个合成会话和非空详情，切回候选后草稿仍在。API 停止/刷新/重试/恢复通过；真实 staging、多实例 Worker、数据库降级和外部写入 unknown 对账仍待授权环境 |
 | UI-01 / UI-02 / UX-03 | 部分完成 | 非空 Safari 合成 A/B 会话、transcript/composer/Copilot AX tree、同源多标签草稿冲突策略、跨会话隔离、刷新和 API outage recovery 已实测；VoiceOver 已启用并读取 AX 结构，但自动化无法可靠区分 VO 修饰键与页面箭头，完整原生 VO 朗读/键盘走查仍待真人复核。逐规格 PNG 归档仍被浏览器安全策略阻止 |
 | TOOL-03 / R3 | 无真实业务连接器 | 由用户提供授权的 ERP/CRM sandbox、字段契约和归属证明 |
@@ -54,14 +54,14 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 统一 adapter contract：tenant connector、credential_ref、目标记录归属验证、字段 allowlist、超时与 bounded retry、breaker、稳定 idempotency key、受控 confirmation 和读回 postcondition。
 - 对超时/断连返回 `unknown` 并提供对账流程；不得把“请求已发出”写成“业务成功”。外部 payload 只在 adapter 边界做 canonical projection。
 - 先实现 fake contract tests 与协议文档；真正 provider adapter 需有用户授权的 sandbox、版本化 REST schema、归属证明和重放预算。
-- 当前：已新增覆盖九种 authority domain 的 canonical schemas、来源/时效/归属验证和 fake-provider boundary tests。额外使用 shipped Demo ERP 经 Tool Gateway 完成 synthetic `SO-9001` 查询及 connector outage 降级（2 passed）；输出明确标为 `source=demo`。该模拟验证平台路径，不替代真实 ERP/CRM authority、sandbox 或客户归属证明。
+- 当前：已新增覆盖九种 authority domain 的 canonical schemas、来源/时效/归属验证和 fake-provider boundary tests；新增 local/test-only `DemoCanonicalBusinessAdapter`，九域全部经 `read_verified_fact()` 校验并标记 `source_version=demo-fixture-v1`。shipped Demo ERP 另经 Tool Gateway 完成 synthetic order/stock read；标准订单流程也记录 verified Demo receipt。该模拟验证平台路径，不替代真实 ERP/MES/WMS/CRM authority、sandbox 或客户归属证明。
 
 ### R3-02 售前选型与商机交接
 
 - 定义产品目录、规格、库存、报价版本/有效期和销售交接契约；每个建议带来源与抓取时间，缺失或过期时转人工。
 - 仅使用企业授权的权威产品/ERP/PLM 数据；现有公开参考价不能伪装成客户报价，不允许模型生成折扣、交期或库存承诺。
 - CRM 商机创建是受控写入，经 Tool Gateway proposal/confirmation/idempotency/读回；没有真实 sandbox 时仅测 canonical contract，不宣称真实落地。
-- 当前：契约禁止无来源的客户报价、库存和交期承诺；具体产品目录、库存和报价权威绑定尚未选定，因此没有真实售前推荐或 CRM 商机写入。
+- 当前：契约禁止无来源的客户报价、库存和交期承诺；local/test `DemoCanonicalBusinessAdapter` 和 `build_demo_presales_evidence()` 已从产品、账户库存和报价合成 facts 构造一个只能给销售人员复核的证据包，明确禁止直接对客户报价并要求人工 handoff。它尚未接入面向坐席的产品推荐 UI，也没有 CRM opportunity 写入；真实权威目录、客户报价绑定和 CRM sandbox 仍未选定。
 
 ## 集成发布顺序
 
