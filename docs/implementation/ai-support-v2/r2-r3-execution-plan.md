@@ -15,7 +15,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 | PERF-01 / PERF-02 | 未执行/阻塞 | 批准的生产近似拓扑、负载目标、真实模型延迟与成本观测 |
 | SEC-02 / SEC-03 | 部分完成 | `test_orchestrator_lease_race.py` 验证“生成挂起时人工接管、恢复后无 AI 外发”；另有两个 Chrome origin/token 并发认领 smoke，一席成功、一席冲突，lease 唯一归属与 version 递增。真实 OIDC 撤权和外部 transport timeout/unknown 对账仍待演练 |
 | OPS-01 / OPS-02 | 部分完成 | 旧 R1 API `dc1c0a8` 在隔离 PostgreSQL head `0070` 上 usage/agents/queue 读取、claim/release 和读回通过；多主机 Worker/外部写入对账故障、staging 应用回滚和待确认动作故障注入仍待演练 |
-| UI-01 / UI-02 / UX-03 | 部分完成 | Chrome 合成认证态验证队列 tab 键盘/tabpanel、空状态 13 个焦点控件 accessible name、200% 缩放和窄视口无溢出；两独立 origin/token 的坐席认领竞争一胜一冲突。VoiceOver、非空内容/弹层走查、逐规格截图归档和跨会话 Copilot 草稿/任务隔离与断线恢复仍待做 |
+| UI-01 / UI-02 / UX-03 | 部分完成 | Chrome 合成认证态验证队列 tab 键盘/tabpanel、空状态 13 个焦点控件 accessible name、200% 缩放和窄视口无溢出；两独立 origin/token 的坐席认领竞争一胜一冲突；Workbench 当前 route/detail 不匹配时隐藏旧客户/副驾上下文，并丢弃旧会话的异步 UI 回写。VoiceOver、非空内容/弹层实测、逐规格截图归档和跨标签 Copilot 草稿/任务及断线恢复仍待做 |
 | TOOL-03 / R3 | 无真实业务连接器 | 由用户提供授权的 ERP/CRM sandbox、字段契约和归属证明 |
 
 ## R2：服务流程与运营能力

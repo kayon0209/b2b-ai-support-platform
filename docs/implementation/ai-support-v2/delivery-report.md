@@ -500,3 +500,14 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 - 浏览器 UI-01 视口已查看，但逐规格 PNG 未归档；浏览器下载策略拒绝该导出，Chrome headless 在本机应用注册时崩溃。该截图证据仍待通过批准的环境归档；不影响本节 R3 合同测试结论。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 完成 R3 风险面审查、fail-closed 修复、回归测试和验收文档同步。
+
+---
+
+## 15. Codex follow-up：Workbench 路由切换时的会话上下文隔离（2026-09-28）
+
+- 旧版路由会在新详情请求完成前继续保留上一会话的 `detail`。主聊天面板原先做了 ref 比较，右侧 Copilot/客户上下文与转接/结束对话框没有一致的 current-route gate；用户可在路由切换窗口看到旧会话信息。
+- 新增统一的 active conversation identity guard：详情不属于当前 URL 时显示加载状态、隐藏副驾和客户内容、禁止从旧详情发起新的回复/任务写入；转接与结束对话框随会话变化关闭。
+- 旧会话的 Copilot 请求、分页历史、快捷话术、回复、附件及分类更正等异步结果在回写前校验 active conversation。待重试回复幂等键按 conversation_ref 分开，避免两个会话的相同文案复用同一 key；旧发送请求完成时，仅当草稿 revision 未变化才清空输入框。
+- 新增 `workbench-conversation.test.mts`，覆盖 4 个 route identity、6 个幂等键和 2 个草稿 revision 保护断言；Admin Web 全部行为测试、typecheck 和 production build 通过。尚未做真实非空会话浏览器矩阵、跨标签草稿同步、断线恢复或 VoiceOver 验收。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 完成路由/异步竞态审查、状态隔离修复、前端复验和验收文档更新。
