@@ -203,11 +203,13 @@ class _FixedGenerator:
 def test_human_takeover_mid_generation_blocks_outbound_send() -> None:
     """The P0 race, exercised through the real pipeline.
 
-    Sequence: the run is queued while AI owns the lease (version captured),
-    a human takes over, then the run executes. Retrieval and generation both
-    succeed — only the pre-send re-check stands between the model's answer
-    and the customer. It must stop the send.
+    The AI run begins with an AI-owned lease and blocks inside generation.
+    A second database session transfers the lease to a human while generation
+    is still in flight. After generation resumes, the pre-send re-check must
+    see the committed takeover and prevent transport delivery.
     """
+    import asyncio
+
     from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
     from platform_core.db import create_engine
     from platform_core.identity import lease_service
@@ -221,7 +223,7 @@ def test_human_takeover_mid_generation_blocks_outbound_send() -> None:
         engine = create_engine(APP_URL)
         factory = _factory(engine)
 
-        # 1. AI observes the lease when the run is queued.
+        # Seed an AI-owned lease and capture the version carried by the run.
         async with factory() as session:
             await _with_ctx(session, TENANT)
             lease = await lease_service.acquire_or_get(
@@ -230,54 +232,85 @@ def test_human_takeover_mid_generation_blocks_outbound_send() -> None:
             await session.commit()
         expected_version = int(lease.lease_version)
 
-        # 2. A human takes over while the AI is "generating".
-        async with factory() as session:
-            await _with_ctx(session, TENANT)
-            await lease_service.transfer_to_human(
-                session,
-                tenant_id=tid,
-                conversation_ref_id=conv,
-                human_ref="agent-7",
-                reason="customer asked for a human",
-            )
-            await session.commit()
+        class _BlockedGenerator(_FixedGenerator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.resume = asyncio.Event()
 
-        # 3. The run executes with the now-stale expected version.
+            async def generate(self, question, evidence, **kwargs):
+                self.started.set()
+                await asyncio.wait_for(self.resume.wait(), timeout=10)
+                return await super().generate(question, evidence, **kwargs)
+
         sender = _RecordingTransport()
-        generator = _FixedGenerator()
-        async with factory() as session:
-            await _with_ctx(session, TENANT)
-            orch = AgentOrchestrator(
-                session,
-                OrchestratorDeps(
-                    generator=generator, channel_sender=ChannelSender({"email": sender})
-                ),
-            )
-            outcome = await orch.run(
-                tenant_id=tid,
-                conversation_ref_id=conv,
-                question="how long is the refund window?",
-                principal=principal,
-                channel_system="email",
-                channel_address="buyer@example.test",
-                channel_conversation_key=str(conv),
-                expected_lease_version=expected_version,
-            )
-            await session.commit()
-            # set_config(..., true) is transaction-local, so the tenant
-            # context must be re-applied before any post-commit read.
-            await _with_ctx(session, TENANT)
-            from sqlalchemy import select
+        generator = _BlockedGenerator()
 
-            from platform_core.agent_runtime.models import AgentRun
+        async def run_ai() -> tuple[object, str, str | None]:
+            async with factory() as session:
+                await _with_ctx(session, TENANT)
+                orch = AgentOrchestrator(
+                    session,
+                    OrchestratorDeps(
+                        generator=generator, channel_sender=ChannelSender({"email": sender})
+                    ),
+                )
+                outcome = await orch.run(
+                    tenant_id=tid,
+                    conversation_ref_id=conv,
+                    question="how long is the refund window?",
+                    principal=principal,
+                    channel_system="email",
+                    channel_address="buyer@example.test",
+                    channel_conversation_key=str(conv),
+                    expected_lease_version=expected_version,
+                )
+                await session.commit()
+                # set_config(..., true) is transaction-local, so re-apply it
+                # before reading the committed run under the application role.
+                await _with_ctx(session, TENANT)
+                from sqlalchemy import select
 
-            persisted = (
-                await session.execute(select(AgentRun).where(AgentRun.id == outcome.run_id))
-            ).scalar_one()
-            status = persisted.status
-            output_hash = persisted.output_hash
+                from platform_core.agent_runtime.models import AgentRun
 
-        await engine.dispose()
+                persisted = (
+                    await session.execute(select(AgentRun).where(AgentRun.id == outcome.run_id))
+                ).scalar_one()
+                return outcome, persisted.status, persisted.output_hash
+
+        run_task = asyncio.create_task(run_ai())
+        try:
+            # The model boundary signals that the AI run has entered generation
+            # and is waiting on its response; no sleeps or timing guesses.
+            await asyncio.wait_for(generator.started.wait(), timeout=10)
+
+            # A separate application-role session takes over the lease while
+            # generation remains in flight, as a second operator request would.
+            async with factory() as session:
+                await _with_ctx(session, TENANT)
+                await lease_service.transfer_to_human(
+                    session,
+                    tenant_id=tid,
+                    conversation_ref_id=conv,
+                    human_ref="agent-7",
+                    reason="customer asked for a human",
+                )
+                await session.commit()
+
+            generator.resume.set()
+            outcome, status, output_hash = await asyncio.wait_for(run_task, timeout=10)
+        finally:
+            # Make a failed assertion or timeout release the test double so it
+            # cannot strand a DB session in the integration-test process.
+            generator.resume.set()
+            if not run_task.done():
+                run_task.cancel()
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    pass
+            await engine.dispose()
+
         return outcome, sender, generator, status, output_hash
 
     outcome, sender, generator, status, output_hash = _run(scenario())
