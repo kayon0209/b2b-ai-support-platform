@@ -526,7 +526,7 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 ### 浏览器与辅助技术复验
 
 - Safari 同源双标签使用隔离 API 与两条非空合成会话：A 标签草稿广播到同会话新标签；两个标签各自编辑后显示冲突且不静默覆盖；分别实测保留本页与显式采用远端草稿。切换到 B 会话时 A 草稿不显示。B 的会话专属草稿在同一标签刷新后恢复。没有发送任何回复。
-- macOS 系统设置确认 VoiceOver 最初关闭，本轮按授权临时开启；Safari AX tree 可见 skip-main、主导航、队列 tabs、会话按钮、三条消息、带标签 composer、发送按钮及 Copilot tab/panel。自动化键盘 Control+Option+Arrow 在此运行环境无法可靠与页面箭头事件区分，出现过队列 tab 切换，因此不把 AX 树检查冒充完整原生 VoiceOver 朗读/键盘验收；该部分仍需真实 VoiceOver 手动复核。完成后会恢复 VoiceOver 原设置。
+- macOS 系统设置确认 VoiceOver 最初关闭，本轮按授权临时开启；Safari AX tree 可见 skip-main、主导航、队列 tabs、会话按钮、三条消息、带标签 composer、发送按钮及 Copilot tab/panel。自动化键盘 Control+Option+Arrow 在此运行环境无法可靠与页面箭头事件区分，出现过队列 tab 切换，因此不把 AX 树检查冒充完整原生 VoiceOver 朗读/键盘验收；该部分仍需真实 VoiceOver 手动复核。验收后已恢复原始状态：VoiceOver 关闭、Option 修饰键为右 Option。
 - 逐规格截图 PNG 仍未归档：浏览器安全策略阻止页面导出，已有画面仅作临时目视检查，不声称存在持久化截图证据。
 
 ### 断线恢复与本地 staging 模拟
