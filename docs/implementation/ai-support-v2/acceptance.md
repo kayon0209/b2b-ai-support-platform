@@ -47,7 +47,7 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | MIG-01 | 清洁库升级、带合成业务数据升级、回滚到上版应用可读写、隔离库迁移往返；新表 RLS/索引/外键完整 | migration test 从 base 到 head、单步 downgrade/re-upgrade、完整 downgrade/re-upgrade；全表 FORCE RLS 扫描 | 通过（本机专用合成数据库；非 staging/生产回滚演练） |
 | OPS-01 | 持久任务超时、Worker 重启、provider 429/5xx、连接器断连、重复 outbox 可恢复；无孤儿 executing | 子进程 hard-exit 后新 Worker stale-claim 恢复、重复 outbox/过期恢复测试 | 部分完成（本地 OS 子进程故障恢复通过；未做多主机拓扑及真实 provider/connector 故障演练） |
 | OPS-02 | 租户开关/kill switch 生效，旧应用回滚保留数据；待确认动作不被自动执行 | 既有 R1 API 扩展 schema smoke；本轮在隔离库上并行运行候选 UI 与 `68de17e` 基线 UI，基线仍读到 2 个 synthetic cases 和 3 条 B 会话 turns，切回候选后草稿保留；另完成 API 停止、页面重试和恢复 | 本地 staging 模拟与 UI 回退 smoke 通过；未进行真实 staging/Kubernetes 多实例、数据库降级、Worker 重启或待确认外部写入回滚 |
-| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | PR #27 head `b1d9f88`；GitHub Actions [run #36414098456](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36414098456) 九个 job 全通过，含 unit、integration、Release Evidence/零容忍、并发、Admin Web、typecheck、lint、依赖与密钥扫描 | 通过（证据绑定本地模拟验收和文档同步 head；无生产数据或模型质量主张） |
+| CI-01 | 当前代码实现分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | Workbench 草稿恢复实现提交 `8f47c34`；GitHub Actions [run #36413261026](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36413261026) 九个 job 全通过，含 unit、integration、Release Evidence/零容忍、并发、Admin Web、typecheck、lint、依赖与密钥扫描 | 通过（CI 绑定实现提交；后续文档-only提交不改变被测代码，无生产数据或模型质量主张）
 | DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | `delivery-report.md` §16 记录草稿同步、合成 ERP/评测、断线恢复和本地 UI 回退复验 | 部分完成（本地模拟证据可复核；真实 staging、获批评测数据和企业系统证据仍阻塞） |
 
 ## 3. 质量阈值：R1 提议的启用门槛
