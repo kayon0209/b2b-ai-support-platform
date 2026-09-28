@@ -477,3 +477,13 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 - 旧应用代码在 R2/R3 扩展 schema 上保留了本地读写兼容。这不是 staging/生产 rollback、数据库 downgrade 或 Worker/待确认动作故障演练。API 停止、隔离数据库及临时 token/seed 文件均已清理；没有读写共享开发库。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 完成隔离环境准备、旧版本兼容 smoke 与清理核验。
+
+---
+
+## 13. Codex follow-up：双坐席浏览器并发认领 smoke（2026-09-28）
+
+- 在新建隔离 PostgreSQL 库中准备两个独立的 synthetic `support_agent`、agent profiles 和一个 queued conversation；两个 Chrome 标签使用不同 localhost origin 和各自本地合成 bootstrap token，访问当前分支前端及隔离 API。
+- 两个浏览器同时点击“接入会话”：Synthetic Seat Two 收到成功状态并在“我的会话”中看到该项；Synthetic Seat One 收到 lease/version 冲突，回复区保持只读。数据库最后验证 `owner_type=human`、`lease_version=2` 且只有一个 `owner_ref`，证明单条会话不会被两名坐席同时接管。
+- 此测试不包含客户消息、Case 或真实连接器，也没有验证双浏览器 Copilot 草稿串扰、断线恢复和真实 OIDC 撤权。临时 Chrome tabs、两套 Vite、隔离 API、数据库及测试令牌已清理。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 完成合成双坐席并发场景、浏览器复验与隔离环境清理。
