@@ -47,7 +47,7 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | MIG-01 | 清洁库升级、带合成业务数据升级、回滚到上版应用可读写、隔离库迁移往返；新表 RLS/索引/外键完整 | migration test 从 base 到 head、单步 downgrade/re-upgrade、完整 downgrade/re-upgrade；全表 FORCE RLS 扫描 | 通过（本机专用合成数据库；非 staging/生产回滚演练） |
 | OPS-01 | 持久任务超时、Worker 重启、provider 429/5xx、连接器断连、重复 outbox 可恢复；无孤儿 executing | 子进程 hard-exit 后新 Worker stale-claim 恢复、重复 outbox/过期恢复测试 | 部分完成（本地 OS 子进程故障恢复通过；未做多主机拓扑及真实 provider/connector 故障演练） |
 | OPS-02 | 租户开关/kill switch 生效，旧应用回滚保留数据；待确认动作不被自动执行 | kill switch 测试；R1 基线 API `dc1c0a8` 在隔离 PostgreSQL `0070_outbox_processing_fence` schema 上读 usage/agents/workbench queue，claim、release 和 read-after-write 均返回 200 | 部分完成（旧应用在扩展 schema 上读写通过；未做 staging 回滚、降级演练和待确认动作故障注入） |
-| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | `codex/r2-r3-implementation` 实现提交 `4717deab72865b423269db7d41f327d4b3ce57ef`；PR CI run [#36382604120](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36382604120)，九个 job 全通过，含完整套件和零容忍证据检查 | 通过（证据绑定实现提交；无生产数据或模型质量主张） |
+| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | R3 fail-closed 实现提交 `fabeb30b557722184581d59d01232eea4732860b`；PR CI run [#36396710697](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36396710697)，九个 job 全通过，含 integration、完整 release evidence/零容忍、并发、Admin Web、typecheck、lint、依赖与密钥扫描 | 通过（证据绑定实现提交；无生产数据或模型质量主张） |
 | DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 本地 R2/R3 交付文档、实现提交 `4717dea`、PR #27 与 CI run #36382604120 | 部分完成（实现和 CI 证据可复核；staging 回滚、真实 evaluator 与业务系统仍阻塞） |
 
 ## 3. 质量阈值：R1 提议的启用门槛
