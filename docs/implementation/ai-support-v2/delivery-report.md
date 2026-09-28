@@ -441,3 +441,28 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 此结果只关闭了一个本地代码级接管竞态缺口。真实 OIDC 撤权、屏幕阅读器/200% 浏览器验收、外部系统故障对账、生产近似性能与评测门槛仍未完成；feature flags 继续默认关闭。本轮未合并或部署 PR #27。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 完成并发测试设计、实现、测试与 CI 核验。
+
+---
+
+## 11. Codex follow-up：坐席队列标签的键盘可访问性（2026-09-28）
+
+### 实施与本地复验
+
+- 会话队列现在把 `queue / mine / waiting` 的同一组 tab 契约用于 URL 状态、渲染和键盘导航。添加选中项 roving `tabIndex`、`aria-controls`/`aria-labelledby`、`tabpanel`，并实现左右方向键循环、Home/End；方向键切换同步焦点、选中项与 `?tab=`。未选中的标签不再占用额外 Tab 停靠点。
+- `workbench-tabs.test.mts` 增加 6 个队列标签规则断言，现共 13 项导航断言。Admin Web 测试、typecheck 与 production build 通过。
+- 使用当前分支前端和 API、隔离 PostgreSQL、随机生成的本地合成管理员身份核对认证态工作台。1280×800 页面显示导航、会话队列和空态；浏览器 AX 树显示 tab/panel 关系。实测 ArrowRight、Home、End 更新 tab、焦点和 URL；Tab 从选中 tab 到队列搜索，跳过未选中 tab。未接入真实坐席/会话、模型或业务连接器。
+- 隔离库升级至 `0070_outbox_processing_fence`，本地 API 和 Vite 仅绑定回环地址。验收后已停止服务、关闭浏览器标签、删除临时库与临时身份/令牌文件；未访问共享开发库。
+
+### 当前分支证据
+
+实现提交 `4717deab72865b423269db7d41f327d4b3ce57ef` 已推送到 `codex/r2-r3-implementation`。PR #27 的 GitHub Actions [run #36382604120](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36382604120) 九个 job 全部通过，含 integration、完整 release evidence/零容忍检查、admin web、typecheck、lint、依赖与密钥扫描和 concurrency guard。
+
+| 验收项 | 当前状态 | 尚需后续验收 |
+|---|---|---|
+| UI-02 | 部分完成（队列与副驾 tab 键盘/AX 关系、对话框焦点和 Escape 已核对） | 全页面键盘走查、VoiceOver 屏幕阅读器验收 |
+| UI-01 | 部分完成（1280×800 真实分支界面与既有尺寸矩阵） | 真实 200% 浏览器缩放、1536/1280/390 逐规格截图留档 |
+| T07 | 部分完成（认证态工作台队列导航已补齐） | 完整辅助技术和缩放验收 |
+
+浏览器快捷键在当前 in-app browser 未能可靠改变缩放，因此没有把它记为 200% 通过。生产发布仍需完成该验收及真实评测集、性能、OIDC/外部连接器和 staging 回滚门槛；本轮未合并或部署 PR #27。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 完成可访问性缺口核查、实现、浏览器复验与 CI 核验。
