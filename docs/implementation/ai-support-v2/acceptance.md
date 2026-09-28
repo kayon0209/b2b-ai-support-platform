@@ -29,10 +29,10 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | TOOL-02 | 写任务仅提案/人工处理；参数改变使原确认失效；同键不同 payload 冲突；审批人与客户确认角色不混用 | 提案、确认、执行集成 | 通过（stub / 测试数据库） |
 | TOOL-03 | 回执 unknown/失败/记录不属于客户时不展示已办结/已核验；没有 connector 不制造成功卡片 | 回执契约与负例 | 通过（测试边界；无真实连接器沙箱） |
 | COP-01 | 摘要和回复有当前可见来源；生成不发消息；插入后可编辑，最终人工发送仍检查 owner/idempotency | stub worker + 浏览器来源/插入 + API 发送测试 | 通过（非真实模型） |
-| COP-02 | 切换会话、新消息、租约变化使旧 job stale；用户已编辑内容不被自动覆盖；相同请求重放不重复计费执行 | worker/API 集成、浏览器保稿 | 通过（无双坐席并发） |
+| COP-02 | 切换会话、新消息、租约变化使旧 job stale；用户已编辑内容不被自动覆盖；相同请求重放不重复计费执行 | worker/API 集成、浏览器保稿；`test_orchestrator_lease_race.py::test_human_takeover_mid_generation_blocks_outbound_send` 使用独立 PostgreSQL 应用会话，在生成屏障期间完成真实并发接管 | 本地通过（数据库并发控制已验证；双浏览器坐席旅程仍未执行） |
 | SEC-01 | 新表强制 RLS，运行角色无 BYPASSRLS；跨租户 ID、任务引用、缓存、job、分页、引用和导出均不可读写 | 隔离 PostgreSQL 全表租户负例 | 通过（包含 `standard_flow_start_requests`；`platform_app` 仅获 SELECT/INSERT） |
 | SEC-02 | 权限撤销/错误角色/非 owner/会话结束/版本过期时拒绝动作；访客不可访问坐席 job | API 403/404/409 与 RLS 集成 | 部分完成（真实身份撤权未演练） |
-| SEC-03 | AI 派发前与回复前复核 lease；在途外部调用有明确结果/unknown，接管后无新 AI 派发 | stale worker 与回复前 lease 校验 | 部分完成（无真实双窗口在途故障） |
+| SEC-03 | AI 派发前与回复前复核 lease；在途外部调用有明确结果/unknown，接管后无新 AI 派发 | stale worker、回复前 lease 校验；上述集成测试用另一个应用角色数据库会话在 AI 生成仍挂起时接管，恢复生成后断言零 transport send | 部分完成（真实 PostgreSQL 并发接管路径通过；不同坐席身份的浏览器旅程和真实外部 transport 故障对账仍未执行） |
 | SEC-04 | 日志、追踪、指标、评测报告无原始提示/客户文本/槽位值/凭据；失败 provider 输出同样受限 | 日志/PII 测试 | 通过（合成数据） |
 | UI-01 | 1536×1024/1280×800/390×844/200% 缩放无页面横向溢出；桌面对话仍为最大工作区域，输入区可见 | 1536/1280/768/390 CSS 宽度 DOM 测量与浏览器检查 | 部分完成（宽度矩阵通过；真实 200% 浏览器缩放与逐规格截图留档待做） |
 | UI-02 | 任务、状态、来源、失败原因可读；键盘路径完整、焦点恢复、动态状态可访问；无仅颜色编码 | AX 状态/动态状态/来源按钮检查 | 部分完成（右侧标签键盘导航、对话框焦点圈与 Escape 已验证；屏幕阅读器及全页面键盘走查待做） |
@@ -46,8 +46,8 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | MIG-01 | 清洁库升级、带合成业务数据升级、回滚到上版应用可读写、隔离库迁移往返；新表 RLS/索引/外键完整 | migration test 从 base 到 head、单步 downgrade/re-upgrade、完整 downgrade/re-upgrade；全表 FORCE RLS 扫描 | 通过（本机专用合成数据库；非 staging/生产回滚演练） |
 | OPS-01 | 持久任务超时、Worker 重启、provider 429/5xx、连接器断连、重复 outbox 可恢复；无孤儿 executing | 子进程 hard-exit 后新 Worker stale-claim 恢复、重复 outbox/过期恢复测试 | 部分完成（本地 OS 子进程故障恢复通过；未做多主机拓扑及真实 provider/connector 故障演练） |
 | OPS-02 | 租户开关/kill switch 生效，旧应用回滚保留数据；待确认动作不被自动执行 | kill switch 测试；扩展 schema 上的上版应用读写 smoke | 部分完成（本地应用回滚 smoke 通过；未做 staging 回滚、降级演练和待确认动作故障注入） |
-| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | 当前本地分支 `codex/r2-r3-implementation`，base HEAD `8150a74`；CI run 需绑定后续提交 | 未执行（本地验证不能替代当前 head CI） |
-| DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 本地 R2/R3 交付文档与工作区验收结果 | 部分完成（本地代码/文档可复核；无新 commit/CI，真实 evaluator 与业务系统仍阻塞） |
+| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | `codex/r2-r3-implementation` 实现提交 `25e6c2178c4f8f337fc896dcd94ebf52551aaa96`；PR CI run [#36378299874](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36378299874)，九个 job 全通过，含完整套件和零容忍证据检查 | 通过（证据绑定实现提交；无生产数据或模型质量主张） |
+| DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 本地 R2/R3 交付文档、实现提交 `25e6c21`、PR #27 与 CI run #36378299874 | 部分完成（实现和 CI 证据可复核；staging 回滚、真实 evaluator 与业务系统仍阻塞） |
 
 ## 3. 质量阈值：R1 提议的启用门槛
 

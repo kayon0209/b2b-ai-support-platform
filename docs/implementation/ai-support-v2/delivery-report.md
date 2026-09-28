@@ -418,3 +418,26 @@ GitHub Actions run [#36239136194](https://github.com/kayon0209/b2b-ai-support-pl
 GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36295891831) 在实现提交 `247290e5df86c529dde17465efaab64765439764` 上通过所有工作流，包括完整 Integration、Release Evidence、Web、typecheck、lint、secret/dependency scan 和 concurrency guard。对应的本地验收摘要见 [实现提交证据包](evidence/247290e5df86c529dde17465efaab64765439764/local-verification.md)。
 
 **Jev 使用记录**：Jev 只对脱敏的合成模型汇总数据给出“抽取 12 条 dev-only 样本诊断 schema 失败、保持 holdout 封存”的建议；未发送密钥或样本原文。Codex 完成评测设计、代码、复验和门禁结论。
+
+---
+
+## 10. Codex follow-up：生成中接管并发验收与当前分支 CI（2026-09-28）
+
+### 实施与本地复验
+
+- 加强 `test_orchestrator_lease_race.py::test_human_takeover_mid_generation_blocks_outbound_send`：AI 在真实 orchestrator 流程中进入受控生成屏障后，另一独立 `platform_app` 数据库会话执行并提交人工接管，再恢复生成。断言生成只调用一次、transport 零发送、run 变为 `handed_off` 且 `output_hash` 为空。这是 PostgreSQL 应用角色/RLS 边界上的并发测试，不使用真实模型或真实渠道。
+- 新建隔离 PostgreSQL 数据库并升级至迁移 head `0070_outbox_processing_fence`。目标集成文件 **7 passed**；Ruff 检查、格式和 `git diff --check` 通过。为避免 focused pytest 运行尝试在只读 managed-worktree 路径写部分 release-evidence 文件，局部复跑覆盖了 `addopts` 中的证据收集插件；所有测试本身执行通过。完整 release-evidence 插件及零容忍检查由下述 CI 全套验证。
+- 本地验收数据库无活跃连接后已删除，未操作共享 `platform` 数据库。
+
+### 当前分支证据
+
+代码提交 `25e6c2178c4f8f337fc896dcd94ebf52551aaa96` 已推送到 `codex/r2-r3-implementation`。PR #27 的 GitHub Actions [run #36378299874](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36378299874) 九个 job 全部通过：unit、integration、完整 release evidence/零容忍检查、admin web、typecheck、lint、dependency scan、secret scan、concurrency guard。
+
+| 任务 | 当前状态 | 尚需外部条件或后续验收 |
+|---|---|---|
+| T08 | 部分完成（真实 PostgreSQL 两独立应用会话验证生成期间人工接管可阻止 AI 外发） | 不同坐席身份与浏览器双窗口旅程、真实 provider/connector 故障注入、生产负载 |
+| T09 | 部分完成（PR #27 实现提交及完整 CI/Release Evidence 通过） | staging 回滚与降级演练、真实发布证据包 |
+
+此结果只关闭了一个本地代码级接管竞态缺口。真实 OIDC 撤权、屏幕阅读器/200% 浏览器验收、外部系统故障对账、生产近似性能与评测门槛仍未完成；feature flags 继续默认关闭。本轮未合并或部署 PR #27。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 完成并发测试设计、实现、测试与 CI 核验。
