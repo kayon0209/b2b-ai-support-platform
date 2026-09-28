@@ -130,6 +130,7 @@ def test_record_cannot_cross_tenant_connector_or_authority_version() -> None:
                 }
             ),
             fact=_product(),
+            expected_record_ref="part-42",
             as_of=NOW,
         )
 
@@ -137,6 +138,7 @@ def test_record_cannot_cross_tenant_connector_or_authority_version() -> None:
         validate_canonical_fact(
             binding=_binding(),
             fact=_product(_source(connector_id=UUID("01900000-0000-7000-8000-000000000098"))),
+            expected_record_ref="part-42",
             as_of=NOW,
         )
 
@@ -147,13 +149,19 @@ def test_stale_and_ttl_exceeding_provider_data_are_refused() -> None:
         valid_until=NOW - timedelta(hours=1),
     )
     with pytest.raises(BusinessAdapterError, match="BUSINESS_SOURCE_STALE"):
-        validate_canonical_fact(binding=_binding(), fact=_product(stale), as_of=NOW)
+        validate_canonical_fact(
+            binding=_binding(),
+            fact=_product(stale),
+            expected_record_ref="part-42",
+            as_of=NOW,
+        )
 
     too_long = _source(valid_until=NOW + timedelta(days=2))
     with pytest.raises(BusinessAdapterError, match="BUSINESS_SOURCE_TTL_EXCEEDED"):
         validate_canonical_fact(
             binding=_binding(max_age_seconds=3600),
             fact=_product(too_long),
+            expected_record_ref="part-42",
             as_of=NOW,
         )
 
@@ -176,6 +184,7 @@ def test_customer_scoped_quote_requires_matching_ownership_proof() -> None:
         validate_canonical_fact(
             binding=binding,
             fact=quote,
+            expected_record_ref="quote-9",
             as_of=NOW,
             expected_account_ref="account-42",
         )
@@ -194,6 +203,7 @@ def test_customer_scoped_quote_requires_matching_ownership_proof() -> None:
     validate_canonical_fact(
         binding=binding,
         fact=quote,
+        expected_record_ref="quote-9",
         as_of=NOW,
         expected_account_ref="account-42",
         ownership_proof=proof,
@@ -273,13 +283,37 @@ def test_every_authority_domain_has_a_canonical_read_contract() -> None:
     }
     assert set(CANONICAL_FACT_TYPES) == set(AuthorityDomain)
     for domain, fact in facts.items():
-        validate_canonical_fact(binding=_binding(domain=domain), fact=fact, as_of=NOW)
+        owner_ref = getattr(fact, "customer_account_ref", None)
+        proof = (
+            OwnershipProof(
+                tenant_id=TENANT,
+                connector_id=CONNECTOR,
+                authority_binding_id=BINDING,
+                authority_version=4,
+                resource_ref="part-42",
+                expected_account_ref=owner_ref,
+                observed_account_ref=owner_ref,
+                verified_at=NOW - timedelta(minutes=1),
+                method="provider_owner_field",
+            )
+            if owner_ref is not None
+            else None
+        )
+        validate_canonical_fact(
+            binding=_binding(domain=domain),
+            fact=fact,
+            expected_record_ref="part-42",
+            as_of=NOW,
+            expected_account_ref=owner_ref,
+            ownership_proof=proof,
+        )
     with pytest.raises(TypeError):
         CANONICAL_FACT_TYPES[AuthorityDomain.ORDER] = CanonicalProductSpecification  # type: ignore[index]
     with pytest.raises(BusinessAdapterError, match="BUSINESS_FACT_TYPE_MISMATCH"):
         validate_canonical_fact(
             binding=_binding(domain=AuthorityDomain.ORDER),
             fact=_product(),
+            expected_record_ref="part-42",
             as_of=NOW,
         )
 
@@ -321,6 +355,7 @@ def test_order_and_invoice_require_same_customer_ownership_proof() -> None:
             validate_canonical_fact(
                 binding=_binding(domain=domain),
                 fact=fact,
+                expected_record_ref="part-42",
                 as_of=NOW,
                 expected_account_ref="another-account",
                 ownership_proof=proof,
@@ -351,6 +386,7 @@ def test_ownership_proof_is_bound_to_resource_version_and_freshness() -> None:
     validate_canonical_fact(
         binding=binding,
         fact=order,
+        expected_record_ref="order-42",
         as_of=NOW,
         expected_account_ref="account-42",
         ownership_proof=proof,
@@ -360,6 +396,7 @@ def test_ownership_proof_is_bound_to_resource_version_and_freshness() -> None:
         validate_canonical_fact(
             binding=binding,
             fact=order,
+            expected_record_ref="order-42",
             as_of=NOW,
             expected_account_ref="account-42",
             ownership_proof=proof.model_copy(update={"resource_ref": "another-order"}),
@@ -368,6 +405,7 @@ def test_ownership_proof_is_bound_to_resource_version_and_freshness() -> None:
         validate_canonical_fact(
             binding=binding,
             fact=order,
+            expected_record_ref="order-42",
             as_of=NOW,
             expected_account_ref="account-42",
             ownership_proof=proof.model_copy(update={"authority_version": 3}),
@@ -376,6 +414,7 @@ def test_ownership_proof_is_bound_to_resource_version_and_freshness() -> None:
         validate_canonical_fact(
             binding=binding,
             fact=order,
+            expected_record_ref="order-42",
             as_of=NOW,
             expected_account_ref="account-42",
             ownership_proof=proof.model_copy(update={"verified_at": NOW - timedelta(hours=1)}),
@@ -437,4 +476,38 @@ def test_read_result_carries_ownership_proof_into_the_enforcing_helper() -> None
                 as_of=NOW,
                 expected_account_ref="account-42",
             )
+        )
+
+
+def test_provider_cannot_substitute_another_record_for_the_requested_ref() -> None:
+    adapter = _FakeMesAdapter(
+        CanonicalBusinessReadResult(fact=_product(_source(source_record_ref="part-43"))),
+        expected_record_ref="part-42",
+    )
+    with pytest.raises(BusinessAdapterError, match="BUSINESS_RECORD_MISMATCH"):
+        asyncio.run(
+            read_verified_fact(
+                adapter,
+                binding=_binding(),
+                record_ref="part-42",
+                as_of=NOW,
+            )
+        )
+
+
+def test_customer_scoped_fact_cannot_skip_account_scope_and_proof() -> None:
+    order = CanonicalOrderStatus(
+        tenant_id=TENANT,
+        customer_account_ref="account-42",
+        order_ref="order-42",
+        status="accepted",
+        status_updated_at=NOW - timedelta(minutes=6),
+        source=_source(source_record_ref="order-42"),
+    )
+    with pytest.raises(BusinessAdapterError, match="BUSINESS_OWNERSHIP_UNVERIFIED"):
+        validate_canonical_fact(
+            binding=_binding(domain=AuthorityDomain.ORDER),
+            fact=order,
+            expected_record_ref="order-42",
+            as_of=NOW,
         )

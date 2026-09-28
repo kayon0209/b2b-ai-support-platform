@@ -36,7 +36,7 @@ ERP、MES、WMS、CRM 以企业自研为主。标准 ERP 的对象和流程不�
 - `CanonicalQuote` 强制 3 位大写 ISO 币种、整数最小货币单位、最小数量、来源记录和业务报价有效期。
 - 已为全部九种 `AuthorityDomain` 增加一一对应的 canonical read schema：客户账户、订单、发票、生产工单、物流发运、销售商机、产品规格、库存和报价。状态枚举由平台固定；订单/工单/物流/商机的状态更新时间不能晚于读取时间；发票金额和 ISO 币种必须成对出现。
 - `CanonicalOrderStatus` / `CanonicalWorkOrderStatus` / `CanonicalShipmentStatus` / `CanonicalInvoiceStatus` / `CanonicalOpportunity` 只定义边界字段与状态语义，不代表有 provider、权威来源绑定或生产执行器；客户范围事实必须继续通过 `OwnershipProof` 核对外部 account ref。
-- `CanonicalBusinessAdapter.read_fact()` 返回 `CanonicalBusinessReadResult`，把规范事实与可选 ownership proof 放在同一结果中。调用方使用 `read_verified_fact()`；只有 authority、TTL 和账户归属校验通过时才会拿到事实，provider 不能漏传 proof 后仍让 account-scoped read 通过。
+- `CanonicalBusinessAdapter.read_fact()` 返回 `CanonicalBusinessReadResult`，把规范事实与可选 ownership proof 放在同一结果中。调用方使用 `read_verified_fact()`；只有 authority、TTL 和账户归属校验通过时才会拿到事实，且返回的 `source_record_ref` 必须等于本次请求的 `record_ref`。带 `customer_account_ref` 的事实必须提供服务端期望账户和匹配 proof；漏传账户范围或 proof、返回另一个外部记录均 fail closed。
 - 全部 canonical 模型拒绝未知字段；原始 provider payload 和密钥不属于共享契约。
 - 每个 tenant 字段必须和 `SourceMetadata.tenant_id` 一致。租户实际身份由服务端 connector/context 解析，不能接受客户端 tenant id 作为授权依据。
 
@@ -65,4 +65,4 @@ ERP、MES、WMS、CRM 以企业自研为主。标准 ERP 的对象和流程不�
 
 ## 当前验收
 
-当前共享 contracts、九域 canonical schema、canonical adapter 与 R3 fake-boundary 测试覆盖 UTC/TTL、版本绑定、每个 authority domain 的事实类型、tenant/connector/account 归属、按资源绑定且有时效的 ownership proof、陈旧信息拒绝、未知字段、报价/发票币种金额、超时 unknown 与读回成功约束。假 adapter 只测试平台边界，不模拟真实 ERP 行为；没有真实业务 API 或端到端写入验收结论。
+当前共享 contracts、九域 canonical schema、canonical adapter 与 R3 fake-boundary 测试覆盖 UTC/TTL、版本绑定、每个 authority domain 的事实类型、tenant/connector/account 归属、请求记录精确匹配、客户范围必需的按资源 ownership proof、陈旧信息拒绝、未知字段、报价/发票币种金额、超时 unknown 与读回成功约束。假 adapter 只测试平台边界，不模拟真实 ERP 行为；没有真实业务 API 或端到端写入验收结论。

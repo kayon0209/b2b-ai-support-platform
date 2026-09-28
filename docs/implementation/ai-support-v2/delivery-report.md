@@ -487,3 +487,15 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 - 此测试不包含客户消息、Case 或真实连接器，也没有验证双浏览器 Copilot 草稿串扰、断线恢复和真实 OIDC 撤权。临时 Chrome tabs、两套 Vite、隔离 API、数据库及测试令牌已清理。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 完成合成双坐席并发场景、浏览器复验与隔离环境清理。
+
+---
+
+## 14. Codex follow-up：R3 外部记录与客户归属 fail-closed 校验（2026-09-28）
+
+- `read_verified_fact()` 现在要求 canonical `source_record_ref` 与本次请求的 `record_ref` 完全一致；provider 返回同租户/同账户下的另一条记录也会以 `BUSINESS_RECORD_MISMATCH` 被拒绝。
+- 含 `customer_account_ref` 的事实现在必须同时带服务端期望账户和匹配的 `OwnershipProof`。调用方漏传账户范围或 proof 会以 `BUSINESS_OWNERSHIP_UNVERIFIED` 失败；原有验证继续绑定 tenant、connector、authority binding/version、具体外部资源和 freshness TTL。
+- 新增错误 provider 返回其他记录、customer-scoped read 漏传账户范围的回归用例；更新 R3 contract、execution plan 和 acceptance 中的本地/外部条件区分。
+- 本地复验：`apps/api/tests/unit/integrations` 与 `packages/contracts/tests` **140 passed**（含本次新增回归）；Ruff、格式检查、目标模块 Mypy 和 `git diff --check` 通过。仅使用合成 fake provider；未连接或声称验收真实 ERP/CRM。
+- 浏览器 UI-01 视口已查看，但逐规格 PNG 未归档；浏览器下载策略拒绝该导出，Chrome headless 在本机应用注册时崩溃。该截图证据仍待通过批准的环境归档；不影响本节 R3 合同测试结论。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 完成 R3 风险面审查、fail-closed 修复、回归测试和验收文档同步。

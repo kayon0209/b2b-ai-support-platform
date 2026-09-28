@@ -28,6 +28,7 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | TOOL-01 | 名称/参数建议必须在租户允许能力内；缺参先问；模型不能把只读任务变成写动作 | 权限过滤与负例 | 通过（stub） |
 | TOOL-02 | 写任务仅提案/人工处理；参数改变使原确认失效；同键不同 payload 冲突；审批人与客户确认角色不混用 | 提案、确认、执行集成 | 通过（stub / 测试数据库） |
 | TOOL-03 | 回执 unknown/失败/记录不属于客户时不展示已办结/已核验；没有 connector 不制造成功卡片 | 回执契约与负例 | 通过（测试边界；无真实连接器沙箱） |
+| R3-01 | 外部事实必须来自 tenant/domain 已批准 authority；返回记录引用与请求一致，connector/binding 版本和 freshness 有效；客户范围事实必须通过账户归属证明 | R3 canonical contract/fake adapter negative tests：wrong record ref、wrong authority/resource/version/account、stale proof/source 和 missing account scope 均拒绝 | 部分完成（平台侧契约已实现；企业批准的绑定、真实 provider 生成的 proof、授权 sandbox 与端到端适配器验收仍阻塞） |
 | COP-01 | 摘要和回复有当前可见来源；生成不发消息；插入后可编辑，最终人工发送仍检查 owner/idempotency | stub worker + 浏览器来源/插入 + API 发送测试 | 通过（非真实模型） |
 | COP-02 | 切换会话、新消息、租约变化使旧 job stale；用户已编辑内容不被自动覆盖；相同请求重放不重复计费执行 | worker/API 集成、浏览器保稿；`test_orchestrator_lease_race.py::test_human_takeover_mid_generation_blocks_outbound_send` 使用独立 PostgreSQL 应用会话，在生成屏障期间完成真实并发接管 | 本地通过（数据库并发控制已验证；双浏览器坐席旅程仍未执行） |
 | SEC-01 | 新表强制 RLS，运行角色无 BYPASSRLS；跨租户 ID、任务引用、缓存、job、分页、引用和导出均不可读写 | 隔离 PostgreSQL 全表租户负例 | 通过（包含 `standard_flow_start_requests`；`platform_app` 仅获 SELECT/INSERT） |

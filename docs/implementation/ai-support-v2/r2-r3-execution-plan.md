@@ -54,7 +54,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 统一 adapter contract：tenant connector、credential_ref、目标记录归属验证、字段 allowlist、超时与 bounded retry、breaker、稳定 idempotency key、受控 confirmation 和读回 postcondition。
 - 对超时/断连返回 `unknown` 并提供对账流程；不得把“请求已发出”写成“业务成功”。外部 payload 只在 adapter 边界做 canonical projection。
 - 先实现 fake contract tests 与协议文档；真正 provider adapter 需有用户授权的 sandbox、版本化 REST schema、归属证明和重放预算。
-- 当前：已新增覆盖九种 authority domain 的 canonical read schemas（账户、订单、发票、工单、物流、商机、产品、库存、报价）、供应商中立的来源/时效/归属验证，以及携带 proof 的 `CanonicalBusinessReadResult` / `read_verified_fact()` adapter seam 和假 provider 边界测试。各业务域权威系统仍待企业负责人定版；具体 ERP/CRM API、授权 sandbox、生产 adapter、归属证明实施和验收仍未提供。
+- 当前：已新增覆盖九种 authority domain 的 canonical read schemas（账户、订单、发票、工单、物流、商机、产品、库存、报价）、供应商中立的来源/时效/归属验证，以及携带 proof 的 `CanonicalBusinessReadResult` / `read_verified_fact()` adapter seam 和假 provider 边界测试。平台侧现在要求返回记录引用与请求完全一致；客户范围事实强制带服务端预期账户及匹配的资源/authority 版本/时效证明。真实 provider 生成的归属证明、企业批准的 authority binding、具体 ERP/CRM API、授权 sandbox、生产 adapter 和端到端验收仍未提供。
 
 ### R3-02 售前选型与商机交接
 

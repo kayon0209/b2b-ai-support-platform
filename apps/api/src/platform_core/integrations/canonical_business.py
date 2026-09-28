@@ -70,6 +70,7 @@ async def read_verified_fact(
     validate_canonical_fact(
         binding=binding,
         fact=result.fact,
+        expected_record_ref=record_ref,
         as_of=as_of,
         expected_account_ref=expected_account_ref,
         ownership_proof=result.ownership_proof,
@@ -81,6 +82,7 @@ def validate_canonical_fact(
     *,
     binding: AuthorityBinding,
     fact: CanonicalBusinessFact,
+    expected_record_ref: str,
     as_of: datetime,
     expected_account_ref: str | None = None,
     ownership_proof: OwnershipProof | None = None,
@@ -98,6 +100,8 @@ def validate_canonical_fact(
         or fact.source.system_kind != binding.system_kind
     ):
         raise BusinessAdapterError("BUSINESS_AUTHORITY_MISMATCH")
+    if fact.source.source_record_ref != expected_record_ref:
+        raise BusinessAdapterError("BUSINESS_RECORD_MISMATCH")
     freshness_deadline = binding.freshness_deadline(
         retrieved_at=fact.source.retrieved_at,
         source_valid_until=fact.source.valid_until,
@@ -106,6 +110,9 @@ def validate_canonical_fact(
         raise BusinessAdapterError("BUSINESS_SOURCE_TTL_EXCEEDED")
     if not fact.source.is_fresh(as_of=as_of):
         raise BusinessAdapterError("BUSINESS_SOURCE_STALE")
+    record_owner = getattr(fact, "customer_account_ref", None)
+    if record_owner is not None and expected_account_ref is None:
+        raise BusinessAdapterError("BUSINESS_OWNERSHIP_UNVERIFIED")
     if expected_account_ref is not None:
         if ownership_proof is None:
             raise BusinessAdapterError("BUSINESS_OWNERSHIP_UNVERIFIED")
@@ -122,9 +129,6 @@ def validate_canonical_fact(
             raise BusinessAdapterError("BUSINESS_OWNERSHIP_MISMATCH")
         if ownership_proof.verified_at + timedelta(seconds=binding.max_age_seconds) <= as_of:
             raise BusinessAdapterError("BUSINESS_OWNERSHIP_PROOF_STALE")
-        record_owner = getattr(fact, "customer_account_ref", None) or getattr(
-            fact, "account_ref", None
-        )
         if record_owner is not None and record_owner != expected_account_ref:
             raise BusinessAdapterError("BUSINESS_OWNERSHIP_MISMATCH")
 
