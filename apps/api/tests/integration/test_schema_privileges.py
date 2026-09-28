@@ -95,6 +95,11 @@ RESTRICTED_BY_DESIGN: dict[str, tuple[frozenset[str], str]] = {
         frozenset({"UPDATE", "DELETE"}),
         "append-only publication and rollback history",
     ),
+    "standard_flow_start_requests": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only idempotency receipts; retries reuse the stored task and "
+        "never rewrite the receipt",
+    ),
 }
 
 PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
