@@ -130,6 +130,9 @@
 .wb-tool-wrap .tool-card-node-state, .wb-tool-wrap .tool-card-node-at { color: #758496; font-size: 11px; }
 .wb-compose-area { flex: none; padding: 11px 15px 15px; border-top: 1px solid var(--wb-line); background: #fff; }
 .wb-ownership-note { margin-bottom: 8px; padding: 7px 10px; border-radius: 6px; background: #fff8e7; color: #8d601c; font-size: 12px; }
+.wb-draft-sync { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-bottom: 8px; padding: 7px 10px; border: 1px solid #b9d8df; border-radius: 7px; background: #eff8fa; color: #345a63; font-size: 12px; }
+.wb-draft-sync span { flex: 1 1 180px; }
+.wb-draft-sync button { padding: 4px 8px; border: 1px solid #b9d8df; border-radius: 5px; background: #fff; color: inherit; font-size: 12px; }
 .wb-composer { border: 1px solid #cddce8; border-radius: 9px; box-shadow: 0 2px 7px rgb(26 58 84 / 6%); }
 .wb-composer:focus-within { border-color: #50b8ae; box-shadow: 0 0 0 3px rgb(26 151 143 / 10%); }
 .wb-composer textarea { width: 100%; min-height: 74px; max-height: 150px; resize: vertical; border: 0; outline: 0; background: transparent; padding: 12px 13px 5px; color: var(--wb-ink); }
@@ -284,6 +287,8 @@
 [data-theme="dark"] .wb-copilot-ownership.is-owned { background: #1b3d3a; color: #a5ddd2; }
 [data-theme="dark"] .wb-copilot-sources button { background: #243747; border-color: #405568; color: #c1d8e8; }
 [data-theme="dark"] .wb-copilot-error, [data-theme="dark"] .wb-copilot-blocked { background: #3b2526; border-color: #704044; color: #f0b8b5; }
+[data-theme="dark"] .wb-draft-sync { background: #223a43; border-color: #3c6670; color: #d2e8ec; }
+[data-theme="dark"] .wb-draft-sync button { background: #1d2d3b; border-color: #3c6670; color: #d2e8ec; }
 [data-theme="dark"] .wb-turn.is-source-highlight { background: #4b4327; box-shadow: 0 0 0 7px #4b4327; }
 [data-theme="dark"] .wb-global-search input, [data-theme="dark"] .wb-queue-search input, [data-theme="dark"] .wb-composer textarea, [data-theme="dark"] .wb-modal select { color: var(--wb-ink); }
 [data-theme="dark"] .wb-bubble { background: #263a4d; color: var(--wb-ink); border-color: #3e5366; }

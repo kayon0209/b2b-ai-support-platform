@@ -512,3 +512,38 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 - 实现提交 `56833ae3f91d83cd8492020de8ae58b5bd25ee72` 已推送至 PR #27；GitHub Actions [run #36401909032](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36401909032) 九个 job 全部通过，包括 Admin Web、集成测试、并发门禁及完整 release-evidence/零容忍检查。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 完成路由/异步竞态审查、状态隔离修复、前端复验和验收文档更新。
+
+---
+
+## 16. Codex follow-up：非空工作台、草稿恢复与本地 staging 模拟（2026-09-28）
+
+### 草稿同步实现
+
+- 新增 `apps/admin-web/src/lib/workbenchDraftSync.ts`：草稿按 actor/conversation 分区，严格校验 schema、长度、时钟偏差和 30 分钟 TTL；草稿正文只写当前浏览器 tab 的 `sessionStorage`，同源标签间经 `BroadcastChannel` 交换。没有使用 `localStorage`，也没有发送到 API。
+- 新标签打开同一会话时通过 request/draft 握手补齐当前草稿；两边编辑不同内容时显示冲突提示，需坐席明确选择“同步另一标签页”或“保留本页”。清空状态同样可同步。queue/right tablist 只处理无修饰键的方向键/Home/End，Ctrl/Option/Shift/Meta 修饰键不得触发应用级切换。
+- `workbench-conversation.test.mts` 现覆盖 4 identity、6 idempotency、2 draft revision、13 draft sync 断言；`workbench-tabs.test.mts` 21 项验证无修饰键导航和修饰键忽略。
+
+### 浏览器与辅助技术复验
+
+- Safari 同源双标签使用隔离 API 与两条非空合成会话：A 标签草稿广播到同会话新标签；两个标签各自编辑后显示冲突且不静默覆盖；分别实测保留本页与显式采用远端草稿。切换到 B 会话时 A 草稿不显示。B 的会话专属草稿在同一标签刷新后恢复。没有发送任何回复。
+- macOS 系统设置确认 VoiceOver 最初关闭，本轮按授权临时开启；Safari AX tree 可见 skip-main、主导航、队列 tabs、会话按钮、三条消息、带标签 composer、发送按钮及 Copilot tab/panel。自动化键盘 Control+Option+Arrow 在此运行环境无法可靠与页面箭头事件区分，出现过队列 tab 切换，因此不把 AX 树检查冒充完整原生 VoiceOver 朗读/键盘验收；该部分仍需真实 VoiceOver 手动复核。完成后会恢复 VoiceOver 原设置。
+- 逐规格截图 PNG 仍未归档：浏览器安全策略阻止页面导出，已有画面仅作临时目视检查，不声称存在持久化截图证据。
+
+### 断线恢复与本地 staging 模拟
+
+- 专用隔离 PostgreSQL `workbench_live_20260928` 已升级至 `0070_outbox_processing_fence`。停止本地合成 API 后刷新 B 会话，页面呈现暂不可用/重试，未拥有详情时回复区不开放；启动 API 后轮询恢复队列与非空详情，按坐席/会话键从 `sessionStorage` 恢复 B 草稿；点击重试清除错误提示。API `/healthz` 和授权队列在恢复后分别返回 200。
+- 本地“staging”仅为回环地址 UI/容器模拟：候选 Admin Web 运行于 `127.0.0.1:15175`；从 Git commit `68de17e` 导出的基线 UI 运行于 `127.0.0.1:15176`；二者连接同一专用 synthetic API/数据库。基线 UI 可读取 2 条队列会话、B 会话 3 条 timeline turns；切回候选标签后 B 草稿仍在。它验证兼容/恢复 smoke，不是云 staging、Kubernetes、多实例、数据库降级或生产 rollback 演练。
+
+### 模拟业务系统与合成评测
+
+- Demo ERP `business_api_adapter=demo` 通过受控 Tool Gateway 路径回答合成订单 `SO-9001`，receipt 带 `source=demo` 与 `fetched_at`；不可用 provider 走明确的 abstain/error 路径。`test_the_shipped_demo_provider_answers_a_real_question` 和 `test_an_unreachable_erp_tells_the_customer_what_is_wrong` **2 passed**；visitor ownership、1,700 条语义数据 manifest、runner 和 release-gate 单测共 **33 passed**。这些样例全为合成数据。
+- `test_release_evaluation_requires_service_evidence_two_reviewers_and_supports_rollback` 在隔离 PostgreSQL **1 passed**：使用 fake evaluator、deterministic embedder、合成数据和测试密钥验证 candidate-aware evidence 路径，同时确认没有平台来源的自报前测/后测被 `EVALUATOR_PROVENANCE_UNAVAILABLE` 拒绝。测试通过不构成独立人工审批、真实模型质量分数或发布授权。
+
+### 本地复验与仍未关闭项
+
+- Admin Web：`npm test` 通过（URL 12、dialog 7、task panel 10、workbench tabs 21、conversation/draft guards 25 项）；`npm run typecheck`、`npm run build`、`npm run check:runtime` 均通过。
+- 本地 pytest：demo ERP/failure 与 visitor ownership/eval dataset/runner/release gates 共 35 项通过；候选知识发布门禁集成另 1 项通过。Ruff/完整全仓 CI 尚待本轮代码提交后运行。
+- UI-02 仍为部分完成：非空页面 AX/键盘与功能路径已核查，完整原生 VoiceOver 朗读/弹层浏览未被本自动化接口可靠验证。R3 真实 ERP/CRM、人工批准固定评测集、真实模型 holdout/费用、企业身份、生产 staging/多实例 rollback 均未提供；任何模拟结果都不替代这些证据，所有生产 release flags 保持关闭。
+- `acceptance.md` 与执行计划按上述证据同步。本轮没有访问客户/第三方系统，没有调用真实模型，没有合并或生产发布。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 负责实现、合成验证、验收边界判断与文档同步。

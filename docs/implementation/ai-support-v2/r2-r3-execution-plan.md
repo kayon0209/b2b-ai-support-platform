@@ -14,8 +14,8 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 | EVAL-01 / EVAL-02 | 阻塞 | 两位独立领域/安全审阅人复核语料、分歧裁决；锁定后运行当前 `semantic-v7` holdout |
 | PERF-01 / PERF-02 | 未执行/阻塞 | 批准的生产近似拓扑、负载目标、真实模型延迟与成本观测 |
 | SEC-02 / SEC-03 | 部分完成 | `test_orchestrator_lease_race.py` 验证“生成挂起时人工接管、恢复后无 AI 外发”；另有两个 Chrome origin/token 并发认领 smoke，一席成功、一席冲突，lease 唯一归属与 version 递增。真实 OIDC 撤权和外部 transport timeout/unknown 对账仍待演练 |
-| OPS-01 / OPS-02 | 部分完成 | 旧 R1 API `dc1c0a8` 在隔离 PostgreSQL head `0070` 上 usage/agents/queue 读取、claim/release 和读回通过；多主机 Worker/外部写入对账故障、staging 应用回滚和待确认动作故障注入仍待演练 |
-| UI-01 / UI-02 / UX-03 | 部分完成 | Chrome 合成认证态验证队列 tab 键盘/tabpanel、空状态 13 个焦点控件 accessible name、200% 缩放和窄视口无溢出；两独立 origin/token 的坐席认领竞争一胜一冲突；Workbench 当前 route/detail 不匹配时隐藏旧客户/副驾上下文，并丢弃旧会话的异步 UI 回写。VoiceOver、非空内容/弹层实测、逐规格截图归档和跨标签 Copilot 草稿/任务及断线恢复仍待做 |
+| OPS-01 / OPS-02 | 部分完成 | 新增本地 staging 模拟：候选 UI 与 `68de17e` 基线 UI 指向同一隔离 API/数据库；基线读取 2 个合成会话和非空详情，切回候选后草稿仍在。API 停止/刷新/重试/恢复通过；真实 staging、多实例 Worker、数据库降级和外部写入 unknown 对账仍待授权环境 |
+| UI-01 / UI-02 / UX-03 | 部分完成 | 非空 Safari 合成 A/B 会话、transcript/composer/Copilot AX tree、同源多标签草稿冲突策略、跨会话隔离、刷新和 API outage recovery 已实测；VoiceOver 已启用并读取 AX 结构，但自动化无法可靠区分 VO 修饰键与页面箭头，完整原生 VO 朗读/键盘走查仍待真人复核。逐规格 PNG 归档仍被浏览器安全策略阻止 |
 | TOOL-03 / R3 | 无真实业务连接器 | 由用户提供授权的 ERP/CRM sandbox、字段契约和归属证明 |
 
 ## R2：服务流程与运营能力
@@ -45,7 +45,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 评测绑定数据哈希、知识版本、检索配置和 commit；新知识导致核心切片退化时禁止推广，并能恢复上一版活动版本。
 - 只允许审核后的知识文档参与检索；任何未审核会话都不得自动生成或发布知识。
 - 验收：发布前后相同授权语料、tenant RLS、可回滚版本、指标审计，以及并发发布冲突。
-- 当前：评测记录/批准/post-test/event 已持久化并强制 RLS；新增候选暂存、ACL-aware overlay、固定集加载校验、candidate-aware 前后测 runner、Ed25519 签名持久化、验签后的双人批准与 snapshot 复核发布。专用 outbox worker 已实现 owner-only claim、tenant RLS payload、fencing token、stale recovery 与三次有界重试；API publish 可事务化排队后测。自动运行默认关闭，每次样本 ceiling 默认 0；真实获批数据、对象 key、公钥/worker 私钥、费用预算尚未配置，因此无生产评测分数或自动模型调用。staging 灰度/多实例演练未做；2pp 阈值仍需知识/安全负责人签字。见 `r2-03-knowledge-release-contract.md`。
+- 当前：评测记录/批准/post-test/event 已持久化并强制 RLS；候选暂存、ACL-aware overlay、固定集加载校验、candidate-aware runner、签名证据与双人批准仍保留。额外复验的语义合成数据/runner/release gates 33 passed，知识发布集成门禁 1 passed，证实未有平台来源的自报评测返回 `EVALUATOR_PROVENANCE_UNAVAILABLE`。测试数据、模型回答和密钥均为 synthetic/fake；不代表独立人工批准或真实模型成绩。自动运行/发布 flag 默认关闭，真实获批语料、key/预算以及真实 staging 多实例/rollback 仍阻塞。见 `r2-03-knowledge-release-contract.md`。
 
 ## R3：行业业务联通
 
@@ -54,7 +54,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 统一 adapter contract：tenant connector、credential_ref、目标记录归属验证、字段 allowlist、超时与 bounded retry、breaker、稳定 idempotency key、受控 confirmation 和读回 postcondition。
 - 对超时/断连返回 `unknown` 并提供对账流程；不得把“请求已发出”写成“业务成功”。外部 payload 只在 adapter 边界做 canonical projection。
 - 先实现 fake contract tests 与协议文档；真正 provider adapter 需有用户授权的 sandbox、版本化 REST schema、归属证明和重放预算。
-- 当前：已新增覆盖九种 authority domain 的 canonical read schemas（账户、订单、发票、工单、物流、商机、产品、库存、报价）、供应商中立的来源/时效/归属验证，以及携带 proof 的 `CanonicalBusinessReadResult` / `read_verified_fact()` adapter seam 和假 provider 边界测试。平台侧现在要求返回记录引用与请求完全一致；客户范围事实强制带服务端预期账户及匹配的资源/authority 版本/时效证明。真实 provider 生成的归属证明、企业批准的 authority binding、具体 ERP/CRM API、授权 sandbox、生产 adapter 和端到端验收仍未提供。
+- 当前：已新增覆盖九种 authority domain 的 canonical schemas、来源/时效/归属验证和 fake-provider boundary tests。额外使用 shipped Demo ERP 经 Tool Gateway 完成 synthetic `SO-9001` 查询及 connector outage 降级（2 passed）；输出明确标为 `source=demo`。该模拟验证平台路径，不替代真实 ERP/CRM authority、sandbox 或客户归属证明。
 
 ### R3-02 售前选型与商机交接
 

@@ -21,6 +21,16 @@ import {
   pendingReplyIdempotencyKey,
   type PendingReplySubmission,
 } from "../lib/workbenchConversation";
+import {
+  parseWorkbenchComposerDraft,
+  parseWorkbenchDraftSyncMessage,
+  remoteDraftDecision,
+  workbenchDraftChannelName,
+  workbenchDraftStorageKey,
+  type WorkbenchComposerDraft,
+  type WorkbenchDraftSyncMessage,
+  type WorkbenchDraftOrigin,
+} from "../lib/workbenchDraftSync";
 import { ApiError } from "../lib/types";
 import {
   nextWorkbenchQueueTab,
@@ -36,7 +46,8 @@ type Tab = WorkbenchQueueTab;
 /** Use the shared queue-tab contract for URL validation and rendering. */
 const ALL_TABS = WORKBENCH_QUEUE_TABS;
 type Action = "claim" | "release" | "transfer" | "close";
-type Origin = "free" | "canned" | "ai_suggestion";
+type Origin = WorkbenchDraftOrigin;
+type DraftUpdateOptions = { dirty?: boolean; broadcast?: boolean; updatedAtMs?: number };
 type CopilotKind = "summary" | "reply";
 type EmotionLevel = "calm" | "frustrated" | "angry" | "escalation_risk";
 type EmotionReason = "overstated" | "understated" | "quoted_or_negated" | "sarcasm_or_mixed_tone" | "context_missing" | "other";
@@ -255,6 +266,25 @@ function uniqueTurns(older: Turn[], latest: Turn[]): Turn[] {
   });
 }
 
+function workbenchDraftSnapshot(
+  actorRef: string,
+  conversationRef: string,
+  body: string,
+  metadata: { origin: Origin; cannedReplyId: string | null; copilotJobId: string | null },
+  updatedAtMs: number,
+): WorkbenchComposerDraft {
+  return {
+    schema_version: 1,
+    actor_ref: actorRef,
+    conversation_ref: conversationRef,
+    body,
+    origin: metadata.origin,
+    canned_reply_id: metadata.cannedReplyId,
+    copilot_job_id: metadata.copilotJobId,
+    updated_at_ms: updatedAtMs,
+  };
+}
+
 function copilotStorageKey(conversationRef: string): string {
   return `workbench.copilot-job.v1.${conversationRef}`;
 }
@@ -290,6 +320,7 @@ function copilotBlockReason(code: string | null): string {
 export function Workbench() {
   const { conversationRef, caseId } = useParams<{ conversationRef?: string; caseId?: string }>();
   const navigate = useNavigate();
+  const selectedRef = conversationRef ?? null;
   const { lang } = useLang();
   // Tab and search go in the URL. This page already put `caseId` and
   // `conversationRef` in the path, so half of it was linkable and half was
@@ -317,10 +348,33 @@ export function Workbench() {
   const [notice, setNotice] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const draftRevision = useRef(0);
-  const updateDraft = useCallback((next: string | ((current: string) => string)) => {
+  const draftTextRef = useRef("");
+  const draftUpdatedAtRef = useRef(0);
+  const draftDirtyRef = useRef(false);
+  const pendingDraftBroadcastRef = useRef(false);
+  const pendingDraftConversationRef = useRef<string | null>(null);
+  const draftChannelRef = useRef<BroadcastChannel | null>(null);
+  const [draftTabId] = useState(() => newIdempotencyKey());
+  const [draftHydratedKey, setDraftHydratedKey] = useState<string | null>(null);
+  const [otherTabDraft, setOtherTabDraft] = useState<WorkbenchComposerDraft | null>(null);
+  const [otherTabClearedDraft, setOtherTabClearedDraft] = useState(false);
+  const updateDraft = useCallback((
+    next: string | ((current: string) => string),
+    options: DraftUpdateOptions = {},
+  ) => {
+    const value = typeof next === "function" ? next(draftTextRef.current) : next;
+    draftTextRef.current = value;
     draftRevision.current += 1;
-    setDraft(next);
-  }, []);
+    draftUpdatedAtRef.current = options.updatedAtMs ?? Date.now();
+    draftDirtyRef.current = options.dirty ?? true;
+    pendingDraftBroadcastRef.current = options.broadcast ?? true;
+    pendingDraftConversationRef.current = options.broadcast === false || !selectedRef ? null : selectedRef;
+    if (options.dirty !== false) {
+      setOtherTabDraft(null);
+      setOtherTabClearedDraft(false);
+    }
+    setDraft(value);
+  }, [selectedRef]);
   const [origin, setOrigin] = useState<Origin>("free");
   const [cannedId, setCannedId] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState<WorkbenchRightTab>("reply");
@@ -348,6 +402,10 @@ export function Workbench() {
   const [emotionReviewPending, setEmotionReviewPending] = useState(false);
   const [related, setRelated] = useState<RelatedCase[]>([]);
   const [now, setNow] = useState(Math.floor(Date.now() / 1000));
+  const draftMetadataRef = useRef({ origin, cannedReplyId: cannedId, copilotJobId: draftCopilotJobId });
+  useLayoutEffect(() => {
+    draftMetadataRef.current = { origin, cannedReplyId: cannedId, copilotJobId: draftCopilotJobId };
+  }, [origin, cannedId, draftCopilotJobId]);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const pendingSend = useRef(new Map<string, PendingReplySubmission>());
@@ -357,7 +415,6 @@ export function Workbench() {
   const copilotIdempotency = useRef<{ conversationRef: string; kind: CopilotKind; key: string } | null>(null);
   const emotionReviewIdempotency = useRef<{ signature: string; key: string } | null>(null);
   const emotionAdviceId = useRef<string | null>(null);
-  const selectedRef = conversationRef ?? null;
   const activeConversationRef = useRef<string | null>(selectedRef);
   useLayoutEffect(() => {
     activeConversationRef.current = selectedRef;
@@ -375,6 +432,7 @@ export function Workbench() {
   useEffect(() => {
     const onResize = () => {
       if (window.innerWidth <= 760) setRightOpen(false);
+      else if (window.innerWidth > 1320) setRightOpen(true);
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -479,13 +537,16 @@ export function Workbench() {
     setCopilotKind("reply");
     setDraftCopilotJobId(null);
     copilotIdempotency.current = null;
+    setDraftHydratedKey(null);
+    setOtherTabDraft(null);
+    setOtherTabClearedDraft(false);
     if (!selectedRef) {
       setDetail(null);
       return;
     }
     setOlderTurns([]);
     setOlderBefore(null);
-    updateDraft("");
+    updateDraft("", { dirty: false, broadcast: false });
     setOrigin("free");
     setCannedId(null);
     try {
@@ -617,7 +678,197 @@ export function Workbench() {
   }, [selectedRef, detail?.turns.length]);
 
   const myRef = queue?.actor_ref ?? null;
-  const canReply = Boolean(detailIsCurrent && detail && myRef && detail.lease.owner === "human" && detail.lease.owner_ref === myRef);
+  const ownsConversation = Boolean(detailIsCurrent && detail && myRef && detail.lease.owner === "human" && detail.lease.owner_ref === myRef);
+  const composerDraftStorageKey = selectedRef && myRef ? workbenchDraftStorageKey(myRef, selectedRef) : null;
+  const draftHydrated = Boolean(composerDraftStorageKey && draftHydratedKey === composerDraftStorageKey);
+  const canShowDraft = Boolean(ownsConversation && draftHydrated);
+  const canReply = Boolean(ownsConversation && draftHydrated);
+
+  useEffect(() => {
+    if (!selectedRef || !myRef || !detailIsCurrent || !detail) return;
+    const storageKey = workbenchDraftStorageKey(myRef, selectedRef);
+    if (!ownsConversation) {
+      if (draftHydratedKey === storageKey) {
+        updateDraft("", { dirty: false, broadcast: false });
+        setOrigin("free");
+        setCannedId(null);
+        setDraftCopilotJobId(null);
+        setOtherTabDraft(null);
+        setOtherTabClearedDraft(false);
+        setDraftHydratedKey(null);
+      }
+      return;
+    }
+    if (draftHydratedKey === storageKey) return;
+
+    let raw: string | null = null;
+    let saved: WorkbenchComposerDraft | null = null;
+    try {
+      raw = window.sessionStorage.getItem(storageKey);
+      saved = parseWorkbenchComposerDraft(raw, myRef, selectedRef);
+      if (raw && !saved) window.sessionStorage.removeItem(storageKey);
+    } catch {
+      // Draft recovery is best-effort when browser storage is disabled.
+    }
+    if (saved) {
+      updateDraft(saved.body, {
+        dirty: saved.body.length > 0,
+        broadcast: false,
+        updatedAtMs: saved.updated_at_ms,
+      });
+      setOrigin(saved.origin);
+      setCannedId(saved.canned_reply_id);
+      setDraftCopilotJobId(saved.copilot_job_id);
+    } else {
+      updateDraft("", { dirty: false, broadcast: false });
+      setOrigin("free");
+      setCannedId(null);
+      setDraftCopilotJobId(null);
+    }
+    setOtherTabDraft(null);
+    setOtherTabClearedDraft(false);
+    setDraftHydratedKey(storageKey);
+  }, [selectedRef, myRef, detailIsCurrent, detail?.conversation_ref, ownsConversation, draftHydratedKey, updateDraft]);
+
+  useEffect(() => {
+    if (!composerDraftStorageKey || !myRef || !selectedRef || !detailIsCurrent || !ownsConversation || !draftHydrated) return;
+    try {
+      if (draft.length > 0) {
+        const snapshot = workbenchDraftSnapshot(
+          myRef,
+          selectedRef,
+          draft,
+          draftMetadataRef.current,
+          draftUpdatedAtRef.current || Date.now(),
+        );
+        window.sessionStorage.setItem(composerDraftStorageKey, JSON.stringify(snapshot));
+      } else {
+        window.sessionStorage.removeItem(composerDraftStorageKey);
+      }
+    } catch {
+      // Session recovery is optional; unsent input stays in React state.
+    }
+
+    if (!pendingDraftBroadcastRef.current || pendingDraftConversationRef.current !== selectedRef) return;
+    pendingDraftBroadcastRef.current = false;
+    pendingDraftConversationRef.current = null;
+    const channel = draftChannelRef.current;
+    if (!channel) return;
+    const updatedAtMs = draftUpdatedAtRef.current || Date.now();
+    const message: WorkbenchDraftSyncMessage = draft.length > 0
+      ? {
+          schema_version: 1,
+          kind: "draft",
+          sender_tab_id: draftTabId,
+          actor_ref: myRef,
+          conversation_ref: selectedRef,
+          updated_at_ms: updatedAtMs,
+          draft: workbenchDraftSnapshot(myRef, selectedRef, draft, draftMetadataRef.current, updatedAtMs),
+        }
+      : {
+          schema_version: 1,
+          kind: "clear",
+          sender_tab_id: draftTabId,
+          actor_ref: myRef,
+          conversation_ref: selectedRef,
+          updated_at_ms: updatedAtMs,
+        };
+    try {
+      channel.postMessage(message);
+    } catch {
+      // A closed channel cannot affect the local composer.
+    }
+  }, [draft, origin, cannedId, draftCopilotJobId, draftTabId, composerDraftStorageKey, myRef, selectedRef, detailIsCurrent, ownsConversation, draftHydrated]);
+
+  useEffect(() => {
+    if (!composerDraftStorageKey || !myRef || !selectedRef || !detailIsCurrent || !ownsConversation || !draftHydrated || typeof BroadcastChannel === "undefined") return;
+    let channel: BroadcastChannel;
+    try {
+      channel = new BroadcastChannel(workbenchDraftChannelName(myRef, selectedRef));
+    } catch {
+      return;
+    }
+    draftChannelRef.current = channel;
+
+    const postCurrentDraft = () => {
+      if (!draftTextRef.current && !draftDirtyRef.current) return;
+      const updatedAtMs = draftUpdatedAtRef.current || Date.now();
+      const message: WorkbenchDraftSyncMessage = draftTextRef.current.length > 0
+        ? {
+            schema_version: 1,
+            kind: "draft",
+            sender_tab_id: draftTabId,
+            actor_ref: myRef,
+            conversation_ref: selectedRef,
+            updated_at_ms: updatedAtMs,
+            draft: workbenchDraftSnapshot(myRef, selectedRef, draftTextRef.current, draftMetadataRef.current, updatedAtMs),
+          }
+        : {
+            schema_version: 1,
+            kind: "clear",
+            sender_tab_id: draftTabId,
+            actor_ref: myRef,
+            conversation_ref: selectedRef,
+            updated_at_ms: updatedAtMs,
+          };
+      try {
+        channel.postMessage(message);
+      } catch {
+        // A closed channel cannot affect the local composer.
+      }
+    };
+
+    channel.onmessage = (event: MessageEvent<unknown>) => {
+      const message = parseWorkbenchDraftSyncMessage(event.data, myRef, selectedRef);
+      if (!message || message.sender_tab_id === draftTabId) return;
+      if (message.kind === "request") {
+        postCurrentDraft();
+        return;
+      }
+      const incomingBody = message.kind === "draft" ? message.draft?.body ?? "" : "";
+      const decision = remoteDraftDecision(draftTextRef.current, draftDirtyRef.current, incomingBody);
+      if (decision === "ignore") return;
+      if (decision === "conflict") {
+        setOtherTabDraft(message.kind === "draft" ? message.draft ?? null : null);
+        setOtherTabClearedDraft(message.kind === "clear");
+        return;
+      }
+      updateDraft(incomingBody, {
+        dirty: false,
+        broadcast: false,
+        updatedAtMs: message.updated_at_ms,
+      });
+      if (message.kind === "draft" && message.draft) {
+        setOrigin(message.draft.origin);
+        setCannedId(message.draft.canned_reply_id);
+        setDraftCopilotJobId(message.draft.copilot_job_id);
+      } else {
+        setOrigin("free");
+        setCannedId(null);
+        setDraftCopilotJobId(null);
+      }
+      setOtherTabDraft(null);
+      setOtherTabClearedDraft(false);
+    };
+
+    try {
+      channel.postMessage({
+        schema_version: 1,
+        kind: "request",
+        sender_tab_id: draftTabId,
+        actor_ref: myRef,
+        conversation_ref: selectedRef,
+        updated_at_ms: Date.now(),
+      } satisfies WorkbenchDraftSyncMessage);
+      postCurrentDraft();
+    } catch {
+      // Another open tab may not have a usable BroadcastChannel context.
+    }
+    return () => {
+      channel.close();
+      if (draftChannelRef.current === channel) draftChannelRef.current = null;
+    };
+  }, [composerDraftStorageKey, myRef, selectedRef, detailIsCurrent, ownsConversation, draftHydrated, draftTabId, updateDraft]);
   const copilotSourceTurnIds = turns
     .filter((turn) => turn.role === "customer")
     .slice(-20)
@@ -752,6 +1003,29 @@ export function Workbench() {
       search: window.location.search,
     });
   }
+  function adoptOtherTabDraft() {
+    if (!canReply) return;
+    const incoming = otherTabDraft;
+    if (incoming) {
+      updateDraft(incoming.body, { dirty: true, broadcast: true, updatedAtMs: Date.now() });
+      setOrigin(incoming.origin);
+      setCannedId(incoming.canned_reply_id);
+      setDraftCopilotJobId(incoming.copilot_job_id);
+      setNotice("已采用另一标签页的回复草稿。");
+    } else if (otherTabClearedDraft) {
+      updateDraft("", { dirty: false, broadcast: true, updatedAtMs: Date.now() });
+      setOrigin("free");
+      setCannedId(null);
+      setDraftCopilotJobId(null);
+      setNotice("已同步另一标签页的草稿清空状态。");
+    }
+    setOtherTabDraft(null);
+    setOtherTabClearedDraft(false);
+  }
+  function keepThisTabDraft() {
+    setOtherTabDraft(null);
+    setOtherTabClearedDraft(false);
+  }
   function selectTab(next: Tab) {
     setTab(next);
     setOffset(0);
@@ -874,7 +1148,7 @@ export function Workbench() {
       forgetPendingReply(pendingSend.current, conversation, key);
       if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
       if (canClearSubmittedDraft(submittedDraftRevision, draftRevision.current)) {
-        updateDraft("");
+        updateDraft("", { dirty: false, broadcast: true });
         setOrigin("free");
         setCannedId(null);
         if (draftCopilotJobId) {
@@ -883,6 +1157,8 @@ export function Workbench() {
             : previous);
         }
         setDraftCopilotJobId(null);
+        setOtherTabDraft(null);
+        setOtherTabClearedDraft(false);
         setNotice("回复已记录并提交投递。");
       } else {
         setNotice("回复已记录；当前编辑中的新草稿已保留。");
@@ -1003,7 +1279,7 @@ export function Workbench() {
                 className={tab === key ? "active" : ""}
                 onClick={() => selectTab(key)}
                 onKeyDown={(event) => {
-                  const next = nextWorkbenchQueueTab(key, event.key);
+                  const next = nextWorkbenchQueueTab(key, event.key, event);
                   if (!next) return;
                   event.preventDefault();
                   selectTab(next);
@@ -1103,12 +1379,18 @@ export function Workbench() {
               })}
             </div>
             <div className="wb-compose-area">
+              {canReply && (otherTabDraft || otherTabClearedDraft) ? <div className="wb-draft-sync" role="status" aria-live="polite">
+                <span>{otherTabDraft ? "另一标签页更新了本会话草稿。" : "另一标签页已清空本会话草稿。"} 当前编辑内容已保留。</span>
+                <button type="button" onClick={adoptOtherTabDraft}>同步另一标签页</button>
+                <button type="button" onClick={keepThisTabDraft}>保留本页</button>
+              </div> : null}
               {detail.lease.owner === "closed" ? <div className="wb-ownership-note">会话已结束。已发生人工回复的服务可由客户评价。</div>
                 : detail.lease.owner === "queue" ? <div className="wb-ownership-note">客户正在等待人工接入。点击“接入会话”后即可发送回复。</div>
+                : ownsConversation && !draftHydrated ? <div className="wb-ownership-note" role="status" aria-live="polite">正在恢复本会话未发送的草稿…</div>
                 : !canReply ? <div className="wb-ownership-note">当前由其他坐席接待，回复区为只读。</div> : null}
               <div className="wb-composer">
                 <label className="sr-only" htmlFor="wb-reply-input">回复客户</label>
-                <textarea id="wb-reply-input" value={draft} onChange={(event) => { updateDraft(event.target.value); if (origin === "canned") { setOrigin("free"); setCannedId(null); } }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendReply(); } }} placeholder="输入回复…  Shift + Enter 换行" maxLength={4000} disabled={!canReply || busy} />
+                <textarea id="wb-reply-input" value={canShowDraft ? draft : ""} onChange={(event) => { updateDraft(event.target.value); if (origin === "canned") { setOrigin("free"); setCannedId(null); } }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendReply(); } }} placeholder="输入回复…  Shift + Enter 换行" maxLength={4000} disabled={!canReply || busy} />
                 <div className="wb-composer-bar">
                   <div className="wb-composer-tools">
                     <input ref={fileRef} type="file" hidden accept=".pdf,.png,.jpg,.jpeg,.txt,.docx" onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadAttachment(file); }} />
@@ -1127,7 +1409,7 @@ export function Workbench() {
         </section>
 
         {detail && detailIsCurrent && rightOpen ? <aside className="wb-right" aria-label="AI 副驾与客户上下文">
-          <div className="wb-right-header"><Sparkles size={20} /><strong>AI 副驾</strong><button type="button" className="wb-right-close" aria-label="收起 AI 副驾" onClick={() => setRightOpen(false)}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label="副驾内容">{WORKBENCH_RIGHT_TABS.map((key) => <button type="button" role="tab" id={`wb-right-tab-${key}`} aria-controls="wb-right-panel" aria-selected={rightTab === key} tabIndex={rightTab === key ? 0 : -1} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)} onKeyDown={(event) => { const next = nextWorkbenchRightTab(key, event.key); if (!next) return; event.preventDefault(); setRightTab(next); document.getElementById(`wb-right-tab-${next}`)?.focus(); }}>{RIGHT_TAB_LABEL[key]}</button>)}</div></div>
+          <div className="wb-right-header"><Sparkles size={20} /><strong>AI 副驾</strong><button type="button" className="wb-right-close" aria-label="收起 AI 副驾" onClick={() => setRightOpen(false)}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label="副驾内容">{WORKBENCH_RIGHT_TABS.map((key) => <button type="button" role="tab" id={`wb-right-tab-${key}`} aria-controls="wb-right-panel" aria-selected={rightTab === key} tabIndex={rightTab === key ? 0 : -1} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)} onKeyDown={(event) => { const next = nextWorkbenchRightTab(key, event.key, event); if (!next) return; event.preventDefault(); setRightTab(next); document.getElementById(`wb-right-tab-${next}`)?.focus(); }}>{RIGHT_TAB_LABEL[key]}</button>)}</div></div>
           <div className="wb-right-scroll" id="wb-right-panel" role="tabpanel" aria-labelledby={`wb-right-tab-${rightTab}`} tabIndex={0}>
             {rightTab === "reply" ? <>
               {detail.emotion_advice ? <section className={`wb-panel wb-emotion-panel is-${detail.emotion_advice.attention}`} aria-labelledby="wb-emotion-heading">
@@ -1171,7 +1453,7 @@ export function Workbench() {
                   {(["reply", "summary"] as const).map((kind) => <button key={kind} type="button" aria-pressed={copilotKind === kind} disabled={copilotIsActive} className={copilotKind === kind ? "active" : ""} onClick={() => { setCopilotKind(kind); setCopilotError(null); }}>{kind === "reply" ? "建议回复" : "会话摘要"}</button>)}
                 </div>
                 <div className={`wb-copilot-ownership${canReply ? " is-owned" : ""}`}>
-                  {canReply ? "当前由你接待，可生成并插入到自己的草稿。" : detail.lease.owner === "queue" ? "先接入会话，再生成副驾草稿。" : "只有当前接待坐席可以生成或插入草稿。"}
+                  {ownsConversation && !draftHydrated ? "正在恢复本会话草稿…" : canReply ? "当前由你接待，可生成并插入到自己的草稿。" : detail.lease.owner === "queue" ? "先接入会话，再生成副驾草稿。" : "只有当前接待坐席可以生成或插入草稿。"}
                 </div>
                 {!copilotSourceTurnIds.length ? <p className="wb-copilot-hint">需要至少一条客户消息作为依据。</p> : null}
                 <button className="wb-copilot-generate" type="button" disabled={!canReply || copilotPending || copilotIsActive || !copilotSourceTurnIds.length} onClick={() => void requestCopilot(copilotKind)}>
