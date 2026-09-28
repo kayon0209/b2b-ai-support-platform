@@ -171,7 +171,7 @@ export function StandardFlowCatalog({
   return (
     <section className="wb-panel wb-flow-catalog" aria-labelledby="wb-flow-catalog-title">
       <h3 id="wb-flow-catalog-title"><ClipboardList size={18} />标准服务流程</h3>
-      <p className="wb-muted">发起后绑定当前会话最新客户消息。实例目前仅支持坐席收集字段、取消或转人工；流程专用查询和写入执行器尚未接入。</p>
+      <p className="wb-muted">发起后绑定当前会话最新客户消息。local/test Demo 配置读取能力后可查合成订单；质量、技术和发票流程只会准备需确认的平台内部 Case，不调用真实业务系统。</p>
       <p className="sr-only" role="status" aria-live="polite">{announcement}</p>
       {error ? <div className="wb-flow-error" role="alert"><AlertCircle size={15} />{error}</div> : null}
       {!catalog && !error ? <p className="wb-muted" role="status">正在读取租户能力配置…</p> : null}

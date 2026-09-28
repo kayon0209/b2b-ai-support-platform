@@ -282,6 +282,71 @@ def _seed_invoice_context() -> tuple[str, str]:
     return account_id, tool_id
 
 
+def test_demo_presales_endpoint_returns_only_source_backed_non_quote_evidence() -> None:
+    account_id, _tool_id = _seed_invoice_context()
+    tasks = _client().get(f"/v1/workbench/conversations/{CONVERSATION}/tasks")
+    assert tasks.status_code == 200, tasks.text
+    assert tasks.json()["demo_presales_enabled"] is True
+
+    response = _client().get(
+        f"/v1/workbench/conversations/{CONVERSATION}/demo-presales/PCB-DEMO-100"
+    )
+    assert response.status_code == 200, response.text
+    evidence = response.json()["evidence"]
+    assert response.json()["demo_only"] is True
+    assert evidence["product_ref"] == "PCB-DEMO-100"
+    assert evidence["available_quantity"] == "120"
+    assert evidence["indicative_unit_price_minor"] == 1250
+    assert evidence["synthetic"] is True
+    assert evidence["customer_quote_allowed"] is False
+    assert evidence["handoff_required"] is True
+    assert evidence["product_source_version"] == "demo-fixture-v1"
+    assert evidence["inventory_source_version"] == "demo-fixture-v1"
+    assert evidence["quote_source_version"] == "demo-fixture-v1"
+
+    unknown = _client().get(
+        f"/v1/workbench/conversations/{CONVERSATION}/demo-presales/PCB-NOT-IN-DEMO"
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "DEMO_PRESALES_RECORD_UNAVAILABLE"
+
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE enterprise_accounts SET attributes = CAST(:attributes AS jsonb) "
+                "WHERE tenant_id = :t AND id = :account"
+            ),
+            {
+                "t": TENANT,
+                "account": account_id,
+                "attributes": json.dumps({"business_system_refs": {"business_api": "other-co"}}),
+            },
+        )
+    admin.dispose()
+
+    foreign = _client().get(
+        f"/v1/workbench/conversations/{CONVERSATION}/demo-presales/PCB-DEMO-100"
+    )
+    assert foreign.status_code == 409
+    assert foreign.json()["error"]["code"] == "DEMO_PRESALES_ACCOUNT_UNVERIFIED"
+
+
+def test_demo_presales_endpoint_requires_business_read_permission() -> None:
+    _seed_invoice_context()
+    viewer = _client(role="support_viewer")
+    tasks = viewer.get(f"/v1/workbench/conversations/{CONVERSATION}/tasks")
+    assert tasks.status_code == 200, tasks.text
+    assert tasks.json()["demo_presales_enabled"] is False
+
+    response = viewer.get(
+        f"/v1/workbench/conversations/{CONVERSATION}/demo-presales/PCB-DEMO-100",
+        headers=_headers("demo-presales-viewer-denied"),
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "POLICY_DENIED"
+
+
 def _seed_flow_teams() -> None:
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:

@@ -33,6 +33,7 @@ import json
 import time
 import uuid
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
@@ -255,6 +256,9 @@ async def list_conversation_tasks(
     return ok_response(
         {
             "conversation_ref": str(conversation_ref),
+            "demo_presales_enabled": (
+                _demo_business_flows_enabled() and require_policy(ctx, Action.TOOL_READ) is None
+            ),
             "items": [
                 _task_out(
                     row,
@@ -268,6 +272,128 @@ async def list_conversation_tasks(
             "limit": limit,
             "offset": offset,
         }
+    )
+
+
+@router.get("/conversations/{conversation_ref}/demo-presales/{product_ref}")
+async def demo_presales_evidence(
+    request: Request,
+    conversation_ref: uuid.UUID,
+    product_ref: str,
+) -> Any:
+    """Read local/test synthetic product, stock and quote evidence for a human.
+
+    The endpoint never writes a CRM opportunity, emits no customer-facing
+    quote, and derives the account only from the conversation's linked Case.
+    """
+    ctx, denied = _auth(request, Action.CASE_READ)
+    if denied is not None:
+        return denied
+    assert ctx is not None
+    tool_denied = require_policy(ctx, Action.TOOL_READ)
+    if tool_denied is not None:
+        return tool_denied
+    if not _demo_business_flows_enabled():
+        return error_response(
+            "DEMO_PRESALES_UNAVAILABLE",
+            "synthetic pre-sales evidence is enabled only in local/test Demo mode",
+            status_code=404,
+        )
+    product_ref = product_ref.strip()
+    if not product_ref or len(product_ref) > 255:
+        return error_response(VALIDATION_FAILED, "invalid product reference", status_code=400)
+
+    trace_id = new_trace_id()
+    from platform_core.integrations.canonical_business import BusinessAdapterError
+
+    try:
+        async with tenant_session(ctx) as session:
+            account_id = await verified_account_for_conversation(
+                session,
+                tenant_id=ctx.tenant_id,
+                conversation_ref_id=conversation_ref,
+            )
+            if account_id is None:
+                return error_response(
+                    "DEMO_PRESALES_ACCOUNT_UNVERIFIED",
+                    "link this conversation to one tenant account before viewing demo evidence",
+                    status_code=409,
+                    trace_id=trace_id,
+                )
+            from platform_core.identity.profile import business_system_ref_for_account
+            from platform_core.integrations.demo_canonical_business import (
+                DemoCanonicalBusinessAdapter,
+                synthetic_demo_authority_bindings,
+            )
+            from platform_core.integrations.demo_presales import build_demo_presales_evidence
+
+            account_ref = await business_system_ref_for_account(
+                session,
+                tenant_id=ctx.tenant_id,
+                account_id=account_id,
+                system_key="business_api",
+            )
+            if account_ref is None:
+                return error_response(
+                    "DEMO_PRESALES_ACCOUNT_UNVERIFIED",
+                    "the linked account has no Demo business-system reference",
+                    status_code=409,
+                    trace_id=trace_id,
+                )
+            now = datetime.now(UTC)
+            try:
+                adapter = DemoCanonicalBusinessAdapter()
+                evidence = await build_demo_presales_evidence(
+                    adapter,
+                    bindings=synthetic_demo_authority_bindings(ctx.tenant_id, now=now),
+                    product_ref=product_ref,
+                    expected_account_ref=account_ref,
+                    as_of=now,
+                )
+            except BusinessAdapterError as exc:
+                if exc.code == "DEMO_PRESALES_RECORD_UNAVAILABLE":
+                    code = "DEMO_PRESALES_RECORD_UNAVAILABLE"
+                    status_code = 404
+                elif exc.code.startswith("BUSINESS_OWNERSHIP_"):
+                    code = "DEMO_PRESALES_ACCOUNT_UNVERIFIED"
+                    status_code = 409
+                else:
+                    code = "DEMO_PRESALES_SOURCE_UNVERIFIED"
+                    status_code = 409
+                return error_response(
+                    code,
+                    "the Demo source did not verify fresh, matching product, inventory "
+                    "and quote facts",
+                    status_code=status_code,
+                    trace_id=trace_id,
+                )
+            await audit_service.record(
+                session,
+                ctx=ctx,
+                action="demo_presales.evidence_viewed",
+                resource_type="conversation",
+                resource_id=conversation_ref,
+                metadata={
+                    "source": "demo",
+                    "source_version": "demo-fixture-v1",
+                    "synthetic_records_verified": 3,
+                },
+                trace_id=trace_id,
+            )
+    except BusinessAdapterError:
+        return error_response(
+            "DEMO_PRESALES_UNAVAILABLE",
+            "the synthetic authority refused this evidence request",
+            status_code=503,
+            retryable=True,
+            trace_id=trace_id,
+        )
+    return ok_response(
+        {
+            "evidence": evidence.model_dump(mode="json"),
+            "demo_only": True,
+        },
+        trace_id=trace_id,
     )
 
 

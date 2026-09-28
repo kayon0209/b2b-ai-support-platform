@@ -14,9 +14,9 @@ import asyncio
 import json
 import os
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID, uuid5
+from uuid import UUID
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 for _relative in (
@@ -36,31 +36,19 @@ os.environ.setdefault("APP_ALLOW_BOOTSTRAP_TOKENS", "true")
 from platform_contracts.business_systems import (  # noqa: E402
     AuthorityBinding,
     AuthorityDomain,
-    BusinessSystemKind,
 )
 from platform_core.integrations.canonical_business import read_verified_fact  # noqa: E402
 from platform_core.integrations.demo_canonical_business import (  # noqa: E402
     DEMO_ACCOUNT_REF,
     DemoCanonicalBusinessAdapter,
     demo_record_ref,
+    synthetic_demo_authority_bindings,
 )
 from platform_core.integrations.demo_presales import (  # noqa: E402
     build_demo_presales_evidence,
 )
 
 DEMO_TENANT = UUID("0190d300-0000-7000-8000-000000000101")
-DEMO_ACTOR = uuid5(DEMO_TENANT, "demo-only-binding-fixture")
-DOMAIN_SYSTEM = {
-    AuthorityDomain.CUSTOMER_ACCOUNT: BusinessSystemKind.CRM,
-    AuthorityDomain.ORDER: BusinessSystemKind.ERP,
-    AuthorityDomain.INVOICE: BusinessSystemKind.ERP,
-    AuthorityDomain.WORK_ORDER: BusinessSystemKind.MES,
-    AuthorityDomain.SHIPMENT: BusinessSystemKind.WMS,
-    AuthorityDomain.OPPORTUNITY: BusinessSystemKind.CRM,
-    AuthorityDomain.PRODUCT_SPECIFICATION: BusinessSystemKind.PLM,
-    AuthorityDomain.INVENTORY: BusinessSystemKind.WMS,
-    AuthorityDomain.QUOTE: BusinessSystemKind.CRM,
-}
 ACCOUNT_SCOPED = frozenset(
     {
         AuthorityDomain.ORDER,
@@ -76,20 +64,7 @@ ACCOUNT_SCOPED = frozenset(
 
 def _bindings() -> dict[AuthorityDomain, AuthorityBinding]:
     now = datetime.now(UTC)
-    return {
-        domain: AuthorityBinding(
-            tenant_id=DEMO_TENANT,
-            binding_id=uuid5(DEMO_TENANT, f"binding:{domain.value}"),
-            domain=domain,
-            system_kind=system,
-            connector_id=uuid5(DEMO_TENANT, f"connector:{domain.value}"),
-            binding_version=1,
-            max_age_seconds=3600,
-            approved_by=DEMO_ACTOR,
-            approved_at=now - timedelta(seconds=1),
-        )
-        for domain, system in DOMAIN_SYSTEM.items()
-    }
+    return synthetic_demo_authority_bindings(DEMO_TENANT, now=now)
 
 
 async def _run() -> None:

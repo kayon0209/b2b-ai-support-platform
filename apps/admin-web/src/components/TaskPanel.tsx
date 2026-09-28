@@ -93,6 +93,29 @@ interface TasksResponse {
   items: ConversationTask[];
   limit: number;
   offset: number;
+  demo_presales_enabled: boolean;
+}
+
+interface DemoPreSalesEvidence {
+  product_ref: string;
+  product_name: string;
+  revision: string;
+  product_kind: string;
+  specifications: Record<string, string | number | boolean>;
+  available_quantity: string;
+  unit_code: string;
+  warehouse_ref: string;
+  indicative_unit_price_minor: number;
+  currency: string;
+  minimum_quantity: string;
+  lead_time_business_days: number | null;
+  quote_valid_until: string;
+  product_source_version: string;
+  inventory_source_version: string;
+  quote_source_version: string;
+  synthetic: true;
+  customer_quote_allowed: false;
+  handoff_required: true;
 }
 
 export type TaskCommand =
@@ -200,6 +223,7 @@ export function TaskPanel({
   onChanged,
 }: TaskPanelProps) {
   const [tasks, setTasks] = useState<ConversationTask[] | null>(null);
+  const [demoPresalesEnabled, setDemoPresalesEnabled] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
   // Keyed `${task_id}:${field}` rather than by field name. Two tasks on one
@@ -226,9 +250,11 @@ export function TaskPanel({
       );
       if (!mayApply(seqRef.current, startedAt, forConversation, conversationRef)) return;
       setTasks(data.items);
+      setDemoPresalesEnabled(data.demo_presales_enabled === true);
     } catch (reason) {
       if (!mayApply(seqRef.current, startedAt, forConversation, conversationRef)) return;
       setTasks([]);
+      setDemoPresalesEnabled(false);
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   }, [conversationRef]);
@@ -341,6 +367,11 @@ export function TaskPanel({
   if (tasks.length === 0) {
     return (
       <div className="wb-tasks" role="group" aria-label="会话任务">
+        <DemoPreSalesPanel
+          key={conversationRef}
+          conversationRef={conversationRef}
+          enabled={demoPresalesEnabled}
+        />
         <p className="wb-tasks-empty">
           暂无待处理任务。新消息的需求识别在后台运行，稍后会自动刷新。
         </p>
@@ -368,6 +399,12 @@ export function TaskPanel({
       <p className="sr-only" role="status" aria-live="polite">
         {announcement}
       </p>
+
+      <DemoPreSalesPanel
+        key={conversationRef}
+        conversationRef={conversationRef}
+        enabled={demoPresalesEnabled}
+      />
 
       {!isOwner ? (
         <p className="wb-tasks-notice">
@@ -419,6 +456,133 @@ export function TaskPanel({
         </section>
       ) : null}
     </div>
+  );
+}
+
+interface DemoPreSalesPanelProps {
+  conversationRef: string;
+  enabled: boolean;
+}
+
+function DemoPreSalesPanel({ conversationRef, enabled }: DemoPreSalesPanelProps) {
+  const [productRef, setProductRef] = useState("PCB-DEMO-100");
+  const [evidence, setEvidence] = useState<DemoPreSalesEvidence | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [announcement, setAnnouncement] = useState("");
+
+  if (!enabled) return null;
+
+  const loadEvidence = async () => {
+    const candidate = productRef.trim();
+    if (!candidate || candidate.length > 255) {
+      setError("请输入不超过 255 个字符的产品编号。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setAnnouncement("");
+    try {
+      const response = await apiGet<{
+        evidence: DemoPreSalesEvidence;
+        demo_only: true;
+      }>(
+        `/v1/workbench/conversations/${conversationRef}/demo-presales/${encodeURIComponent(candidate)}`,
+      );
+      setEvidence(response.evidence);
+      setAnnouncement("已核验产品规格、账户库存和报价样例三份合成来源，必须由销售人工复核。");
+    } catch (reason) {
+      setEvidence(null);
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setError(message);
+      setAnnouncement("");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section
+      className="wb-task-slots"
+      aria-labelledby={`demo-presales-heading-${conversationRef}`}
+      aria-busy={busy}
+    >
+      <h3 id={`demo-presales-heading-${conversationRef}`}>合成售前资料（仅供销售复核）</h3>
+      <p id={`demo-presales-help-${conversationRef}`}>
+        local/test Demo 样例；不是客户报价，不会创建 CRM 商机或发送消息。
+      </p>
+      <p className="sr-only" role="status" aria-live="polite">
+        {announcement}
+      </p>
+      <label htmlFor={`demo-presales-product-${conversationRef}`}>产品编号</label>
+      <input
+        id={`demo-presales-product-${conversationRef}`}
+        aria-describedby={`demo-presales-help-${conversationRef}`}
+        value={productRef}
+        maxLength={255}
+        disabled={busy}
+        onChange={(event) => {
+          setProductRef(event.target.value);
+          setEvidence(null);
+          setError(null);
+          setAnnouncement("");
+        }}
+      />
+      <button
+        type="button"
+        className="wb-btn wb-btn-ghost"
+        disabled={busy || productRef.trim().length === 0}
+        onClick={() => void loadEvidence()}
+      >
+        {busy ? "核验 Demo 来源…" : "查看合成预售依据"}
+      </button>
+      {error ? <p role="alert" className="wb-tasks-error">{error}</p> : null}
+      {evidence ? (
+        <section aria-label="经来源校验的合成证据">
+          <p>
+            {evidence.product_name} / {evidence.product_ref} / Revision {evidence.revision}
+          </p>
+          <dl>
+            <div>
+              <dt>规格</dt>
+              <dd>
+                {Object.entries(evidence.specifications)
+                  .map(([key, value]) => `${key}: ${String(value)}`)
+                  .join(" · ")}
+              </dd>
+            </div>
+            <div>
+              <dt>演示库存</dt>
+              <dd>
+                {evidence.available_quantity} {evidence.unit_code} · {evidence.warehouse_ref}
+              </dd>
+            </div>
+            <div>
+              <dt>合成参考报价</dt>
+              <dd>
+                {(evidence.indicative_unit_price_minor / 100).toFixed(2)} {evidence.currency} / 件；
+                起订量 {evidence.minimum_quantity}；示例交期 {evidence.lead_time_business_days ?? "—"} 个工作日
+              </dd>
+            </div>
+            <div>
+              <dt>报价样例有效期</dt>
+              <dd>{evidence.quote_valid_until}</dd>
+            </div>
+            <div>
+              <dt>来源版本</dt>
+              <dd>
+                产品 {evidence.product_source_version} · 库存 {evidence.inventory_source_version} ·
+                报价 {evidence.quote_source_version}
+              </dd>
+            </div>
+          </dl>
+          <p role="note">
+            必须转销售人工确认；不能直接作为客户报价（
+            customer_quote_allowed: {String(evidence.customer_quote_allowed)}）。
+          </p>
+        </section>
+      ) : null}
+    </section>
   );
 }
 

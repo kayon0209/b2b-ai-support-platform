@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from uuid import UUID, uuid5
 
 from platform_contracts.business_systems import (
     AuthorityBinding,
@@ -35,7 +36,7 @@ from platform_core.integrations.canonical_business import (
     CanonicalBusinessFact,
 )
 
-DEMO_ACCOUNT_REF = "ACME-DEMO"
+DEMO_ACCOUNT_REF = "acme"
 DEMO_CANONICAL_SOURCE_VERSION = "demo-fixture-v1"
 
 _DOMAIN_SYSTEMS: dict[AuthorityDomain, frozenset[BusinessSystemKind]] = {
@@ -52,6 +53,17 @@ _DOMAIN_SYSTEMS: dict[AuthorityDomain, frozenset[BusinessSystemKind]] = {
         {BusinessSystemKind.WMS, BusinessSystemKind.MES, BusinessSystemKind.ERP}
     ),
     AuthorityDomain.QUOTE: frozenset({BusinessSystemKind.CRM, BusinessSystemKind.ERP}),
+}
+_DEMO_BINDING_SYSTEM: dict[AuthorityDomain, BusinessSystemKind] = {
+    AuthorityDomain.CUSTOMER_ACCOUNT: BusinessSystemKind.CRM,
+    AuthorityDomain.ORDER: BusinessSystemKind.ERP,
+    AuthorityDomain.INVOICE: BusinessSystemKind.ERP,
+    AuthorityDomain.WORK_ORDER: BusinessSystemKind.MES,
+    AuthorityDomain.SHIPMENT: BusinessSystemKind.WMS,
+    AuthorityDomain.OPPORTUNITY: BusinessSystemKind.CRM,
+    AuthorityDomain.PRODUCT_SPECIFICATION: BusinessSystemKind.PLM,
+    AuthorityDomain.INVENTORY: BusinessSystemKind.WMS,
+    AuthorityDomain.QUOTE: BusinessSystemKind.CRM,
 }
 
 _DEMO_RECORD_REFS: dict[AuthorityDomain, str] = {
@@ -70,6 +82,41 @@ _DEMO_RECORD_REFS: dict[AuthorityDomain, str] = {
 def demo_record_ref(domain: AuthorityDomain) -> str:
     """The stable synthetic record identifier for a domain's example row."""
     return _DEMO_RECORD_REFS[domain]
+
+
+def synthetic_demo_authority_bindings(
+    tenant_id: UUID, *, now: datetime
+) -> dict[AuthorityDomain, AuthorityBinding]:
+    """Build ephemeral fixture bindings; this does not record a real approval.
+
+    ``approved_by`` is a deterministic synthetic marker required by the
+    canonical contract. The bindings are never persisted and must not be used
+    outside a local/test Demo scenario.
+    """
+    from platform_core.config import get_settings
+
+    settings = get_settings()
+    if (
+        settings.environment not in ("local", "test")
+        or settings.business_api_adapter.strip().lower() != "demo"
+    ):
+        raise BusinessAdapterError("DEMO_BUSINESS_AUTHORITY_DISABLED")
+    tenant = tenant_id
+    fixture_actor = uuid5(tenant, "synthetic-demo-fixture-actor")
+    return {
+        domain: AuthorityBinding(
+            tenant_id=tenant,
+            binding_id=uuid5(tenant, f"demo-binding:{domain.value}"),
+            domain=domain,
+            system_kind=system,
+            connector_id=uuid5(tenant, f"demo-connector:{domain.value}"),
+            binding_version=1,
+            max_age_seconds=3600,
+            approved_by=fixture_actor,
+            approved_at=now - timedelta(days=1),
+        )
+        for domain, system in _DEMO_BINDING_SYSTEM.items()
+    }
 
 
 class DemoCanonicalBusinessAdapter:
@@ -258,4 +305,5 @@ __all__ = [
     "DEMO_CANONICAL_SOURCE_VERSION",
     "DemoCanonicalBusinessAdapter",
     "demo_record_ref",
+    "synthetic_demo_authority_bindings",
 ]

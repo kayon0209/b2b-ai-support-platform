@@ -25,7 +25,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -600,7 +600,8 @@ async def publish_draft(
         ).one_or_none()
         if staged is None:
             raise GapError("RELEASE_CANDIDATE_NOT_FOUND", "evaluated candidate is not staged")
-        version, document = staged
+        version = cast(DocumentVersion, staged[0])
+        document = cast(Document, staged[1])
         expected_hash = hashlib.sha256(draft.body.encode("utf-8")).hexdigest()
         expected_uri = f"gap-candidate://{draft.id}/{space_id}/{expected_hash}"
         if (

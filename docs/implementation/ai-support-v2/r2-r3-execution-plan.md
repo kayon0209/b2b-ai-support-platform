@@ -1,6 +1,6 @@
 # R2 / R3 实施计划与验收门禁
 
-日期：2026-09-27
+日期：2026-09-29
 
 基线：R1 修复分支 `83968f38acfaebf907ef9e56708e2100dbe99db1`（GitHub CI 已通过）。本分支基于该提交继续，不把未完成的生产门禁伪装成通过。
 
@@ -61,7 +61,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 定义产品目录、规格、库存、报价版本/有效期和销售交接契约；每个建议带来源与抓取时间，缺失或过期时转人工。
 - 仅使用企业授权的权威产品/ERP/PLM 数据；现有公开参考价不能伪装成客户报价，不允许模型生成折扣、交期或库存承诺。
 - CRM 商机创建是受控写入，经 Tool Gateway proposal/confirmation/idempotency/读回；没有真实 sandbox 时仅测 canonical contract，不宣称真实落地。
-- 当前：契约禁止无来源的客户报价、库存和交期承诺；local/test `DemoCanonicalBusinessAdapter` 和 `build_demo_presales_evidence()` 已从产品、账户库存和报价合成 facts 构造一个只能给销售人员复核的证据包，明确禁止直接对客户报价并要求人工 handoff。它尚未接入面向坐席的产品推荐 UI，也没有 CRM opportunity 写入；真实权威目录、客户报价绑定和 CRM sandbox 仍未选定。
+- 当前：契约禁止无来源的客户报价、库存和交期承诺；local/test Demo canonical facts 可在 Workbench 只读查看，证据包同时绑定产品、账户库存、客户报价有效期，且只有具备 `case.read` 与 `tool.read` 的坐席可查看。非空浏览器已核对三份来源、人工复核提示和键盘触发的 live status。它不自动判断适配度，也没有 CRM opportunity 写入；真实权威目录、客户报价绑定和 CRM sandbox 仍未选定。
 
 ## 集成发布顺序
 

@@ -150,6 +150,13 @@ def test_demo_adapter_is_unavailable_outside_local_and_test(
     with pytest.raises(BusinessAdapterError, match="DEMO_BUSINESS_AUTHORITY_DISABLED"):
         DemoCanonicalBusinessAdapter(clock=lambda: NOW)
 
+    from platform_core.integrations.demo_canonical_business import (
+        synthetic_demo_authority_bindings,
+    )
+
+    with pytest.raises(BusinessAdapterError, match="DEMO_BUSINESS_AUTHORITY_DISABLED"):
+        synthetic_demo_authority_bindings(TENANT, now=NOW)
+
 
 def test_demo_erp_stock_read_returns_a_marked_synthetic_record() -> None:
     from platform_core.integrations.demo_erp import DemoBusinessToolExecutor

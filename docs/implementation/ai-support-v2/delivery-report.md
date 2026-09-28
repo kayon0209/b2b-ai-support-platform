@@ -586,6 +586,21 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 - 新增合成 OIDC 边界测试：有效测试 identity 在 tenant membership 从 active 改为 suspended 后，下一次平台 API 请求返回 401。它证明应用每次请求重解 membership；不模拟或证明 Keycloak/外部 IdP 的 refresh/access token 吊销。
 - 本地 performance smoke：100 条合成 webhook 并发写入、warm pool 10，最新一轮 P50 31.2ms/P95 49.0ms/P99 49.1ms，100 rows 持久化且 duplicate replay 命中。此结果只度量单机 webhook ACK 的 warm-pool 路径；不代表模型、队列、shadow/off 对照或生产容量门禁通过。
 - 最终组合复验：local/test isolated database 上 **149 passed**，包括 R2 标准流程、OIDC membership deactivation、R3 九域 canonical fake、pre-sales evidence guard 与 migration-independent webhook perf smoke；Ruff/Mypy 检查通过。上述 synthetic webhook 指标不能替代 off/shadow、多轮负载、模型 p95 或生产拓扑验收。仍需完整 HEAD CI。
-- R3-02 仍无面向坐席的产品适配推荐流程，也无 CRM opportunity 写入；真实产品/库存/客户报价 source、CRM sandbox 和外部 owner proof 仍待确定。真实评测审核、生产性能、企业 OIDC 撤权、真人 VoiceOver 和浏览器安全策略阻止的 PNG 归档仍是独立验收门禁。
+- R3-02 的 local/test Workbench 有只读 synthetic 证据面板；它不自动判断产品适配度，也无 CRM opportunity 写入。真实产品/库存/客户报价 source、CRM sandbox 和外部 owner proof 仍待确定。真实评测审核、生产性能、企业 OIDC 撤权、真人 VoiceOver 和浏览器安全策略阻止的 PNG 归档仍是独立验收门禁。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 编写并验证了 local/test synthetic canonical provider 和 R3 边界文档。
+
+---
+
+## 19. Codex follow-up：Workbench 售前证据、权限与全量静态复验（2026-09-29）
+
+- **远端评估核对**：PR #27 仍为 Draft，目标分支仍是 `codex/ai-support-v2-r1-fix`；远端 `b45b846` 的最新 Actions run #36415996078 九个 job 成功。当前隔离分支 `codex/r2-r3-implementation` 在该远端 head 之后另有本地提交和本轮代码改动，因此这次实现尚无对应 GitHub CI，也没有推送到远端。
+- **R3-02 Workbench 本地入口**：增加 local/test Demo 只读证据接口和任务面板，按当前会话关联 Case 在服务端解析账户，分别核对产品规格、账户库存和客户报价的记录引用、来源版本、有效期与账户归属。接口同时要求 `case.read` 和 `tool.read`；任务列表只在具备 `tool.read` 时显示面板。账户不明、来源不匹配、未知商品和无业务读取权限均 fail-closed。合成 authority binding 只能在 local/test Demo 环境创建，仍是临时 fixture，不记录或声称真实审批。
+- **不可对客承诺**：面板清楚标记样例为 synthetic，显示 `customer_quote_allowed=false` 和销售人工复核要求；不创建 CRM opportunity、不发送消息、不触发外部写入。非空 Workbench 浏览器会话含三条合成对话；键盘 Enter 可读取三份 evidence，状态区用 `aria-live` 播报，产品输入有可访问名称与帮助文字。标准流程说明中发现的旧“执行器尚未接入”提示已改为当前 Demo 边界。
+- **全仓类型检查修复**：Mypy 2.3.1 在 258 个 Python 源文件中报告了 5 个既有问题：知识候选查询的 ORM 行被推断为 `Any`，两个 worker 将普通 Python 值传给 SQLAlchemy `tuple_`。现已显式收窄候选 ORM 类型，并用等价的时间戳加 UUID 词典序谓词查询历史消息；全量 Mypy 复验通过。
+- **PostgreSQL 集成复验**：随机隔离数据库从空库迁移到 `0070_outbox_processing_fence`，运行标准流程、知识发布 gate、客户旅程任务规划、shadow side-effect 和 Demo authority 测试：**73 passed**，1 条 Starlette/httpx deprecation warning。随后在另一新隔离库重跑标准流程及售前权限显隐用例：**25 passed**。临时库随后删除，共用 `platform` 数据库未迁移。
+- **前端与静态检查**：Admin Web 测试通过（12、7、10 项三个小套件，WorkBench tabs 21 项，身份/幂等/版本/草稿同步保护通过）；`npm run typecheck`、`npm run build`、`npm run check:runtime` 通过。7 个变更 Python 文件 Ruff check/format 通过；Mypy 全仓 258 个源文件通过。
+- **R3 Demo 脚本**：`scripts/demo_r3_authorities.py` 成功列出九个固定 synthetic domain facts 和组合证据；结果标明没有人类 authority approval、客户报价禁止、没有 CRM write。
+- **仍未关闭的门禁**：真实 ERP/MES/WMS/CRM/质量/工程 sandbox 与 authority 映射、经人工批准的评测集/主体映射、真实模型质量及费用上限、企业 IdP 撤权、真实 staging 多实例/回滚和外部写入 unknown 对账仍需相应人员/环境。完整原生 macOS VoiceOver 浏览器与弹层朗读/键盘验收仍需真人；PNG 归档未绕过浏览器安全限制。生产发布、评测和标准流程 feature flags 保持默认关闭。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 核对 PR/CI、实现售前只读面板与权限边界，修复全仓类型错误并完成本地复验。

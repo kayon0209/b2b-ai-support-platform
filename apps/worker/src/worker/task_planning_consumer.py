@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, tuple_, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
@@ -140,7 +140,13 @@ async def process_task_planning_event(
             .where(
                 ConversationTurn.tenant_id == claim.tenant_id,
                 ConversationTurn.conversation_ref_id == conversation_ref_id,
-                tuple_(ConversationTurn.ts, ConversationTurn.id) < tuple_(turn.ts, turn.id),
+                or_(
+                    ConversationTurn.ts < turn.ts,
+                    and_(
+                        ConversationTurn.ts == turn.ts,
+                        ConversationTurn.id < turn.id,
+                    ),
+                ),
             )
             .order_by(ConversationTurn.ts.desc(), ConversationTurn.id.desc())
             .limit(8)
