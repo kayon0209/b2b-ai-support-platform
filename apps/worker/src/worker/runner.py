@@ -567,9 +567,7 @@ def main() -> None:
         logger.info(
             "worker_wiring",
             queue=queue,
-            has_chat=True,
             has_embedding=True,
-            signing_key_id=os.environ.get("APP_KNOWLEDGE_EVALUATOR_KEY_ID", ""),
             max_cases_per_run=runtime.max_cases_per_run,
         )
         run(_run_release_evaluator(runtime))

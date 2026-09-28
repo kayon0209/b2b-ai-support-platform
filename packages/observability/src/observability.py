@@ -84,6 +84,12 @@ ALLOWED_LOG_FIELDS = {
     "local_turns",
     "output_hash",
     "count",
+    # Dedicated knowledge-release worker fields. These are closed outcomes,
+    # booleans, and bounded case limits; no prompt, dataset text, or key bytes
+    # are ever logged.
+    "result",
+    "claim_owned",
+    "max_cases_per_run",
     "tenants",
     "attempts",
     "consecutive_failures",

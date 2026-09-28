@@ -121,7 +121,17 @@ def test_every_logged_field_is_allowlisted() -> None:
     )
 
 
-@pytest.mark.parametrize("required", ["reason_code", "error_code", "document_version_id"])
+@pytest.mark.parametrize(
+    "required",
+    [
+        "reason_code",
+        "error_code",
+        "document_version_id",
+        "result",
+        "claim_owned",
+        "max_cases_per_run",
+    ],
+)
 def test_the_fields_an_operator_needs_to_triage_are_allowlisted(required: str) -> None:
     """Pinned by name: these are the ones a failure investigation reaches for."""
     assert required in ALLOWED_LOG_FIELDS
