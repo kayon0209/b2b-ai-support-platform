@@ -169,6 +169,7 @@ def test_flow_catalog_uses_active_tenant_connectors_and_staffed_owner_groups() -
         body = response.json()
         flows = {item["template"]["key"]: item for item in body["items"]}
         assert body["execution_requires_tool_gateway"] is True
+        assert body["instances_enabled"] is False
         assert flows["order_status"]["availability"]["status"] == "available"
         assert flows["order_status"]["availability"]["optional_unavailable_tools"] == [
             "shipment.track"

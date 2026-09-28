@@ -37,7 +37,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 当前租户没有对应工具或业务负责人时，模板显示 `unsupported`/`needs_human`，不显示假成功。
 - 多意图按子任务推进；已完成部分不重复执行，依赖阻塞时不跳过前置条件。
 - 验收：模板 schema 合同测试、每模板状态机测试、权限负例、同键重放/不同 payload 冲突，以及浏览器补参/取消/人工接续。
-- 当前：四种有界领域模板已接入只读 Workbench API 和 Tasks 面板，按当前坐席权限、active Connector 和有坐席成员的负责人组判断基础可用性；仍只引用现有工具。没有新增 invoice issue 或 ERP 写能力。流程实例化、与 task DAG 绑定和每流程状态图仍未实现。详细范围见 `r2-02-standard-flow-catalog.md`。
+- 当前：四种模板可由当前会话 owner 发起真实 task，服务端绑定最新 customer turn、模板 key/version 和 append-only 幂等 receipt；字段采集、取消/转人工写事件并经 lease 复核。实例停在专用 `manual_flow`（不进入 scheduler），默认关闭 flag `agent.standard_flow_instances`。`invoice_application` 有一个受限本地路径：从现有关联 Case 唯一解析 tenant account 后，可经 Tool Gateway 创建需独立确认的内部 `case.create`；撤回、并发执行和 verified receipt 回写已有验收。它不调用开票系统。订单查询、质量和技术升级的 executor、产品字段权威核验与真实连接器仍待完成。详细范围见 `r2-02-standard-flow-catalog.md`。
 
 ### R2-03 知识改进追踪
 
@@ -45,7 +45,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 评测绑定数据哈希、知识版本、检索配置和 commit；新知识导致核心切片退化时禁止推广，并能恢复上一版活动版本。
 - 只允许审核后的知识文档参与检索；任何未审核会话都不得自动生成或发布知识。
 - 验收：发布前后相同授权语料、tenant RLS、可回滚版本、指标审计，以及并发发布冲突。
-- 当前：评测记录/批准/post-test/event 已持久化并强制 RLS；flag 开启时知识草稿发布要求固定评测证据与双人审批，Workbench 支持查证据、审批和在失败后测时回滚。可信 evaluator worker、正式固定数据集、staging 灰度/多实例发布演练仍未完成，flag 默认关闭。2pp 阈值需知识/安全负责人签字。见 `r2-03-knowledge-release-contract.md`。
+- 当前：评测记录/批准/post-test/event 已持久化并强制 RLS；新增候选暂存、ACL-aware overlay、固定集加载校验、candidate-aware 前后测 runner、Ed25519 签名持久化、验签后的双人批准与 snapshot 复核发布。专用 outbox worker 已实现 owner-only claim、tenant RLS payload、fencing token、stale recovery 与三次有界重试；API publish 可事务化排队后测。自动运行默认关闭，每次样本 ceiling 默认 0；真实获批数据、对象 key、公钥/worker 私钥、费用预算尚未配置，因此无生产评测分数或自动模型调用。staging 灰度/多实例演练未做；2pp 阈值仍需知识/安全负责人签字。见 `r2-03-knowledge-release-contract.md`。
 
 ## R3：行业业务联通
 
@@ -54,7 +54,7 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 统一 adapter contract：tenant connector、credential_ref、目标记录归属验证、字段 allowlist、超时与 bounded retry、breaker、稳定 idempotency key、受控 confirmation 和读回 postcondition。
 - 对超时/断连返回 `unknown` 并提供对账流程；不得把“请求已发出”写成“业务成功”。外部 payload 只在 adapter 边界做 canonical projection。
 - 先实现 fake contract tests 与协议文档；真正 provider adapter 需有用户授权的 sandbox、版本化 REST schema、归属证明和重放预算。
-- 当前：已新增供应商中立的 authority/来源/时效/归属契约、canonical adapter Protocol 和假 provider 边界测试。各业务域的权威系统仍待企业负责人定版；具体 ERP/CRM API、授权 sandbox、归属证明流程和生产验收仍未提供。
+- 当前：已新增覆盖九种 authority domain 的 canonical read schemas（账户、订单、发票、工单、物流、商机、产品、库存、报价）、供应商中立的来源/时效/归属验证，以及携带 proof 的 `CanonicalBusinessReadResult` / `read_verified_fact()` adapter seam 和假 provider 边界测试。各业务域权威系统仍待企业负责人定版；具体 ERP/CRM API、授权 sandbox、生产 adapter、归属证明实施和验收仍未提供。
 
 ### R3-02 售前选型与商机交接
 

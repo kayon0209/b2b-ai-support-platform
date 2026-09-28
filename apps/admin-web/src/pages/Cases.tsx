@@ -128,6 +128,7 @@ function NewCasePanel({
         <select value={category} onChange={(e) => setCategory(e.target.value)}>
           <option value="general">{t("case.category.general")}</option>
           <option value="eq_confirmation">{t("case.category.eq_confirmation")}</option>
+          <option value="invoice_application">{t("case.category.invoice_application")}</option>
         </select>
       </label>
       <label className="field">

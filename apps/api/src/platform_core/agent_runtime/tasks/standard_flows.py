@@ -18,6 +18,13 @@ FlowReason = Literal[
     "FLOW_READY",
 ]
 
+# Operator-created catalog instances remain behind their own default-off
+# switch; enabling semantic task suggestions does not implicitly enable this
+# new workflow surface.
+FLAG_STANDARD_FLOW_INSTANCES = "agent.standard_flow_instances"
+FLOW_EXECUTOR_UNAVAILABLE = "FLOW_EXECUTOR_UNAVAILABLE"
+FLOW_INTERNAL_CASE_ONLY = "FLOW_INTERNAL_CASE_ONLY"
+
 
 class FlowField(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -39,6 +46,7 @@ class FlowTemplate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     key: str = Field(min_length=1, max_length=63)
+    version: int = Field(default=1, ge=1)
     title: str = Field(min_length=1, max_length=127)
     business_lines: tuple[str, ...]
     intent_codes: tuple[str, ...]
@@ -276,6 +284,9 @@ def get_standard_flow(flow_key: str) -> FlowTemplate | None:
 
 
 __all__ = [
+    "FLAG_STANDARD_FLOW_INSTANCES",
+    "FLOW_EXECUTOR_UNAVAILABLE",
+    "FLOW_INTERNAL_CASE_ONLY",
     "STANDARD_FLOW_TEMPLATES",
     "ConnectorRequirement",
     "FlowAvailability",

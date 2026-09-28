@@ -137,3 +137,23 @@ async def tenant_session(ctx: TenantContext) -> AsyncIterator[AsyncSession]:
         # belt-and-braces for a session handed out with no transaction yet.
         await apply_rls_tenant(session, ctx)
         yield session
+
+
+@asynccontextmanager
+async def tenant_repeatable_read_session(ctx: TenantContext) -> AsyncIterator[AsyncSession]:
+    """One tenant-bound transaction with a stable corpus and ACL snapshot."""
+    from platform_core.db import app_role_url, get_engine
+
+    engine = get_engine(app_role_url())
+    async with engine.connect() as connection:
+        # Set isolation before the first SQL statement starts the transaction.
+        await connection.execution_options(isolation_level="REPEATABLE READ")
+        async with AsyncSession(bind=connection, expire_on_commit=False) as session:
+            bind_tenant_on_every_transaction(session, ctx)
+            await apply_rls_tenant(session, ctx)
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise

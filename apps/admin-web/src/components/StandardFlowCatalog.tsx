@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AlertCircle, ChevronDown, ClipboardList, ShieldCheck } from "lucide-react";
-import { apiGet } from "../lib/api";
+import { apiGet, apiPost } from "../lib/api";
+import { newIdempotencyKey } from "../lib/idempotency";
 
 type Availability = {
   status: "available" | "needs_human";
@@ -47,6 +48,14 @@ interface FlowItem {
 interface FlowCatalogResponse {
   items: FlowItem[];
   execution_requires_tool_gateway: true;
+  instances_enabled: boolean;
+}
+
+interface StandardFlowCatalogProps {
+  conversationRef: string;
+  leaseVersion: number;
+  isOwner: boolean;
+  onStarted?: () => void;
 }
 
 const FIELD_LABELS: Record<string, string> = {
@@ -115,9 +124,16 @@ function sourceLabel(source: string): string {
   return names[source] ?? source;
 }
 
-export function StandardFlowCatalog() {
+export function StandardFlowCatalog({
+  conversationRef,
+  leaseVersion,
+  isOwner,
+  onStarted,
+}: StandardFlowCatalogProps) {
   const [catalog, setCatalog] = useState<FlowCatalogResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [startingKey, setStartingKey] = useState<string | null>(null);
+  const [announcement, setAnnouncement] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -131,10 +147,32 @@ export function StandardFlowCatalog() {
     return () => { active = false; };
   }, []);
 
+  async function startFlow(flowKey: string) {
+    setStartingKey(flowKey);
+    setError(null);
+    try {
+      const result = await apiPost<{ task: { flow_title: string | null }; replayed: boolean }>(
+        `/v1/workbench/conversations/${conversationRef}/standard-flows/tasks`,
+        { flow_key: flowKey, expected_lease_version: leaseVersion },
+        newIdempotencyKey(),
+      );
+      setAnnouncement(`${result.task.flow_title ?? "标准流程"}已加入当前会话任务。`);
+      onStarted?.();
+      window.dispatchEvent(
+        new CustomEvent("workbench:tasks-changed", { detail: { conversationRef } }),
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setStartingKey(null);
+    }
+  }
+
   return (
     <section className="wb-panel wb-flow-catalog" aria-labelledby="wb-flow-catalog-title">
       <h3 id="wb-flow-catalog-title"><ClipboardList size={18} />标准服务流程</h3>
-      <p className="wb-muted">展示已配置的流程边界与人工退出条件。实际执行仍经权限校验和 Tool Gateway。</p>
+      <p className="wb-muted">发起后绑定当前会话最新客户消息。实例目前仅支持坐席收集字段、取消或转人工；流程专用查询和写入执行器尚未接入。</p>
+      <p className="sr-only" role="status" aria-live="polite">{announcement}</p>
       {error ? <div className="wb-flow-error" role="alert"><AlertCircle size={15} />{error}</div> : null}
       {!catalog && !error ? <p className="wb-muted" role="status">正在读取租户能力配置…</p> : null}
       {catalog ? <div className="wb-flow-list">
@@ -166,6 +204,20 @@ export function StandardFlowCatalog() {
               <p><strong>超时：</strong>{template.timeout_rule}</p>
               <p><strong>取消：</strong>{template.cancellation_rule}</p>
               <p><strong>转人工条件：</strong>{template.human_exit_conditions.join("、")}</p>
+              <button
+                type="button"
+                className="wb-btn wb-btn-primary"
+                disabled={!catalog.instances_enabled || !isOwner || startingKey !== null}
+                title={!catalog.instances_enabled ? "租户尚未启用标准流程实例" : !isOwner ? "只有当前会话负责人可以发起流程" : undefined}
+                onClick={() => void startFlow(template.key)}
+              >
+                {startingKey === template.key ? "正在发起…" : "发起到当前会话"}
+              </button>
+              {!catalog.instances_enabled ? (
+                <p className="wb-flow-caution">会话流程实例默认关闭，需先由管理员开启租户开关。</p>
+              ) : !isOwner ? (
+                <p className="wb-flow-caution">只有当前会话负责人可以发起流程。</p>
+              ) : null}
             </div>
           </details>
         ))}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 import uuid
 from datetime import UTC, datetime
@@ -19,10 +20,15 @@ from platform_contracts.knowledge_release import (
     evaluate_knowledge_release,
 )
 from platform_contracts.knowledge_release import KnowledgeReleaseApproval as ApprovalContract
+from platform_contracts.release_attestation import ReleaseEvaluationArtifact
 from platform_core.audit import service as audit_service
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.knowledge.gap_models import DraftStatus, KnowledgeDraft, KnowledgeGap
 from platform_core.knowledge.models import Document, DocumentVersion
+from platform_core.knowledge.release_attestation_service import (
+    ReleaseAttestationError,
+    verify_persisted_release_evaluation,
+)
 from platform_core.knowledge.release_models import (
     KnowledgeReleaseApproval,
     KnowledgeReleaseEvaluation,
@@ -45,6 +51,28 @@ def draft_content_sha256(draft: KnowledgeDraft) -> str:
     return hashlib.sha256(draft.body.encode("utf-8")).hexdigest()
 
 
+def document_content_sha256(stored_hash: str) -> str:
+    """Normalize legacy prefixed and gap-draft content hashes for contracts."""
+    value = stored_hash.removeprefix("sha256:")
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise KnowledgeReleaseError("KNOWLEDGE_CONTENT_HASH_INVALID")
+    return value
+
+
+def _require_verified_evaluator_provenance() -> None:
+    """The legacy self-reported metrics endpoint is permanently closed."""
+    raise KnowledgeReleaseError("EVALUATOR_PROVENANCE_UNAVAILABLE")
+
+
+def _require_attested_evaluation(
+    evaluation: KnowledgeReleaseEvaluation, *, tenant_id: uuid.UUID
+) -> ReleaseEvaluationArtifact:
+    try:
+        return verify_persisted_release_evaluation(evaluation, tenant_id=tenant_id)
+    except ReleaseAttestationError as exc:
+        raise KnowledgeReleaseError(exc.code) from exc
+
+
 async def record_evaluation(
     session: AsyncSession,
     *,
@@ -55,13 +83,14 @@ async def record_evaluation(
     candidate_run: KnowledgeEvalRun,
     idempotency_key: str,
 ) -> tuple[KnowledgeReleaseEvaluation, bool]:
-    """Store an evaluator-worker result. Human/browser principals are refused.
+    """Store verified evaluator output once candidate-aware provenance exists.
 
-    The caller is an authenticated internal evaluator. The admin UI cannot
-    submit its own metrics as release evidence.
+    Human/browser principals are refused. An authenticated service alone
+    cannot establish that its submitted metrics came from a real evaluation.
     """
     _require_evaluator(ctx)
     _require_idempotency_key(idempotency_key)
+    _require_verified_evaluator_provenance()
     # Candidate ids are allocated by the platform and stable for a retry. The
     # evaluator cannot choose a UUID that collides with another tenant's
     # DocumentVersion or bind evidence to a caller-selected record.
@@ -135,7 +164,10 @@ async def record_evaluation(
         version_id=baseline_run.document_version_id,
         require_active=True,
     )
-    if baseline_version.content_hash != baseline_run.knowledge_content_sha256:
+    if (
+        document_content_sha256(baseline_version.content_hash)
+        != baseline_run.knowledge_content_sha256
+    ):
         raise KnowledgeReleaseError("BASELINE_CONTENT_MOVED")
     decision = evaluate_knowledge_candidate(baseline_run, candidate_run)
     fingerprint = candidate_fingerprint
@@ -218,6 +250,7 @@ async def approve_evaluation(
     evaluation = await _load_evaluation(
         session, tenant_id=ctx.tenant_id, evaluation_id=evaluation_id
     )
+    _require_attested_evaluation(evaluation, tenant_id=ctx.tenant_id)
     if draft_id is not None and evaluation.draft_id != draft_id:
         raise KnowledgeReleaseError("EVALUATION_NOT_FOUND")
     if evaluation.status != "eligible":
@@ -377,6 +410,7 @@ async def require_publish_evaluation(
     evaluation = await _load_evaluation(
         session, tenant_id=ctx.tenant_id, evaluation_id=evaluation_id
     )
+    artifact = _require_attested_evaluation(evaluation, tenant_id=ctx.tenant_id)
     draft = await _load_draft(session, tenant_id=ctx.tenant_id, draft_id=draft_id)
     if evaluation.draft_id != draft.id or evaluation.knowledge_space_id != space_id:
         raise KnowledgeReleaseError("EVALUATION_NOT_FOUND")
@@ -400,8 +434,47 @@ async def require_publish_evaluation(
         require_active=True,
         for_update=True,
     )
-    if baseline_version.content_hash != baseline.knowledge_content_sha256:
+    if document_content_sha256(baseline_version.content_hash) != baseline.knowledge_content_sha256:
         raise KnowledgeReleaseError("EVAL_BASELINE_STALE")
+    from platform_core.knowledge.release_evaluator import (
+        ReleaseEvaluationError,
+        _load_candidate_version,
+        _require_tenant_repeatable_read,
+        _space_snapshot_sha256,
+    )
+
+    try:
+        await _require_tenant_repeatable_read(session, ctx.tenant_id)
+        candidate_version = await _load_candidate_version(
+            session,
+            tenant_id=ctx.tenant_id,
+            knowledge_space_id=space_id,
+            version_id=evaluation.candidate_version_id,
+        )
+        current_time = int(time.time())
+        baseline_snapshot = await _space_snapshot_sha256(
+            session,
+            tenant_id=ctx.tenant_id,
+            knowledge_space_id=space_id,
+            candidate_version_id=None,
+            now_ts=current_time,
+        )
+        candidate_snapshot = await _space_snapshot_sha256(
+            session,
+            tenant_id=ctx.tenant_id,
+            knowledge_space_id=space_id,
+            candidate_version_id=evaluation.candidate_version_id,
+            now_ts=current_time,
+        )
+    except ReleaseEvaluationError as exc:
+        raise KnowledgeReleaseError(exc.code) from exc
+    if (
+        document_content_sha256(candidate_version.content_hash)
+        != candidate.knowledge_content_sha256
+        or baseline_snapshot != artifact.baseline_run.knowledge_snapshot_sha256
+        or candidate_snapshot != artifact.candidate_run.knowledge_snapshot_sha256
+    ):
+        raise KnowledgeReleaseError("EVAL_KNOWLEDGE_SNAPSHOT_MOVED")
     approval_rows = (
         await session.execute(
             select(KnowledgeReleaseApproval).where(
@@ -522,6 +595,7 @@ async def record_post_test(
 ) -> tuple[KnowledgeReleasePostTest, bool]:
     _require_evaluator(ctx)
     _require_idempotency_key(idempotency_key)
+    _require_verified_evaluator_provenance()
     post_run_json = post_run.model_dump(mode="json")
     existing = (
         await session.execute(
@@ -545,7 +619,7 @@ async def record_post_test(
         version_id=post_run.document_version_id,
         require_active=True,
     )
-    if post_version.content_hash != post_run.knowledge_content_sha256:
+    if document_content_sha256(post_version.content_hash) != post_run.knowledge_content_sha256:
         raise KnowledgeReleaseError("POST_TEST_CONTENT_MISMATCH")
     decision = evaluate_knowledge_post_test(_candidate_run(evaluation), post_run)
     values = {

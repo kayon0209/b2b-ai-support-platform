@@ -31,6 +31,7 @@ from platform_core.agent_runtime.emotion_review_service import (
 from platform_core.agent_runtime.semantic.contracts import SemanticTaskKind
 from platform_core.agent_runtime.tasks.capability import tenant_capabilities
 from platform_core.agent_runtime.tasks.standard_flows import (
+    FLAG_STANDARD_FLOW_INSTANCES,
     STANDARD_FLOW_TEMPLATES,
     resolve_flow_availability,
 )
@@ -212,6 +213,12 @@ async def list_standard_flows(request: Request) -> Any:
         capabilities = {**read_filter.available, **write_filter.available}
         connector_caps = await active_connector_capabilities(session, tenant_id=ctx.tenant_id)
         owner_groups = await org.routable_support_department_slugs(session, tenant_id=ctx.tenant_id)
+        instances_enabled = await flag_service.evaluate(
+            session,
+            flag_key=FLAG_STANDARD_FLOW_INSTANCES,
+            tenant_id=ctx.tenant_id,
+            default=False,
+        )
         items = [
             {
                 "template": template.model_dump(mode="json"),
@@ -224,7 +231,13 @@ async def list_standard_flows(request: Request) -> Any:
             }
             for template in STANDARD_FLOW_TEMPLATES
         ]
-    return ok_response({"items": items, "execution_requires_tool_gateway": True})
+    return ok_response(
+        {
+            "items": items,
+            "execution_requires_tool_gateway": True,
+            "instances_enabled": instances_enabled.enabled,
+        }
+    )
 
 
 @router.get("/conversations")

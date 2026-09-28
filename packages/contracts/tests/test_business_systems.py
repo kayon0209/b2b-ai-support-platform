@@ -13,9 +13,15 @@ from platform_contracts.business_systems import (
     BusinessSystemKind,
     BusinessWriteReason,
     BusinessWriteStatus,
+    CanonicalCustomerAccount,
     CanonicalInventorySnapshot,
+    CanonicalInvoiceStatus,
+    CanonicalOpportunity,
+    CanonicalOrderStatus,
     CanonicalProductSpecification,
     CanonicalQuote,
+    CanonicalShipmentStatus,
+    CanonicalWorkOrderStatus,
     ExternalWriteReceipt,
     OwnershipProof,
     SourceMetadata,
@@ -56,7 +62,7 @@ def test_authority_binding_is_tenant_owned_versioned_and_explicitly_approved() -
         approved_at=NOW,
     )
 
-    assert binding.canonical_schema_version == "1.0"
+    assert binding.canonical_schema_version == "1.1"
     assert binding.max_age_seconds == 3600
     assert binding.freshness_deadline(retrieved_at=NOW) == NOW + timedelta(hours=1)
     assert binding.freshness_deadline(
@@ -146,10 +152,100 @@ def test_inventory_and_quote_require_units_provenance_and_source_expiry() -> Non
         )
 
 
+def test_order_and_shipment_states_are_canonical_source_backed_facts() -> None:
+    order = CanonicalOrderStatus(
+        tenant_id=TENANT,
+        customer_account_ref="account-9",
+        order_ref="order-17",
+        status="in_production",
+        status_updated_at=NOW - timedelta(minutes=1),
+        estimated_delivery_at=NOW + timedelta(days=4),
+        source=_source(),
+    )
+    shipment = CanonicalShipmentStatus(
+        tenant_id=TENANT,
+        customer_account_ref="account-9",
+        order_ref="order-17",
+        shipment_ref="shipment-2",
+        tracking_ref="track-9",
+        status="in_transit",
+        status_updated_at=NOW - timedelta(minutes=2),
+        source=_source(),
+    )
+    assert order.status == "in_production"
+    assert shipment.status == "in_transit"
+    with pytest.raises(ValidationError):
+        CanonicalOrderStatus(**{**order.model_dump(), "status": "almost_shipped"})
+    with pytest.raises(ValidationError, match="later than source retrieval"):
+        CanonicalShipmentStatus(
+            **{**shipment.model_dump(), "status_updated_at": NOW + timedelta(seconds=1)}
+        )
+
+
+def test_customer_account_work_order_invoice_and_crm_contracts_are_typed() -> None:
+    account = CanonicalCustomerAccount(
+        tenant_id=TENANT,
+        account_ref="account-9",
+        status="active",
+        source=_source(),
+    )
+    work_order = CanonicalWorkOrderStatus(
+        tenant_id=TENANT,
+        customer_account_ref="account-9",
+        work_order_ref="work-11",
+        product_ref="pcb-123",
+        revision="B",
+        status="quality_hold",
+        quality_status="hold",
+        status_updated_at=NOW - timedelta(minutes=1),
+        source=_source(),
+    )
+    invoice = CanonicalInvoiceStatus(
+        tenant_id=TENANT,
+        customer_account_ref="account-9",
+        invoice_ref="invoice-31",
+        invoice_type="tax",
+        status="issued",
+        currency="CNY",
+        total_amount_minor=120050,
+        issued_at=NOW - timedelta(days=1),
+        due_at=NOW + timedelta(days=20),
+        source=_source(),
+    )
+    opportunity = CanonicalOpportunity(
+        tenant_id=TENANT,
+        customer_account_ref="account-9",
+        opportunity_ref="opportunity-8",
+        stage="proposal",
+        product_refs=("pcb-123", "component-7"),
+        quote_ref="quote-9",
+        status_updated_at=NOW - timedelta(minutes=3),
+        source=_source(),
+    )
+    assert account.status == "active"
+    assert work_order.quality_status == "hold"
+    assert invoice.total_amount_minor == 120050
+    assert opportunity.stage == "proposal"
+
+    with pytest.raises(ValidationError, match="amount and currency"):
+        CanonicalInvoiceStatus(
+            tenant_id=TENANT,
+            customer_account_ref="account-9",
+            invoice_ref="invoice-32",
+            invoice_type="tax",
+            status="issued",
+            total_amount_minor=1200,
+            source=_source(),
+        )
+
+
 def test_external_record_must_prove_account_ownership() -> None:
     proof = OwnershipProof(
         tenant_id=TENANT,
         connector_id=CONNECTOR,
+        authority_binding_id=BINDING,
+        authority_version=1,
+        resource_ref="record-42",
         expected_account_ref="account-9",
         observed_account_ref="account-9",
         verified_at=NOW,

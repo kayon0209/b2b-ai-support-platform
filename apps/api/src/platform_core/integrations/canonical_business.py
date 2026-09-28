@@ -2,20 +2,39 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import Protocol
 
 from platform_contracts.business_systems import (
     AuthorityBinding,
     AuthorityDomain,
+    CanonicalBusinessFact,
+    CanonicalBusinessReadResult,
+    CanonicalCustomerAccount,
     CanonicalInventorySnapshot,
+    CanonicalInvoiceStatus,
+    CanonicalOpportunity,
+    CanonicalOrderStatus,
     CanonicalProductSpecification,
     CanonicalQuote,
+    CanonicalShipmentStatus,
+    CanonicalWorkOrderStatus,
     OwnershipProof,
 )
 
-type CanonicalBusinessFact = (
-    CanonicalProductSpecification | CanonicalInventorySnapshot | CanonicalQuote
+CANONICAL_FACT_TYPES = MappingProxyType(
+    {
+        AuthorityDomain.CUSTOMER_ACCOUNT: CanonicalCustomerAccount,
+        AuthorityDomain.ORDER: CanonicalOrderStatus,
+        AuthorityDomain.INVOICE: CanonicalInvoiceStatus,
+        AuthorityDomain.WORK_ORDER: CanonicalWorkOrderStatus,
+        AuthorityDomain.SHIPMENT: CanonicalShipmentStatus,
+        AuthorityDomain.OPPORTUNITY: CanonicalOpportunity,
+        AuthorityDomain.PRODUCT_SPECIFICATION: CanonicalProductSpecification,
+        AuthorityDomain.INVENTORY: CanonicalInventorySnapshot,
+        AuthorityDomain.QUOTE: CanonicalQuote,
+    }
 )
 
 
@@ -33,7 +52,29 @@ class CanonicalBusinessAdapter(Protocol):
         *,
         binding: AuthorityBinding,
         record_ref: str,
-    ) -> CanonicalBusinessFact | None: ...
+    ) -> CanonicalBusinessReadResult | None: ...
+
+
+async def read_verified_fact(
+    adapter: CanonicalBusinessAdapter,
+    *,
+    binding: AuthorityBinding,
+    record_ref: str,
+    as_of: datetime,
+    expected_account_ref: str | None = None,
+) -> CanonicalBusinessFact | None:
+    """Return a fact only after authority, freshness, and optional owner checks."""
+    result = await adapter.read_fact(binding=binding, record_ref=record_ref)
+    if result is None:
+        return None
+    validate_canonical_fact(
+        binding=binding,
+        fact=result.fact,
+        as_of=as_of,
+        expected_account_ref=expected_account_ref,
+        ownership_proof=result.ownership_proof,
+    )
+    return result.fact
 
 
 def validate_canonical_fact(
@@ -45,11 +86,7 @@ def validate_canonical_fact(
     ownership_proof: OwnershipProof | None = None,
 ) -> None:
     """Reject mismatched authority, tenant, expired facts, and unowned records."""
-    expected_fact_type = {
-        AuthorityDomain.PRODUCT_SPECIFICATION: CanonicalProductSpecification,
-        AuthorityDomain.INVENTORY: CanonicalInventorySnapshot,
-        AuthorityDomain.QUOTE: CanonicalQuote,
-    }.get(binding.domain)
+    expected_fact_type = CANONICAL_FACT_TYPES.get(binding.domain)
     if expected_fact_type is None or not isinstance(fact, expected_fact_type):
         raise BusinessAdapterError("BUSINESS_FACT_TYPE_MISMATCH")
     if fact.tenant_id != binding.tenant_id or fact.source.tenant_id != binding.tenant_id:
@@ -75,19 +112,29 @@ def validate_canonical_fact(
         if (
             ownership_proof.tenant_id != binding.tenant_id
             or ownership_proof.connector_id != binding.connector_id
+            or ownership_proof.authority_binding_id != binding.binding_id
+            or ownership_proof.authority_version != binding.binding_version
+            or ownership_proof.resource_ref != fact.source.source_record_ref
             or ownership_proof.expected_account_ref != expected_account_ref
             or ownership_proof.observed_account_ref != expected_account_ref
             or ownership_proof.verified_at > as_of
         ):
             raise BusinessAdapterError("BUSINESS_OWNERSHIP_MISMATCH")
-        record_owner = getattr(fact, "customer_account_ref", None)
+        if ownership_proof.verified_at + timedelta(seconds=binding.max_age_seconds) <= as_of:
+            raise BusinessAdapterError("BUSINESS_OWNERSHIP_PROOF_STALE")
+        record_owner = getattr(fact, "customer_account_ref", None) or getattr(
+            fact, "account_ref", None
+        )
         if record_owner is not None and record_owner != expected_account_ref:
             raise BusinessAdapterError("BUSINESS_OWNERSHIP_MISMATCH")
 
 
 __all__ = [
     "BusinessAdapterError",
+    "CANONICAL_FACT_TYPES",
     "CanonicalBusinessAdapter",
     "CanonicalBusinessFact",
+    "CanonicalBusinessReadResult",
+    "read_verified_fact",
     "validate_canonical_fact",
 ]

@@ -1,7 +1,7 @@
 # Codex 最终验收协议
 
 状态：验收标准为持续有效的门槛；逐项当前结论与绑定提交的证据见
-[交付/验收报告](delivery-report.md) §8。下表状态按 2026-09-27 本地隔离环境复核结果更新；未执行或阻塞项不得作为通过发布的依据。
+[交付/验收报告](delivery-report.md) 的 2026-09-28 R2/R3 continuation 及 §9 的最新 R1 follow-up。下表状态按 2026-09-28 本地隔离环境复核结果更新；未执行或阻塞项不得作为通过发布的依据。
 
 ## 1. 交付与独立复核
 
@@ -23,12 +23,14 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | TASK-01 | 多意图任务拆解保留所有可识别需求；只读成功、缺参、未支持写入均有独立状态与原因 | 旅程 API/DB 集成 | 通过（stub） |
 | TASK-02 | 条件依赖、不满足条件、矛盾参数、重复字段、多轮纠正和取消有确定结果；最多 5 任务、深度 3、拒绝环 | 状态机与边界用例 | 通过 |
 | TASK-03 | 重复点击、消息重放、Worker 崩溃恢复、两个消费者竞争只产生一个逻辑执行；unknown 经对账处理 | 幂等/竞争集成与子进程崩溃后新 Worker 恢复 | 部分完成（隔离库子进程 hard-exit 后 stale claim 被新 Worker 回收；多主机生产拓扑与真实外部 write unknown 对账仍待演练） |
+| FLOW-01 | 坐席发起 task 绑定 server-resolved turn/tenant/owner/flow version；幂等/RLS；发票内部 Case 提案限有权限角色，撤回与执行串行，verified receipt 回写 task；其它 flow 不能被误调度 | `test_standard_flow_instances.py`、`test_task_state_machine.py`、RLS/cross-tenant suite | 本地通过（发票仅创建内部平台 Case；真实开票、订单读取、质量/技术 executor 仍未实现） |
+| KNOW-01 | 可信 evaluator 必须对发布 candidate version 做 candidate-aware retrieval，并绑定固定期望引用数据集 | `test_knowledge_release_gate.py` 在隔离 PostgreSQL 经真实 outbox consumer 运行签名前/后测：baseline 候选 key 召回 0、staged candidate 为 1；安全 fake post-run citation support 为 1.0，unsafe fake post-run 被签名阻塞并触发回滚；数据/模型/密钥均为测试合成 | 本地 SQL/retrieval、worker 前后测签名持久化与发布快照路径通过；真实获批语料、真实模型质量和 staging 仍阻塞，release flag 保持关闭 |
 | TOOL-01 | 名称/参数建议必须在租户允许能力内；缺参先问；模型不能把只读任务变成写动作 | 权限过滤与负例 | 通过（stub） |
 | TOOL-02 | 写任务仅提案/人工处理；参数改变使原确认失效；同键不同 payload 冲突；审批人与客户确认角色不混用 | 提案、确认、执行集成 | 通过（stub / 测试数据库） |
 | TOOL-03 | 回执 unknown/失败/记录不属于客户时不展示已办结/已核验；没有 connector 不制造成功卡片 | 回执契约与负例 | 通过（测试边界；无真实连接器沙箱） |
 | COP-01 | 摘要和回复有当前可见来源；生成不发消息；插入后可编辑，最终人工发送仍检查 owner/idempotency | stub worker + 浏览器来源/插入 + API 发送测试 | 通过（非真实模型） |
 | COP-02 | 切换会话、新消息、租约变化使旧 job stale；用户已编辑内容不被自动覆盖；相同请求重放不重复计费执行 | worker/API 集成、浏览器保稿 | 通过（无双坐席并发） |
-| SEC-01 | 新表强制 RLS，运行角色无 BYPASSRLS；跨租户 ID、任务引用、缓存、job、分页、引用和导出均不可读写 | 隔离 PostgreSQL 全表租户负例 | 通过（R1 表） |
+| SEC-01 | 新表强制 RLS，运行角色无 BYPASSRLS；跨租户 ID、任务引用、缓存、job、分页、引用和导出均不可读写 | 隔离 PostgreSQL 全表租户负例 | 通过（包含 `standard_flow_start_requests`；`platform_app` 仅获 SELECT/INSERT） |
 | SEC-02 | 权限撤销/错误角色/非 owner/会话结束/版本过期时拒绝动作；访客不可访问坐席 job | API 403/404/409 与 RLS 集成 | 部分完成（真实身份撤权未演练） |
 | SEC-03 | AI 派发前与回复前复核 lease；在途外部调用有明确结果/unknown，接管后无新 AI 派发 | stale worker 与回复前 lease 校验 | 部分完成（无真实双窗口在途故障） |
 | SEC-04 | 日志、追踪、指标、评测报告无原始提示/客户文本/槽位值/凭据；失败 provider 输出同样受限 | 日志/PII 测试 | 通过（合成数据） |
@@ -41,11 +43,11 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | EVAL-02 | 真实模型对固定保留集达成约定质量；每意图/多意图/槽位/反讽否定均有切片，失败样例脱敏 | 当前 prompt/schema 与冻结人工审核 holdout 的脱敏报告 | 阻塞（独立标注未完成；历史合成模型结果的 prompt 版本元数据不一致，不作为当前 v7 验收；此前延迟已明显超过 2 秒） |
 | PERF-01 | off/shadow 客户路径与基线对比；shadow 不等待模型，队列可限流、过期与清理，数据库池不超预算 | 生产近似负载与分位数 | 未执行 |
 | PERF-02 | 分类/副驾 p95、超时率、token/费用与预算拦截可量化，响应时间含排队和失败请求 | 真实模型固定配置报告 | 阻塞（仅有合成探测；延迟超标，未测 p95 与生产负载） |
-| MIG-01 | 清洁库升级、带合成业务数据升级、回滚到上版应用可读写、隔离库迁移往返；新表 RLS/索引/外键完整 | 迁移全链回滚/重建、RLS 测试、master API 在 0065 扩展 schema 上读写 smoke | 通过（本机专用合成数据库；非 staging/生产回滚演练） |
+| MIG-01 | 清洁库升级、带合成业务数据升级、回滚到上版应用可读写、隔离库迁移往返；新表 RLS/索引/外键完整 | migration test 从 base 到 head、单步 downgrade/re-upgrade、完整 downgrade/re-upgrade；全表 FORCE RLS 扫描 | 通过（本机专用合成数据库；非 staging/生产回滚演练） |
 | OPS-01 | 持久任务超时、Worker 重启、provider 429/5xx、连接器断连、重复 outbox 可恢复；无孤儿 executing | 子进程 hard-exit 后新 Worker stale-claim 恢复、重复 outbox/过期恢复测试 | 部分完成（本地 OS 子进程故障恢复通过；未做多主机拓扑及真实 provider/connector 故障演练） |
 | OPS-02 | 租户开关/kill switch 生效，旧应用回滚保留数据；待确认动作不被自动执行 | kill switch 测试；扩展 schema 上的上版应用读写 smoke | 部分完成（本地应用回滚 smoke 通过；未做 staging 回滚、降级演练和待确认动作故障注入） |
-| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | [Release Evidence run #36295891831](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36295891831)，实现 head `247290e5df86c529dde17465efaab64765439764` | 通过（unit、integration、Release Evidence、Web、typecheck、lint、secret/dependency scan 和 concurrency guard 全通过） |
-| DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 更新后的验收/交付报告、语义标注指南、commit 证据包和 Release Evidence run #36295891831 | 部分完成（文档、CI 与本地回滚 smoke 齐备；staging/生产证据待补） |
+| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | 当前本地分支 `codex/r2-r3-implementation`，base HEAD `8150a74`；CI run 需绑定后续提交 | 未执行（本地验证不能替代当前 head CI） |
+| DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 本地 R2/R3 交付文档与工作区验收结果 | 部分完成（本地代码/文档可复核；无新 commit/CI，真实 evaluator 与业务系统仍阻塞） |
 
 ## 3. 质量阈值：R1 提议的启用门槛
 

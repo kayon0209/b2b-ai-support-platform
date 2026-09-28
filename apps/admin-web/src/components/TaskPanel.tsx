@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { apiGet, apiPost } from "../lib/api";
 import { newIdempotencyKey } from "../lib/idempotency";
 import {
@@ -59,7 +60,8 @@ export interface ConversationTask {
     | "succeeded"
     | "failed"
     | "unknown"
-    | "cancelled";
+    | "cancelled"
+    | "manual_flow";
   sequence: number;
   version: number;
   action_revision: number;
@@ -71,6 +73,10 @@ export interface ConversationTask {
   proposal_id: string | null;
   execution_id: string | null;
   source_turn_id: string;
+  flow_key: string | null;
+  flow_version: number | null;
+  flow_title: string | null;
+  flow_can_prepare_proposal: boolean;
   updated_at: number;
 }
 
@@ -90,6 +96,7 @@ const STATUS_LABEL: Record<string, string> = {
   ready: "可执行",
   needs_human: "待人工处理",
   awaiting_confirmation: "待坐席确认",
+  manual_flow: "标准流程·人工接续",
   executing: "执行中",
   succeeded: "已核验完成",
   failed: "执行失败",
@@ -112,6 +119,11 @@ const BLOCKED_LABEL: Record<string, string> = {
   TASK_WAITING_DEPENDENCY: "等待前置任务完成。",
   TASK_HANDED_TO_HUMAN: "已转人工处理。",
   TASK_CONDITION_UNMET: "前置条件不满足，已跳过。",
+  FLOW_EXECUTOR_UNAVAILABLE: "该流程已绑定到当前会话并进入人工接续；流程专用执行器尚未接入，不会自动查询或写入业务系统。",
+  FLOW_INTERNAL_CASE_ONLY: "当前只可准备平台内部申请工单；账户需从已关联 Case 唯一核验，且这不代表已开票。",
+  FLOW_INTERNAL_CASE_PROPOSAL_UNAVAILABLE: "平台未能准备内部工单提案；请人工核对账户关联和当前工具权限。",
+  TOOL_EXECUTION_FAILED: "工具执行失败；请查看关联提案和审计记录后再决定如何处理。",
+  TOOL_EXECUTION_UNKNOWN: "执行结果未知，不能视为完成；请先对账，禁止盲目重试。",
 };
 
 const KIND_LABEL: Record<string, string> = {
@@ -194,11 +206,28 @@ export function TaskPanel({
   }, [load]);
 
   useEffect(() => {
+    const refresh = (event: Event) => {
+      const detail = (event as CustomEvent<{ conversationRef?: string }>).detail;
+      if (detail?.conversationRef === conversationRef) void load();
+    };
+    window.addEventListener("workbench:tasks-changed", refresh);
+    return () => window.removeEventListener("workbench:tasks-changed", refresh);
+  }, [conversationRef, load]);
+
+  useEffect(() => {
     if (tasks === null || tasks.length > 0 || emptyRefreshes.current >= 3) return;
     const timer = window.setTimeout(() => {
       emptyRefreshes.current += 1;
       void load();
     }, 2000);
+    return () => window.clearTimeout(timer);
+  }, [load, tasks]);
+
+  useEffect(() => {
+    if (!tasks?.some((task) => task.status === "awaiting_confirmation" || task.status === "executing")) {
+      return;
+    }
+    const timer = window.setTimeout(() => void load(), 3000);
     return () => window.clearTimeout(timer);
   }, [load, tasks]);
 
@@ -224,7 +253,9 @@ export function TaskPanel({
               ? "任务已转人工。"
               : command === "prepare_proposal"
                 ? "任务已进入待确认，等待坐席确认后执行。"
-                : "已记录客户补充的信息。",
+                : task.flow_key
+                  ? "已记录坐席整理的字段；流程仍需人工接续，不会自动执行。"
+                  : "已记录客户补充的信息。",
         );
         await load();
         onChanged?.();
@@ -367,7 +398,16 @@ function TaskRow({
 }: TaskRowProps) {
   const [expanded, setExpanded] = useState(false);
   const missing = task.missing_slots;
-  const collectable = task.status === "awaiting_input" || task.status === "ready";
+  const collectable =
+    task.status === "awaiting_input" ||
+    task.status === "ready" ||
+    task.status === "manual_flow" ||
+    (task.flow_key === "invoice_application" && task.status === "needs_human");
+  const mayPrepareInvoiceProposal =
+    task.flow_key === "invoice_application" &&
+    (task.status === "manual_flow" || task.status === "needs_human") &&
+    missing.length === 0 &&
+    task.flow_can_prepare_proposal;
   // Both decisions come from `lib/taskPanelState`, which `task-panel-state`
   // executes: per-task field keys, and only the fields this task is waiting
   // for. Inlined here they were correct but untested, and the acceptance
@@ -377,6 +417,7 @@ function TaskRow({
 
   return (
     <li className={`wb-task wb-task-${task.status}`}>
+      {task.flow_title ? <p className="wb-task-flow-title">标准流程：{task.flow_title}（v{task.flow_version}）</p> : null}
       <div className="wb-task-head">
         <span className={`wb-task-status wb-task-status-${task.status}`}>
           {STATUS_LABEL[task.status] ?? task.status}
@@ -413,7 +454,7 @@ function TaskRow({
         </dl>
       ) : null}
 
-      {task.blocked_reason ? (
+        {task.blocked_reason ? (
         <p className="wb-task-blocked">
           {BLOCKED_LABEL[task.blocked_reason] ?? `原因：${task.blocked_reason}`}
         </p>
@@ -469,35 +510,52 @@ function TaskRow({
             {busy ? "提交中…" : "记录补充"}
           </button>
         ) : null}
+      {task.flow_key === "invoice_application" &&
+      (task.status === "manual_flow" || task.status === "needs_human") &&
+      missing.length === 0 &&
+      !task.flow_can_prepare_proposal ? (
+        <p className="wb-task-disabled-reason">
+          需要具备受控写入权限的支持管理员或租户负责人准备内部申请工单提案。
+        </p>
+      ) : null}
 
         {canCommand && !isTerminal(task.status) ? (
           <>
-            {task.kind === "write" ? (
+            {task.kind === "write" &&
+            ((task.status === "ready" && !task.flow_key) || mayPrepareInvoiceProposal) ? (
               <button
                 type="button"
                 className="wb-btn"
                 disabled={busy}
                 onClick={() => void onCommand(task, "prepare_proposal")}
-                title="生成待确认提案；不会自动执行"
+                title={
+                  task.flow_key === "invoice_application"
+                    ? "准备创建平台内部申请工单的提案；不会开票，也不会自动执行"
+                    : "生成待确认提案；不会自动执行"
+                }
               >
-                准备提案
+                {task.flow_key === "invoice_application" ? "准备内部申请提案" : "准备提案"}
               </button>
             ) : null}
-            <button
+            {task.status !== "needs_human" ? <button
               type="button"
               className="wb-btn"
               disabled={busy}
               onClick={() => void onCommand(task, "handoff")}
             >
-              转人工
-            </button>
+              {task.proposal_id && task.status === "awaiting_confirmation"
+                ? "撤回提案并转人工"
+                : "转人工"}
+            </button> : null}
             <button
               type="button"
               className="wb-btn wb-btn-danger"
               disabled={busy}
               onClick={() => void onCommand(task, "cancel")}
             >
-              取消
+              {task.proposal_id && task.status === "awaiting_confirmation"
+                ? "撤回提案并取消"
+                : "取消"}
             </button>
           </>
         ) : null}
@@ -528,7 +586,9 @@ function TaskRow({
           {task.proposal_id ? (
             <div>
               <dt>关联提案</dt>
-              <dd>{task.proposal_id}</dd>
+              <dd>
+                {task.proposal_id} · <Link to={`/admin/approvals?proposal_id=${encodeURIComponent(task.proposal_id)}`}>在审批页查看</Link>
+              </dd>
             </div>
           ) : null}
         </dl>

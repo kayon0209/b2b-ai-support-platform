@@ -10,6 +10,53 @@
 
 > 当前状态以文末 §9「Codex follow-up：剩余 R1 实施与再验收」及 [验收表](acceptance.md) 为准；§1–§6 保留 WorkBuddy 原交付时的记录，§7–§8 保留先前 follow-up 记录。
 
+## Codex continuation：R2/R3 本地增量（2026-09-27）
+
+本节记录当前隔离 worktree 的新增结果，不改写上方历史交付。分支为
+`codex/r2-r3-implementation`，基线 HEAD `8150a74e29b58a6f090916412482b8e51abefe5e`；
+本轮改动尚未提交、推送或触发 GitHub CI。
+
+### R2-02：标准流程会话任务入口
+
+- 新增默认关闭的 `agent.standard_flow_instances` flag、API 和 Workbench 按钮。服务端绑定最新同租户 customer turn、当前人工 owner、lease version、模板 key/version；浏览器不能指定 tenant/actor/source turn。
+- `standard_flow_start_requests` 保存哈希后的 idempotency key/request fingerprint，强制 tenant RLS 且应用角色仅 SELECT/INSERT。相同 key/相同请求回放同一 task；异请求冲突。task 创建写 append-only task event、AuditEvent、outbox 与低基数指标。
+- 实例使用 `manual_flow` 状态，明确排除 `can_progress()`。坐席可记录 customer-source 字段、取消或转人工；verified-business-record/human-review 字段不能靠自由文本冒充已核验。`invoice_application` 只在已有 Case 关联能唯一解析账户时，由有 `tool.write.confirmed` 权限的支持管理员/租户负责人准备平台内部 `case.create` 提案；executor 在写入时再次核对会话账户关联，审批页确认/执行后 verified receipt 回写 task。撤回与 execute 通过 ToolProposal 行锁串行；不执行开票。其它模板继续人工接续。
+
+### R2-03 与 R3 边界
+
+- 已检查 `EvaluationRunner`、`scripts/run_eval.py` 和 `hybrid_search`。本轮补上 tenant/space fixed-set manifest loader、Ed25519 前后测 attestation、signed artifact RLS persistence、approve/publish 快照复核及候选激活路径；旧的 unsigned metrics/post-test 路径拒绝写入。部署 allowlist、公钥/worker 私钥和真实数据集尚未配置，因此没有真实候选质量分数，普通 tenant flag 仍默认关闭。原有语义 CLI 的临时 corpus 不作为知识发布集。契约细节见 [R2-03 知识发布契约](r2-03-knowledge-release-contract.md)。
+- R3 继续使用 vendor-neutral canonical contract 与 fake adapter tests；本轮 canonical read schema 覆盖账户、订单、发票、工单、物流、商机、产品、库存、报价九个 authority domain。没有引入真实 ERP/MES/WMS/CRM provider；真实适配器仍需企业 authority、授权 sandbox 和归属证明。
+- 2026-09-28 R3 contract continuation：新增九域 canonical read model；`OwnershipProof` 现在绑定 tenant、connector、authority binding/version、具体外部 record 和 freshness TTL；`read_verified_fact()` 强制校验后才返回事实。canonical schema 版本更新为 `1.1`。`packages/contracts/tests` 与 `apps/api/tests/unit/integrations` 共 **138 passed**，Ruff、format、Mypy 通过；未调用真实 ERP/CRM provider。
+
+### 本地验证
+
+- R2 task state/planner/template unit tests：56 passed。
+- 定向 unit、API、RLS/cross-tenant、知识发布门禁、Tool Gateway 和 R3 canonical fake contract：**227 passed**，1 个 Starlette/httpx deprecation warning；包括标准流程 16 项集成验收（内部提案、角色限制、账户重核、撤回、确认执行状态回写）。此结果早于本节的 R2-03 硬阻断改动；新断言本轮未执行。
+- 2026-09-28 candidate-aware runner 复验：更新后的 `test_knowledge_release_gate.py` 使用隔离 PostgreSQL、合成 baseline/candidate 文档、fake answerer 和 deterministic embedder，经真实 `ReleaseEvaluationWorker` outbox handler 运行并签名持久化 pre/post test；baseline expected-candidate recall `0.0`、candidate recall `1.0`，安全 fake post-run citation support `1.0`，unsafe fake post-run 被签名阻塞并触发回滚。前后测事件覆盖 metadata-only claim、tenant-RLS payload load 和 fencing-token completion。R2-03/worker/迁移定向套件共 24 passed。此为 SQL/retrieval、签名、快照与队列边界验证，不是获批固定语料或真实模型质量评测。
+- 新建的隔离 PostgreSQL 数据库从 base 迁移到 `0068_standard_flow_instances`；完整 downgrade-to-base/re-upgrade、one-step rollback、全租户表 FORCE RLS 扫描：1 passed。`0068` 已计入 67 个 migration revisions。
+- Ruff check/format 与本轮修改的 15 个 Python source 文件 Mypy 检查通过。
+- Admin Web 临时镜像：typecheck、Vite production build、36 项 UI 测试和 runtime guards 通过。临时镜像输出用于验证，不是交付目录。
+- 新 HEAD 的 GitHub CI 尚未执行；生产 browser/A11y、真实候选 evaluator、真实外部业务连接器和 staging 演练仍未完成。功能 flag 保持默认关闭。
+
+### 本轮接续：候选暂存底座（2026-09-27）
+
+- 增加仅限 `system` / `service` + `integration_service` 的 release-candidate staging API；要求幂等键、已批准草稿、活动知识空间和干净扫描结果。候选使用可重放 UUID、内容哈希和 `gap-candidate://` 地址，审计只记录标识与哈希，不记录草稿正文。
+- ingestion 完成时保留候选的 `draft` 状态；普通检索仍只查 active 版本。候选不出现在文档/版本列表或下载 API；内部 overlay 仅允许同租户、同空间、ready/clean、专属地址的候选，并继续应用 principal ACL、扫描和有效期过滤。
+- 当前工作未运行测试、未触发 CI；仅做静态 diff 检查。此路径还没有接 evaluator runner、授权固定数据集、candidate snapshot/provenance artifact 或发布激活衔接，前后测写入和 release hard block 保持生效，不能据此给候选评测或生产就绪结论。
+
+### 本轮接续：可重放评测执行 seam（2026-09-27）
+
+- 扩展 `EvaluationRunner` 接受调用方解析的 principal scope；新 `release_evaluator.py` 要求租户绑定和 repeatable-read/serializable 事务，在固定时间点以相同样本先测 active baseline、再测单个 staged candidate。
+- runner 校验获批 dataset hash、稳定 sample id、expected source 和 principal scope；retrieval config hash 覆盖 aliases、candidate overlay、embedding/answerer 配置、retrieval 参数及 principal scope；snapshot hash 覆盖知识空间、版本、ACL 与 chunks。artifact 只保存 metrics 和结果摘要 hash，不保存原始问句、答案或片段。
+- signed pre/post artifact 已持久化并在 approve/publish 前验签、核对 allowlist 和当前快照；普通签名配置为空时拒绝写入。尚无真实获批固定集、已配置 worker 私钥、公钥 allowlist或持久 job 触发器，所以没有生产候选分数或自动评测调用。人工 rollback 保留。
+
+### 本轮接续：签名前后测和候选激活（2026-09-28）
+
+- 增加严格 dataset manifest；语义 hash 覆盖 case 内容、expected sources、tenant/space 和 principal scope。获批对象配置要求 tenant 前缀 object key、hash、approval reference 和两位不同 reviewer ID；worker loader 读取对象后重新计算 hash。
+- 新增 worker-only Ed25519 签名入口与 API 公钥验签，签名 artifact 绑定 paired runs、candidate、dataset approval reference、result digests 和 retrieval cutoff。签名验收后，应用在 RLS 表持久化 attestation；approval/publish 会再次验签、检查 allowlist 和知识/ACL/chunk 快照。发布激活已索引的候选；签名 post-test 会写通过或 rollback_required 事件。
+- 旧 unsigned metrics 和 post-test API 永久拒绝。新增 `release_evaluator` 专用 outbox worker、严格事件契约、租户 RLS payload 读取、fencing token、stale claim 恢复及三次有界重试；publish 开启自动运行时，会和知识激活在同一事务写 post-test event。自动运行默认关闭，样本 ceiling 默认为 0；当前未配置真实 dataset、公钥、worker 私钥或费用预算，因此尚无真实模型评测，也没有自动 worker 调用。tenant gate 默认关闭。
+- 验收：release signature、dataset hash、loader 单测与 signed API 集成旅程共 9 passed；Ruff check/format、Mypy（本轮涉及的 15 个 source modules）、worker/API import smoke 通过。Migration 0069 在隔离 PostgreSQL 完成 upgrade、降级到 0068、再 upgrade；两张 release evidence 表 FORCE RLS 均开启。GitHub CI 和 staging 未运行。
+
 ## Codex 后续修复（2026-09-26）
 
 以下为本交付报告编写后的代码修复与复验结果；下文原始交付说明保留 WorkBuddy 当时的状态记录。

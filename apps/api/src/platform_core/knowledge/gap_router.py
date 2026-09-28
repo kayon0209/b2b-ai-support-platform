@@ -25,14 +25,22 @@ not approved and a publisher who is also the reviewer (four-eyes), both
 enforced in `gap_service` so the HTTP path cannot bypass them.
 """
 
+import hashlib
+import json
+import time
 import uuid
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from platform_contracts.knowledge_release import KnowledgeEvalRun
+from platform_contracts.release_attestation import (
+    SignedReleaseEvaluationArtifact,
+    SignedReleasePostTestArtifact,
+)
 from platform_core.api import (
     domain_error_response,
     error_response,
@@ -40,10 +48,26 @@ from platform_core.api import (
     require_write_idempotency,
     tenant_session,
 )
+from platform_core.audit import service as audit_service
+from platform_core.config import get_settings
 from platform_core.identity import tenant_context
-from platform_core.identity.tenant_context import TenantContext
-from platform_core.knowledge import flag_service, gap_service, release_service
+from platform_core.identity.tenant_context import TenantContext, tenant_repeatable_read_session
+from platform_core.knowledge import (
+    flag_service,
+    gap_service,
+    release_artifacts,
+    release_evaluator,
+    release_service,
+)
 from platform_core.knowledge.gap_models import GapStatus
+from platform_core.knowledge.models import KnowledgeSpace
+from platform_core.knowledge.release_attestation_service import release_evidence_available
+from platform_core.knowledge.release_signatures import (
+    ReleaseSignatureError,
+    configured_approved_release_datasets,
+    configured_evaluator_public_keys,
+)
+from platform_core.outbox import OutboxEvent, OutboxStatus
 from platform_policy import Action, Decision, PolicyEngine, Principal
 
 router = APIRouter(prefix="/v1/knowledge", tags=["knowledge-gaps"])
@@ -83,6 +107,16 @@ class InternalReleaseEvaluationIn(BaseModel):
     knowledge_space_id: uuid.UUID
     baseline_run: KnowledgeEvalRun
     candidate_run: KnowledgeEvalRun
+
+
+class InternalReleaseCandidateIn(BaseModel):
+    knowledge_space_id: uuid.UUID
+
+
+class InternalReleaseEvaluationRequestIn(BaseModel):
+    knowledge_space_id: uuid.UUID
+    baseline_version_id: uuid.UUID
+    candidate_version_id: uuid.UUID
 
 
 class InternalReleasePostTestIn(BaseModel):
@@ -269,6 +303,7 @@ async def list_knowledge_drafts(
             "items": [_draft_out(r) for r in rows],
             "total": len(rows),
             "release_gate_enabled": release_gate.enabled,
+            "release_evidence_available": release_evidence_available(ctx.tenant_id),
         }
 
 
@@ -392,14 +427,40 @@ async def publish_gap_draft(
     if idempotency_key is None:
         return error_response("IDEMPOTENCY_KEY_REQUIRED", status_code=400)
 
-    async with tenant_session(ctx) as session:
-        decision = await flag_service.evaluate(
-            session,
-            flag_key=release_service.FLAG_KNOWLEDGE_RELEASE_GATE,
-            tenant_id=ctx.tenant_id,
-            default=False,
-        )
-        try:
+    try:
+        async with tenant_repeatable_read_session(ctx) as session:
+            decision = await flag_service.evaluate(
+                session,
+                flag_key=release_service.FLAG_KNOWLEDGE_RELEASE_GATE,
+                tenant_id=ctx.tenant_id,
+                default=False,
+            )
+            post_approval = None
+            settings = get_settings()
+            if (
+                decision.enabled
+                and payload.release_evaluation_id is not None
+                and settings.knowledge_evaluator_auto_run
+                and settings.knowledge_evaluator_max_cases_per_run > 0
+            ):
+                try:
+                    post_approval = configured_approved_release_datasets().get(
+                        (ctx.tenant_id, _uuid(payload.space_id, "knowledge space"))
+                    )
+                    public_keys = configured_evaluator_public_keys()
+                except ReleaseSignatureError as exc:
+                    return error_response(exc.code, status_code=409)
+                if post_approval is None or not public_keys:
+                    return error_response("EVALUATOR_PROVENANCE_UNAVAILABLE", status_code=409)
+                try:
+                    post_dataset = release_evaluator.load_approved_release_dataset(
+                        tenant_id=ctx.tenant_id,
+                        knowledge_space_id=_uuid(payload.space_id, "knowledge space"),
+                    )
+                except release_evaluator.ReleaseEvaluationError as exc:
+                    return error_response(exc.code, exc.detail, status_code=409)
+                if len(post_dataset.cases) > settings.knowledge_evaluator_max_cases_per_run:
+                    return error_response("EVAL_CASE_BUDGET_EXCEEDED", status_code=409)
             version = await gap_service.publish_draft(
                 session,
                 ctx=ctx,
@@ -410,17 +471,68 @@ async def publish_gap_draft(
                 release_evaluation_id=payload.release_evaluation_id,
                 idempotency_key=idempotency_key,
             )
-        except gap_service.GapError as exc:
-            return _gap_error(exc)
-        except release_service.KnowledgeReleaseError as exc:
-            return _release_error(exc)
-        await session.commit()
-        return {
-            "document_version_id": str(version.id),
-            "document_id": str(version.document_id),
-            "status": version.status,
-            "version_label": version.version_label,
-        }
+            if post_approval is not None and payload.release_evaluation_id is not None:
+                post_payload = {
+                    "schema_version": 1,
+                    "evaluation_id": str(payload.release_evaluation_id),
+                    "dataset_sha256": post_approval.sha256,
+                    "dataset_approval_ref": post_approval.approval_ref,
+                }
+                post_hash = hashlib.sha256(
+                    json.dumps(post_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                event_id = uuid.uuid5(
+                    ctx.tenant_id,
+                    f"knowledge-release-post-test:{payload.release_evaluation_id}",
+                )
+                existing = (
+                    await session.execute(
+                        select(OutboxEvent).where(
+                            OutboxEvent.tenant_id == ctx.tenant_id,
+                            OutboxEvent.event_id == event_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    if (existing.payload or {}).get("request_hash") != post_hash:
+                        return error_response("IDEMPOTENCY_CONFLICT", status_code=409)
+                else:
+                    session.add(
+                        OutboxEvent(
+                            id=uuid.uuid4(),
+                            tenant_id=ctx.tenant_id,
+                            event_id=event_id,
+                            event_type=release_evaluator.RELEASE_POST_TEST_REQUEST_EVENT,
+                            event_version=1,
+                            aggregate_type="knowledge_release_evaluation",
+                            aggregate_id=str(payload.release_evaluation_id),
+                            payload={**post_payload, "request_hash": post_hash},
+                            status=OutboxStatus.QUEUED.value,
+                            created_at=int(time.time()),
+                            trace_id=getattr(request.state, "trace_id", "") or "",
+                        )
+                    )
+                    await audit_service.record(
+                        session,
+                        ctx=ctx,
+                        action="knowledge.release_post_test_requested",
+                        resource_type="knowledge_release_evaluation",
+                        resource_id=payload.release_evaluation_id,
+                        metadata={
+                            "event_id": str(event_id),
+                            "dataset_sha256": post_approval.sha256,
+                        },
+                    )
+    except gap_service.GapError as exc:
+        return _gap_error(exc)
+    except release_service.KnowledgeReleaseError as exc:
+        return _release_error(exc)
+    return {
+        "document_version_id": str(version.id),
+        "document_id": str(version.document_id),
+        "status": version.status,
+        "version_label": version.version_label,
+    }
 
 
 @router.get("/drafts/{draft_id}/release-evaluations")
@@ -450,6 +562,7 @@ async def list_draft_release_evaluations(request: Request, draft_id: str) -> Any
         return {
             "items": items,
             "release_gate_enabled": decision.enabled,
+            "release_evidence_available": release_evidence_available(ctx.tenant_id),
             "can_approve": ctx.role in {"knowledge_manager", "tenant_owner"}
             and ctx.actor_id is not None,
         }
@@ -503,6 +616,228 @@ async def approve_knowledge_release(request: Request, draft_id: str, evaluation_
     }
 
 
+@router.post("/internal/drafts/{draft_id}/release-candidates")
+async def prepare_internal_knowledge_release_candidate(
+    request: Request,
+    draft_id: str,
+    payload: Annotated[InternalReleaseCandidateIn, Body()],
+) -> Any:
+    """Stage approved content as non-retrievable input for the release evaluator."""
+    ctx = _ctx_of(request)
+    if (
+        ctx.actor_kind not in {"system", "service"}
+        or ctx.actor_id is None
+        or ctx.role != "integration_service"
+    ):
+        return error_response("EVALUATOR_SERVICE_REQUIRED", status_code=403)
+    idempotency_key = require_idempotency_key(request)
+    if idempotency_key is None:
+        return error_response("IDEMPOTENCY_KEY_REQUIRED", status_code=400)
+    try:
+        draft_uuid = _uuid(draft_id, "knowledge draft")
+    except gap_service.GapError as exc:
+        return _gap_error(exc)
+
+    async with tenant_session(ctx) as session:
+        enabled = await flag_service.evaluate(
+            session,
+            flag_key=release_service.FLAG_KNOWLEDGE_RELEASE_GATE,
+            tenant_id=ctx.tenant_id,
+            default=False,
+        )
+        if not enabled.enabled:
+            return error_response(
+                "FEATURE_DISABLED", "knowledge release gate is not enabled", status_code=409
+            )
+        try:
+            version, replayed = await gap_service.prepare_release_candidate(
+                session,
+                ctx=ctx,
+                draft_id=draft_uuid,
+                space_id=payload.knowledge_space_id,
+                idempotency_key=idempotency_key,
+            )
+        except gap_service.GapError as exc:
+            return _gap_error(exc)
+        await session.commit()
+    return {
+        "candidate_version_id": str(version.id),
+        "knowledge_space_id": str(payload.knowledge_space_id),
+        "status": version.status,
+        "ingestion_status": version.ingestion_status,
+        "replayed": replayed,
+    }
+
+
+@router.post("/internal/drafts/{draft_id}/release-evaluation-requests")
+async def request_internal_knowledge_release_evaluation(
+    request: Request,
+    draft_id: str,
+    payload: Annotated[InternalReleaseEvaluationRequestIn, Body()],
+) -> Any:
+    """Durably request a signed evaluation; the request contains identifiers only."""
+    ctx = _ctx_of(request)
+    if (
+        ctx.actor_kind not in {"system", "service"}
+        or ctx.actor_id is None
+        or ctx.role != "integration_service"
+    ):
+        return error_response("EVALUATOR_SERVICE_REQUIRED", status_code=403)
+    idempotency_key = require_idempotency_key(request)
+    if idempotency_key is None:
+        return error_response("IDEMPOTENCY_KEY_REQUIRED", status_code=400)
+    try:
+        draft_uuid = _uuid(draft_id, "knowledge draft")
+    except gap_service.GapError as exc:
+        return _gap_error(exc)
+
+    key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    async with tenant_session(ctx) as session:
+        enabled = await flag_service.evaluate(
+            session,
+            flag_key=release_service.FLAG_KNOWLEDGE_RELEASE_GATE,
+            tenant_id=ctx.tenant_id,
+            default=False,
+        )
+        if not enabled.enabled:
+            return error_response(
+                "FEATURE_DISABLED", "knowledge release gate is not enabled", status_code=409
+            )
+        settings = get_settings()
+        if (
+            not settings.knowledge_evaluator_auto_run
+            or settings.knowledge_evaluator_max_cases_per_run <= 0
+        ):
+            return error_response("EVALUATOR_AUTORUN_DISABLED", status_code=409)
+        try:
+            approval = configured_approved_release_datasets().get(
+                (ctx.tenant_id, payload.knowledge_space_id)
+            )
+            public_keys = configured_evaluator_public_keys()
+        except ReleaseSignatureError as exc:
+            return error_response(exc.code, status_code=409)
+        if approval is None or not public_keys:
+            return error_response("EVALUATOR_PROVENANCE_UNAVAILABLE", status_code=409)
+        try:
+            approved_dataset = release_evaluator.load_approved_release_dataset(
+                tenant_id=ctx.tenant_id,
+                knowledge_space_id=payload.knowledge_space_id,
+            )
+        except release_evaluator.ReleaseEvaluationError as exc:
+            return error_response(exc.code, exc.detail, status_code=409)
+        if len(approved_dataset.cases) > settings.knowledge_evaluator_max_cases_per_run:
+            return error_response("EVAL_CASE_BUDGET_EXCEEDED", status_code=409)
+        try:
+            draft = await gap_service._load_draft(
+                session, ctx=ctx, draft_id=draft_uuid, for_update=True
+            )
+            if draft.status != "approved":
+                return _gap_error(
+                    gap_service.GapError(
+                        "DRAFT_NOT_APPROVED", "only an approved draft can be evaluated"
+                    )
+                )
+            space = (
+                await session.execute(
+                    select(KnowledgeSpace).where(
+                        KnowledgeSpace.tenant_id == ctx.tenant_id,
+                        KnowledgeSpace.id == payload.knowledge_space_id,
+                        KnowledgeSpace.status == "active",
+                    )
+                )
+            ).scalar_one_or_none()
+            if space is None:
+                return _gap_error(
+                    gap_service.GapError("KNOWLEDGE_SPACE_NOT_FOUND", "no active tenant space")
+                )
+            candidate = await release_evaluator._load_candidate_version(
+                session,
+                tenant_id=ctx.tenant_id,
+                knowledge_space_id=payload.knowledge_space_id,
+                version_id=payload.candidate_version_id,
+            )
+            baseline = await release_evaluator._load_baseline_version(
+                session,
+                tenant_id=ctx.tenant_id,
+                knowledge_space_id=payload.knowledge_space_id,
+                version_id=payload.baseline_version_id,
+            )
+        except (gap_service.GapError, release_evaluator.ReleaseEvaluationError) as exc:
+            if isinstance(exc, gap_service.GapError):
+                return _gap_error(exc)
+            return error_response(exc.code, exc.detail, status_code=409)
+        expected_candidate_id = uuid.uuid5(
+            ctx.tenant_id,
+            f"knowledge-release-candidate:{draft.id}:{payload.knowledge_space_id}:"
+            f"{release_service.draft_content_sha256(draft)}",
+        )
+        if (
+            candidate.id != expected_candidate_id
+            or baseline.id == candidate.id
+            or payload.candidate_version_id != candidate.id
+        ):
+            return error_response("CANDIDATE_VERSION_MISMATCH", status_code=409)
+
+        request_payload = {
+            "schema_version": 1,
+            "draft_id": str(draft.id),
+            "knowledge_space_id": str(payload.knowledge_space_id),
+            "baseline_version_id": str(baseline.id),
+            "candidate_version_id": str(candidate.id),
+            "dataset_sha256": approval.sha256,
+            "dataset_approval_ref": approval.approval_ref,
+            "idempotency_key_sha256": key_hash,
+        }
+        request_hash = hashlib.sha256(
+            json.dumps(request_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        event_id = uuid.uuid5(ctx.tenant_id, f"knowledge-release-evaluation:{key_hash}")
+        existing = (
+            await session.execute(
+                select(OutboxEvent).where(
+                    OutboxEvent.tenant_id == ctx.tenant_id,
+                    OutboxEvent.event_id == event_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if (existing.payload or {}).get("request_hash") != request_hash:
+                return error_response("IDEMPOTENCY_CONFLICT", status_code=409)
+            return {
+                "event_id": str(existing.event_id),
+                "status": str(existing.status),
+                "replayed": True,
+            }
+        event = OutboxEvent(
+            id=uuid.uuid4(),
+            tenant_id=ctx.tenant_id,
+            event_id=event_id,
+            event_type=release_evaluator.RELEASE_EVALUATION_REQUEST_EVENT,
+            event_version=1,
+            aggregate_type="knowledge_draft",
+            aggregate_id=str(draft.id),
+            payload={**request_payload, "request_hash": request_hash},
+            status=OutboxStatus.QUEUED.value,
+            created_at=int(time.time()),
+            trace_id=getattr(request.state, "trace_id", "") or "",
+        )
+        session.add(event)
+        await audit_service.record(
+            session,
+            ctx=ctx,
+            action="knowledge.release_evaluation_requested",
+            resource_type="knowledge_draft",
+            resource_id=draft.id,
+            metadata={
+                "event_id": str(event_id),
+                "dataset_sha256": approval.sha256,
+                "candidate_version_id": str(candidate.id),
+            },
+        )
+        await session.commit()
+    return {"event_id": str(event_id), "status": OutboxStatus.QUEUED.value, "replayed": False}
+
+
 @router.post("/internal/drafts/{draft_id}/release-evaluations")
 async def record_internal_knowledge_evaluation(
     request: Request,
@@ -553,6 +888,50 @@ async def record_internal_knowledge_evaluation(
     }
 
 
+@router.post("/internal/drafts/{draft_id}/signed-release-evaluations")
+async def record_signed_knowledge_evaluation(
+    request: Request,
+    draft_id: str,
+    payload: Annotated[SignedReleaseEvaluationArtifact, Body()],
+) -> Any:
+    """Record only a trusted worker signature over an approved fixed-set run."""
+    ctx = _ctx_of(request)
+    if (
+        ctx.actor_kind not in {"system", "service"}
+        or ctx.actor_id is None
+        or ctx.role != "integration_service"
+    ):
+        return error_response("EVALUATOR_SERVICE_REQUIRED", status_code=403)
+    idempotency_key = require_idempotency_key(request)
+    if idempotency_key is None:
+        return error_response("IDEMPOTENCY_KEY_REQUIRED", status_code=400)
+    try:
+        draft_uuid = _uuid(draft_id, "knowledge draft")
+    except gap_service.GapError as exc:
+        return _gap_error(exc)
+    if payload.artifact.draft_id != draft_uuid:
+        return error_response("EVAL_DRAFT_MISMATCH", status_code=409)
+
+    try:
+        async with tenant_repeatable_read_session(ctx) as session:
+            row, replayed = await release_artifacts.persist_signed_release_evaluation(
+                session,
+                ctx=ctx,
+                signed=payload,
+                idempotency_key=idempotency_key,
+            )
+    except release_service.KnowledgeReleaseError as exc:
+        return _release_error(exc)
+    return {
+        "evaluation_id": str(row.id),
+        "candidate_version_id": str(row.candidate_version_id),
+        "candidate_fingerprint": row.candidate_fingerprint,
+        "status": row.status,
+        "reason_code": row.reason_code,
+        "replayed": replayed,
+    }
+
+
 @router.post("/internal/releases/{evaluation_id}/post-test")
 async def record_internal_knowledge_post_test(
     request: Request,
@@ -581,6 +960,49 @@ async def record_internal_knowledge_post_test(
         except release_service.KnowledgeReleaseError as exc:
             return _release_error(exc)
         await session.commit()
+    return {
+        "post_test_id": str(row.id),
+        "evaluation_id": str(row.evaluation_id),
+        "status": row.status,
+        "reason_code": row.reason_code,
+        "replayed": replayed,
+    }
+
+
+@router.post("/internal/releases/{evaluation_id}/signed-post-test")
+async def record_signed_knowledge_post_test(
+    request: Request,
+    evaluation_id: str,
+    payload: Annotated[SignedReleasePostTestArtifact, Body()],
+) -> Any:
+    ctx = _ctx_of(request)
+    if (
+        ctx.actor_kind not in {"system", "service"}
+        or ctx.actor_id is None
+        or ctx.role != "integration_service"
+    ):
+        return error_response("EVALUATOR_SERVICE_REQUIRED", status_code=403)
+    idempotency_key = require_idempotency_key(request)
+    if idempotency_key is None:
+        return error_response("IDEMPOTENCY_KEY_REQUIRED", status_code=400)
+    try:
+        evaluation_uuid = _uuid(evaluation_id, "knowledge release evaluation")
+    except gap_service.GapError as exc:
+        return _gap_error(exc)
+    if payload.artifact.evaluation_id != evaluation_uuid:
+        return error_response("POST_TEST_INPUT_MISMATCH", status_code=409)
+
+    try:
+        async with tenant_repeatable_read_session(ctx) as session:
+            row, replayed = await release_artifacts.persist_signed_release_post_test(
+                session,
+                ctx=ctx,
+                evaluation_id=evaluation_uuid,
+                signed=payload,
+                idempotency_key=idempotency_key,
+            )
+    except release_service.KnowledgeReleaseError as exc:
+        return _release_error(exc)
     return {
         "post_test_id": str(row.id),
         "evaluation_id": str(row.evaluation_id),

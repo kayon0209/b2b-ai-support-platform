@@ -74,7 +74,7 @@ RUN_ROUTES = (
 # a runtime condition, so `observe_run` refuses to invent a label for it.
 CITATION_STATUSES = ("supported", "unsupported", "no_claims")
 
-WORKER_QUEUES = ("interactive", "ingestion", "outbox")
+WORKER_QUEUES = ("interactive", "ingestion", "outbox", "release_evaluator")
 
 # Latency buckets. The upper bound matters: docs/development-plan.md sets a
 # first-token P95 budget of 2.5 s, so the buckets must be dense below 5 s or
@@ -161,6 +161,12 @@ class PlatformMetrics:
             labelnames=("action", "outcome"),
             registry=r,
         )
+        self.workbench_standard_flow_actions_total = Counter(
+            "platform_workbench_standard_flow_actions_total",
+            "Operator-started standard flow lifecycle actions by bounded flow and outcome.",
+            labelnames=("flow_key", "action", "outcome"),
+            registry=r,
+        )
 
         # --- Retrieval ---
         self.retrieval_latency_seconds = Histogram(
@@ -242,6 +248,12 @@ class PlatformMetrics:
             "producer with no consumer is invisible: the event is marked sent "
             "and nothing anywhere reports that it went nowhere.",
             labelnames=("event_type",),
+            registry=r,
+        )
+        self.knowledge_release_jobs_total = Counter(
+            "platform_knowledge_release_jobs_total",
+            "Release evaluation jobs by bounded lifecycle outcome.",
+            labelnames=("result",),
             registry=r,
         )
 

@@ -50,6 +50,7 @@ class CaseCategory(enum.StrEnum):
     """
 
     GENERAL = "general"
+    INVOICE_APPLICATION = "invoice_application"
     # A customer's answer to an engineering question is outstanding, and
     # production waits on it. The case sits in WAITING_CUSTOMER until the
     # customer confirms; recording that confirmation is what

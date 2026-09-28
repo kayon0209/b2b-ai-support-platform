@@ -115,6 +115,7 @@ TENANT_TABLES = (
     "conversation_task_events",
     "copilot_drafts",
     "emotion_advice_reviews",
+    "standard_flow_start_requests",
 )
 
 _seed_ids: dict[str, str] = {}
@@ -583,6 +584,13 @@ def seed_all_tables() -> None:
                 "idempotency_key, created_at) VALUES (:i, :t, :conversation, :hash, "
                 "'angry', 'frustrated', 'overstated', gen_random_uuid(), :slug, 1000)",
             ),
+            (
+                "standard_flow_start_requests",
+                "INSERT INTO standard_flow_start_requests (id, tenant_id, conversation_ref_id, "
+                "task_id, idempotency_key_hash, request_hash, created_by, created_at) "
+                "VALUES (:i, :t, :conversation, :taskid, :hash, :request_hash, "
+                "gen_random_uuid(), 1000)",
+            ),
         ]
         for _table, stmt in stmts:
             if stmt is None:
@@ -607,6 +615,7 @@ def seed_all_tables() -> None:
                     "slug": f"neg-{_tid[-4:]}-x",
                     "email": f"neg-{slug}@test.local",
                     "hash": "a" * 64,
+                    "request_hash": "b" * 64,
                 },
             )
     yield

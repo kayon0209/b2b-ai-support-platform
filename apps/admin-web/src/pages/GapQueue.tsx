@@ -37,6 +37,7 @@ interface ReleaseEvaluationSummary {
 interface ReleaseEvaluationsResponse {
   items: ReleaseEvaluationSummary[];
   release_gate_enabled: boolean;
+  release_evidence_available: boolean;
   can_approve: boolean;
 }
 
@@ -86,6 +87,7 @@ export function GapQueue() {
     items: Draft[];
     total: number;
     release_gate_enabled: boolean;
+    release_evidence_available: boolean;
   }>(
     () => apiGet(`/v1/knowledge/gaps/drafts?limit=100`),
     [],
@@ -93,7 +95,7 @@ export function GapQueue() {
   const releaseEvaluations = useAsync<ReleaseEvaluationsResponse>(
     () => releaseDraftId
       ? apiGet(`/v1/knowledge/drafts/${releaseDraftId}/release-evaluations`)
-      : Promise.resolve({ items: [], release_gate_enabled: false, can_approve: false }),
+      : Promise.resolve({ items: [], release_gate_enabled: false, release_evidence_available: false, can_approve: false }),
     [releaseDraftId],
   );
   const stats = useAsync<GapStats>(() => apiGet<GapStats>(`/v1/knowledge/gaps/stats`), []);
@@ -373,7 +375,7 @@ export function GapQueue() {
                       </button>
                       <button
                         className="btn"
-                        disabled={action.busy || d.status !== "approved" || d.published_document_id !== null}
+                        disabled={action.busy || d.status !== "approved" || d.published_document_id !== null || (drafts.data?.release_gate_enabled && !drafts.data?.release_evidence_available)}
                         onClick={async () => {
                           const spaceItems = spaces.data?.items ?? [];
                           const releaseGateEnabled = drafts.data?.release_gate_enabled ?? false;
@@ -476,7 +478,11 @@ export function GapQueue() {
               </button>
             </div>
             <p className="muted">
-              {t(releaseEvaluations.data?.release_gate_enabled ? "gaps.releaseGateEnabled" : "gaps.releaseGateDisabled")}
+              {t(releaseEvaluations.data?.release_gate_enabled
+                ? releaseEvaluations.data?.release_evidence_available
+                  ? "gaps.releaseGateEnabled"
+                  : "gaps.releaseEvidenceUnavailable"
+                : "gaps.releaseGateDisabled")}
             </p>
             <LoadError
               error={releaseEvaluations.error}
@@ -496,7 +502,7 @@ export function GapQueue() {
                 <div className="release-evidence-actions">
                   <button
                     className="btn"
-                    disabled={action.busy || !releaseEvaluations.data?.release_gate_enabled || !releaseEvaluations.data?.can_approve || item.status !== "eligible" || item.current_user_approved || item.approval_count >= 2}
+                    disabled={action.busy || !releaseEvaluations.data?.release_gate_enabled || !releaseEvaluations.data?.release_evidence_available || !releaseEvaluations.data?.can_approve || item.status !== "eligible" || item.current_user_approved || item.approval_count >= 2}
                     onClick={() => act(
                       `/v1/knowledge/drafts/${releaseDraftId}/release-evaluations/${item.evaluation_id}/approve`,
                       undefined,

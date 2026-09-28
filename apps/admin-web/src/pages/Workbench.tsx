@@ -1108,7 +1108,12 @@ export function Workbench() {
               <CustomerPanel detail={detail} />
             </> : null}
             {rightTab === "tasks" ? <>
-              <StandardFlowCatalog />
+              <StandardFlowCatalog
+                conversationRef={detail.conversation_ref}
+                leaseVersion={detail.lease.version}
+                isOwner={detail.lease.owner === "human" && detail.lease.owner_ref === myRef}
+                onStarted={() => void loadDetail(detail.conversation_ref)}
+              />
               <TaskPanel
                 conversationRef={detail.conversation_ref}
                 leaseVersion={detail.lease.version}

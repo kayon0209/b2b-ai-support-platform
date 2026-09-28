@@ -67,6 +67,7 @@ QUEUE_ENV_VAR = "APP_WORKER_QUEUE"
 ROLE_INTERACTIVE = "interactive"
 ROLE_INGESTION = "ingestion"
 ROLE_OUTBOX = "outbox"
+ROLE_RELEASE_EVALUATOR = "release_evaluator"
 # Retention is a periodic sweep, not a queue drain: it owns every tenant at
 # once and runs on a long interval. Its own role so a slow sweep never delays
 # customer replies.
@@ -76,6 +77,7 @@ WORKER_ROLES = (
     ROLE_INTERACTIVE,
     ROLE_INGESTION,
     ROLE_OUTBOX,
+    ROLE_RELEASE_EVALUATOR,
     ROLE_RETENTION,
     ROLE_SLA,
 )
@@ -558,6 +560,21 @@ def main() -> None:
         run(_run_outbox_only())
         return
 
+    if queue == ROLE_RELEASE_EVALUATOR:
+        from worker.release_evaluation_consumer import build_release_evaluator_runtime
+
+        runtime = build_release_evaluator_runtime()
+        logger.info(
+            "worker_wiring",
+            queue=queue,
+            has_chat=True,
+            has_embedding=True,
+            signing_key_id=os.environ.get("APP_KNOWLEDGE_EVALUATOR_KEY_ID", ""),
+            max_cases_per_run=runtime.max_cases_per_run,
+        )
+        run(_run_release_evaluator(runtime))
+        return
+
     if queue == ROLE_INGESTION:
         ingestion_deps = build_ingestion_deps()
         logger.info("worker_wiring", queue=queue, has_embedding=ingestion_deps.can_embed)
@@ -659,6 +676,24 @@ async def _run_outbox_only() -> None:
     except KeyboardInterrupt:  # pragma: no cover - interactive stop
         relay_worker.request_stop()
         logger.info("worker_interrupted")
+
+
+async def _run_release_evaluator(runtime: Any) -> None:
+    from worker.release_evaluation_consumer import ReleaseEvaluationWorker
+
+    worker = ReleaseEvaluationWorker(runtime)
+    loop = asyncio.get_running_loop()
+    install_signal_handlers(worker, loop)
+    try:
+        await _run_poll_loop(
+            name=ROLE_RELEASE_EVALUATOR,
+            cycle=worker.run_once,
+            config=WorkerConfig(batch=1, poll_interval_seconds=5.0),
+            stopping=lambda: worker.stopping,
+        )
+    except KeyboardInterrupt:  # pragma: no cover - interactive stop
+        worker.request_stop()
+        logger.info("worker_interrupted", queue=ROLE_RELEASE_EVALUATOR)
 
 
 __all__ = [

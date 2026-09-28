@@ -34,6 +34,7 @@ class AuthorityDomain(StrEnum):
     QUOTE = "quote"
     CUSTOMER_ACCOUNT = "customer_account"
     ORDER = "order"
+    INVOICE = "invoice"
     WORK_ORDER = "work_order"
     SHIPMENT = "shipment"
     OPPORTUNITY = "opportunity"
@@ -48,7 +49,7 @@ class AuthorityBinding(StrictContract):
     system_kind: BusinessSystemKind
     connector_id: UUID
     binding_version: int = Field(ge=1)
-    canonical_schema_version: Literal["1.0"] = "1.0"
+    canonical_schema_version: Literal["1.1"] = "1.1"
     max_age_seconds: int = Field(gt=0, le=31_536_000)
     approved_by: UUID
     approved_at: datetime
@@ -170,11 +171,167 @@ class CanonicalQuote(StrictContract):
         return self
 
 
+class CanonicalCustomerAccount(StrictContract):
+    """Tenant-mapped account reference used to scope external business records."""
+
+    tenant_id: UUID
+    account_ref: str = Field(min_length=1, max_length=255)
+    status: Literal["active", "inactive", "credit_hold", "closed", "unknown"]
+    source: SourceMetadata
+
+    @model_validator(mode="after")
+    def tenant_matches_source(self) -> CanonicalCustomerAccount:
+        if self.tenant_id != self.source.tenant_id:
+            raise ValueError("account tenant must match provenance tenant")
+        return self
+
+
+class CanonicalOrderStatus(StrictContract):
+    """Customer-scoped order status; no provider-specific raw fields."""
+
+    tenant_id: UUID
+    customer_account_ref: str = Field(min_length=1, max_length=255)
+    order_ref: str = Field(min_length=1, max_length=255)
+    status: Literal[
+        "draft",
+        "submitted",
+        "accepted",
+        "in_production",
+        "partially_shipped",
+        "shipped",
+        "delivered",
+        "on_hold",
+        "cancelled",
+        "unknown",
+    ]
+    status_updated_at: datetime
+    estimated_delivery_at: datetime | None = None
+    source: SourceMetadata
+
+    @model_validator(mode="after")
+    def tenant_and_status_times_match_source(self) -> CanonicalOrderStatus:
+        _require_fact_tenant(self.tenant_id, self.source, "order")
+        _require_fact_timestamp(self.status_updated_at, self.source, "status_updated_at")
+        if self.estimated_delivery_at is not None:
+            _require_utc(self.estimated_delivery_at, "estimated_delivery_at")
+        return self
+
+
+class CanonicalWorkOrderStatus(StrictContract):
+    """Customer/product-scoped manufacturing progress from MES or ERP."""
+
+    tenant_id: UUID
+    customer_account_ref: str = Field(min_length=1, max_length=255)
+    work_order_ref: str = Field(min_length=1, max_length=255)
+    product_ref: str = Field(min_length=1, max_length=255)
+    revision: str = Field(min_length=1, max_length=63)
+    status: Literal[
+        "queued",
+        "in_production",
+        "quality_hold",
+        "inspection",
+        "complete",
+        "cancelled",
+        "unknown",
+    ]
+    quality_status: Literal[
+        "not_started", "pending", "passed", "failed", "hold", "not_applicable", "unknown"
+    ]
+    status_updated_at: datetime
+    source: SourceMetadata
+
+    @model_validator(mode="after")
+    def tenant_and_status_time_match_source(self) -> CanonicalWorkOrderStatus:
+        _require_fact_tenant(self.tenant_id, self.source, "work order")
+        _require_fact_timestamp(self.status_updated_at, self.source, "status_updated_at")
+        return self
+
+
+class CanonicalShipmentStatus(StrictContract):
+    """Customer-scoped delivery status, without inferred carrier semantics."""
+
+    tenant_id: UUID
+    customer_account_ref: str = Field(min_length=1, max_length=255)
+    order_ref: str = Field(min_length=1, max_length=255)
+    shipment_ref: str = Field(min_length=1, max_length=255)
+    tracking_ref: str | None = Field(default=None, max_length=255)
+    status: Literal[
+        "label_created",
+        "in_transit",
+        "customs_hold",
+        "out_for_delivery",
+        "delivered",
+        "exception",
+        "cancelled",
+        "unknown",
+    ]
+    status_updated_at: datetime
+    source: SourceMetadata
+
+    @model_validator(mode="after")
+    def tenant_and_status_time_match_source(self) -> CanonicalShipmentStatus:
+        _require_fact_tenant(self.tenant_id, self.source, "shipment")
+        _require_fact_timestamp(self.status_updated_at, self.source, "status_updated_at")
+        return self
+
+
+class CanonicalInvoiceStatus(StrictContract):
+    """Read-only invoice facts; issuance and corrections remain controlled writes."""
+
+    tenant_id: UUID
+    customer_account_ref: str = Field(min_length=1, max_length=255)
+    invoice_ref: str = Field(min_length=1, max_length=255)
+    invoice_type: Literal["tax", "commercial", "credit_note", "other"]
+    status: Literal["draft", "issued", "partially_paid", "paid", "overdue", "void", "unknown"]
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+    total_amount_minor: int | None = Field(default=None, ge=0)
+    issued_at: datetime | None = None
+    due_at: datetime | None = None
+    source: SourceMetadata
+
+    @model_validator(mode="after")
+    def tenant_and_money_fields_match_source(self) -> CanonicalInvoiceStatus:
+        _require_fact_tenant(self.tenant_id, self.source, "invoice")
+        if (self.currency is None) != (self.total_amount_minor is None):
+            raise ValueError("invoice amount and currency must be provided together")
+        if self.issued_at is not None:
+            _require_utc(self.issued_at, "issued_at")
+        if self.due_at is not None:
+            _require_utc(self.due_at, "due_at")
+        if self.issued_at is not None and self.due_at is not None and self.due_at < self.issued_at:
+            raise ValueError("invoice due_at must not precede issued_at")
+        return self
+
+
+class CanonicalOpportunity(StrictContract):
+    """CRM opportunity projection; forecast stage is not a customer quote."""
+
+    tenant_id: UUID
+    customer_account_ref: str = Field(min_length=1, max_length=255)
+    opportunity_ref: str = Field(min_length=1, max_length=255)
+    stage: Literal["new", "qualified", "proposal", "negotiation", "won", "lost", "unknown"]
+    product_refs: tuple[str, ...] = Field(default=(), max_length=100)
+    quote_ref: str | None = Field(default=None, max_length=255)
+    status_updated_at: datetime
+    source: SourceMetadata
+
+    @model_validator(mode="after")
+    def tenant_and_status_time_match_source(self) -> CanonicalOpportunity:
+        _require_fact_tenant(self.tenant_id, self.source, "opportunity")
+        _require_fact_timestamp(self.status_updated_at, self.source, "status_updated_at")
+        if any(not product_ref or len(product_ref) > 255 for product_ref in self.product_refs):
+            raise ValueError("opportunity product references must be non-empty and bounded")
+        return self
+
+
 class OwnershipProof(StrictContract):
     """Evidence that an external record belongs to the requested account."""
 
     tenant_id: UUID
     connector_id: UUID
+    authority_binding_id: UUID
+    authority_version: int = Field(ge=1)
+    resource_ref: str = Field(min_length=1, max_length=255)
     expected_account_ref: str = Field(min_length=1, max_length=255)
     observed_account_ref: str = Field(min_length=1, max_length=255)
     verified_at: datetime
@@ -186,6 +343,26 @@ class OwnershipProof(StrictContract):
             raise ValueError("external record ownership does not match the requested account")
         _require_utc(self.verified_at, "verified_at")
         return self
+
+
+CanonicalBusinessFact = (
+    CanonicalCustomerAccount
+    | CanonicalOrderStatus
+    | CanonicalWorkOrderStatus
+    | CanonicalShipmentStatus
+    | CanonicalInvoiceStatus
+    | CanonicalOpportunity
+    | CanonicalProductSpecification
+    | CanonicalInventorySnapshot
+    | CanonicalQuote
+)
+
+
+class CanonicalBusinessReadResult(StrictContract):
+    """A canonical fact and the optional proof needed to authorize its reader."""
+
+    fact: CanonicalBusinessFact
+    ownership_proof: OwnershipProof | None = None
 
 
 class BusinessWriteStatus(StrEnum):
@@ -256,15 +433,34 @@ def _require_utc(value: datetime, field_name: str) -> None:
         raise ValueError(f"{field_name} must be timezone-aware UTC")
 
 
+def _require_fact_tenant(tenant_id: UUID, source: SourceMetadata, kind: str) -> None:
+    if tenant_id != source.tenant_id:
+        raise ValueError(f"{kind} tenant must match provenance tenant")
+
+
+def _require_fact_timestamp(value: datetime, source: SourceMetadata, field_name: str) -> None:
+    _require_utc(value, field_name)
+    if value > source.retrieved_at:
+        raise ValueError(f"{field_name} must not be later than source retrieval")
+
+
 __all__ = [
     "AuthorityBinding",
     "AuthorityDomain",
     "BusinessWriteReason",
     "BusinessSystemKind",
     "BusinessWriteStatus",
+    "CanonicalBusinessFact",
+    "CanonicalBusinessReadResult",
     "CanonicalInventorySnapshot",
+    "CanonicalCustomerAccount",
+    "CanonicalInvoiceStatus",
+    "CanonicalOpportunity",
+    "CanonicalOrderStatus",
     "CanonicalProductSpecification",
     "CanonicalQuote",
+    "CanonicalShipmentStatus",
+    "CanonicalWorkOrderStatus",
     "ExternalWriteReceipt",
     "OwnershipProof",
     "SourceMetadata",

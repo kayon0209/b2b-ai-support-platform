@@ -37,6 +37,11 @@ class KnowledgeReleaseEvaluation(Base, PkMixin, TenantMixin):
             "candidate_fingerprint",
             name="uq_knowledge_release_eval_candidate",
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "attestation_sha256",
+            name="uq_knowledge_release_eval_attestation",
+        ),
         ForeignKeyConstraint(
             ["tenant_id", "draft_id"],
             ["knowledge_drafts.tenant_id", "knowledge_drafts.id"],
@@ -65,6 +70,8 @@ class KnowledgeReleaseEvaluation(Base, PkMixin, TenantMixin):
     author_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     baseline_run: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     candidate_run: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    attestation_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    attestation_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     candidate_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(15), nullable=False)
     reason_code: Mapped[str] = mapped_column(String(63), nullable=False)
@@ -122,6 +129,11 @@ class KnowledgeReleasePostTest(Base, PkMixin, TenantMixin):
             "idempotency_key",
             name="uq_knowledge_release_post_test_idempotency",
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "attestation_sha256",
+            name="uq_knowledge_release_post_test_attestation",
+        ),
         CheckConstraint(
             "status IN ('passed', 'blocked')", name="ck_knowledge_release_post_test_status"
         ),
@@ -130,6 +142,8 @@ class KnowledgeReleasePostTest(Base, PkMixin, TenantMixin):
 
     evaluation_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     run: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    attestation_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    attestation_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(15), nullable=False)
     reason_code: Mapped[str] = mapped_column(String(63), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)

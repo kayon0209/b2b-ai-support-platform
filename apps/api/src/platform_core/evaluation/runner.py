@@ -201,6 +201,7 @@ class EvaluationRunner:
         retrieve_fn: RetrieveFn,
         *,
         key_of: Callable[[RetrievedChunk], str] | None = None,
+        principal_scope_for_case: Callable[[EvalCase], PrincipalScope] | None = None,
     ) -> None:
         """retrieve_fn(question, principal_scope) -> list[RetrievedChunk].
 
@@ -212,6 +213,7 @@ class EvaluationRunner:
         self._answer_fn = answer_fn
         self._retrieve_fn = retrieve_fn
         self._key_of = key_of or (lambda chunk: chunk.title)
+        self._principal_scope_for_case = principal_scope_for_case
 
     async def run_case(self, case: EvalCase) -> CaseResult:
         started = time.monotonic()
@@ -219,9 +221,13 @@ class EvaluationRunner:
         # was a field nothing ever wrote, so a report could not say which route a
         # case had taken - the one fact needed to explain a routing regression.
         route = classify(case.question).route.value
-        scope = PrincipalScope(
-            principal_types=("role", "department"),
-            principal_ids=(case.role, *case.principal_groups),
+        scope = (
+            self._principal_scope_for_case(case)
+            if self._principal_scope_for_case is not None
+            else PrincipalScope(
+                principal_types=("role", "department"),
+                principal_ids=(case.role, *case.principal_groups),
+            )
         )
         evidence = await self._retrieve_fn(case.question, scope)
 

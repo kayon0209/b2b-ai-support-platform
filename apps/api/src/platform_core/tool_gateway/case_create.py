@@ -70,7 +70,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.cases.models import Case, CaseCategory
-from platform_core.cases.service import CaseError, CaseService
+from platform_core.cases.service import (
+    CaseError,
+    CaseService,
+    verified_account_for_conversation,
+)
 
 # Mirrors `cases.router.VALID_PRIORITIES`. Duplicated rather than imported
 # because the router module pulls in the HTTP layer; the two are kept in step
@@ -121,6 +125,19 @@ class CaseCreateExecutor:
             # refusal is worth more than the quiet success a `None` would give.
             return {"ok": False, "error_code": "ENTERPRISE_ACCOUNT_REQUIRED"}
 
+        category = str(parameters.get("category") or CaseCategory.GENERAL.value).strip()
+        conversation_ref_id = _optional_uuid(parameters.get("conversation_ref_id"))
+        if category == "invoice_application":
+            if conversation_ref_id is None:
+                return {"ok": False, "error_code": "CONVERSATION_ACCOUNT_LINK_REQUIRED"}
+            linked_account = await verified_account_for_conversation(
+                self._session,
+                tenant_id=uuid.UUID(str(self._tenant_id)),
+                conversation_ref_id=conversation_ref_id,
+            )
+            if linked_account != account_id:
+                return {"ok": False, "error_code": "ACCOUNT_CONVERSATION_MISMATCH"}
+
         subject = " ".join(str(parameters.get("subject") or "").split())
         if not subject:
             return {"ok": False, "error_code": "SUBJECT_REQUIRED"}
@@ -135,10 +152,10 @@ class CaseCreateExecutor:
                 subject=subject,
                 description=str(parameters.get("description") or ""),
                 priority=priority,
-                category=str(parameters.get("category") or CaseCategory.GENERAL.value).strip(),
+                category=category,
                 actor_id=self._actor_id,
                 enterprise_account_id=account_id,
-                conversation_ref_id=_optional_uuid(parameters.get("conversation_ref_id")),
+                conversation_ref_id=conversation_ref_id,
             )
         except CaseError as exc:
             # `ACCOUNT_NOT_FOUND` from the service means "no such account, or not

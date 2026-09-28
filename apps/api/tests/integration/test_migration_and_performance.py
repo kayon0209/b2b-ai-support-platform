@@ -80,7 +80,10 @@ TENANT_TABLES = (
     "contact_facts",
     "conversation_contacts",
     "conversation_control_leases",
+    "conversation_task_events",
+    "conversation_tasks",
     "conversation_turns",
+    "copilot_drafts",
     "csat_responses",
     "dead_letter_items",
     "departments",
@@ -112,12 +115,15 @@ TENANT_TABLES = (
     "saml_connections",
     "saml_consumed_assertions",
     "scim_tokens",
+    "semantic_assessments",
     "sla_policies",
+    "standard_flow_start_requests",
     "sync_cursors",
     "tenant_domains",
     "tool_definitions",
     "tool_executions",
     "tool_proposals",
+    "visitor_session_revocations",
 )
 
 # Bump this when adding a migration. It is a deliberate speed bump: the
@@ -136,10 +142,10 @@ TENANT_TABLES = (
 # "how many revisions are registered", and a stray untracked file on one
 # machine must not be able to satisfy it.
 #
-# 66 as of 2026-09-27. `0067_knowledge_release_gate` is the newest registered
-# revision (R2-03 immutable evaluations, approvals, and release transitions); keep this synchronized
+# 69 as of 2026-09-28. `0070_outbox_processing_fence` adds a claim token for
+# dedicated consumers that commit before external work; keep this synchronized
 # with the tracked revision set, excluding `.gitkeep` and local-only files.
-EXPECTED_MIGRATIONS = 66
+EXPECTED_MIGRATIONS = 69
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

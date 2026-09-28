@@ -228,7 +228,9 @@ export function Approvals() {
   const { t } = useLang();
   const [status, setStatus] = useState<string>("authorized");
   const [offset, setOffset] = useState(0);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(
+    () => new URLSearchParams(window.location.search).get("proposal_id"),
+  );
   const [raising, setRaising] = useState(false);
   // Bumped on a timer so the "time left" on a proposal counts down instead of
   // freezing at whatever it read when the page loaded.

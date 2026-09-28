@@ -322,6 +322,34 @@ class ToolGateway:
         await self._session.flush()
         return confirmation
 
+    async def withdraw(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        proposal_id: uuid.UUID,
+    ) -> ToolProposal:
+        """Revoke an unexecuted proposal while serializing against execute.
+
+        Task cancellation is only truthful if its frozen write cannot execute
+        later. `_get_proposal` locks the row, the same lock used by confirm and
+        execute, so one of withdrawal or execution wins atomically.
+        """
+        proposal = await self._get_proposal(tenant_id, proposal_id)
+        if proposal is None:
+            raise ToolGatewayError("PROPOSAL_NOT_FOUND")
+        if proposal.status == ProposalStatus.REJECTED.value:
+            return proposal
+        if proposal.status not in {
+            ProposalStatus.PROPOSED.value,
+            ProposalStatus.AUTHORIZED.value,
+            ProposalStatus.CONFIRMED.value,
+        }:
+            raise ToolGatewayError("PROPOSAL_NOT_WITHDRAWABLE", proposal.status)
+        proposal.status = ProposalStatus.REJECTED.value
+        proposal.error_code = "WITHDRAWN_BY_OPERATOR"
+        await self._session.flush()
+        return proposal
+
     async def execute(
         self,
         *,
@@ -439,8 +467,10 @@ class ToolGateway:
     async def _get_proposal(
         self, tenant_id: uuid.UUID, proposal_id: uuid.UUID
     ) -> ToolProposal | None:
-        stmt = select(ToolProposal).where(
-            ToolProposal.tenant_id == tenant_id, ToolProposal.id == proposal_id
+        stmt = (
+            select(ToolProposal)
+            .where(ToolProposal.tenant_id == tenant_id, ToolProposal.id == proposal_id)
+            .with_for_update()
         )
         return (await self._session.execute(stmt)).scalar_one_or_none()
 

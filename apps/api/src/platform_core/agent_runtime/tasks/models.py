@@ -116,6 +116,10 @@ class ConversationTask(Base, PkMixin, TenantMixin):
     sequence: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     kind: Mapped[str] = mapped_column(String(31), nullable=False)
     status: Mapped[str] = mapped_column(String(31), nullable=False)
+    # Present only for tasks explicitly started from the versioned standard
+    # flow catalog. Semantic planner tasks remain unbound to a guessed flow.
+    flow_key: Mapped[str | None] = mapped_column(String(63), nullable=True)
+    flow_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     # Bumped when the action's arguments change, so a confirmation bound to the
     # old revision stops matching.
@@ -188,6 +192,38 @@ class ConversationTaskEvent(Base, PkMixin, TenantMixin):
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class StandardFlowStartRequest(Base, PkMixin, TenantMixin):
+    """Append-only idempotency receipt for an operator starting a flow."""
+
+    __tablename__ = "standard_flow_start_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "conversation_ref_id",
+            "idempotency_key_hash",
+            name="uq_standard_flow_start_idempotency",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "task_id", "conversation_ref_id"],
+            [
+                "conversation_tasks.tenant_id",
+                "conversation_tasks.id",
+                "conversation_tasks.conversation_ref_id",
+            ],
+            name="fk_standard_flow_start_task_tenant",
+            ondelete="RESTRICT",
+        ),
+        Index("ix_standard_flow_start_task", "tenant_id", "task_id"),
+    )
+
+    conversation_ref_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    task_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    idempotency_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class CopilotDraft(Base, PkMixin, TenantMixin):
     """Controlled business data. Never logged, never in a metric label."""
 
@@ -236,4 +272,5 @@ __all__ = [
     "ConversationTaskEvent",
     "CopilotDraft",
     "SemanticAssessmentRow",
+    "StandardFlowStartRequest",
 ]

@@ -28,8 +28,11 @@ returned to a `CASE_READ` principal on a conversation they can already see.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
@@ -37,6 +40,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select as sa_select
 from sqlalchemy.exc import IntegrityError
 
+from observability_metrics import get_metrics
 from platform_core.agent_runtime import chat_service
 from platform_core.agent_runtime.copilot import (
     COPILOT_EVENT_TYPE,
@@ -51,7 +55,13 @@ from platform_core.agent_runtime.copilot import (
 from platform_core.agent_runtime.models import ConversationTurn
 from platform_core.agent_runtime.semantic.modes import FLAG_COPILOT
 from platform_core.agent_runtime.tasks import store as task_store
-from platform_core.agent_runtime.tasks.models import CopilotDraft
+from platform_core.agent_runtime.tasks.models import CopilotDraft, StandardFlowStartRequest
+from platform_core.agent_runtime.tasks.standard_flows import (
+    FLAG_STANDARD_FLOW_INSTANCES,
+    FLOW_EXECUTOR_UNAVAILABLE,
+    FLOW_INTERNAL_CASE_ONLY,
+    get_standard_flow,
+)
 from platform_core.agent_runtime.tasks.state_machine import (
     TaskKind,
     TaskStatus,
@@ -68,10 +78,13 @@ from platform_core.api import (
     require_write_idempotency,
     tenant_session,
 )
+from platform_core.audit import service as audit_service
+from platform_core.cases.service import verified_account_for_conversation
 from platform_core.evaluation.pii import should_withhold_value
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
 from platform_core.identity.tenant_context import TenantContext
+from platform_core.knowledge import flag_service
 from platform_core.outbox import OutboxEvent
 from platform_core.outbox_service import enqueue
 from platform_policy import Action
@@ -95,6 +108,13 @@ class TaskCommandIn(BaseModel):
     fields: dict[str, str] = Field(default_factory=dict)
 
 
+class StandardFlowStartIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    flow_key: str = Field(min_length=1, max_length=63)
+    expected_lease_version: int = Field(ge=1)
+
+
 class CopilotJobIn(BaseModel):
     kind: Literal["summary", "reply"]
     timeline_revision: int = Field(ge=0)
@@ -113,7 +133,7 @@ def _auth(request: Request, action: Action) -> tuple[Any, Any]:
     return ctx, require_policy(ctx, action)
 
 
-def _task_out(row: Any) -> dict[str, Any]:
+def _task_out(row: Any, *, can_prepare_invoice_proposal: bool = False) -> dict[str, Any]:
     """The task projection.
 
     `slots` holds names, origins and confirmation flags. The value of a
@@ -121,6 +141,7 @@ def _task_out(row: Any) -> dict[str, Any]:
     transcript, which is access-controlled and retention-bounded, and this row
     is read by a list endpoint and by the audit path.
     """
+    template = get_standard_flow(row.flow_key) if row.flow_key else None
     return {
         "task_id": str(row.id),
         "local_key": row.task_local_key,
@@ -137,6 +158,12 @@ def _task_out(row: Any) -> dict[str, Any]:
         "proposal_id": str(row.proposal_id) if row.proposal_id else None,
         "execution_id": str(row.execution_id) if row.execution_id else None,
         "source_turn_id": row.source_turn_id,
+        "flow_key": row.flow_key,
+        "flow_version": row.flow_version,
+        "flow_title": template.title if template else None,
+        "flow_can_prepare_proposal": bool(
+            row.flow_key == "invoice_application" and can_prepare_invoice_proposal
+        ),
         "updated_at": row.updated_at,
     }
 
@@ -167,10 +194,268 @@ async def list_conversation_tasks(
     return ok_response(
         {
             "conversation_ref": str(conversation_ref),
-            "items": [_task_out(r) for r in rows],
+            "items": [
+                _task_out(
+                    row,
+                    can_prepare_invoice_proposal=(
+                        require_policy(ctx, Action.TOOL_WRITE_CONFIRMED) is None
+                    ),
+                )
+                for row in rows
+            ],
             "limit": limit,
             "offset": offset,
         }
+    )
+
+
+def _request_digest(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@router.post("/conversations/{conversation_ref}/standard-flows/tasks")
+async def start_standard_flow(
+    request: Request,
+    conversation_ref: uuid.UUID,
+    body: StandardFlowStartIn,
+) -> Any:
+    """Create an operator-owned task bound to the latest customer turn.
+
+    A catalog instance is intentionally parked in `manual_flow`, which is not
+    schedulable. A flow-specific executor must be implemented and authorized
+    before any template can become ready or produce a Tool Gateway proposal.
+    """
+    ctx, denied = _auth(request, Action.CASE_UPDATE)
+    if denied is not None:
+        return denied
+    assert ctx is not None
+    missing = require_write_idempotency(request, Action.CASE_UPDATE)
+    if missing is not None:
+        return missing
+    if ctx.actor_id is None:
+        return error_response(VALIDATION_FAILED, "an identified agent is required", status_code=400)
+    template = get_standard_flow(body.flow_key)
+    if template is None:
+        return error_response("FLOW_NOT_FOUND", "unknown standard flow", status_code=404)
+
+    idem_raw = request.headers["Idempotency-Key"]
+    idem_hash = hashlib.sha256(idem_raw.encode("utf-8")).hexdigest()
+    request_hash = _request_digest(
+        {"flow_key": template.key, "expected_lease_version": body.expected_lease_version}
+    )
+    actor_ref = str(ctx.actor_id)
+    trace_id = new_trace_id()
+    try:
+        async with tenant_session(ctx) as session:
+            # Locking the lease row makes ownership and task creation one
+            # serialized decision with concurrent operator reassignment.
+            lease = await lease_service.lease_snapshot(
+                session,
+                tenant_id=ctx.tenant_id,
+                conversation_ref_id=conversation_ref,
+                for_update=True,
+            )
+            if lease is None:
+                return error_response(CASE_NOT_FOUND, "conversation not found", status_code=404)
+            if lease.owner_type != "human" or lease.owner_ref != actor_ref:
+                return error_response(
+                    "LEASE_NOT_OWNED",
+                    "only the current human owner may start a standard flow",
+                    status_code=409,
+                    trace_id=trace_id,
+                )
+            if lease.expires_at is not None and lease.expires_at <= int(time.time()):
+                return error_response(
+                    "LEASE_EXPIRED", "conversation lease expired", status_code=409
+                )
+            receipt = (
+                await session.execute(
+                    sa_select(StandardFlowStartRequest).where(
+                        StandardFlowStartRequest.tenant_id == ctx.tenant_id,
+                        StandardFlowStartRequest.conversation_ref_id == conversation_ref,
+                        StandardFlowStartRequest.idempotency_key_hash == idem_hash,
+                    )
+                )
+            ).scalar_one_or_none()
+            if receipt is not None:
+                if receipt.request_hash != request_hash:
+                    return error_response(
+                        "IDEMPOTENCY_CONFLICT",
+                        "key was used for a different standard flow request",
+                        status_code=409,
+                        trace_id=trace_id,
+                    )
+                replay = await task_store.get_task(
+                    session, tenant_id=ctx.tenant_id, task_id=receipt.task_id
+                )
+                if replay is None or replay.conversation_ref_id != conversation_ref:
+                    return error_response(CASE_NOT_FOUND, "flow task not found", status_code=404)
+                get_metrics().workbench_standard_flow_actions_total.labels(
+                    flow_key=template.key, action="start", outcome="replayed"
+                ).inc()
+                return ok_response(
+                    {
+                        "task": _task_out(
+                            replay,
+                            can_prepare_invoice_proposal=(
+                                require_policy(ctx, Action.TOOL_WRITE_CONFIRMED) is None
+                            ),
+                        ),
+                        "replayed": True,
+                    },
+                    trace_id=trace_id,
+                )
+
+            if lease.lease_version != body.expected_lease_version:
+                return error_response(
+                    "LEASE_CONFLICT",
+                    f"lease version moved to {lease.lease_version}",
+                    status_code=409,
+                    trace_id=trace_id,
+                )
+
+            enabled = await flag_service.evaluate(
+                session,
+                flag_key=FLAG_STANDARD_FLOW_INSTANCES,
+                tenant_id=ctx.tenant_id,
+                default=False,
+            )
+            if not enabled.enabled:
+                return error_response(
+                    "STANDARD_FLOW_INSTANCES_DISABLED",
+                    "standard flow task creation is not enabled for this tenant",
+                    status_code=403,
+                    trace_id=trace_id,
+                )
+
+            latest_turn = (
+                await session.execute(
+                    sa_select(ConversationTurn)
+                    .where(
+                        ConversationTurn.tenant_id == ctx.tenant_id,
+                        ConversationTurn.conversation_ref_id == conversation_ref,
+                        ConversationTurn.role == "customer",
+                    )
+                    .order_by(
+                        ConversationTurn.ts.desc(),
+                        ConversationTurn.created_at.desc(),
+                        ConversationTurn.id.desc(),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if latest_turn is None:
+                return error_response(
+                    "FLOW_SOURCE_TURN_REQUIRED",
+                    "a standard flow must be started from a customer turn",
+                    status_code=409,
+                    trace_id=trace_id,
+                )
+
+            local_key = f"standard-flow:{template.key}:v{template.version}"
+            customer_fields = [
+                field.name for field in template.required_fields if field.source == "customer"
+            ]
+            task_kind = (
+                TaskKind.READ
+                if template.required_read_tools and not template.allowed_confirmed_write_tools
+                else TaskKind.WRITE
+            )
+            task_id = uuid.uuid4()
+            # The locked lease row serializes starts for this conversation.
+            # Create/get the stable flow task first so the append-only receipt
+            # can be inserted with its final task id and needs no UPDATE grant.
+            task, _created = await task_store.create_or_get(
+                session,
+                tenant_id=ctx.tenant_id,
+                conversation_ref_id=conversation_ref,
+                source_turn_id=str(latest_turn.id),
+                task_local_key=local_key,
+                kind=task_kind,
+                status=TaskStatus.MANUAL_FLOW,
+                slots=[],
+                missing_slots=customer_fields,
+                blocked_reason=(
+                    FLOW_INTERNAL_CASE_ONLY
+                    if template.key == "invoice_application"
+                    else FLOW_EXECUTOR_UNAVAILABLE
+                ),
+                sequence=0,
+                trace_id=trace_id,
+                flow_key=template.key,
+                flow_version=template.version,
+                actor_type="human",
+                actor_ref=actor_ref,
+                reason_code="STANDARD_FLOW_STARTED",
+                task_id=task_id,
+            )
+            start_receipt = StandardFlowStartRequest(
+                id=uuid.uuid4(),
+                tenant_id=ctx.tenant_id,
+                conversation_ref_id=conversation_ref,
+                task_id=task.id,
+                idempotency_key_hash=idem_hash,
+                request_hash=request_hash,
+                created_by=ctx.actor_id,
+                created_at=int(time.time()),
+            )
+            session.add(start_receipt)
+            await session.flush()
+            await audit_service.record(
+                session,
+                ctx=ctx,
+                action=(
+                    "conversation.standard_flow_started"
+                    if _created
+                    else "conversation.standard_flow_start_reused"
+                ),
+                resource_type="conversation_task",
+                resource_id=task.id,
+                metadata={
+                    "flow_key": template.key,
+                    "flow_version": template.version,
+                    "conversation_ref": str(conversation_ref),
+                    "source_turn_id": str(latest_turn.id),
+                },
+                trace_id=trace_id,
+            )
+            if _created:
+                await enqueue(
+                    session,
+                    tenant_id=ctx.tenant_id,
+                    event_type="conversation_task.updated",
+                    aggregate_type="conversation_task",
+                    aggregate_id=str(task.id),
+                    payload={
+                        "task_id": str(task.id),
+                        "conversation_ref": str(conversation_ref),
+                        "flow_key": template.key,
+                        "version": task.version,
+                    },
+                    trace_id=trace_id,
+                )
+            get_metrics().workbench_standard_flow_actions_total.labels(
+                flow_key=template.key,
+                action="start",
+                outcome="created" if _created else "reused",
+            ).inc()
+    except TaskConflict_ as exc:
+        return error_response(exc.code, exc.detail, status_code=409, trace_id=trace_id)
+    except TaskTransitionError as exc:
+        return error_response(exc.code, exc.detail, status_code=409, trace_id=trace_id)
+
+    return ok_response(
+        {
+            "task": _task_out(
+                task,
+                can_prepare_invoice_proposal=(
+                    require_policy(ctx, Action.TOOL_WRITE_CONFIRMED) is None
+                ),
+            ),
+            "replayed": not _created,
+        },
+        trace_id=trace_id,
     )
 
 
@@ -225,7 +510,10 @@ async def command_conversation_task(
             # Ownership first, and re-read inside this transaction: the panel
             # the agent acted on may be a version behind.
             lease = await lease_service.lease_snapshot(
-                session, tenant_id=ctx.tenant_id, conversation_ref_id=conversation_ref
+                session,
+                tenant_id=ctx.tenant_id,
+                conversation_ref_id=conversation_ref,
+                for_update=True,
             )
             if lease is None:
                 return error_response(CASE_NOT_FOUND, "conversation not found", status_code=404)
@@ -234,6 +522,10 @@ async def command_conversation_task(
                     "LEASE_NOT_OWNED",
                     "only the current human owner may command a task",
                     status_code=409,
+                )
+            if lease.expires_at is not None and lease.expires_at <= int(time.time()):
+                return error_response(
+                    "LEASE_EXPIRED", "conversation lease expired", status_code=409
                 )
             if lease.lease_version != body.expected_lease_version:
                 return error_response(
@@ -247,6 +539,11 @@ async def command_conversation_task(
                 # 404 rather than 403: a task id from another conversation must
                 # not be distinguishable from one that does not exist.
                 return error_response(CASE_NOT_FOUND, "task not found", status_code=404)
+
+            if task.flow_key == "invoice_application" and body.command == "prepare_proposal":
+                proposal_denied = require_policy(ctx, Action.TOOL_WRITE_CONFIRMED)
+                if proposal_denied is not None:
+                    return proposal_denied
 
             command = await _build_command(
                 session,
@@ -263,6 +560,34 @@ async def command_conversation_task(
                     "this command does not apply to the task's current state",
                     status_code=409,
                 )
+
+            if (
+                task.proposal_id is not None
+                and TaskStatus(task.status) is TaskStatus.AWAITING_CONFIRMATION
+                and command.target in (TaskStatus.CANCELLED, TaskStatus.NEEDS_HUMAN)
+            ):
+                from platform_core.tool_gateway.gateway import ToolGateway, ToolGatewayError
+
+                try:
+                    await ToolGateway(session, {}).withdraw(
+                        tenant_id=ctx.tenant_id,
+                        proposal_id=task.proposal_id,
+                    )
+                except ToolGatewayError as exc:
+                    raise TaskCommandRefused(
+                        "TASK_PROPOSAL_NOT_WITHDRAWABLE",
+                        "the proposal is already executing or has a final result",
+                    ) from exc
+                await audit_service.record(
+                    session,
+                    ctx=ctx,
+                    action="tool_proposal.withdrawn",
+                    resource_type="tool_proposal",
+                    resource_id=task.proposal_id,
+                    metadata={"task_id": str(task.id), "command": body.command},
+                    trace_id=trace_id,
+                )
+                command = replace(command, proposal_withdrawn=True)
 
             updated = await task_store.transition(
                 session, tenant_id=ctx.tenant_id, task=task, command=command
@@ -281,6 +606,10 @@ async def command_conversation_task(
                 },
                 trace_id=trace_id,
             )
+            if task.flow_key:
+                get_metrics().workbench_standard_flow_actions_total.labels(
+                    flow_key=task.flow_key, action=body.command, outcome="updated"
+                ).inc()
     except TaskCommandRefused as exc:
         return error_response(exc.code, exc.detail, status_code=409, trace_id=trace_id)
     except TaskConflict_ as exc:
@@ -290,7 +619,17 @@ async def command_conversation_task(
     except TaskTransitionError as exc:
         return error_response(exc.code, exc.detail, status_code=409, trace_id=trace_id)
 
-    return ok_response({"task": _task_out(updated)}, trace_id=trace_id)
+    return ok_response(
+        {
+            "task": _task_out(
+                updated,
+                can_prepare_invoice_proposal=(
+                    require_policy(ctx, Action.TOOL_WRITE_CONFIRMED) is None
+                ),
+            )
+        },
+        trace_id=trace_id,
+    )
 
 
 class TaskCommandRefused(Exception):
@@ -419,6 +758,32 @@ async def _build_command(
         # anything to a task, and a value with no source is the exact shape
         # EVAL-02 counts as a failure.
         requested = list(body.fields)
+        if not requested:
+            return None
+        flow_template = get_standard_flow(task.flow_key) if task.flow_key else None
+        if task.flow_key:
+            flow_status = TaskStatus(task.status)
+            allowed_flow_states = {TaskStatus.MANUAL_FLOW}
+            if task.flow_key == "invoice_application":
+                allowed_flow_states.add(TaskStatus.NEEDS_HUMAN)
+            if (
+                flow_template is None
+                or task.flow_version != flow_template.version
+                or flow_status not in allowed_flow_states
+            ):
+                raise TaskCommandRefused(
+                    "FLOW_INSTANCE_NOT_COLLECTABLE",
+                    "this standard flow instance is not in its current manual collection state",
+                )
+            customer_fields = {
+                field.name for field in flow_template.required_fields if field.source == "customer"
+            }
+            invalid_sources = [name for name in requested if name not in customer_fields]
+            if invalid_sources:
+                raise TaskCommandRefused(
+                    "FLOW_FIELD_SOURCE_REQUIRES_VERIFICATION",
+                    "verified-source fields must come from their trusted record or reviewer",
+                )
         unknown = [name for name in requested if name not in task.missing_slots]
         if unknown:
             # Refused, not ignored: silently dropping a field the operator
@@ -437,6 +802,23 @@ async def _build_command(
 
         remaining = [m for m in task.missing_slots if m not in requested]
         new_slots = _merge_slots(task.slots, collected)
+        if task.flow_key:
+            return task_store.TaskCommand(
+                target=(
+                    TaskStatus.NEEDS_HUMAN
+                    if TaskStatus(task.status) is TaskStatus.NEEDS_HUMAN
+                    else TaskStatus.MANUAL_FLOW
+                ),
+                reason_code="STANDARD_FLOW_FIELDS_RECORDED",
+                missing_slots=remaining,
+                slots=new_slots,
+                blocked_reason=(
+                    FLOW_INTERNAL_CASE_ONLY
+                    if task.flow_key == "invoice_application"
+                    else FLOW_EXECUTOR_UNAVAILABLE
+                ),
+                **base,
+            )
         return task_store.TaskCommand(
             target=TaskStatus.READY if not remaining else TaskStatus.AWAITING_INPUT,
             reason_code=("TASK_FIELDS_COLLECTED" if not remaining else "TASK_FIELDS_PARTIAL"),
@@ -470,6 +852,62 @@ async def _build_command(
     # If no write capability exists for this tenant the task goes to
     # `needs_human` with the reason, rather than sitting in a state that
     # advertises a confirmation that will never arrive.
+    if task.flow_key:
+        flow = get_standard_flow(task.flow_key)
+        flow_status = TaskStatus(task.status)
+        allowed_flow_states = {TaskStatus.MANUAL_FLOW}
+        if task.flow_key == "invoice_application":
+            allowed_flow_states.add(TaskStatus.NEEDS_HUMAN)
+        if (
+            flow is None
+            or task.flow_version != flow.version
+            or task.kind != TaskKind.WRITE.value
+            or flow_status not in allowed_flow_states
+        ):
+            return None
+        # Invoice application currently supports only an internal platform
+        # case, never invoice issuance. The account comes from an unambiguous
+        # tenant-owned Case link, and the customer fields must have been
+        # collected before this button becomes actionable.
+        if task.flow_key != "invoice_application":
+            return None
+        if task.missing_slots:
+            raise TaskCommandRefused(
+                "FLOW_FIELDS_REQUIRED", "collect all customer-sourced invoice fields first"
+            )
+        account_id = await verified_account_for_conversation(
+            session,
+            tenant_id=ctx.tenant_id,
+            conversation_ref_id=conversation_ref,
+        )
+        if account_id is None:
+            raise TaskCommandRefused(
+                "FLOW_ACCOUNT_UNVERIFIED",
+                "link this conversation to a tenant account before preparing the internal case",
+            )
+        proposal = await _create_proposal(
+            session,
+            ctx=ctx,
+            task=task,
+            trace_id=trace_id,
+            verified_account_id=account_id,
+        )
+        if proposal is None:
+            return task_store.TaskCommand(
+                target=TaskStatus.NEEDS_HUMAN,
+                reason_code="FLOW_INTERNAL_CASE_PROPOSAL_UNAVAILABLE",
+                blocked_reason="FLOW_INTERNAL_CASE_PROPOSAL_UNAVAILABLE",
+                **base,
+            )
+        return task_store.TaskCommand(
+            target=TaskStatus.AWAITING_CONFIRMATION,
+            reason_code="STANDARD_FLOW_INTERNAL_CASE_PROPOSAL_PREPARED",
+            blocked_reason="",
+            bump_action_revision=True,
+            proposal_id=proposal.id,
+            **base,
+        )
+
     if task.kind != TaskKind.WRITE.value:
         return None
     if TaskStatus(task.status) is not TaskStatus.READY:
@@ -506,6 +944,7 @@ async def _create_proposal(
     ctx: TenantContext,
     task: Any,
     trace_id: str,
+    verified_account_id: uuid.UUID | None = None,
 ) -> Any | None:
     """Create a real `ToolProposal` for a write task, or None when it cannot.
 
@@ -546,7 +985,7 @@ async def _create_proposal(
     if tool is None or tool.risk not in ("low_write", "confirmed_write", "human_approval"):
         return None
 
-    arguments = _proposal_arguments(task)
+    arguments = _proposal_arguments(task, verified_account_id=verified_account_id)
     if arguments is None:
         # A required argument has no value. Proposing anyway would produce a
         # proposal the gateway refuses with a schema error the agent cannot
@@ -638,19 +1077,44 @@ def _write_tool_for(task: Any) -> str | None:
     deterministic way to choose a write tool from a set of collected fields, and
     choosing wrong would propose a real write against the wrong target.
     """
+    if task.flow_key == "invoice_application":
+        return "case.create"
     for slot in task.slots or []:
         if slot.get("name") == "tool" and slot.get("value"):
             return str(slot["value"])
     return None
 
 
-def _proposal_arguments(task: Any) -> dict[str, Any] | None:
+def _proposal_arguments(
+    task: Any,
+    *,
+    verified_account_id: uuid.UUID | None = None,
+) -> dict[str, Any] | None:
     """Build the tool arguments from the task's slots, or None if incomplete.
 
     Only non-sensitive, confirmed-by-presence slot values are used. A withheld
     value cannot become an argument: the proposal would carry an empty string
     where the customer gave an address, and the gateway would accept it.
     """
+    if task.flow_key == "invoice_application":
+        values = {
+            slot.get("name"): slot.get("value")
+            for slot in task.slots or []
+            if slot.get("origin") == "agent_collected" and not slot.get("value_withheld")
+        }
+        order_id = str(values.get("order_id") or "").strip()
+        invoice_type = str(values.get("invoice_type") or "").strip()
+        if not verified_account_id or not order_id or not invoice_type:
+            return None
+        return {
+            "enterprise_account_id": str(verified_account_id),
+            "subject": f"发票申请：订单 {order_id}",
+            "description": f"订单号：{order_id}；发票类型：{invoice_type}",
+            "category": "invoice_application",
+            "priority": "p2",
+            "conversation_ref_id": str(task.conversation_ref_id),
+        }
+
     arguments: dict[str, Any] = {}
     for slot in task.slots or []:
         name = slot.get("name")

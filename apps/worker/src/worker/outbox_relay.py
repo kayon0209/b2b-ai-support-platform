@@ -46,6 +46,10 @@ from platform_core.agent_runtime.semantic.shadow import SHADOW_EVENT_TYPE
 from platform_core.agent_runtime.tasks.planning_seam import TASK_PLANNING_EVENT_TYPE
 from platform_core.billing.service import handle_usage_recorded
 from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
+from platform_core.knowledge.release_evaluator import (
+    RELEASE_EVALUATION_REQUEST_EVENT,
+    RELEASE_POST_TEST_REQUEST_EVENT,
+)
 from platform_core.outbox import OutboxEvent
 from platform_core.outbox_service import claim_pending, mark_failed, mark_sent
 
@@ -321,6 +325,8 @@ def build_default_relay(batch: int = DEFAULT_BATCH) -> OutboxRelay:
             SHADOW_EVENT_TYPE,
             COPILOT_EVENT_TYPE,
             TASK_PLANNING_EVENT_TYPE,
+            RELEASE_EVALUATION_REQUEST_EVENT,
+            RELEASE_POST_TEST_REQUEST_EVENT,
         ),
     )
     relay.register("case.created", log_only_handler)
