@@ -1,6 +1,6 @@
-"""Gitee AI (模力方舟) provider adapter (tickets 17-18).
+"""Gitee AI / MoArk provider adapter (tickets 17-18).
 
-OpenAI-compatible surface at https://ai.gitee.com/v1. Three capabilities:
+OpenAI-compatible surface at https://api.moark.com/v1. Three capabilities:
 - chat completions  -> qwen3.8-flash (reasoning model; thinking channel is
   separated from the customer-visible answer)
 - embeddings        -> Qwen3-Embedding-8B, requested at 1536 dimensions so

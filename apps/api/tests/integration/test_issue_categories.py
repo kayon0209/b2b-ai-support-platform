@@ -31,7 +31,10 @@ ADMIN_URL = os.environ.get(
     "APP_ADMIN_DATABASE_URL",
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
-APP_URL = "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform"
+APP_URL = os.environ.get(
+    "APP_TEST_DATABASE_URL",
+    "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
+)
 
 _NS = uuid.uuid5(uuid.NAMESPACE_URL, "b2b-ai-support/tests/issue-categories")
 TENANT = str(uuid.uuid5(_NS, "tenant"))

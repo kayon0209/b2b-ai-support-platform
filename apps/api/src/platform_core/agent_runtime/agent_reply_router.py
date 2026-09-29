@@ -63,6 +63,9 @@ class AgentReplyIn(BaseModel):
     # model's suggestion. It is telemetry, not authorization - it gates nothing.
     origin: str = Field(default="", max_length=31)
     canned_reply_id: uuid.UUID | None = None
+    # The server resolves the source references from this tenant-bound job.
+    # Client-supplied citations would let a caller forge provenance.
+    copilot_job_id: uuid.UUID | None = None
 
 
 @router.post("/{conversation_ref}/replies")
@@ -124,6 +127,7 @@ async def post_agent_reply(request: Request, conversation_ref: str, body: AgentR
                     or existing.author_ref != agent_ref
                     or existing.origin != body.origin
                     or existing.canned_reply_id != body.canned_reply_id
+                    or existing.copilot_job_id != body.copilot_job_id
                 ):
                     return error_response(
                         "IDEMPOTENCY_CONFLICT",
@@ -157,6 +161,7 @@ async def post_agent_reply(request: Request, conversation_ref: str, body: AgentR
                 trace_id=getattr(request.state, "trace_id", None),
                 origin=body.origin,
                 canned_reply_id=body.canned_reply_id,
+                copilot_job_id=body.copilot_job_id,
                 turn_id=turn_id,
             )
             await audit_service.record(
@@ -174,7 +179,7 @@ async def post_agent_reply(request: Request, conversation_ref: str, body: AgentR
                 },
             )
     except AgentReplyError as exc:
-        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+        return error_response(VALIDATION_FAILED, str(exc), status_code=exc.status_code)
 
     return {
         # The canonical form, not the path string: a ref is a UUID and a

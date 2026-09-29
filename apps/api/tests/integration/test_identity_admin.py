@@ -9,6 +9,7 @@ Covers the identity router's membership management endpoints:
 - invite tokens are single-use and expire
 """
 
+import os
 import uuid
 
 import pytest
@@ -16,7 +17,10 @@ from fastapi.testclient import TestClient
 
 pytestmark = pytest.mark.integration
 
-ADMIN_URL = "postgresql+psycopg://platform:platform@localhost:5435/platform"
+ADMIN_URL = os.environ.get(
+    "APP_ADMIN_DATABASE_URL",
+    "postgresql+psycopg://platform:platform@localhost:5435/platform",
+)
 TENANT = "0190d000-0000-7000-8000-0000000000c3"
 TENANT_OTHER = "0190d000-0000-7000-8000-0000000000c4"
 

@@ -378,7 +378,10 @@ def test_another_tenants_external_id_cannot_be_resolved() -> None:
         from platform_core.db import create_engine
 
         engine = create_engine(
-            "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform"
+            os.environ.get(
+                "APP_TEST_DATABASE_URL",
+                "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
+            )
         )
         factory = async_sessionmaker(engine, expire_on_commit=False)
         async with factory() as session:

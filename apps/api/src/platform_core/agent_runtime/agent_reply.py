@@ -39,12 +39,14 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
 from platform_core.agent_runtime import conversation_store
 from platform_core.agent_runtime.conversation import TurnRole
-from platform_core.agent_runtime.models import KNOWN_ORIGINS, ORIGIN_UNKNOWN
+from platform_core.agent_runtime.models import KNOWN_ORIGINS, ORIGIN_UNKNOWN, ConversationTurn
+from platform_core.agent_runtime.tasks.models import CopilotDraft
 from platform_core.cases.service import CaseService, cases_for_conversation
 from platform_core.identity import lease_service
 from platform_core.outbox_service import enqueue
@@ -73,6 +75,10 @@ AGENT_REPLY_SOURCE = "agent"
 class AgentReplyError(ValueError):
     """A refused reply. Mapped to 400/409 by the router."""
 
+    def __init__(self, message: str, *, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 @dataclass(frozen=True)
 class AgentReplyResult:
@@ -97,6 +103,7 @@ async def send_agent_reply(
     trace_id: str | None = None,
     origin: str = ORIGIN_UNKNOWN,
     canned_reply_id: uuid.UUID | None = None,
+    copilot_job_id: uuid.UUID | None = None,
     turn_id: uuid.UUID | None = None,
 ) -> AgentReplyResult:
     """Record a human's reply and arrange for it to reach the customer.
@@ -118,6 +125,18 @@ async def send_agent_reply(
         # dilute the adoption rate it exists to measure, and a typo is cheaper
         # to fix at the call site than in a dashboard nobody trusts.
         raise AgentReplyError(f"unknown reply origin: {origin!r}")
+
+    source_refs: list[dict[str, object]] = []
+    if copilot_job_id is not None:
+        if origin != "ai_suggestion":
+            raise AgentReplyError("a copilot job requires ai_suggestion origin")
+        source_refs = await _validated_copilot_sources(
+            session,
+            tenant_id=tenant_id,
+            conversation_ref_id=conversation_ref_id,
+            actor_ref=owner,
+            copilot_job_id=copilot_job_id,
+        )
 
     # 1. Ownership. Acquire first because `transfer_to_human` refuses a missing
     #    row ("lease row missing; acquire first") - the two calls are one
@@ -150,6 +169,8 @@ async def send_agent_reply(
         source=AGENT_REPLY_SOURCE,
         origin=origin,
         canned_reply_id=canned_reply_id,
+        copilot_job_id=copilot_job_id,
+        source_refs=source_refs,
         author_ref=owner,
         turn_id=turn_id,
     )
@@ -216,3 +237,81 @@ async def send_agent_reply(
         channel=channel or None,
         event_id=event_id,
     )
+
+
+async def _validated_copilot_sources(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_ref_id: uuid.UUID,
+    actor_ref: str,
+    copilot_job_id: uuid.UUID,
+) -> list[dict[str, object]]:
+    """Resolve citations from a current, authorized job rather than the client.
+
+    The lease row is locked before checking its version. `send_agent_reply`
+    later transfers that same row in this transaction, so ownership cannot
+    move between validation and the customer-visible outbox write.
+    """
+    from platform_core.agent_runtime.chat_service import timeline_revision
+    from platform_core.agent_runtime.copilot import CopilotJobStatus
+
+    actor_id = uuid.UUID(actor_ref)
+    draft = (
+        await session.execute(
+            select(CopilotDraft).where(
+                CopilotDraft.tenant_id == tenant_id,
+                CopilotDraft.conversation_ref_id == conversation_ref_id,
+                CopilotDraft.actor_id == actor_id,
+                CopilotDraft.job_id == copilot_job_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if draft is None:
+        raise AgentReplyError("copilot job is not available to this agent", status_code=404)
+    if draft.status != CopilotJobStatus.SUCCEEDED.value or draft.edited_by_human:
+        raise AgentReplyError("copilot job is not insertable", status_code=409)
+
+    current_lease = await lease_service.lease_snapshot(
+        session,
+        tenant_id=tenant_id,
+        conversation_ref_id=conversation_ref_id,
+        for_update=True,
+    )
+    if (
+        current_lease is None
+        or current_lease.owner_type != "human"
+        or current_lease.owner_ref != actor_ref
+        or current_lease.lease_version != draft.lease_version
+    ):
+        raise AgentReplyError("copilot job is stale after a lease change", status_code=409)
+
+    if draft.timeline_revision != await timeline_revision(session, ref_id=conversation_ref_id):
+        raise AgentReplyError("copilot job is stale after a conversation update", status_code=409)
+
+    source_refs = list(draft.source_refs or [])
+    source_ids: list[uuid.UUID] = []
+    for source in source_refs:
+        try:
+            source_ids.append(uuid.UUID(str(source["turn_id"])))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AgentReplyError(
+                "copilot job has invalid source references", status_code=409
+            ) from exc
+    if source_ids:
+        rows = (
+            (
+                await session.execute(
+                    select(ConversationTurn.id).where(
+                        ConversationTurn.tenant_id == tenant_id,
+                        ConversationTurn.conversation_ref_id == conversation_ref_id,
+                        ConversationTurn.id.in_(source_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if {str(row_id) for row_id in rows} != {str(row_id) for row_id in source_ids}:
+            raise AgentReplyError("copilot job sources are no longer available", status_code=409)
+    return source_refs

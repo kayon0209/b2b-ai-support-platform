@@ -96,7 +96,7 @@ class Settings(BaseSettings):
     # LLM provider (Gitee AI / 模力方舟, OpenAI-compatible surface).
     # Credentials are resolved server-side and never reach the model or logs
     # (docs/security.md). Unset api_key means the model boundary fails closed.
-    llm_base_url: str = "https://ai.gitee.com/v1"
+    llm_base_url: str = "https://api.moark.com/v1"
     llm_api_key: SecretStr | None = None
     llm_model: str = "qwen3.8-flash"
     # Feature list 11.2: per-task model routing. Classification and answer
@@ -332,6 +332,26 @@ class Settings(BaseSettings):
     # Priority claiming is a deployment-level decision (the claim query is
     # cross-tenant), so it is a plain switch rather than a tenant flag.
     priority_claim_enabled: bool = False
+
+    # --- R1 semantic enhancement kill switch (ai-support-v2) -----------------
+    # Process-level stop for every semantic/conversation-task/copilot
+    # enhancement, independent of the per-tenant feature flags. Turning this
+    # off halts new enhanced work immediately, which is the difference between
+    # "roll the flag back for one tenant" and "stop it everywhere" during an
+    # incident.
+    #
+    # It gates *starting* work only. A tool call already in flight is recorded
+    # by its own outcome (succeeded/failed/unknown) and reconciled afterwards;
+    # pretending a switch can recall an external side effect would be false.
+    # Any pending write proposal is left un-confirmed rather than auto-approved.
+    #
+    # Defaults True so the code is reachable in a development environment; the
+    # tenant flags all default False, so the effective behaviour is still
+    # closed everywhere until a tenant opts in.
+    semantic_enhancements_enabled: bool = True
+    # Hard deadline for one semantic classification call, including its single
+    # transport retry. A design target pending real-provider measurement.
+    semantic_classify_deadline_seconds: float = 2.0
 
 
 @lru_cache

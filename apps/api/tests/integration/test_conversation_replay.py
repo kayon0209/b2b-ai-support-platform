@@ -47,7 +47,10 @@ ADMIN_URL = os.environ.get(
     "APP_ADMIN_DATABASE_URL",
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
-APP_URL = "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform"
+APP_URL = os.environ.get(
+    "APP_TEST_DATABASE_URL",
+    "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
+)
 
 TENANT = "01900000-0000-7000-8000-0000000000c3"
 OTHER_TENANT = "01900000-0000-7000-8000-0000000000de"

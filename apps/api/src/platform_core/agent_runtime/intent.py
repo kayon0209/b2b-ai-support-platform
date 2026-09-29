@@ -93,6 +93,14 @@ RESTRICTED_TERMS: tuple[str, ...] = (
     "social security",
     "credit card number",
     "bank account",
+    "密码",
+    "凭证",
+    "api密钥",
+    "社会保障号",
+    "信用卡号",
+    "银行卡号",
+    "银行账号",
+    "银行账户",
 )
 
 

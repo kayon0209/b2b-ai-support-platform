@@ -207,6 +207,116 @@ class InboxWorker:
         )
 
 
+class SemanticWorker:
+    """Drain semantic, task-planning and copilot jobs off the customer path.
+
+    Queue claims use the owner connection only to read event identifiers and
+    atomically mark rows in flight. Message-bearing payloads and all tenant
+    writes are handled on a `tenant_session`, with RLS enforced.
+    """
+
+    def __init__(self, deps: OrchestratorDeps, config: WorkerConfig | None = None) -> None:
+        self._deps = deps
+        self._config = config or WorkerConfig()
+        self._stopping = False
+
+    def request_stop(self) -> None:
+        self._stopping = True
+
+    @property
+    def stopping(self) -> bool:
+        return self._stopping
+
+    async def run_once(self) -> int:
+        from worker import copilot_consumer, shadow_consumer, task_planning_consumer
+
+        async with queue_bookkeeping_session() as bookkeeping:
+            shadow_reclaimed = await shadow_consumer.reclaim_stale_shadow(bookkeeping)
+            copilot_reclaimed = await copilot_consumer.reclaim_stale_copilot(bookkeeping)
+            tasks_reclaimed = await task_planning_consumer.reclaim_stale_task_planning(bookkeeping)
+            shadows = await shadow_consumer.claim_shadow_events(
+                bookkeeping, batch=min(self._config.batch, shadow_consumer.SHADOW_BATCH)
+            )
+            copilot_jobs = await copilot_consumer.claim_copilot_jobs(
+                bookkeeping, batch=min(self._config.batch, copilot_consumer.COPILOT_BATCH)
+            )
+            task_plans = await task_planning_consumer.claim_task_planning_events(
+                bookkeeping, batch=min(self._config.batch, task_planning_consumer.TASK_PLAN_BATCH)
+            )
+            await bookkeeping.commit()
+
+        for queue_name, reclaimed_count in (
+            ("shadow", shadow_reclaimed),
+            ("copilot", copilot_reclaimed),
+            ("task_planning", tasks_reclaimed),
+        ):
+            if not reclaimed_count:
+                continue
+            logger.warning(
+                "semantic_stale_claims_reclaimed",
+                queue=queue_name,
+                count=reclaimed_count,
+            )
+
+        processed = 0
+        shadow_provider = shadow_consumer.chat_provider(self._deps)
+        copilot_provider = copilot_consumer.chat_provider(self._deps)
+        from platform_core.identity.tenant_context import tenant_session
+
+        for shadow_claim in shadows:
+            try:
+                async with tenant_session(shadow_consumer.context_for(shadow_claim)) as session:
+                    await shadow_consumer.process_shadow_event(
+                        session, shadow_claim, provider=shadow_provider
+                    )
+            except Exception as exc:  # noqa: BLE001 - stale-claim recovery retries it
+                logger.error(
+                    "shadow_event_cycle_failed",
+                    event_id=str(shadow_claim.event_id),
+                    error_code=type(exc).__name__,
+                )
+            processed += 1
+
+        for copilot_claim in copilot_jobs:
+            try:
+                async with tenant_session(copilot_consumer.context_for(copilot_claim)) as session:
+                    await copilot_consumer.process_copilot_job(
+                        session, copilot_claim, provider=copilot_provider
+                    )
+            except Exception as exc:  # noqa: BLE001 - stale-claim recovery retries it
+                logger.error(
+                    "copilot_job_cycle_failed",
+                    event_id=str(copilot_claim.event_id),
+                    error_code=type(exc).__name__,
+                )
+            processed += 1
+
+        for task_plan_claim in task_plans:
+            try:
+                async with tenant_session(
+                    task_planning_consumer.context_for(task_plan_claim)
+                ) as session:
+                    await task_planning_consumer.process_task_planning_event(
+                        session, task_plan_claim, deps=self._deps
+                    )
+            except Exception as exc:  # noqa: BLE001 - stale-claim recovery retries it
+                logger.error(
+                    "task_planning_cycle_failed",
+                    event_id=str(task_plan_claim.event_id),
+                    error_code=type(exc).__name__,
+                )
+            processed += 1
+        return processed
+
+    async def run_forever(self) -> None:
+        await _run_poll_loop(
+            name="semantic",
+            cycle=self.run_once,
+            config=self._config,
+            stopping=lambda: self._stopping,
+        )
+
+
 class IngestionWorker:
     """Polls `document_versions` and runs the ingestion pipeline.
 
@@ -427,11 +537,11 @@ def run(coro: "Coroutine[Any, Any, None]") -> None:
 def main() -> None:
     """Local entrypoint, dispatched by `APP_WORKER_QUEUE`.
 
-    The interactive worker and the outbox relay share one process because
-    both are lightweight pollers and the relay has no reason to be its own
-    deployment unit until it becomes a throughput bottleneck. Ingestion is
-    its own process: it is bulk work whose batches would otherwise compete
-    with customer-facing runs for the same event loop.
+    The inbox, semantic worker and outbox relay share the interactive process.
+    Semantic work has its own poll loop and tenant session, so it does not hold
+    the inbox event open while a model responds. Ingestion remains a separate
+    process because it is bulk work whose batches would compete with customer
+    runs for the same event loop.
     """
     try:
         queue = resolve_queue(sys.argv[1:])
@@ -483,23 +593,29 @@ def main() -> None:
 
 
 async def _run_both(deps: OrchestratorDeps) -> None:
-    """Run the inbox worker and the outbox relay concurrently.
+    """Run inbox, semantic jobs and the outbox relay concurrently.
 
     Either loop failing must not take the other down: they own independent
     units of work, and a relay fault should not stop customer replies.
     """
     inbox = InboxWorker(deps)
     relay_worker = OutboxWorker(build_default_relay())
+    semantic_worker = SemanticWorker(deps)
 
     loop = asyncio.get_running_loop()
-    for worker in (inbox, relay_worker):
+    for worker in (inbox, relay_worker, semantic_worker):
         install_signal_handlers(worker, loop)
 
     try:
-        await asyncio.gather(inbox.run_forever(), relay_worker.run_forever())
+        await asyncio.gather(
+            inbox.run_forever(),
+            relay_worker.run_forever(),
+            semantic_worker.run_forever(),
+        )
     except KeyboardInterrupt:  # pragma: no cover - interactive stop
         inbox.request_stop()
         relay_worker.request_stop()
+        semantic_worker.request_stop()
         logger.info("worker_interrupted")
 
 

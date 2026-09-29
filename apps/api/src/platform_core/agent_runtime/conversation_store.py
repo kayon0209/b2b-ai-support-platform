@@ -70,6 +70,8 @@ async def append_authored_turn(
     ts: int | None = None,
     origin: str = "",
     canned_reply_id: uuid.UUID | None = None,
+    copilot_job_id: uuid.UUID | None = None,
+    source_refs: list[dict[str, object]] | None = None,
     author_ref: str | None = None,
     turn_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
@@ -107,6 +109,8 @@ async def append_authored_turn(
             created_at=int(time.time()),
             origin=origin,
             canned_reply_id=canned_reply_id,
+            copilot_job_id=copilot_job_id,
+            source_refs=source_refs or [],
             author_ref=author_ref,
         )
     )

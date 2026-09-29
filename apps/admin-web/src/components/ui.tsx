@@ -194,6 +194,7 @@ export function Dialog({
   label,
   children,
   className,
+  backdropClassName,
 }: {
   open: boolean;
   onClose: () => void;
@@ -201,6 +202,7 @@ export function Dialog({
   label: string;
   children: ReactNode;
   className?: string;
+  backdropClassName?: string;
 }) {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const openerRef = useRef<HTMLElement | null>(null);
@@ -258,7 +260,10 @@ export function Dialog({
 
   if (!open) return null;
   return (
-    <div className="dialog-backdrop" onClick={onClose}>
+    <div
+      className={backdropClassName ? `dialog-backdrop ${backdropClassName}` : "dialog-backdrop"}
+      onClick={onClose}
+    >
       <div
         ref={panelRef}
         className={className ? `dialog ${className}` : "dialog"}

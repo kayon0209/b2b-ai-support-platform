@@ -220,6 +220,13 @@ class ConversationTurn(Base, PkMixin, TenantMixin):
     canned_reply_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("canned_replies.id"), nullable=True
     )
+    # Internal provenance for a human reply drafted from a copilot job. The
+    # write route resolves this through tenant + conversation + actor before
+    # persisting; clients cannot supply source refs directly.
+    copilot_job_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    source_refs: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
     # Who wrote it, when the platform authored the turn. NULL for customer turns.
     # The lease holds current ownership, so it cannot answer "who said this" for
     # a conversation that has since changed hands.

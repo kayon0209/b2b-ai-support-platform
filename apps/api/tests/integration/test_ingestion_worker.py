@@ -45,7 +45,7 @@ ADMIN_URL = os.environ.get(
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
 APP_URL = os.environ.get(
-    "APP_APP_DATABASE_URL",
+    "APP_TEST_DATABASE_URL",
     "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
 )
 

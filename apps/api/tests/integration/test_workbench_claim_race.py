@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 
 import httpx
@@ -15,7 +16,10 @@ from platform_core.identity.tenant_context import TenantContext
 
 pytestmark = pytest.mark.integration
 
-ADMIN_URL = "postgresql+psycopg://platform:platform@localhost:5435/platform"
+ADMIN_URL = os.environ.get(
+    "APP_ADMIN_DATABASE_URL",
+    "postgresql+psycopg://platform:platform@localhost:5435/platform",
+)
 
 
 class _AgentResolver:

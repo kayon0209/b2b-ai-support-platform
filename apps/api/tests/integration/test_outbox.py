@@ -50,7 +50,10 @@ def test_enqueue_rollback_removes_event() -> None:
 
     async def scenario() -> bool:
         engine = create_async_engine(
-            "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform"
+            os.environ.get(
+                "APP_TEST_DATABASE_URL",
+                "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
+            )
         )
         # RLS context needed for insert; use raw SQL set_config per tx.
         from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -118,7 +121,10 @@ def test_relay_claims_and_marks_sent() -> None:
 
     async def scenario() -> tuple[int, int]:
         engine = create_async_engine(
-            "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform"
+            os.environ.get(
+                "APP_TEST_DATABASE_URL",
+                "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
+            )
         )
         factory = async_sessionmaker(engine, expire_on_commit=False)
         eid = uuid.uuid4()

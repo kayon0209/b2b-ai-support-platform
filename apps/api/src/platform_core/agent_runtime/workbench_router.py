@@ -101,6 +101,7 @@ class AccountInfo(BaseModel):
 
 class DetailResponse(BaseModel):
     conversation_ref: str
+    timeline_revision: int
     lease: LeaseInfo
     case: CaseInfo | None
     channel: str | None
@@ -225,8 +226,9 @@ async def workbench_conversation(request: Request, conversation_ref: uuid.UUID) 
         if lease is None:
             return error_response(CASE_NOT_FOUND, "conversation not found", status_code=404)
         turns, older_before = await chat_service.read_timeline_page(
-            session, ref_id=conversation_ref, limit=80
+            session, ref_id=conversation_ref, limit=80, include_source_refs=True
         )
+        timeline_revision = await chat_service.timeline_revision(session, ref_id=conversation_ref)
         cases = await workbench_cases_for_conversations(
             session, tenant_id=ctx.tenant_id, conversation_refs=[conversation_ref]
         )
@@ -259,6 +261,7 @@ async def workbench_conversation(request: Request, conversation_ref: uuid.UUID) 
         )
     payload = DetailResponse(
         conversation_ref=str(conversation_ref),
+        timeline_revision=timeline_revision,
         lease=_lease_out(lease),
         case=CaseInfo(**case) if case else None,
         channel=channel.get("channel") or ("web" if not channel else None),
@@ -289,7 +292,11 @@ async def older_workbench_turns(
         if lease is None:
             return error_response(CASE_NOT_FOUND, "conversation not found", status_code=404)
         turns, older_before = await chat_service.read_timeline_page(
-            session, ref_id=conversation_ref, limit=limit, before_id=before
+            session,
+            ref_id=conversation_ref,
+            limit=limit,
+            before_id=before,
+            include_source_refs=True,
         )
     return ok_response({"items": turns, "older_before": older_before})
 

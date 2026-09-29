@@ -55,19 +55,21 @@ async def enqueue(
     return eid
 
 
-async def claim_pending(session: AsyncSession, *, batch: int = 50) -> list[OutboxEvent]:
+async def claim_pending(
+    session: AsyncSession,
+    *,
+    batch: int = 50,
+    exclude_event_types: tuple[str, ...] = (),
+) -> list[OutboxEvent]:
     """Claim queued rows with SKIP LOCKED (safe for concurrent relays).
 
     Claims mark rows 'sent-in-flight' by bumping attempts; actual SENT is
     set by mark_sent after successful publish.
     """
-    stmt = (
-        select(OutboxEvent)
-        .where(OutboxEvent.status == OutboxStatus.QUEUED.value)
-        .order_by(OutboxEvent.id)
-        .limit(batch)
-        .with_for_update(skip_locked=True)
-    )
+    stmt = select(OutboxEvent).where(OutboxEvent.status == OutboxStatus.QUEUED.value)
+    if exclude_event_types:
+        stmt = stmt.where(OutboxEvent.event_type.not_in(exclude_event_types))
+    stmt = stmt.order_by(OutboxEvent.id).limit(batch).with_for_update(skip_locked=True)
     rows = (await session.execute(stmt)).scalars().all()
     if rows:
         ids = [r.id for r in rows]
@@ -83,11 +85,17 @@ async def mark_sent(session: AsyncSession, row_id: uuid.UUID) -> None:
     await session.execute(
         update(OutboxEvent)
         .where(OutboxEvent.id == row_id)
-        .values(status=OutboxStatus.SENT.value, published_at=int(time.time()))
+        .values(
+            status=OutboxStatus.SENT.value,
+            published_at=int(time.time()),
+            processing_started_at=None,
+        )
     )
 
 
 async def mark_failed(session: AsyncSession, row_id: uuid.UUID, error: str) -> None:
     await session.execute(
-        update(OutboxEvent).where(OutboxEvent.id == row_id).values(last_error=error[:2000])
+        update(OutboxEvent)
+        .where(OutboxEvent.id == row_id)
+        .values(last_error=error[:2000], processing_started_at=None)
     )

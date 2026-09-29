@@ -32,6 +32,7 @@ so there is no cycle.
 """
 
 from platform_core.agent_runtime import models as _agent_runtime_models  # noqa: F401
+from platform_core.agent_runtime.tasks import models as _task_models  # noqa: F401
 from platform_core.audit import models as _audit_models  # noqa: F401
 from platform_core.billing import models as _billing_models  # noqa: F401
 from platform_core.cases import agent_models as _agent_models  # noqa: F401

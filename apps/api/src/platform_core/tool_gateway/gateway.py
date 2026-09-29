@@ -30,6 +30,7 @@ from jsonschema import validate as jsonschema_validate
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from platform_core.evaluation.pii import Sensitivity, classify_field
 from platform_core.tool_gateway.models import (
     ActionConfirmation,
     ProposalStatus,
@@ -137,15 +138,25 @@ SENSITIVE_FIELD_NAMES = {
 
 def sanitize_arguments(args: dict[str, Any]) -> dict[str, Any]:
     """Strip credential-shaped keys and redact PII-shaped values."""
-    cleaned: dict[str, Any] = {}
-    for key, value in args.items():
-        if key.lower() in SENSITIVE_FIELD_NAMES:
-            cleaned[key] = "***"
-        elif isinstance(value, dict):
-            cleaned[key] = sanitize_arguments(value)
-        else:
-            cleaned[key] = value
-    return cleaned
+    return {key: _sanitize_argument_value(key, value) for key, value in args.items()}
+
+
+def _sanitize_argument_value(key: str, value: Any) -> Any:
+    if key.lower() in SENSITIVE_FIELD_NAMES or classify_field(key) is Sensitivity.RESTRICTED:
+        return "***"
+    if isinstance(value, dict):
+        return sanitize_arguments(value)
+    if isinstance(value, list):
+        return [_sanitize_nested_value(item) for item in value]
+    return value
+
+
+def _sanitize_nested_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return sanitize_arguments(value)
+    if isinstance(value, list):
+        return [_sanitize_nested_value(item) for item in value]
+    return value
 
 
 def compute_action_hash(tool_name: str, tool_version: int, sanitized: dict[str, Any]) -> str:

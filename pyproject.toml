@@ -30,6 +30,13 @@ ignore = ["S101"]  # assert allowed in tests
 "apps/api/src/platform_core/retrieval/hybrid.py" = ["S608"]
 # negative suite builds DELETE/SELECT from a code-owned table list
 "apps/api/tests/integration/test_cross_tenant_negative.py" = ["S608"]
+# The R1 task suite builds INSERTs from a per-table column list so one
+# parametrized case can cover all three new tables. The table name and the
+# column list are module-level literals selected by `pytest.mark.parametrize`;
+# no test input reaches the string. PostgreSQL cannot bind an identifier as a
+# parameter, so there is no parameterised form of these statements to prefer -
+# and every *value* in them is a bound parameter.
+"apps/api/tests/integration/test_conversation_tasks_rls.py" = ["S608"]
 # 0053 interpolates TABLE/COLUMN into an UPDATE. Both are module-level string
 # literals (`"tenants"`, `"brand_display_name"`), not caller input, and the
 # interpolation is unavoidable: Postgres cannot bind an identifier as a

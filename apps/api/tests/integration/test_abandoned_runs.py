@@ -53,7 +53,10 @@ ADMIN_URL = os.environ.get(
     "APP_ADMIN_DATABASE_URL",
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
-APP_URL = "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform"
+APP_URL = os.environ.get(
+    "APP_TEST_DATABASE_URL",
+    "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
+)
 
 # One tenant per assertion domain, all previously unused ids.
 TENANTS = {

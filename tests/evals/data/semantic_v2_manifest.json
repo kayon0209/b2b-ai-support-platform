@@ -1,0 +1,53 @@
+{
+  "dataset_id": "semantic-v2-r1-balanced-highrisk-synthetic-2026-09-27",
+  "dataset_hash": "200cb1fa0a42da8c59083cbb150e8303b4eb4f379420dbed1e9029a532c13608",
+  "case_count": 1700,
+  "split_counts": {
+    "dev": 1020,
+    "validation": 340,
+    "holdout": 340
+  },
+  "split_method": "SHA-256 phrase-family assignment; six dev, two validation, two holdout families per group; core groups contain 12 variants per family and security groups contain 10",
+  "schema_version": "v1",
+  "prompt_version": "semantic-v7",
+  "provenance": "synthetic; template-authored scenarios, no customer data",
+  "independent_human_review": "pending",
+  "release_gate_status": "not eligible for production quality claims until independent annotation review",
+  "high_risk_additional_case_count": 500,
+  "high_risk_holdout_case_count": 100,
+  "primary_intent_holdout_minimums": {
+    "knowledge_question": 24,
+    "business_query": 24,
+    "business_action": 24,
+    "sales_inquiry": 24,
+    "sensitive_request": 24,
+    "human_request": 24,
+    "social": 24,
+    "out_of_domain": 24
+  },
+  "holdout_minimums": {
+    "explicit_human_request": 24,
+    "sensitive_or_privileged": 24,
+    "injection_attempt": 24,
+    "negation_or_quotation": 24,
+    "multi_intent": 24,
+    "coreference": 24,
+    "missing_slots": 24,
+    "business_action": 24,
+    "sales_inquiry": 24,
+    "social": 24,
+    "out_of_domain": 24,
+    "pcb": 24,
+    "smt": 24,
+    "component": 24,
+    "dfm": 24
+  },
+  "high_risk_holdout_minimums": {
+    "cross_tenant_access": 20,
+    "claim_handling": 20,
+    "prompt_injection_boundary": 20,
+    "false_approval_claim": 20,
+    "restricted_data_boundary": 20
+  },
+  "holdout_unique_tool_cases": 24
+}

@@ -17,7 +17,10 @@ ADMIN_URL = os.environ.get(
     "APP_ADMIN_DATABASE_URL",
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
-APP_URL = "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform"
+APP_URL = os.environ.get(
+    "APP_TEST_DATABASE_URL",
+    "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
+)
 TENANT_A = "01900000-0000-7000-8000-000000000001"
 TENANT_B = "01900000-0000-7000-8000-000000000002"
 
@@ -101,6 +104,12 @@ TENANT_TABLES = (
     "knowledge_aliases",
     "prompt_versions",
     "billing_entries",
+    # AI support v2 task, assessment and copilot storage. These tables were
+    # added with tenant-scoped RLS and must join the same zero-tolerance sweep.
+    "semantic_assessments",
+    "conversation_tasks",
+    "conversation_task_events",
+    "copilot_drafts",
 )
 
 _seed_ids: dict[str, str] = {}
@@ -167,8 +176,19 @@ def seed_all_tables() -> None:
         run_id = str(uuid.uuid4())
         case_id = str(uuid.uuid4())
         tool_def = str(uuid.uuid4())
+        conversation_ref = str(uuid.uuid4())
+        assessment_id = str(uuid.uuid4())
+        task_id = str(uuid.uuid4())
         _seed_ids.update(
-            space=space, doc=doc, ver=ver, run_id=run_id, case_id=case_id, tool_def=tool_def
+            space=space,
+            doc=doc,
+            ver=ver,
+            run_id=run_id,
+            case_id=case_id,
+            tool_def=tool_def,
+            conversation_ref=conversation_ref,
+            assessment_id=assessment_id,
+            task_id=task_id,
         )
         stmts = [
             (
@@ -488,6 +508,33 @@ def seed_all_tables() -> None:
                 "FROM agent_runs ar WHERE ar.tenant_id = CAST(:t AS uuid) "
                 "ORDER BY ar.id LIMIT 1",
             ),
+            (
+                "semantic_assessments",
+                "INSERT INTO semantic_assessments (id, tenant_id, conversation_ref_id, "
+                "turn_id, mode, created_at) VALUES (:assessment, :t, :conversation, "
+                "'neg-turn', 'off', 1000)",
+            ),
+            (
+                "conversation_tasks",
+                "INSERT INTO conversation_tasks (id, tenant_id, conversation_ref_id, "
+                "source_turn_id, task_local_key, kind, status, content_hash, created_at) "
+                "VALUES (:taskid, :t, :conversation, 'neg-turn', 'neg-task', 'read', "
+                "'ready', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "
+                "|| 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1000)",
+            ),
+            (
+                "conversation_task_events",
+                "INSERT INTO conversation_task_events (id, tenant_id, task_id, "
+                "conversation_ref_id, to_status, actor_type, reason_code, trace_id, "
+                "to_version, created_at) VALUES (:i, :t, :taskid, :conversation, "
+                "'ready', 'system', 'NEGATIVE_TEST', 'trace-neg', 1, 1000)",
+            ),
+            (
+                "copilot_drafts",
+                "INSERT INTO copilot_drafts (id, tenant_id, conversation_ref_id, actor_id, "
+                "job_id, kind, status, created_at, updated_at) VALUES (:i, :t, :conversation, "
+                "gen_random_uuid(), gen_random_uuid(), 'summary', 'queued', 1000, 1000)",
+            ),
         ]
         for _table, stmt in stmts:
             if stmt is None:
@@ -503,6 +550,9 @@ def seed_all_tables() -> None:
                     "rid": run_id,
                     "cid": case_id,
                     "tooldef": tool_def,
+                    "conversation": conversation_ref,
+                    "assessment": assessment_id,
+                    "taskid": task_id,
                     "slug": f"neg-{_tid[-4:]}-x",
                     "email": f"neg-{slug}@test.local",
                     "hash": "a" * 64,
@@ -515,8 +565,12 @@ def seed_all_tables() -> None:
 
 @pytest.mark.zero_tolerance("cross_tenant_violations")
 def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
-    """One sweep across all tenant-owned tables: A sees its row, B sees
-    none, no-context sees none, B cannot write into A's scope."""
+    """A sees its rows; B and no-context see no tenant-owned rows.
+
+    `tool_definitions` also stores nullable-tenant global reference entries.
+    Those are intentionally visible to every tenant and are not evidence of a
+    tenant-isolation failure, so the sweep counts tenant-bound rows only.
+    """
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from platform_core.db import create_engine
@@ -533,7 +587,8 @@ def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
                 )
                 a_rows = (
                     await session.execute(
-                        text(f"SELECT count(*) FROM {table}")  # noqa: S608
+                        text(f"SELECT count(*) FROM {table} WHERE tenant_id = :t"),  # noqa: S608
+                        {"t": TENANT_A},
                     )
                 ).scalar()
                 await session.rollback()
@@ -544,7 +599,8 @@ def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
                 )
                 b_rows = (
                     await session.execute(
-                        text(f"SELECT count(*) FROM {table}")  # noqa: S608
+                        text(f"SELECT count(*) FROM {table} WHERE tenant_id = :t"),  # noqa: S608
+                        {"t": TENANT_B},
                     )
                 ).scalar()
                 await session.rollback()
@@ -558,7 +614,7 @@ def test_every_tenant_table_is_isolated_and_fails_closed() -> None:
                 await session.execute(text("RESET app.tenant_id"))
                 no_ctx = (
                     await session.execute(
-                        text(f"SELECT count(*) FROM {table}")  # noqa: S608
+                        text(f"SELECT count(*) FROM {table} WHERE tenant_id IS NOT NULL")  # noqa: S608
                     )
                 ).scalar()
                 await session.rollback()

@@ -37,6 +37,7 @@ class OutboxEvent(Base, PkMixin, TenantMixin):
     status: Mapped[str] = mapped_column(
         String(31), nullable=False, default=OutboxStatus.QUEUED.value, index=True
     )
+    processing_started_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     published_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     attempts: Mapped[int] = mapped_column(nullable=False, default=0)
