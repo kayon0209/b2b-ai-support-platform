@@ -64,7 +64,7 @@ prometheus-client>=0.21
 # The floor is the first release whose `OTLPSpanExporter` and `Resource` import
 # paths this module uses; the four imports were verified against 1.44.0.
 opentelemetry-sdk>=1.27
-opentelemetry-exporter-otlp>=1.27
+opentelemetry-exporter-otlp>=1.45.0
 
 # --- Contracts and utilities -----------------------------------------------
 jsonschema>=4.23
