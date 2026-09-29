@@ -31,6 +31,9 @@ session has complete metadata. None of the mapped modules import `db` (checked),
 so there is no cycle.
 """
 
+from platform_core.agent_runtime import (
+    emotion_advice_models as _emotion_advice_models,  # noqa: F401
+)
 from platform_core.agent_runtime import models as _agent_runtime_models  # noqa: F401
 from platform_core.agent_runtime.tasks import models as _task_models  # noqa: F401
 from platform_core.audit import models as _audit_models  # noqa: F401
@@ -49,6 +52,7 @@ from platform_core.knowledge import correction_models as _correction_models  # n
 from platform_core.knowledge import flag_models as _flag_models  # noqa: F401
 from platform_core.knowledge import gap_models as _gap_models  # noqa: F401
 from platform_core.knowledge import models as _knowledge_models  # noqa: F401
+from platform_core.knowledge import release_models as _knowledge_release_models  # noqa: F401
 from platform_core.outbox import OutboxEvent as _OutboxEvent  # noqa: F401
 from platform_core.support_bridge import continuity_models as _continuity_models  # noqa: F401
 from platform_core.support_bridge import csat_models as _csat_models  # noqa: F401

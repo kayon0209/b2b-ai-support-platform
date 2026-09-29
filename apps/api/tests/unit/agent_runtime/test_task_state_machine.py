@@ -61,6 +61,20 @@ def test_a_task_cannot_move_to_its_own_state() -> None:
     assert exc.value.code == "TASK_ALREADY_IN_STATE"
 
 
+def test_manual_flow_is_not_schedulable_but_allows_explicit_read_execution() -> None:
+    assert can_progress(TaskStatus.MANUAL_FLOW) is False
+    check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.MANUAL_FLOW, WRITE)
+    check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.CANCELLED, WRITE)
+    check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.AWAITING_CONFIRMATION, WRITE)
+    check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.EXECUTING, READ)
+    with pytest.raises(TaskTransitionError) as execution_error:
+        check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.EXECUTING, WRITE)
+    assert execution_error.value.code == "TASK_WRITE_REQUIRES_CONFIRMATION"
+    with pytest.raises(TaskTransitionError) as exc:
+        check_transition(TaskStatus.MANUAL_FLOW, TaskStatus.AWAITING_CONFIRMATION, READ)
+    assert exc.value.code == "TASK_CONFIRMATION_REQUIRES_WRITE"
+
+
 # --- writes need confirmation ----------------------------------------------
 
 
@@ -147,6 +161,7 @@ def test_unknown_is_not_polled_by_the_scheduler() -> None:
     assert can_progress(TaskStatus.READY) is True
     assert can_progress(TaskStatus.AWAITING_CONFIRMATION) is True
     assert can_progress(TaskStatus.UNKNOWN) is False
+    assert can_progress(TaskStatus.MANUAL_FLOW) is False
     assert can_progress(TaskStatus.SUCCEEDED) is False
 
 
@@ -352,6 +367,35 @@ def test_content_hash_notices_different_missing_fields() -> None:
     a = content_hash(kind=WRITE, slots=[], missing_slots=["street"], condition=None)
     b = content_hash(kind=WRITE, slots=[], missing_slots=["street", "postal_code"], condition=None)
     assert a != b
+
+
+def test_content_hash_binds_standard_flow_identity_and_version() -> None:
+    base = content_hash(
+        kind=WRITE,
+        slots=[],
+        missing_slots=["issue_summary"],
+        condition=None,
+        flow_key="repair_quality_intake",
+        flow_version=1,
+    )
+    other_flow = content_hash(
+        kind=WRITE,
+        slots=[],
+        missing_slots=["issue_summary"],
+        condition=None,
+        flow_key="technical_escalation",
+        flow_version=1,
+    )
+    other_version = content_hash(
+        kind=WRITE,
+        slots=[],
+        missing_slots=["issue_summary"],
+        condition=None,
+        flow_key="repair_quality_intake",
+        flow_version=2,
+    )
+    assert base != other_flow
+    assert base != other_version
 
 
 def test_content_hash_is_order_independent_for_missing_slots() -> None:

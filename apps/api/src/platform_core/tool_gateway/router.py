@@ -23,13 +23,15 @@ Truthfulness rules enforced here:
 """
 
 import time
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from observability_metrics import get_metrics
 from platform_core.api import (
     IDEMPOTENCY_KEY_REQUIRED,
     VALIDATION_FAILED,
@@ -44,9 +46,13 @@ from platform_core.api import (
     tenant_session,
 )
 from platform_core.audit import service as audit_service
+from platform_core.outbox_service import enqueue
 from platform_core.tool_gateway.gateway import (
     ToolGateway,
     ToolGatewayError,
+    compute_action_hash,
+    sanitize_arguments,
+    validate_against_schema,
 )
 from platform_core.tool_gateway.models import (
     ActionConfirmation,
@@ -283,6 +289,68 @@ async def propose_tool_call(request: Request, body: ToolProposeIn) -> Any:
         if denied is not None:
             return denied
 
+        # The proposal row is the durable confirmation target, so duplicate
+        # submissions must resolve to one frozen action. The transaction lock
+        # closes the select-then-insert race across API processes without a
+        # migration; the scope is tenant + caller-provided idempotency key.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:scope, 0))"),
+            {"scope": f"tool-proposal:{ctx.tenant_id}:{idem}"},
+        )
+        existing = (
+            await session.execute(
+                select(ToolProposal)
+                .where(
+                    ToolProposal.tenant_id == ctx.tenant_id,
+                    ToolProposal.idempotency_key == idem,
+                )
+                .order_by(ToolProposal.id.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            try:
+                validate_against_schema(body.arguments, tool.input_schema)
+            except ToolGatewayError as exc:
+                return gateway_error_response(exc, trace_id=trace_id)
+            expected_hash = compute_action_hash(
+                tool.name,
+                tool.version,
+                sanitize_arguments(body.arguments),
+            )
+            if existing.tool_definition_id != tool.id or existing.action_hash != expected_hash:
+                await audit_service.record(
+                    session,
+                    ctx=ctx,
+                    action="tool_proposal.idempotency_conflict",
+                    resource_type="tool_proposal",
+                    resource_id=existing.id,
+                    decision="denied",
+                    reason_code="IDEMPOTENCY_CONFLICT",
+                    trace_id=trace_id,
+                )
+                return error_response(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Idempotency-Key was already used for a different tool action",
+                    status_code=409,
+                    trace_id=trace_id,
+                )
+            await audit_service.record(
+                session,
+                ctx=ctx,
+                action="tool_proposal.replayed",
+                resource_type="tool_proposal",
+                resource_id=existing.id,
+                decision="completed",
+                reason_code="IDEMPOTENT_REPLAY",
+                trace_id=trace_id,
+            )
+            return ok_response(
+                {"proposal": _serialize_proposal(existing, tool), "replayed": True},
+                trace_id=trace_id,
+            )
+
         if ctx.actor_id is None:
             # The gateway records actor_id as a non-nullable column; an
             # unattributable write must not be proposed at all.
@@ -339,7 +407,7 @@ async def propose_tool_call(request: Request, body: ToolProposeIn) -> Any:
         )
         payload = _serialize_proposal(proposal, tool)
 
-    return ok_response({"proposal": payload}, trace_id=trace_id)
+    return ok_response({"proposal": payload, "replayed": False}, trace_id=trace_id)
 
 
 @router.post("/{proposal_id}/confirm")
@@ -532,6 +600,28 @@ async def execute_tool_call(request: Request, proposal_id: str, body: ToolPropos
                 confirmed_by=confirmed_by,
             )
         except ToolGatewayError as exc:
+            failed_execution = (
+                await session.execute(
+                    select(ToolExecution)
+                    .where(
+                        ToolExecution.tenant_id == ctx.tenant_id,
+                        ToolExecution.proposal_id == proposal.id,
+                    )
+                    .order_by(ToolExecution.started_at.desc(), ToolExecution.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if (
+                failed_execution is not None
+                and failed_execution.status != ProposalStatus.EXECUTING.value
+            ):
+                await _sync_linked_task_execution(
+                    session,
+                    ctx=ctx,
+                    proposal_id=proposal.id,
+                    execution=failed_execution,
+                    trace_id=trace_id,
+                )
             await audit_service.record(
                 session,
                 ctx=ctx,
@@ -548,6 +638,13 @@ async def execute_tool_call(request: Request, proposal_id: str, body: ToolPropos
         # response must report the post-execution truth, not the pre-call
         # snapshot.
         await session.refresh(proposal)
+        await _sync_linked_task_execution(
+            session,
+            ctx=ctx,
+            proposal_id=proposal.id,
+            execution=execution,
+            trace_id=trace_id,
+        )
         await audit_service.record(
             session,
             ctx=ctx,
@@ -570,6 +667,65 @@ async def execute_tool_call(request: Request, proposal_id: str, body: ToolPropos
         }
 
     return ok_response(payload, trace_id=trace_id)
+
+
+async def _sync_linked_task_execution(
+    session: AsyncSession,
+    *,
+    ctx: Any,
+    proposal_id: uuid.UUID,
+    execution: ToolExecution,
+    trace_id: str,
+) -> None:
+    """Project a Gateway receipt into its task within the same transaction."""
+    from platform_core.agent_runtime.tasks.gateway_lifecycle import record_execution_result
+
+    task = await record_execution_result(
+        session,
+        tenant_id=ctx.tenant_id,
+        proposal_id=proposal_id,
+        execution_id=execution.id,
+        execution_status=execution.status,
+        verification_status=execution.verification_status,
+        trace_id=trace_id,
+    )
+    if task is None:
+        return
+    await audit_service.record(
+        session,
+        ctx=ctx,
+        action="conversation.task_gateway_execution",
+        resource_type="conversation_task",
+        resource_id=task.id,
+        reason_code=task.status,
+        metadata={
+            "proposal_id": str(proposal_id),
+            "execution_id": str(execution.id),
+            "execution_status": execution.status,
+            "verification_status": execution.verification_status or "",
+        },
+        trace_id=trace_id,
+    )
+    await enqueue(
+        session,
+        tenant_id=ctx.tenant_id,
+        event_type="conversation_task.updated",
+        aggregate_type="conversation_task",
+        aggregate_id=str(task.id),
+        payload={
+            "task_id": str(task.id),
+            "conversation_ref": str(task.conversation_ref_id),
+            "command": "tool_execution_result",
+            "version": task.version,
+        },
+        trace_id=trace_id,
+    )
+    if task.flow_key:
+        get_metrics().workbench_standard_flow_actions_total.labels(
+            flow_key=task.flow_key,
+            action="gateway_execution",
+            outcome=task.status,
+        ).inc()
 
 
 def _audit_decision(status: str) -> str:

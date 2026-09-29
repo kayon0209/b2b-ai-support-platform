@@ -1,0 +1,84 @@
+{
+  "evidenceType": "local synthetic multi-worker drill",
+  "implementationRevision": "35195b4+source:fe0617b5b732",
+  "startedAtUtc": "2026-09-29T06:55:15.706487+00:00",
+  "finishedAtUtc": "2026-09-29T06:56:23.640719+00:00",
+  "composeProject": "codex-r2r3-worker-drill-18ea9b69",
+  "isolatedDatabase": "codex_r2r3_drill_8f1a1aba",
+  "initialWorkerReplicas": 2,
+  "faultInjection": {
+    "inFlightWorkerKilled": true,
+    "recoveredEventStatus": "sent",
+    "recoveredEventAttempts": 2,
+    "billingRowsAfterDuplicateReplay": 1,
+    "duplicateDeliveryCreatedOneBillingRow": true
+  },
+  "queueDrainRuns": [
+    {
+      "batchSize": 1,
+      "enqueueToDrainMs": 860.562,
+      "billingRows": 1
+    },
+    {
+      "batchSize": 10,
+      "enqueueToDrainMs": 1033.933,
+      "billingRows": 10
+    },
+    {
+      "batchSize": 50,
+      "enqueueToDrainMs": 1060.384,
+      "billingRows": 50
+    }
+  ],
+  "integrationSuiteExitCode": 0,
+  "integrationSuiteSummary": "80 passed",
+  "performanceSmoke": {
+    "concurrency": 100,
+    "pool_size": 10,
+    "p50_ms": 25.145,
+    "p95_ms": 38.778,
+    "p99_ms": 38.969,
+    "target_p95_ms": 300,
+    "target_scope": "webhook acknowledgement, warm pool. Connection setup is excluded: one connect costs ~28ms solo but ~444ms when 50 are issued concurrently on this host, so a cold pool reports connect serialisation rather than ingest latency.",
+    "persisted_rows": 100,
+    "duplicate_replay_detected": true,
+    "_artifact": {
+      "artifact": "performance_report",
+      "run_id": "91189-1790664960",
+      "produced_at": 1790664982,
+      "code_version": "35195b4-dirty",
+      "derived_from": [
+        "release_gate_evidence"
+      ],
+      "version": 1
+    }
+  },
+  "poolComparison": {
+    "concurrency": 60,
+    "small_pool_size": 5,
+    "small_pool_p50_ms": 9.043,
+    "large_pool_size": 50,
+    "large_pool_p50_ms": 5.807,
+    "large_to_small_p50_ratio": 0.642,
+    "host_specific_ranking": "larger_pool_faster",
+    "evidence_scope": "single local host, synthetic SELECT 1 connection-pool comparison",
+    "_artifact": {
+      "artifact": "pool_comparison_report",
+      "run_id": "91189-1790664960",
+      "produced_at": 1790664983,
+      "code_version": "35195b4-dirty",
+      "derived_from": [],
+      "version": 1
+    }
+  },
+  "migrationRollback": {
+    "downgradeOneRevisionThenUpgradeHead": true,
+    "headVersion": "0071_task_command_idempotency",
+    "billingRowsPreserved": 1
+  },
+  "limitations": [
+    "Synthetic data and one local Docker host; not a multi-host production drill.",
+    "Fake/local handlers only; no external ERP, CRM, or provider failure was run.",
+    "Queue latency is enqueue-to-drain time for synthetic usage events on this host."
+  ]
+}

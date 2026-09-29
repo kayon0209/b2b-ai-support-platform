@@ -177,6 +177,81 @@ async def latest_previews(
     }
 
 
+async def recent_customer_turns_by_ref(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    refs: list[uuid.UUID],
+    limit_per_conversation: int = 5,
+) -> dict[uuid.UUID, list[dict[str, Any]]]:
+    """Return a bounded, oldest-first customer-turn window for visible refs."""
+    if not refs or limit_per_conversation <= 0:
+        return {}
+    ranked = (
+        select(
+            ConversationTurn.conversation_ref_id.label("conversation_ref_id"),
+            ConversationTurn.id.label("turn_id"),
+            ConversationTurn.ts.label("ts"),
+            ConversationTurn.text_redacted.label("text"),
+            sa_func.row_number()
+            .over(
+                partition_by=ConversationTurn.conversation_ref_id,
+                order_by=(ConversationTurn.ts.desc(), ConversationTurn.id.desc()),
+            )
+            .label("turn_rank"),
+        )
+        .where(
+            ConversationTurn.tenant_id == tenant_id,
+            ConversationTurn.conversation_ref_id.in_(refs),
+            ConversationTurn.role == "customer",
+        )
+        .subquery()
+    )
+    rows = (
+        await session.execute(
+            select(
+                ranked.c.conversation_ref_id,
+                ranked.c.turn_id,
+                ranked.c.ts,
+                ranked.c.text,
+            )
+            .where(ranked.c.turn_rank <= limit_per_conversation)
+            .order_by(ranked.c.conversation_ref_id, ranked.c.ts, ranked.c.turn_id)
+        )
+    ).all()
+    result: dict[uuid.UUID, list[dict[str, Any]]] = {}
+    for row in rows:
+        result.setdefault(row.conversation_ref_id, []).append(
+            {"turn_id": str(row.turn_id), "at": int(row.ts), "text": row.text}
+        )
+    return result
+
+
+async def timeline_revisions_by_ref(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    refs: list[uuid.UUID],
+) -> dict[uuid.UUID, int]:
+    """Batch the authoritative all-role timeline revision for workbench refs."""
+    if not refs:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                ConversationTurn.conversation_ref_id,
+                sa_func.count(ConversationTurn.id),
+            )
+            .where(
+                ConversationTurn.tenant_id == tenant_id,
+                ConversationTurn.conversation_ref_id.in_(refs),
+            )
+            .group_by(ConversationTurn.conversation_ref_id)
+        )
+    ).all()
+    return {row[0]: int(row[1]) for row in rows}
+
+
 async def search_conversation_refs(
     session: AsyncSession, *, tenant_id: uuid.UUID, term: str
 ) -> set[uuid.UUID]:

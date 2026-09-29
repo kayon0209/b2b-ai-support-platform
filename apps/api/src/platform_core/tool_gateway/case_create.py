@@ -70,7 +70,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.cases.models import Case, CaseCategory
-from platform_core.cases.service import CaseError, CaseService
+from platform_core.cases.service import (
+    CaseError,
+    CaseService,
+    verified_account_for_conversation,
+)
 
 # Mirrors `cases.router.VALID_PRIORITIES`. Duplicated rather than imported
 # because the router module pulls in the HTTP layer; the two are kept in step
@@ -121,6 +125,66 @@ class CaseCreateExecutor:
             # refusal is worth more than the quiet success a `None` would give.
             return {"ok": False, "error_code": "ENTERPRISE_ACCOUNT_REQUIRED"}
 
+        category = str(parameters.get("category") or CaseCategory.GENERAL.value).strip()
+        conversation_ref_id = _optional_uuid(parameters.get("conversation_ref_id"))
+        if category in {
+            CaseCategory.INVOICE_APPLICATION.value,
+            CaseCategory.QUALITY_ISSUE.value,
+            CaseCategory.TECHNICAL_ESCALATION.value,
+        }:
+            if conversation_ref_id is None:
+                return {"ok": False, "error_code": "CONVERSATION_ACCOUNT_LINK_REQUIRED"}
+            linked_account = await verified_account_for_conversation(
+                self._session,
+                tenant_id=uuid.UUID(str(self._tenant_id)),
+                conversation_ref_id=conversation_ref_id,
+            )
+            if linked_account != account_id:
+                return {"ok": False, "error_code": "ACCOUNT_CONVERSATION_MISMATCH"}
+
+        product_ref = str(parameters.get("product_ref") or "").strip()
+        team_ref = str(parameters.get("team_ref") or "").strip() or None
+        if category in {
+            CaseCategory.QUALITY_ISSUE.value,
+            CaseCategory.TECHNICAL_ESCALATION.value,
+        }:
+            from platform_core.config import get_settings
+            from platform_core.identity.org import routable_support_department_slugs
+            from platform_core.identity.profile import business_system_ref_for_account
+            from platform_core.integrations.demo_erp import verify_demo_product_owner
+
+            settings = get_settings()
+            if (
+                settings.environment not in ("local", "test")
+                or settings.business_api_adapter.strip().lower() != "demo"
+                or parameters.get("product_verification_source") != "demo"
+            ):
+                return {"ok": False, "error_code": "DEMO_BUSINESS_AUTHORITY_DISABLED"}
+            if not product_ref:
+                return {"ok": False, "error_code": "PRODUCT_REFERENCE_REQUIRED"}
+            expected_team = (
+                "quality" if category == CaseCategory.QUALITY_ISSUE.value else "engineering"
+            )
+            if team_ref != expected_team:
+                return {"ok": False, "error_code": "FLOW_TEAM_MISMATCH"}
+            routable_owners = await routable_support_department_slugs(
+                self._session,
+                tenant_id=uuid.UUID(str(self._tenant_id)),
+            )
+            if expected_team not in routable_owners:
+                return {"ok": False, "error_code": "FLOW_OWNER_UNASSIGNED"}
+            external_account_ref = await business_system_ref_for_account(
+                self._session,
+                tenant_id=uuid.UUID(str(self._tenant_id)),
+                account_id=account_id,
+                system_key="business_api",
+            )
+            if (
+                external_account_ref is None
+                or verify_demo_product_owner(product_ref, external_account_ref) is None
+            ):
+                return {"ok": False, "error_code": "PRODUCT_OWNERSHIP_UNVERIFIED"}
+
         subject = " ".join(str(parameters.get("subject") or "").split())
         if not subject:
             return {"ok": False, "error_code": "SUBJECT_REQUIRED"}
@@ -135,10 +199,11 @@ class CaseCreateExecutor:
                 subject=subject,
                 description=str(parameters.get("description") or ""),
                 priority=priority,
-                category=str(parameters.get("category") or CaseCategory.GENERAL.value).strip(),
+                category=category,
                 actor_id=self._actor_id,
                 enterprise_account_id=account_id,
-                conversation_ref_id=_optional_uuid(parameters.get("conversation_ref_id")),
+                conversation_ref_id=conversation_ref_id,
+                team_ref=team_ref,
             )
         except CaseError as exc:
             # `ACCOUNT_NOT_FOUND` from the service means "no such account, or not
@@ -153,6 +218,7 @@ class CaseCreateExecutor:
             "status": case.status,
             "priority": case.priority,
             "category": case.category,
+            "team_ref": case.team_ref,
             "sla_tier": case.sla_tier,
             "first_response_due_at": _iso(case.first_response_due_at),
             "resolution_due_at": _iso(case.resolution_due_at),
@@ -180,7 +246,12 @@ class CaseCreateExecutor:
         ).scalar_one_or_none()
         if row is None:
             return False
-        return row.enterprise_account_id is not None and row.sla_tier is not None
+        return (
+            row.enterprise_account_id is not None
+            and row.sla_tier is not None
+            and row.team_ref == parameters.get("team_ref")
+            and row.category == parameters.get("category", CaseCategory.GENERAL.value)
+        )
 
 
 def _optional_uuid(raw: Any) -> uuid.UUID | None:

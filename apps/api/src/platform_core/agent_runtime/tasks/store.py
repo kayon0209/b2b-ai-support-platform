@@ -107,6 +107,8 @@ def content_hash(
     slots: list[dict[str, Any]],
     missing_slots: list[str],
     condition: dict[str, Any] | None,
+    flow_key: str | None = None,
+    flow_version: int | None = None,
 ) -> str:
     """Hash of what the task *means*, not of the row.
 
@@ -131,6 +133,8 @@ def content_hash(
             ],
             "missing_slots": sorted(missing_slots),
             "condition": condition,
+            "flow_key": flow_key,
+            "flow_version": flow_version,
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -158,6 +162,8 @@ class TaskCommand:
     actor_ref: str | None = None
     trace_id: str | None = None
     expected_version: int | None = None
+    idempotency_key_hash: str | None = None
+    request_hash: str | None = None
     completion_evidence: str | None = None
     blocked_reason: str | None = None
     missing_slots: list[str] | None = None
@@ -170,6 +176,11 @@ class TaskCommand:
     # for an agent to confirm. The id is written here so the row and the
     # proposal cannot drift apart.
     proposal_id: uuid.UUID | None = None
+    execution_id: uuid.UUID | None = None
+    # A pending ToolProposal must be withdrawn before its task can be
+    # cancelled or handed off. The HTTP boundary sets this only after the
+    # Gateway serializes withdrawal against execution.
+    proposal_withdrawn: bool = False
     # When set, the action's arguments changed: bump the revision so any
     # confirmation bound to the old one stops matching.
     bump_action_revision: bool = False
@@ -192,6 +203,12 @@ async def create_or_get(
     assessment_id: uuid.UUID | None = None,
     sequence: int = 0,
     trace_id: str | None = None,
+    flow_key: str | None = None,
+    flow_version: int | None = None,
+    actor_type: str = "system",
+    actor_ref: str | None = None,
+    reason_code: str = "TASK_CREATED",
+    task_id: uuid.UUID | None = None,
 ) -> tuple[ConversationTask, bool]:
     """Create a task, or return the existing one for this identity.
 
@@ -201,7 +218,14 @@ async def create_or_get(
     """
     slots = slots or []
     missing = missing_slots or []
-    digest = content_hash(kind=kind, slots=slots, missing_slots=missing, condition=condition)
+    digest = content_hash(
+        kind=kind,
+        slots=slots,
+        missing_slots=missing,
+        condition=condition,
+        flow_key=flow_key,
+        flow_version=flow_version,
+    )
 
     existing = (
         await session.execute(
@@ -225,6 +249,7 @@ async def create_or_get(
 
     now = int(time.time())
     task = ConversationTask(
+        id=task_id or uuid.uuid4(),
         tenant_id=tenant_id,
         conversation_ref_id=conversation_ref_id,
         source_turn_id=source_turn_id,
@@ -233,6 +258,8 @@ async def create_or_get(
         sequence=sequence,
         kind=kind.value,
         status=status.value,
+        flow_key=flow_key,
+        flow_version=flow_version,
         version=1,
         action_revision=1,
         content_hash=digest,
@@ -271,8 +298,9 @@ async def create_or_get(
         task=task,
         from_status=None,
         to_status=status,
-        reason_code="TASK_CREATED",
-        actor_type="system",
+        reason_code=reason_code,
+        actor_type=actor_type,
+        actor_ref=actor_ref,
         trace_id=trace_id,
     )
     return task, True
@@ -289,6 +317,8 @@ async def append_event(
     actor_type: str,
     actor_ref: str | None = None,
     trace_id: str | None = None,
+    idempotency_key_hash: str | None = None,
+    request_hash: str | None = None,
 ) -> ConversationTaskEvent:
     """Append one transition. The only writer of the event log."""
     current_max = (
@@ -313,6 +343,8 @@ async def append_event(
         actor_ref=actor_ref,
         reason_code=reason_code,
         trace_id=trace_id,
+        idempotency_key_hash=idempotency_key_hash,
+        request_hash=request_hash,
         from_version=task.version,
         to_version=task.version + 1,
         created_at=int(time.time()),
@@ -320,6 +352,27 @@ async def append_event(
     session.add(event)
     await session.flush()
     return event
+
+
+async def command_request_hash(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    task_id: uuid.UUID,
+    idempotency_key_hash: str,
+) -> str | None:
+    """Return the request digest recorded for a task-command replay key."""
+    return (
+        await session.execute(
+            select(ConversationTaskEvent.request_hash)
+            .where(
+                ConversationTaskEvent.tenant_id == tenant_id,
+                ConversationTaskEvent.task_id == task_id,
+                ConversationTaskEvent.idempotency_key_hash == idempotency_key_hash,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
 
 
 async def transition(
@@ -349,6 +402,21 @@ async def transition(
 
     if command.target is TaskStatus.SUCCEEDED:
         _require_evidence(command.completion_evidence)
+    if command.target is TaskStatus.AWAITING_CONFIRMATION and command.proposal_id is None:
+        raise TaskTransitionError(
+            "TASK_PROPOSAL_REQUIRED",
+            "awaiting_confirmation requires a persisted Tool Gateway proposal",
+        )
+    if (
+        current is TaskStatus.AWAITING_CONFIRMATION
+        and task.proposal_id is not None
+        and command.target in (TaskStatus.CANCELLED, TaskStatus.NEEDS_HUMAN)
+        and not command.proposal_withdrawn
+    ):
+        raise TaskTransitionError(
+            "TASK_PROPOSAL_WITHDRAWAL_REQUIRED",
+            "withdraw the pending Tool Gateway proposal before cancelling or handing off",
+        )
 
     new_version = task.version + 1
     values: dict[str, Any] = {
@@ -377,6 +445,8 @@ async def transition(
         values["completion_evidence"] = command.completion_evidence
     if command.proposal_id is not None:
         values["proposal_id"] = command.proposal_id
+    if command.execution_id is not None:
+        values["execution_id"] = command.execution_id
 
     result = await session.execute(
         update(ConversationTask)
@@ -409,6 +479,8 @@ async def transition(
         actor_type=command.actor_type,
         actor_ref=command.actor_ref,
         trace_id=command.trace_id,
+        idempotency_key_hash=command.idempotency_key_hash,
+        request_hash=command.request_hash,
     )
     return task
 

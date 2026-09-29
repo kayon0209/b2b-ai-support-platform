@@ -43,6 +43,8 @@ from platform_core.identity.models import (
     Department,
     EnterpriseAccount,
     EnterpriseAccountContact,
+    Membership,
+    MembershipRole,
 )
 from platform_core.identity.tenant_context import TenantContext
 
@@ -464,6 +466,22 @@ async def get_account(
     ).scalar_one_or_none()
 
 
+async def department_slug_exists(session: AsyncSession, *, tenant_id: uuid.UUID, slug: str) -> bool:
+    """Check that a routing target exists inside the current tenant."""
+    try:
+        normalised = normalise_slug(slug)
+    except OrgError:
+        return False
+    return (
+        await session.execute(
+            select(Department.id).where(
+                Department.tenant_id == tenant_id,
+                Department.slug == normalised,
+            )
+        )
+    ).scalar_one_or_none() is not None
+
+
 async def update_account(
     session: AsyncSession,
     *,
@@ -616,6 +634,40 @@ async def list_departments(
         )
     ).scalars()
     return list(rows)
+
+
+async def routable_support_department_slugs(
+    session: AsyncSession, *, tenant_id: uuid.UUID
+) -> frozenset[str]:
+    """Departments with at least one active support owner in this tenant.
+
+    A department row alone is not an owner. A flow should only be presented as
+    operationally routable when an active support agent, support admin, or
+    tenant owner is assigned to that department.
+    """
+    rows = (
+        await session.execute(
+            select(Department.slug)
+            .join(
+                Membership,
+                (Membership.department_id == Department.id)
+                & (Membership.tenant_id == Department.tenant_id),
+            )
+            .where(
+                Department.tenant_id == tenant_id,
+                Membership.status == "active",
+                Membership.role.in_(
+                    (
+                        MembershipRole.SUPPORT_AGENT,
+                        MembershipRole.SUPPORT_ADMIN,
+                        MembershipRole.TENANT_OWNER,
+                    )
+                ),
+            )
+            .distinct()
+        )
+    ).scalars()
+    return frozenset(str(slug) for slug in rows)
 
 
 async def get_department(

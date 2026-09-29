@@ -8,6 +8,7 @@ const API_TARGET = process.env.VITE_API_TARGET || "http://localhost:8000";
 
 export default defineConfig({
   plugins: [react()],
+  cacheDir: process.env.VITE_CACHE_DIR || "node_modules/.vite",
   server: {
     port: 5173,
     proxy: {

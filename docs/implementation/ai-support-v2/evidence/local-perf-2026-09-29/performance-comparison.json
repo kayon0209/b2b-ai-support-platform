@@ -1,0 +1,242 @@
+{
+  "evidenceType": "local synthetic performance comparison",
+  "implementationRevision": "35195b4+source:b04388b61c95",
+  "database": "disposable local PostgreSQL database",
+  "roundsPerModeConcurrency": 3,
+  "modes": [
+    "off",
+    "shadow"
+  ],
+  "concurrencyLevels": [
+    50,
+    100
+  ],
+  "measurement": "warm pooled inbox persistence plus real shadow outbox enqueue gate",
+  "modelCalls": 0,
+  "httpTransportMeasured": false,
+  "workerCompletionLatencyMeasured": false,
+  "runs": [
+    {
+      "mode": "off",
+      "round": 1,
+      "concurrency": 50,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 42.866,
+        "p95": 51.476,
+        "p99": 51.602
+      },
+      "shadowEnqueueMs": {
+        "p50": 17.976,
+        "p95": 27.865,
+        "p99": 27.921
+      },
+      "shadowRequestsQueued": 0,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "off",
+      "round": 2,
+      "concurrency": 50,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 12.586,
+        "p95": 18.642,
+        "p99": 18.686
+      },
+      "shadowEnqueueMs": {
+        "p50": 15.787,
+        "p95": 28.709,
+        "p99": 28.78
+      },
+      "shadowRequestsQueued": 0,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "off",
+      "round": 3,
+      "concurrency": 50,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 16.584,
+        "p95": 23.588,
+        "p99": 23.752
+      },
+      "shadowEnqueueMs": {
+        "p50": 17.914,
+        "p95": 28.236,
+        "p99": 28.254
+      },
+      "shadowRequestsQueued": 0,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "off",
+      "round": 1,
+      "concurrency": 100,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 22.696,
+        "p95": 37.321,
+        "p99": 38.414
+      },
+      "shadowEnqueueMs": {
+        "p50": 31.873,
+        "p95": 77.257,
+        "p99": 77.354
+      },
+      "shadowRequestsQueued": 0,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "off",
+      "round": 2,
+      "concurrency": 100,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 21.636,
+        "p95": 36.629,
+        "p99": 37.222
+      },
+      "shadowEnqueueMs": {
+        "p50": 36.686,
+        "p95": 62.396,
+        "p99": 62.616
+      },
+      "shadowRequestsQueued": 0,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "off",
+      "round": 3,
+      "concurrency": 100,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 22.346,
+        "p95": 36.258,
+        "p99": 36.483
+      },
+      "shadowEnqueueMs": {
+        "p50": 29.91,
+        "p95": 53.304,
+        "p99": 53.596
+      },
+      "shadowRequestsQueued": 0,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "shadow",
+      "round": 1,
+      "concurrency": 50,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 12.124,
+        "p95": 18.896,
+        "p99": 18.917
+      },
+      "shadowEnqueueMs": {
+        "p50": 27.815,
+        "p95": 44.125,
+        "p99": 44.167
+      },
+      "shadowRequestsQueued": 50,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "shadow",
+      "round": 2,
+      "concurrency": 50,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 35.143,
+        "p95": 41.44,
+        "p99": 41.776
+      },
+      "shadowEnqueueMs": {
+        "p50": 24.031,
+        "p95": 37.658,
+        "p99": 37.689
+      },
+      "shadowRequestsQueued": 50,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "shadow",
+      "round": 3,
+      "concurrency": 50,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 12.262,
+        "p95": 18.411,
+        "p99": 18.448
+      },
+      "shadowEnqueueMs": {
+        "p50": 21.567,
+        "p95": 35.296,
+        "p99": 35.976
+      },
+      "shadowRequestsQueued": 50,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "shadow",
+      "round": 1,
+      "concurrency": 100,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 22.346,
+        "p95": 35.768,
+        "p99": 36.286
+      },
+      "shadowEnqueueMs": {
+        "p50": 51.92,
+        "p95": 85.796,
+        "p99": 87.057
+      },
+      "shadowRequestsQueued": 100,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "shadow",
+      "round": 2,
+      "concurrency": 100,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 22.0,
+        "p95": 35.862,
+        "p99": 36.897
+      },
+      "shadowEnqueueMs": {
+        "p50": 47.682,
+        "p95": 100.035,
+        "p99": 100.898
+      },
+      "shadowRequestsQueued": 100,
+      "duplicateReplayDetected": true
+    },
+    {
+      "mode": "shadow",
+      "round": 3,
+      "concurrency": 100,
+      "poolSize": 10,
+      "inboxStoreAckMs": {
+        "p50": 21.051,
+        "p95": 34.983,
+        "p99": 35.673
+      },
+      "shadowEnqueueMs": {
+        "p50": 49.962,
+        "p95": 81.167,
+        "p99": 82.232
+      },
+      "shadowRequestsQueued": 100,
+      "duplicateReplayDetected": true
+    }
+  ],
+  "limitations": [
+    "Synthetic local data and one host; not a production capacity or latency claim.",
+    "Inbox metric measures persist_inbox_event, not socket, signature, or full API latency.",
+    "Shadow enqueue is measured after inbox persistence; no model is invoked.",
+    "Multi-worker queue drain latency is captured by the separate local worker drill."
+  ]
+}

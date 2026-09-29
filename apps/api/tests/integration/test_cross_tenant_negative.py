@@ -101,6 +101,10 @@ TENANT_TABLES = (
     "visitor_session_revocations",
     "knowledge_gaps",
     "knowledge_drafts",
+    "knowledge_release_evaluations",
+    "knowledge_release_approvals",
+    "knowledge_release_post_tests",
+    "knowledge_release_events",
     "knowledge_aliases",
     "prompt_versions",
     "billing_entries",
@@ -110,6 +114,8 @@ TENANT_TABLES = (
     "conversation_tasks",
     "conversation_task_events",
     "copilot_drafts",
+    "emotion_advice_reviews",
+    "standard_flow_start_requests",
 )
 
 _seed_ids: dict[str, str] = {}
@@ -179,6 +185,9 @@ def seed_all_tables() -> None:
         conversation_ref = str(uuid.uuid4())
         assessment_id = str(uuid.uuid4())
         task_id = str(uuid.uuid4())
+        draft_id = str(uuid.uuid4())
+        release_eval_id = str(uuid.uuid4())
+        candidate_version_id = str(uuid.uuid4())
         _seed_ids.update(
             space=space,
             doc=doc,
@@ -189,6 +198,8 @@ def seed_all_tables() -> None:
             conversation_ref=conversation_ref,
             assessment_id=assessment_id,
             task_id=task_id,
+            draft_id=draft_id,
+            release_eval_id=release_eval_id,
         )
         stmts = [
             (
@@ -487,8 +498,39 @@ def seed_all_tables() -> None:
             (
                 "knowledge_drafts",
                 "INSERT INTO knowledge_drafts (id, tenant_id, gap_id, title, body) "
-                "SELECT :i, :t, kg.id, 'Neg Draft', 'neg body' FROM knowledge_gaps kg "
+                "SELECT :draft, :t, kg.id, 'Neg Draft', 'neg body' FROM knowledge_gaps kg "
                 "WHERE kg.tenant_id = CAST(:t AS uuid) ORDER BY kg.id LIMIT 1",
+            ),
+            (
+                "knowledge_release_evaluations",
+                "INSERT INTO knowledge_release_evaluations "
+                "(id, tenant_id, draft_id, knowledge_space_id, baseline_version_id, "
+                "candidate_version_id, author_id, baseline_run, candidate_run, "
+                "candidate_fingerprint, status, reason_code, idempotency_key, created_by, "
+                "created_at) VALUES (:release_eval, :t, :draft, :sid, :vid, :candidate_ver, "
+                "gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, :hash, 'blocked', "
+                "'EVAL_INPUT_MISMATCH', :slug, gen_random_uuid(), 1000)",
+            ),
+            (
+                "knowledge_release_approvals",
+                "INSERT INTO knowledge_release_approvals "
+                "(id, tenant_id, evaluation_id, reviewer_id, reviewer_role, "
+                "candidate_fingerprint, idempotency_key, created_at) VALUES "
+                "(:i, :t, :release_eval, gen_random_uuid(), 'knowledge_manager', "
+                ":hash, :slug, 1000)",
+            ),
+            (
+                "knowledge_release_post_tests",
+                "INSERT INTO knowledge_release_post_tests "
+                "(id, tenant_id, evaluation_id, run, status, reason_code, idempotency_key, "
+                "created_by, created_at) VALUES (:i, :t, :release_eval, '{}'::jsonb, "
+                "'blocked', 'UNSAFE_ANSWER_FOUND', :slug, gen_random_uuid(), 1000)",
+            ),
+            (
+                "knowledge_release_events",
+                "INSERT INTO knowledge_release_events "
+                "(id, tenant_id, evaluation_id, action, reason_code, idempotency_key, created_at) "
+                "VALUES (:i, :t, :release_eval, 'publish_requested', 'NEGATIVE_TEST', :slug, 1000)",
             ),
             (
                 "knowledge_aliases",
@@ -535,6 +577,20 @@ def seed_all_tables() -> None:
                 "job_id, kind, status, created_at, updated_at) VALUES (:i, :t, :conversation, "
                 "gen_random_uuid(), gen_random_uuid(), 'summary', 'queued', 1000, 1000)",
             ),
+            (
+                "emotion_advice_reviews",
+                "INSERT INTO emotion_advice_reviews (id, tenant_id, conversation_ref_id, "
+                "advice_id, suggested_level, corrected_level, reason_code, reviewer_id, "
+                "idempotency_key, created_at) VALUES (:i, :t, :conversation, :hash, "
+                "'angry', 'frustrated', 'overstated', gen_random_uuid(), :slug, 1000)",
+            ),
+            (
+                "standard_flow_start_requests",
+                "INSERT INTO standard_flow_start_requests (id, tenant_id, conversation_ref_id, "
+                "task_id, idempotency_key_hash, request_hash, created_by, created_at) "
+                "VALUES (:i, :t, :conversation, :taskid, :hash, :request_hash, "
+                "gen_random_uuid(), 1000)",
+            ),
         ]
         for _table, stmt in stmts:
             if stmt is None:
@@ -553,9 +609,13 @@ def seed_all_tables() -> None:
                     "conversation": conversation_ref,
                     "assessment": assessment_id,
                     "taskid": task_id,
+                    "draft": draft_id,
+                    "release_eval": release_eval_id,
+                    "candidate_ver": candidate_version_id,
                     "slug": f"neg-{_tid[-4:]}-x",
                     "email": f"neg-{slug}@test.local",
                     "hash": "a" * 64,
+                    "request_hash": "b" * 64,
                 },
             )
     yield

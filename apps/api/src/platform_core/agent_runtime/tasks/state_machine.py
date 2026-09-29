@@ -11,10 +11,10 @@ rather than at the call sites that happen to remember them today:
    cannot tell" - resolving it after reconciliation is the whole point of
    having the state.
 
-2. **`ready -> executing` is for reads only.** A write task goes
-   `ready -> awaiting_confirmation` and cannot skip the confirmation. This is
-   checked here against the task's `kind`, so a new call site cannot reach
-   execution by passing a different status.
+2. **Execution is for reads only.** A normal read goes `ready -> executing`;
+   the one operator-started `manual_flow` read path may also enter execution
+   through its explicit flow executor. A write task cannot skip confirmation.
+   This is checked here against the task's `kind`.
 
 3. **Nothing writes `succeeded`.** There is deliberately no transition into
    `succeeded` from `executing` in this table's *caller* contract - the store
@@ -42,6 +42,10 @@ class TaskStatus(StrEnum):
     FAILED = "failed"
     UNKNOWN = "unknown"
     CANCELLED = "cancelled"
+    # An operator-started standard flow with no flow-specific executor. It is
+    # deliberately excluded from `can_progress`: a generic task worker must
+    # never mistake a catalog instance for executable work.
+    MANUAL_FLOW = "manual_flow"
 
 
 class TaskKind(StrEnum):
@@ -81,6 +85,8 @@ _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         {
             TaskStatus.READY,  # an agent supplied what was missing
             TaskStatus.AWAITING_INPUT,
+            TaskStatus.AWAITING_CONFIRMATION,  # a controlled write proposal was prepared
+            TaskStatus.NEEDS_HUMAN,  # a manual flow recorded another operator update
             TaskStatus.CANCELLED,
         }
     ),
@@ -88,6 +94,7 @@ _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         {
             TaskStatus.EXECUTING,  # after confirmation
             TaskStatus.READY,  # arguments changed; revision bumped
+            TaskStatus.NEEDS_HUMAN,  # an unexecuted proposal was withdrawn for handoff
             TaskStatus.CANCELLED,
         }
     ),
@@ -115,6 +122,15 @@ _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.SUCCEEDED: frozenset(),
     TaskStatus.FAILED: frozenset(),
     TaskStatus.CANCELLED: frozenset(),
+    TaskStatus.MANUAL_FLOW: frozenset(
+        {
+            TaskStatus.MANUAL_FLOW,
+            TaskStatus.EXECUTING,
+            TaskStatus.AWAITING_CONFIRMATION,
+            TaskStatus.NEEDS_HUMAN,
+            TaskStatus.CANCELLED,
+        }
+    ),
 }
 
 
@@ -127,13 +143,13 @@ class TaskTransitionError(Exception):
 
 # States a task may legitimately remain in while something happens to it.
 #
-# `awaiting_input -> awaiting_input` is a second clarification round, which is
-# ordinary: the platform asked for a field, the customer supplied a different
-# one, and the run asks again. `config.clarification_max_streak` is what bounds
-# it, so the loop is stopped by policy rather than by a state machine that
-# cannot express "still asking". A self-transition also bumps the version and
-# appends an event, so the rounds remain countable.
-SELF_TRANSITIONS: frozenset[TaskStatus] = frozenset({TaskStatus.AWAITING_INPUT})
+# `awaiting_input -> awaiting_input` is a second clarification round. Manual
+# flow/needs-human self transitions record operator field updates while
+# keeping the task outside generic execution. Each bumps the version and
+# appends an event, so each round remains countable.
+SELF_TRANSITIONS: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.AWAITING_INPUT, TaskStatus.NEEDS_HUMAN, TaskStatus.MANUAL_FLOW}
+)
 
 
 def check_transition(
@@ -150,9 +166,9 @@ def check_transition(
       pass through `awaiting_confirmation`, which is where the confirmation and
       the re-authorization live;
     - a task may not move to the state it is already in, except for the
-      clarification states in `SELF_TRANSITIONS`. Re-running the same command
-      should be a no-op the caller recognises, not a version bump that makes an
-      idempotent retry look like a new intent.
+      explicitly repeatable states in `SELF_TRANSITIONS`. Re-running the same
+      command should be a no-op the caller recognises, not a version bump that
+      makes an idempotent retry look like a new intent.
     """
     # Checked here and not only in `store.transition`: a terminal state must
     # be final for every caller, and a caller that reaches the state machine
@@ -168,12 +184,20 @@ def check_transition(
     if target not in allowed:
         raise TaskTransitionError("TASK_TRANSITION_NOT_ALLOWED", f"{current.value}->{target.value}")
 
-    if target is TaskStatus.EXECUTING and current is TaskStatus.READY:
+    if target is TaskStatus.EXECUTING and current in {
+        TaskStatus.READY,
+        TaskStatus.MANUAL_FLOW,
+    }:
         if kind is not TaskKind.READ:
             raise TaskTransitionError(
                 "TASK_WRITE_REQUIRES_CONFIRMATION",
                 "a write must pass through awaiting_confirmation",
             )
+    if target is TaskStatus.AWAITING_CONFIRMATION and kind is not TaskKind.WRITE:
+        raise TaskTransitionError(
+            "TASK_CONFIRMATION_REQUIRES_WRITE",
+            "only a write task may wait for tool confirmation",
+        )
 
 
 def is_terminal(status: TaskStatus) -> bool:

@@ -344,3 +344,27 @@ def test_no_task_is_ever_created_in_a_successful_or_executing_state() -> None:
     )
     forbidden = {TaskStatus.SUCCEEDED, TaskStatus.EXECUTING, TaskStatus.FAILED, TaskStatus.UNKNOWN}
     assert not ({t.status for t in tasks} & forbidden)
+
+
+def test_free_text_customer_slots_redact_email_and_phone_values() -> None:
+    intent = SemanticIntent(
+        task_kind=SemanticTaskKind.READ,
+        source_turn_id="t-contact-details",
+        slots=[
+            SemanticSlot(
+                name="description",
+                value="Contact support@example.test or +1 415 555 0199.",
+                origin=SlotOrigin.CUSTOMER_STATED,
+                confirmed=True,
+            )
+        ],
+    )
+
+    task = plan_tasks(
+        [intent],
+        capabilities=READ_CAPS,
+        accepted_tool_names=["order.get_status"],
+        unsupported={},
+    )[0]
+
+    assert task.slots[0]["value"] == "Contact [EMAIL] or [PHONE]."

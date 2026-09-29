@@ -38,6 +38,10 @@ class OutboxEvent(Base, PkMixin, TenantMixin):
         String(31), nullable=False, default=OutboxStatus.QUEUED.value, index=True
     )
     processing_started_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Fences a recovered queue claim from a worker that resumed after its
+    # lease expired. Generic relays do not use this; dedicated consumers that
+    # commit claims before external work must.
+    processing_token: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     published_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     attempts: Mapped[int] = mapped_column(nullable=False, default=0)

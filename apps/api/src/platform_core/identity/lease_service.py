@@ -31,6 +31,7 @@ class LeaseSnapshot:
     mode: str
     lease_version: int
     updated_at: int
+    expires_at: int | None = None
 
 
 def _snapshot(row: ConversationControlLease) -> LeaseSnapshot:
@@ -41,6 +42,7 @@ def _snapshot(row: ConversationControlLease) -> LeaseSnapshot:
         mode=row.mode,
         lease_version=int(row.lease_version),
         updated_at=int(row.updated_at),
+        expires_at=int(row.expires_at) if row.expires_at is not None else None,
     )
 
 

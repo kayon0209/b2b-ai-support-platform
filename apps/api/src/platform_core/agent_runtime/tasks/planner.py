@@ -36,7 +36,7 @@ from platform_core.agent_runtime.semantic.contracts import (
 )
 from platform_core.agent_runtime.semantic.validator import CapabilityView
 from platform_core.agent_runtime.tasks.state_machine import TaskKind, TaskStatus
-from platform_core.evaluation.pii import should_withhold_value
+from platform_core.evaluation.pii import redact_text, should_withhold_value
 
 # Why a task is in the state it is in. These become `blocked_reason` and are
 # shown to the operator verbatim: "unsupported" without a reason is not
@@ -249,7 +249,10 @@ def _slot_row(slot: Any) -> dict[str, Any]:
         row["value_withheld"] = True
         row["inferred"] = True
     else:
-        row["value"] = slot.value
+        if isinstance(slot.value, str):
+            row["value"], _redaction_count = redact_text(slot.value)
+        else:
+            row["value"] = slot.value
     return row
 
 

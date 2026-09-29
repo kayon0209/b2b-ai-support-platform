@@ -114,6 +114,41 @@ async def account_profile(
     )
 
 
+async def business_system_ref_for_account(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+    system_key: str,
+) -> str | None:
+    """Read one tenant-owned business-system reference from account metadata.
+
+    Callers must resolve ``account_id`` from a trusted platform relationship;
+    this helper is not itself evidence that a browser-supplied account belongs
+    to a conversation.
+    """
+    if not system_key or len(system_key) > 63:
+        return None
+    attributes = (
+        await session.execute(
+            select(EnterpriseAccount.attributes).where(
+                EnterpriseAccount.tenant_id == tenant_id,
+                EnterpriseAccount.id == account_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if not isinstance(attributes, dict):
+        return None
+    refs = attributes.get("business_system_refs")
+    if not isinstance(refs, dict):
+        return None
+    value = refs.get(system_key)
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value[:255] if value else None
+
+
 async def profile_for_contact(
     session: AsyncSession, *, tenant_id: uuid.UUID, external_contact_id: str
 ) -> AccountProfile | None:
@@ -141,5 +176,6 @@ __all__ = [
     "PROFILE_ATTRIBUTE_KEYS",
     "AccountProfile",
     "account_profile",
+    "business_system_ref_for_account",
     "profile_for_contact",
 ]

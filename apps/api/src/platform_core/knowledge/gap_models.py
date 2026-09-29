@@ -102,7 +102,10 @@ class KnowledgeDraft(Base, PkMixin, TenantMixin):
     """
 
     __tablename__ = "knowledge_drafts"
-    __table_args__ = (Index("ix_drafts_status", "status"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_knowledge_drafts_tenant_id"),
+        Index("ix_drafts_status", "status"),
+    )
 
     gap_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("knowledge_gaps.id"), nullable=False, index=True
@@ -120,6 +123,7 @@ class KnowledgeDraft(Base, PkMixin, TenantMixin):
     conversation_ref_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
+    author_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     status: Mapped[str] = mapped_column(String(31), nullable=False, default=DraftStatus.PENDING)
     author_kind: Mapped[str] = mapped_column(String(31), nullable=False, default="human")
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(nullable=True)

@@ -69,6 +69,7 @@ CredentialResolver = Callable[[str | None], dict[str, str]]
 TOOL_CAPABILITY: dict[str, str] = {
     "jira.create_issue": "create_issue",
     "crm.update_account": "update_account",
+    "crm.create_opportunity": "opportunity_create",
     # Linear is the other half of Phase 3's "Jira or Linear" priority. A tenant
     # on Linear had no ticket path at all before this entry existed.
     "linear.create_issue": "create_issue",
@@ -121,6 +122,7 @@ WRITE_ARG_DEFAULTS: dict[str, tuple[tuple[str, str], ...]] = {
 TOOL_PROVIDERS: dict[str, tuple[str, ...]] = {
     "jira.create_issue": ("jira",),
     "crm.update_account": ("crm",),
+    "crm.create_opportunity": ("demo_crm",),
     "linear.create_issue": ("linear",),
     "im.send_notification": ("im_webhook", "feishu", "teams"),
     "order.get_status": ("business_api",),
@@ -488,6 +490,13 @@ def default_factories() -> dict[str, AdapterFactory]:
         # claims `update_account`, so a lookup-only CRM stays read-only.
         return CrmWriteAdapter(context)
 
+    def _build_demo_crm(context: ConnectorContext) -> ToolExecutor:
+        from platform_core.integrations.demo_crm import DemoCrmOpportunityExecutor
+
+        # This factory rechecks local/test and the synthetic connector mode.
+        # A row named demo_crm in another environment never creates a writer.
+        return DemoCrmOpportunityExecutor(context)
+
     def _build_linear(context: ConnectorContext) -> ToolExecutor:
         from platform_core.integrations.linear import LinearAdapter
 
@@ -530,6 +539,7 @@ def default_factories() -> dict[str, AdapterFactory]:
     return {
         "jira": AdapterFactory(provider="jira", build=_build_jira),
         "crm": AdapterFactory(provider="crm", build=_build_crm),
+        "demo_crm": AdapterFactory(provider="demo_crm", build=_build_demo_crm),
         "linear": AdapterFactory(provider="linear", build=_build_linear),
         "im_webhook": AdapterFactory(provider="im_webhook", build=_build_im),
         "feishu": AdapterFactory(provider="feishu", build=_build_feishu),
@@ -690,6 +700,20 @@ TOOL_CATALOG: dict[str, tuple[str, dict[str, Any], list[str], bool]] = {
         ["tool.write.confirmed"],
         True,
     ),
+    "crm.create_opportunity": (
+        "confirmed_write",
+        {
+            "type": "object",
+            "properties": {
+                "account_ref": {"type": "string", "minLength": 1, "maxLength": 255},
+                "product_ref": {"type": "string", "minLength": 1, "maxLength": 255},
+            },
+            "required": ["account_ref", "product_ref"],
+            "additionalProperties": False,
+        },
+        ["tool.write.confirmed"],
+        True,
+    ),
     "im.send_notification": (
         "low_write",
         {
@@ -774,6 +798,9 @@ TOOL_CATALOG: dict[str, tuple[str, dict[str, Any], list[str], bool]] = {
                 "priority": {"type": "string"},
                 "category": {"type": "string"},
                 "conversation_ref_id": {"type": "string"},
+                "team_ref": {"type": "string", "minLength": 1, "maxLength": 255},
+                "product_ref": {"type": "string", "minLength": 1, "maxLength": 255},
+                "product_verification_source": {"type": "string", "enum": ["demo"]},
             },
             "required": ["enterprise_account_id", "subject"],
             "additionalProperties": False,

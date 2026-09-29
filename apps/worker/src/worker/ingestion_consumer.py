@@ -460,20 +460,47 @@ async def ingest_version(
 
     # --- INDEXING -> READY, and only now is the version retrievable ---
     await _advance(session, version.version_id, IngestionStatus.READY)
-    await session.execute(
-        update(DocumentVersion)
-        .where(DocumentVersion.id == version.version_id)
-        .values(
-            status="active",
-            metadata_json=_merged_metadata(
-                version,
-                chunks=len(chunks),
-                chunking=chunk_config.as_metadata(),
-                cleaning=cleaning_report.as_metadata(),
-                document_metadata=doc_metadata,
-            ),
+    indexed_version = (
+        await session.execute(
+            select(DocumentVersion).where(
+                DocumentVersion.id == version.version_id,
+                DocumentVersion.tenant_id == version.tenant_id,
+            )
         )
+    ).scalar_one()
+    prior_metadata = dict(indexed_version.metadata_json or {})
+    is_release_candidate = (
+        indexed_version.status == "draft" and prior_metadata.get("release_candidate") is True
     )
+    indexed_version.status = "draft" if is_release_candidate else "active"
+    merged_metadata = {
+        **prior_metadata,
+        **_merged_metadata(
+            version,
+            chunks=len(chunks),
+            chunking=chunk_config.as_metadata(),
+            cleaning=cleaning_report.as_metadata(),
+            document_metadata=doc_metadata,
+        ),
+    }
+    if is_release_candidate:
+        merged_metadata.update(
+            {
+                key: value
+                for key, value in prior_metadata.items()
+                if key == "release_candidate" or key.startswith("release_candidate_")
+            }
+        )
+    indexed_version.metadata_json = merged_metadata
+    await session.flush()
+    if not is_release_candidate:
+        from platform_core.knowledge import release_service
+
+        await release_service.record_activation(
+            session,
+            ctx=TenantContext(tenant_id=version.tenant_id, actor_id=None, actor_kind="system"),
+            version_id=version.version_id,
+        )
     return len(chunks)
 
 

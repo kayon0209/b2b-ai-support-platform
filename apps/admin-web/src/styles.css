@@ -1343,3 +1343,26 @@ select:focus-visible {
     animation: none;
   }
 }
+
+.release-evidence-head,
+.release-evidence-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.release-evidence-head p,
+.release-evidence-row p {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.release-evidence-row {
+  padding: 10px 0;
+  border-top: 1px solid var(--border, #e2e8f0);
+}
+
+.release-evidence-row > div {
+  min-width: 0;
+}

@@ -286,7 +286,9 @@ async def get_version(
             )
         )
     ).scalar_one_or_none()
-    if version is None:
+    if version is None or (
+        version.status == "draft" and (version.metadata_json or {}).get("release_candidate") is True
+    ):
         raise KnowledgeError("NOT_FOUND", "no such document version for this tenant")
     return version
 
@@ -300,6 +302,10 @@ async def list_versions(
             .where(
                 DocumentVersion.document_id == document_id,
                 DocumentVersion.tenant_id == tenant_id,
+                ~(
+                    (DocumentVersion.status == "draft")
+                    & DocumentVersion.metadata_json["release_candidate"].as_boolean().is_(True)
+                ),
             )
             .order_by(DocumentVersion.version_label)
         )
@@ -308,7 +314,7 @@ async def list_versions(
 
 
 async def mark_ready(
-    session: AsyncSession, *, tenant_id: uuid.UUID, version_id: uuid.UUID
+    session: AsyncSession, *, ctx: TenantContext, version_id: uuid.UUID
 ) -> DocumentVersion:
     """Drive the version to READY through the validated state machine.
 
@@ -316,7 +322,7 @@ async def mark_ready(
     place that decides which moves are legal - the router must not set
     `ingestion_status` directly, or the state machine becomes advisory.
     """
-    version = await get_version(session, tenant_id=tenant_id, version_id=version_id)
+    version = await get_version(session, tenant_id=ctx.tenant_id, version_id=version_id)
     current = str(version.ingestion_status)
     for target in (
         IngestionStatus.PARSING,
@@ -327,8 +333,16 @@ async def mark_ready(
     ):
         current = ingest.transition(current, target.value)
     version.ingestion_status = current
-    version.status = "active"
+    is_release_candidate = (
+        version.status == "draft" and (version.metadata_json or {}).get("release_candidate") is True
+    )
+    if not is_release_candidate:
+        version.status = "active"
     await session.flush()
+    if not is_release_candidate:
+        from platform_core.knowledge import release_service
+
+        await release_service.record_activation(session, ctx=ctx, version_id=version.id)
     return version
 
 

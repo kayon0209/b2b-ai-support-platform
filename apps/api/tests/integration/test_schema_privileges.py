@@ -75,6 +75,31 @@ RESTRICTED_BY_DESIGN: dict[str, tuple[frozenset[str], str]] = {
         "was consumed. Corrections are new rows (`record_adjustment`), and the "
         "rollup applies the sign, so no UPDATE is ever needed",
     ),
+    "emotion_advice_reviews": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only supervisor feedback: corrections are new audited rows",
+    ),
+    "knowledge_release_evaluations": (
+        frozenset({"UPDATE", "DELETE"}),
+        "immutable evaluation evidence; a rerun creates a new row",
+    ),
+    "knowledge_release_approvals": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only human approval bound to an evaluation fingerprint",
+    ),
+    "knowledge_release_post_tests": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only post-publication measurements",
+    ),
+    "knowledge_release_events": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only publication and rollback history",
+    ),
+    "standard_flow_start_requests": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only idempotency receipts; retries reuse the stored task and "
+        "never rewrite the receipt",
+    ),
 }
 
 PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")

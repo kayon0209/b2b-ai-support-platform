@@ -118,6 +118,14 @@ class PrincipalScope:
     principal_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ReleaseCandidateScope:
+    """One staged version exposed only to an internal release evaluation."""
+
+    version_id: uuid.UUID
+    knowledge_space_id: uuid.UUID
+
+
 @dataclass
 class RetrievedChunk:
     chunk_id: uuid.UUID
@@ -130,6 +138,7 @@ class RetrievedChunk:
     source_uri: str
     score: float
     ranking: dict[str, float] = field(default_factory=dict)
+    document_key: str = ""
 
 
 def _vector_literal(vec: list[float]) -> str:
@@ -286,6 +295,7 @@ async def hybrid_search(
     aliases: list[tuple[str, str, float]] | None = None,
     authority_boost: Mapping[str, float] | None = None,
     embedder: Embedder | None = None,
+    release_candidate: ReleaseCandidateScope | None = None,
 ) -> list[RetrievedChunk]:
     """Run the enabled retrieval paths under tenant/ACL/metadata filter,
     fuse with RRF, optionally boost by document authority.
@@ -295,6 +305,9 @@ async def hybrid_search(
     When `principal` is given, knowledge ACLs narrow results further:
     spaces without any ACL rows stay open; a space/document with ACL rows
     requires a matching principal entry (fail closed per resource).
+    A release candidate scope is reserved for the internal evaluator: it adds
+    exactly one staged, ready, clean candidate alongside active versions in
+    the same space.
 
     `embedder` selects the query vector source. Omitting it falls back to
     the deterministic test embedder so existing call sites and tests keep
@@ -320,6 +333,41 @@ async def hybrid_search(
         "now": now,
     }
 
+    if release_candidate is not None:
+        if principal is None or not principal.principal_types or not principal.principal_ids:
+            raise ValueError("release candidate retrieval requires an explicit ACL principal")
+        if knowledge_space_ids and release_candidate.knowledge_space_id not in knowledge_space_ids:
+            raise ValueError("release candidate space is outside the requested retrieval scope")
+        candidate = (
+            await session.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM document_versions dv
+                    JOIN documents d ON d.id = dv.document_id
+                    WHERE dv.tenant_id = CAST(:tid AS uuid)
+                      AND d.tenant_id = CAST(:tid AS uuid)
+                      AND dv.id = CAST(:candidate_version_id AS uuid)
+                      AND d.space_id = CAST(:candidate_space_id AS uuid)
+                      AND d.canonical_uri LIKE 'gap-candidate://%'
+                      AND dv.status = 'draft'
+                      AND dv.metadata @> '{"release_candidate": true}'::jsonb
+                      AND dv.ingestion_status = 'ready'
+                      AND dv.scan_status = 'clean'
+                    """
+                ),
+                {
+                    "tid": str(tenant_id),
+                    "candidate_version_id": str(release_candidate.version_id),
+                    "candidate_space_id": str(release_candidate.knowledge_space_id),
+                },
+            )
+        ).first()
+        if candidate is None:
+            raise ValueError("release candidate is unavailable for evaluation")
+        params["candidate_version_id"] = str(release_candidate.version_id)
+        params["candidate_space_id"] = str(release_candidate.knowledge_space_id)
+
     # space_filter is built from a code-owned constant, never user
     # input; all values flow through bound parameters (S608 suppressed
     # for this file in pyproject).
@@ -327,6 +375,8 @@ async def hybrid_search(
     if knowledge_space_ids:
         space_filter = "AND d.space_id = ANY(:space_ids)"
         params["space_ids"] = [str(s) for s in knowledge_space_ids]
+    if release_candidate is not None:
+        space_filter += " AND d.space_id = CAST(:candidate_space_id AS uuid)"
 
     # Metadata filter (plan 1.5): JSONB containment on the chunk row, bound
     # as a parameter. The filter object was validated at construction, so no
@@ -365,9 +415,20 @@ async def hybrid_search(
 
     scan_gate = "AND dv.scan_status = 'clean'" if get_settings().require_scanned_documents else ""
 
+    version_visibility = "AND dv.status = 'active'"
+    if release_candidate is not None:
+        version_visibility = """AND (
+              dv.status = 'active'
+              OR (
+                dv.id = CAST(:candidate_version_id AS uuid)
+                AND dv.status = 'draft'
+                AND dv.ingestion_status = 'ready'
+                AND dv.scan_status = 'clean'
+              )
+          )"""
     base_where = f"""
         WHERE c.tenant_id = CAST(:tid AS uuid)
-          AND dv.status = 'active'
+          {version_visibility}
           {scan_gate}
           AND (dv.effective_at IS NULL OR dv.effective_at <= :now)
           AND (dv.expires_at IS NULL OR dv.expires_at > :now)
@@ -379,7 +440,8 @@ async def hybrid_search(
     # reads it from the representative row rather than issuing another query.
     select_cols = (
         "c.id, c.document_version_id, c.section_path, c.text, "
-        "d.title, dv.object_uri AS source_uri, dv.metadata->>'authority' AS authority"
+        "d.title, d.canonical_uri AS document_key, "
+        "dv.object_uri AS source_uri, dv.metadata->>'authority' AS authority"
     )
 
     fts_sql = text(
@@ -524,6 +586,7 @@ async def hybrid_search(
                 "trigram": entry["trigram_score"],
                 "alias": entry["alias_score"],
             },
+            document_key=entry["row"]["document_key"],
         )
         for cid, entry in ranked[:top_k]
     ]

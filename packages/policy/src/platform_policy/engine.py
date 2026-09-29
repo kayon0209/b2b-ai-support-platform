@@ -26,6 +26,7 @@ class Action(StrEnum):
     CASE_READ = "case.read"
     CASE_CREATE = "case.create"
     CASE_UPDATE = "case.update"
+    CASE_REVIEW = "case.review"
     CASE_CLOSE = "case.close"
     # Knowledge vocabulary
     KNOWLEDGE_READ = "knowledge.read"
@@ -108,6 +109,7 @@ RBAC_TABLE: dict[str, frozenset[Action]] = {
             Action.CASE_READ,
             Action.CASE_CREATE,
             Action.CASE_UPDATE,
+            Action.CASE_REVIEW,
             Action.CASE_CLOSE,
             Action.KNOWLEDGE_READ,
             Action.KNOWLEDGE_UPLOAD,

@@ -18,6 +18,16 @@ class Settings(BaseSettings):
 
     # Security-critical: no defaults. Startup fails when unset outside tests.
     secret_key: SecretStr | None = Field(default=None)
+    # JSON mapping of evaluator key IDs to Ed25519 raw public keys
+    # encoded as unpadded base64url. Empty trusts no evaluator.
+    knowledge_evaluator_public_keys_json: str = ""
+    # Tenant/space-specific fixed dataset hashes and two independent reviewers.
+    # Empty means no dataset is approved for any release evaluation.
+    knowledge_evaluator_approved_datasets_json: str = ""
+    # The separate release-evaluator worker may make provider calls only after
+    # an operator explicitly enables it and supplies a positive case ceiling.
+    knowledge_evaluator_auto_run: bool = False
+    knowledge_evaluator_max_cases_per_run: int = Field(default=0, ge=0, le=500)
 
     # Local default matches infra/compose/docker-compose.yml (ai-postgres is
     # published on 5435 to avoid colliding with a host PostgreSQL on 5432).

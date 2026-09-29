@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Bell, BookOpenText, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp,
   Clock3, FileText, Filter, Headset, ImagePlus, MessageCircle, MoreHorizontal,
@@ -8,26 +8,64 @@ import {
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { isOneOf, useUrlState } from "../lib/urlState";
 import { Dialog } from "../components/ui";
+import { StandardFlowCatalog } from "../components/StandardFlowCatalog";
 import { TaskPanel } from "../components/TaskPanel";
 import { ToolCard, type ToolCardData } from "../components/ToolCard";
 import { apiGet, apiPost, apiUpload } from "../lib/api";
 import { newIdempotencyKey } from "../lib/idempotency";
 import { useLang } from "../lib/i18n";
+import {
+  canClearSubmittedDraft,
+  forgetPendingReply,
+  isCurrentWorkbenchConversation,
+  pendingReplyIdempotencyKey,
+  type PendingReplySubmission,
+} from "../lib/workbenchConversation";
+import {
+  parseWorkbenchComposerDraft,
+  parseWorkbenchDraftSyncMessage,
+  isSubmittedDraftSnapshot,
+  remoteDraftDecision,
+  workbenchDraftChannelName,
+  workbenchDraftStorageKey,
+  type WorkbenchComposerDraft,
+  type WorkbenchDraftSyncMessage,
+  type WorkbenchDraftOrigin,
+} from "../lib/workbenchDraftSync";
 import { ApiError } from "../lib/types";
 import {
+  nextWorkbenchQueueTab,
   nextWorkbenchRightTab,
+  WORKBENCH_QUEUE_TABS,
   WORKBENCH_RIGHT_TABS,
+  type WorkbenchQueueTab,
   type WorkbenchRightTab,
 } from "../lib/workbenchTabs";
 import "../styles-workbench.css";
 
-type Tab = "queue" | "mine" | "waiting";
-/** Every tab the page can render. Kept beside the type so a new tab cannot
- *  be added to the union without also becoming a valid `?tab=` value. */
-const ALL_TABS = ["queue", "mine", "waiting"] as const satisfies readonly Tab[];
+type Tab = WorkbenchQueueTab;
+/** Use the shared queue-tab contract for URL validation and rendering. */
+const ALL_TABS = WORKBENCH_QUEUE_TABS;
 type Action = "claim" | "release" | "transfer" | "close";
-type Origin = "free" | "canned" | "ai_suggestion";
+type Origin = WorkbenchDraftOrigin;
+type DraftUpdateOptions = { dirty?: boolean; broadcast?: boolean; updatedAtMs?: number };
 type CopilotKind = "summary" | "reply";
+type EmotionLevel = "calm" | "frustrated" | "angry" | "escalation_risk";
+type EmotionReason = "overstated" | "understated" | "quoted_or_negated" | "sarcasm_or_mixed_tone" | "context_missing" | "other";
+
+interface EmotionAdvice {
+  advice_id: string;
+  current_level: EmotionLevel;
+  trend: "rising" | "stable" | "falling" | "unknown";
+  attention: "none" | "monitor" | "review" | "urgent_review";
+  suggested_case_priority: "p0" | "p1" | "p2" | null;
+  reason_codes: string[];
+  evidence: Array<{ turn_id: string; start: number; end: number; level: EmotionLevel; reason_code: string }>;
+  suppressed_evidence_count: number;
+  ambiguous_tone: boolean;
+  analyzed_customer_turns: number;
+  advisory_only: true;
+}
 
 interface Lease {
   owner: string;
@@ -70,6 +108,7 @@ interface QueueItem {
   contact_ref: string | null;
   case: CaseInfo | null;
   lease: Lease;
+  emotion_advice?: EmotionAdvice | null;
 }
 interface QueueResponse {
   items: QueueItem[];
@@ -80,6 +119,9 @@ interface QueueResponse {
   actor_ref: string | null;
   agent_name: string | null;
   agent_status: string | null;
+  sort_mode: "activity" | "emotion";
+  sort_scope: "queue" | "current_page";
+  emotion_advice_enabled: boolean;
 }
 interface AccountInfo {
   name: string;
@@ -100,6 +142,8 @@ interface Detail {
   turns: Turn[];
   older_before: string | null;
   ai_suggestion: { text: string; sources: string[] } | null;
+  emotion_advice: EmotionAdvice | null;
+  can_review_emotion_advice: boolean;
 }
 interface CopilotSourceRef {
   turn_id: string;
@@ -163,12 +207,36 @@ const STATUS: Record<string, string> = {
   waiting_vendor: "等待供应商", resolved: "已解决", closed: "已关闭",
   reopened: "重新打开",
 };
-const RIGHT_TAB_LABEL: Record<WorkbenchRightTab, string> = {
-  reply: "话术",
-  knowledge: "知识",
-  tools: "工具",
-  tasks: "任务",
+const RIGHT_TAB_LABEL: Record<"en" | "zh", Record<WorkbenchRightTab, string>> = {
+  zh: { reply: "话术", knowledge: "知识", tools: "工具", tasks: "任务" },
+  en: { reply: "Reply", knowledge: "Knowledge", tools: "Tools", tasks: "Tasks" },
 };
+const EMOTION_LABEL: Record<EmotionLevel, string> = {
+  calm: "平稳", frustrated: "不满", angry: "愤怒", escalation_risk: "升级风险",
+};
+const EMOTION_ATTENTION_LABEL: Record<EmotionAdvice["attention"], string> = {
+  none: "无需额外关注", monitor: "建议观察", review: "建议人工复核", urgent_review: "建议优先复核",
+};
+const EMOTION_TREND_LABEL: Record<EmotionAdvice["trend"], string> = {
+  rising: "升高", stable: "稳定", falling: "缓和", unknown: "趋势不确定",
+};
+const EMOTION_REASON_LABEL: Record<string, string> = {
+  external_escalation_language: "出现外部投诉或升级表达",
+  direct_anger_language: "出现明确愤怒表达",
+  direct_frustration_language: "出现不满或催促表达",
+  emotion_trend_rising: "最近表达趋于强烈",
+  emotion_sustained_across_turns: "连续多轮出现不满信号",
+  emotion_context_needs_human_review: "语气可能包含反讽或混合情绪",
+  quoted_or_negated_terms_not_ranked: "引用或否定词未作为当前情绪计分",
+};
+const EMOTION_REVIEW_REASONS: Array<{ value: EmotionReason; label: string }> = [
+  { value: "overstated", label: "建议偏高" },
+  { value: "understated", label: "建议偏低" },
+  { value: "quoted_or_negated", label: "引用或否定语境" },
+  { value: "sarcasm_or_mixed_tone", label: "反讽或混合语气" },
+  { value: "context_missing", label: "缺少上下文" },
+  { value: "other", label: "其他原因" },
+];
 const EMOJIS = ["🙂", "😊", "👍", "🙏", "✅", "📦", "🔧", "💡"];
 
 function clock(seconds: number | null | undefined): string {
@@ -195,6 +263,66 @@ function uniqueTurns(older: Turn[], latest: Turn[]): Turn[] {
     seen.add(turn.turn_id);
     return true;
   });
+}
+
+function workbenchDraftSnapshot(
+  actorRef: string,
+  conversationRef: string,
+  body: string,
+  metadata: { origin: Origin; cannedReplyId: string | null; copilotJobId: string | null },
+  updatedAtMs: number,
+): WorkbenchComposerDraft {
+  return {
+    schema_version: 1,
+    actor_ref: actorRef,
+    conversation_ref: conversationRef,
+    body,
+    origin: metadata.origin,
+    canned_reply_id: metadata.cannedReplyId,
+    copilot_job_id: metadata.copilotJobId,
+    updated_at_ms: updatedAtMs,
+  };
+}
+
+function clearSubmittedDraftSnapshot(
+  actorRef: string | null,
+  conversationRef: string,
+  submittedBody: string,
+  submittedUpdatedAtMs: number,
+  senderTabId: string,
+): void {
+  if (!actorRef) return;
+  const key = workbenchDraftStorageKey(actorRef, conversationRef);
+  try {
+    const saved = parseWorkbenchComposerDraft(
+      window.sessionStorage.getItem(key),
+      actorRef,
+      conversationRef,
+    );
+    if (isSubmittedDraftSnapshot(saved, submittedBody, submittedUpdatedAtMs)) {
+      window.sessionStorage.removeItem(key);
+    }
+  } catch {
+    // Draft recovery is best-effort when browser storage is disabled.
+  }
+
+  if (typeof BroadcastChannel === "undefined") return;
+  try {
+    const channel = new BroadcastChannel(workbenchDraftChannelName(actorRef, conversationRef));
+    channel.postMessage({
+      schema_version: 1,
+      kind: "clear",
+      sender_tab_id: senderTabId,
+      actor_ref: actorRef,
+      conversation_ref: conversationRef,
+      // The clear supersedes the submitted version, while a draft created
+      // after this successful send has a later timestamp and remains intact.
+      updated_at_ms: Math.max(Date.now(), submittedUpdatedAtMs + 1),
+    });
+    channel.close();
+  } catch {
+    // A closed or unavailable channel cannot affect the successful send.
+  }
 }
 
 function copilotStorageKey(conversationRef: string): string {
@@ -232,6 +360,7 @@ function copilotBlockReason(code: string | null): string {
 export function Workbench() {
   const { conversationRef, caseId } = useParams<{ conversationRef?: string; caseId?: string }>();
   const navigate = useNavigate();
+  const selectedRef = conversationRef ?? null;
   const { lang } = useLang();
   // Tab and search go in the URL. This page already put `caseId` and
   // `conversationRef` in the path, so half of it was linkable and half was
@@ -243,6 +372,8 @@ export function Workbench() {
   const [tabParam, setTabParam] = useUrlState("tab", "queue");
   const tab: Tab = isOneOf(tabParam, ALL_TABS) ? tabParam : "queue";
   const setTab = (next: Tab) => setTabParam(next);
+  const [sortParam, setSortParam] = useUrlState("sort", "activity");
+  const sortMode: "activity" | "emotion" = sortParam === "emotion" ? "emotion" : "activity";
   const [query, setQuery] = useUrlState("q", "");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [offset, setOffset] = useState(0);
@@ -256,6 +387,34 @@ export function Workbench() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const draftRevision = useRef(0);
+  const draftTextRef = useRef("");
+  const draftUpdatedAtRef = useRef(0);
+  const draftDirtyRef = useRef(false);
+  const pendingDraftBroadcastRef = useRef(false);
+  const pendingDraftConversationRef = useRef<string | null>(null);
+  const draftChannelRef = useRef<BroadcastChannel | null>(null);
+  const [draftTabId] = useState(() => newIdempotencyKey());
+  const [draftHydratedKey, setDraftHydratedKey] = useState<string | null>(null);
+  const [otherTabDraft, setOtherTabDraft] = useState<WorkbenchComposerDraft | null>(null);
+  const [otherTabClearedDraft, setOtherTabClearedDraft] = useState(false);
+  const updateDraft = useCallback((
+    next: string | ((current: string) => string),
+    options: DraftUpdateOptions = {},
+  ) => {
+    const value = typeof next === "function" ? next(draftTextRef.current) : next;
+    draftTextRef.current = value;
+    draftRevision.current += 1;
+    draftUpdatedAtRef.current = options.updatedAtMs ?? Date.now();
+    draftDirtyRef.current = options.dirty ?? true;
+    pendingDraftBroadcastRef.current = options.broadcast ?? true;
+    pendingDraftConversationRef.current = options.broadcast === false || !selectedRef ? null : selectedRef;
+    if (options.dirty !== false) {
+      setOtherTabDraft(null);
+      setOtherTabClearedDraft(false);
+    }
+    setDraft(value);
+  }, [selectedRef]);
   const [origin, setOrigin] = useState<Origin>("free");
   const [cannedId, setCannedId] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState<WorkbenchRightTab>("reply");
@@ -265,6 +424,11 @@ export function Workbench() {
   const [copilotError, setCopilotError] = useState<string | null>(null);
   const [draftCopilotJobId, setDraftCopilotJobId] = useState<string | null>(null);
   const [rightOpen, setRightOpen] = useState(() => window.innerWidth > 1320);
+  const rightToggleRef = useRef<HTMLButtonElement | null>(null);
+  const closeRightPanel = useCallback(() => {
+    setRightOpen(false);
+    window.requestAnimationFrame(() => rightToggleRef.current?.focus());
+  }, []);
   const [mobileQueue, setMobileQueue] = useState(!conversationRef);
   const [menuOpen, setMenuOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
@@ -278,16 +442,29 @@ export function Workbench() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [canned, setCanned] = useState<CannedReply[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [emotionCorrectionLevel, setEmotionCorrectionLevel] = useState<EmotionLevel>("calm");
+  const [emotionCorrectionReason, setEmotionCorrectionReason] = useState<EmotionReason>("context_missing");
+  const [emotionReviewPending, setEmotionReviewPending] = useState(false);
   const [related, setRelated] = useState<RelatedCase[]>([]);
   const [now, setNow] = useState(Math.floor(Date.now() / 1000));
+  const draftMetadataRef = useRef({ origin, cannedReplyId: cannedId, copilotJobId: draftCopilotJobId });
+  useLayoutEffect(() => {
+    draftMetadataRef.current = { origin, cannedReplyId: cannedId, copilotJobId: draftCopilotJobId };
+  }, [origin, cannedId, draftCopilotJobId]);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
-  const pendingSend = useRef<{ text: string; key: string } | null>(null);
+  const pendingSend = useRef(new Map<string, PendingReplySubmission>());
   const detailRequest = useRef(0);
   const queueRequest = useRef(0);
   const copilotRequest = useRef(0);
   const copilotIdempotency = useRef<{ conversationRef: string; kind: CopilotKind; key: string } | null>(null);
-  const selectedRef = conversationRef ?? null;
+  const emotionReviewIdempotency = useRef<{ signature: string; key: string } | null>(null);
+  const emotionAdviceId = useRef<string | null>(null);
+  const activeConversationRef = useRef<string | null>(selectedRef);
+  useLayoutEffect(() => {
+    activeConversationRef.current = selectedRef;
+  }, [selectedRef]);
+  const detailIsCurrent = isCurrentWorkbenchConversation(detail?.conversation_ref, selectedRef);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 300);
@@ -300,6 +477,7 @@ export function Workbench() {
   useEffect(() => {
     const onResize = () => {
       if (window.innerWidth <= 760) setRightOpen(false);
+      else if (window.innerWidth > 1320) setRightOpen(true);
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -326,7 +504,7 @@ export function Workbench() {
     const request = ++queueRequest.current;
     if (!silent) setLoadingQueue(true);
     try {
-      const params = new URLSearchParams({ tab, limit: "50", offset: String(offset) });
+      const params = new URLSearchParams({ tab, limit: "50", offset: String(offset), sort: sortMode });
       if (debouncedQuery) params.set("q", debouncedQuery);
       const result = await apiGet<QueueResponse>(`/v1/workbench/conversations?${params}`);
       if (queueRequest.current === request) {
@@ -334,13 +512,17 @@ export function Workbench() {
         if (!silent) setError(null);
       }
     } catch (reason) {
-      if (!silent && queueRequest.current === request) {
+      if (queueRequest.current === request && reason instanceof ApiError && reason.code === "FEATURE_DISABLED" && sortMode === "emotion") {
+        setSortParam("activity");
+        setNotice("情绪建议功能已关闭，队列已恢复按最近活动排序。");
+        setError(null);
+      } else if (!silent && queueRequest.current === request) {
         setError(reason instanceof Error ? reason.message : String(reason));
       }
     } finally {
       if (!silent && queueRequest.current === request) setLoadingQueue(false);
     }
-  }, [tab, offset, debouncedQuery]);
+  }, [tab, offset, debouncedQuery, sortMode, setSortParam]);
 
   useEffect(() => {
     void loadQueue();
@@ -361,6 +543,12 @@ export function Workbench() {
     try {
       const result = await apiGet<Detail>(`/v1/workbench/conversations/${ref}`);
       if (detailRequest.current !== request) return;
+      if (!silent || emotionAdviceId.current !== (result.emotion_advice?.advice_id ?? null)) {
+        setEmotionCorrectionLevel(result.emotion_advice?.current_level ?? "calm");
+        setEmotionCorrectionReason("context_missing");
+        emotionReviewIdempotency.current = null;
+        emotionAdviceId.current = result.emotion_advice?.advice_id ?? null;
+      }
       setDetail(result);
       if (!silent) setOlderBefore(result.older_before);
       if (!silent) setError(null);
@@ -375,19 +563,35 @@ export function Workbench() {
 
   useEffect(() => {
     const request = ++copilotRequest.current;
+    setBusy(false);
+    setError(null);
+    setNotice(null);
+    setEmotionReviewPending(false);
+    setEmotionCorrectionLevel("calm");
+    setEmotionCorrectionReason("context_missing");
+    emotionReviewIdempotency.current = null;
+    if (fileRef.current) fileRef.current.value = "";
+    setMenuOpen(false);
+    setEmojiOpen(false);
+    setCannedOpen(false);
+    setTransferOpen(false);
+    setConfirmClose(false);
     setCopilotJob(null);
     setCopilotPending(false);
     setCopilotError(null);
     setCopilotKind("reply");
     setDraftCopilotJobId(null);
     copilotIdempotency.current = null;
+    setDraftHydratedKey(null);
+    setOtherTabDraft(null);
+    setOtherTabClearedDraft(false);
     if (!selectedRef) {
       setDetail(null);
       return;
     }
     setOlderTurns([]);
     setOlderBefore(null);
-    setDraft("");
+    updateDraft("", { dirty: false, broadcast: false });
     setOrigin("free");
     setCannedId(null);
     try {
@@ -420,7 +624,7 @@ export function Workbench() {
       window.clearInterval(timer);
       detailRequest.current += 1;
     };
-  }, [selectedRef, loadDetail]);
+  }, [selectedRef, loadDetail, updateDraft]);
 
   useEffect(() => {
     const current = copilotJob;
@@ -519,7 +723,203 @@ export function Workbench() {
   }, [selectedRef, detail?.turns.length]);
 
   const myRef = queue?.actor_ref ?? null;
-  const canReply = Boolean(detail && myRef && detail.lease.owner === "human" && detail.lease.owner_ref === myRef);
+  const ownsConversation = Boolean(detailIsCurrent && detail && myRef && detail.lease.owner === "human" && detail.lease.owner_ref === myRef);
+  const composerDraftStorageKey = selectedRef && myRef ? workbenchDraftStorageKey(myRef, selectedRef) : null;
+  const draftHydrated = Boolean(composerDraftStorageKey && draftHydratedKey === composerDraftStorageKey);
+  const canShowDraft = Boolean(ownsConversation && draftHydrated);
+  const canReply = Boolean(ownsConversation && draftHydrated);
+
+  useEffect(() => {
+    if (!selectedRef || !myRef || !detailIsCurrent || !detail) return;
+    const storageKey = workbenchDraftStorageKey(myRef, selectedRef);
+    if (!ownsConversation) {
+      if (draftHydratedKey === storageKey) {
+        updateDraft("", { dirty: false, broadcast: false });
+        setOrigin("free");
+        setCannedId(null);
+        setDraftCopilotJobId(null);
+        setOtherTabDraft(null);
+        setOtherTabClearedDraft(false);
+        setDraftHydratedKey(null);
+      }
+      return;
+    }
+    if (draftHydratedKey === storageKey) return;
+
+    let raw: string | null = null;
+    let saved: WorkbenchComposerDraft | null = null;
+    try {
+      raw = window.sessionStorage.getItem(storageKey);
+      saved = parseWorkbenchComposerDraft(raw, myRef, selectedRef);
+      if (raw && !saved) window.sessionStorage.removeItem(storageKey);
+    } catch {
+      // Draft recovery is best-effort when browser storage is disabled.
+    }
+    if (saved) {
+      updateDraft(saved.body, {
+        dirty: saved.body.length > 0,
+        broadcast: false,
+        updatedAtMs: saved.updated_at_ms,
+      });
+      setOrigin(saved.origin);
+      setCannedId(saved.canned_reply_id);
+      setDraftCopilotJobId(saved.copilot_job_id);
+    } else {
+      updateDraft("", { dirty: false, broadcast: false });
+      setOrigin("free");
+      setCannedId(null);
+      setDraftCopilotJobId(null);
+    }
+    setOtherTabDraft(null);
+    setOtherTabClearedDraft(false);
+    setDraftHydratedKey(storageKey);
+  }, [selectedRef, myRef, detailIsCurrent, detail?.conversation_ref, ownsConversation, draftHydratedKey, updateDraft]);
+
+  useEffect(() => {
+    if (!composerDraftStorageKey || !myRef || !selectedRef || !detailIsCurrent || !ownsConversation || !draftHydrated) return;
+    try {
+      if (draft.length > 0) {
+        const snapshot = workbenchDraftSnapshot(
+          myRef,
+          selectedRef,
+          draft,
+          draftMetadataRef.current,
+          draftUpdatedAtRef.current || Date.now(),
+        );
+        window.sessionStorage.setItem(composerDraftStorageKey, JSON.stringify(snapshot));
+      } else {
+        window.sessionStorage.removeItem(composerDraftStorageKey);
+      }
+    } catch {
+      // Session recovery is optional; unsent input stays in React state.
+    }
+
+    if (!pendingDraftBroadcastRef.current || pendingDraftConversationRef.current !== selectedRef) return;
+    pendingDraftBroadcastRef.current = false;
+    pendingDraftConversationRef.current = null;
+    const channel = draftChannelRef.current;
+    if (!channel) return;
+    const updatedAtMs = draftUpdatedAtRef.current || Date.now();
+    const message: WorkbenchDraftSyncMessage = draft.length > 0
+      ? {
+          schema_version: 1,
+          kind: "draft",
+          sender_tab_id: draftTabId,
+          actor_ref: myRef,
+          conversation_ref: selectedRef,
+          updated_at_ms: updatedAtMs,
+          draft: workbenchDraftSnapshot(myRef, selectedRef, draft, draftMetadataRef.current, updatedAtMs),
+        }
+      : {
+          schema_version: 1,
+          kind: "clear",
+          sender_tab_id: draftTabId,
+          actor_ref: myRef,
+          conversation_ref: selectedRef,
+          updated_at_ms: updatedAtMs,
+        };
+    try {
+      channel.postMessage(message);
+    } catch {
+      // A closed channel cannot affect the local composer.
+    }
+  }, [draft, origin, cannedId, draftCopilotJobId, draftTabId, composerDraftStorageKey, myRef, selectedRef, detailIsCurrent, ownsConversation, draftHydrated]);
+
+  useEffect(() => {
+    if (!composerDraftStorageKey || !myRef || !selectedRef || !detailIsCurrent || !ownsConversation || !draftHydrated || typeof BroadcastChannel === "undefined") return;
+    let channel: BroadcastChannel;
+    try {
+      channel = new BroadcastChannel(workbenchDraftChannelName(myRef, selectedRef));
+    } catch {
+      return;
+    }
+    draftChannelRef.current = channel;
+
+    const postCurrentDraft = () => {
+      if (!draftTextRef.current && !draftDirtyRef.current) return;
+      const updatedAtMs = draftUpdatedAtRef.current || Date.now();
+      const message: WorkbenchDraftSyncMessage = draftTextRef.current.length > 0
+        ? {
+            schema_version: 1,
+            kind: "draft",
+            sender_tab_id: draftTabId,
+            actor_ref: myRef,
+            conversation_ref: selectedRef,
+            updated_at_ms: updatedAtMs,
+            draft: workbenchDraftSnapshot(myRef, selectedRef, draftTextRef.current, draftMetadataRef.current, updatedAtMs),
+          }
+        : {
+            schema_version: 1,
+            kind: "clear",
+            sender_tab_id: draftTabId,
+            actor_ref: myRef,
+            conversation_ref: selectedRef,
+            updated_at_ms: updatedAtMs,
+          };
+      try {
+        channel.postMessage(message);
+      } catch {
+        // A closed channel cannot affect the local composer.
+      }
+    };
+
+    channel.onmessage = (event: MessageEvent<unknown>) => {
+      const message = parseWorkbenchDraftSyncMessage(event.data, myRef, selectedRef);
+      if (!message || message.sender_tab_id === draftTabId) return;
+      if (message.kind === "request") {
+        postCurrentDraft();
+        return;
+      }
+      const incomingBody = message.kind === "draft" ? message.draft?.body ?? "" : "";
+      const decision = remoteDraftDecision(
+        draftTextRef.current,
+        draftDirtyRef.current,
+        incomingBody,
+        draftUpdatedAtRef.current,
+        message.updated_at_ms,
+      );
+      if (decision === "ignore") return;
+      if (decision === "conflict") {
+        setOtherTabDraft(message.kind === "draft" ? message.draft ?? null : null);
+        setOtherTabClearedDraft(message.kind === "clear");
+        return;
+      }
+      updateDraft(incomingBody, {
+        dirty: false,
+        broadcast: false,
+        updatedAtMs: message.updated_at_ms,
+      });
+      if (message.kind === "draft" && message.draft) {
+        setOrigin(message.draft.origin);
+        setCannedId(message.draft.canned_reply_id);
+        setDraftCopilotJobId(message.draft.copilot_job_id);
+      } else {
+        setOrigin("free");
+        setCannedId(null);
+        setDraftCopilotJobId(null);
+      }
+      setOtherTabDraft(null);
+      setOtherTabClearedDraft(false);
+    };
+
+    try {
+      channel.postMessage({
+        schema_version: 1,
+        kind: "request",
+        sender_tab_id: draftTabId,
+        actor_ref: myRef,
+        conversation_ref: selectedRef,
+        updated_at_ms: Date.now(),
+      } satisfies WorkbenchDraftSyncMessage);
+      postCurrentDraft();
+    } catch {
+      // Another open tab may not have a usable BroadcastChannel context.
+    }
+    return () => {
+      channel.close();
+      if (draftChannelRef.current === channel) draftChannelRef.current = null;
+    };
+  }, [composerDraftStorageKey, myRef, selectedRef, detailIsCurrent, ownsConversation, draftHydrated, draftTabId, updateDraft]);
   const copilotSourceTurnIds = turns
     .filter((turn) => turn.role === "customer")
     .slice(-20)
@@ -558,7 +958,7 @@ export function Workbench() {
         },
         key,
       );
-      if (copilotRequest.current !== request || selectedRef !== conversation) return;
+      if (copilotRequest.current !== request || !isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
       const job: CopilotJobResponse = {
         ...created,
         draft_id: null,
@@ -576,7 +976,7 @@ export function Workbench() {
         // Polling remains active for the current page even if storage is blocked.
       }
     } catch (reason) {
-      if (copilotRequest.current !== request || selectedRef !== conversation) return;
+      if (copilotRequest.current !== request || !isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
       const code = reason instanceof ApiError ? reason.code : "";
       if (reason instanceof ApiError && reason.status >= 400 && reason.status < 500) {
         copilotIdempotency.current = null;
@@ -592,19 +992,19 @@ export function Workbench() {
         setCopilotError(reason instanceof Error ? reason.message : String(reason));
       }
     } finally {
-      if (copilotRequest.current === request && selectedRef === conversation) setCopilotPending(false);
+      if (copilotRequest.current === request && isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) setCopilotPending(false);
     }
   }
 
   async function insertCopilotDraft(mode: "replace" | "append") {
     const current = copilotJob;
-    if (!current || !canReply) return;
+    if (!current || !canReply || current.conversationRef !== selectedRef) return;
     const conversation = current.conversationRef;
     try {
       const latest = await apiGet<CopilotJobResponse>(
         `/v1/workbench/conversations/${conversation}/copilot/jobs/${current.job.job_id}`,
       );
-      if (selectedRef !== conversation) return;
+      if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
       setCopilotJob({ conversationRef: conversation, job: latest });
       if (!latest.can_insert || latest.status !== "succeeded" || !latest.body.trim()) {
         setCopilotError(copilotBlockReason(latest.error_code));
@@ -612,7 +1012,7 @@ export function Workbench() {
       }
       const result = latest;
       setCopilotError(null);
-      setDraft((currentDraft) => mode === "append" && currentDraft.trim()
+      updateDraft((currentDraft) => mode === "append" && currentDraft.trim()
         ? `${currentDraft.trimEnd()}\n\n${result.body}`
         : result.body);
       setOrigin("ai_suggestion");
@@ -620,7 +1020,7 @@ export function Workbench() {
       setDraftCopilotJobId(result.job_id);
       setNotice("副驾草稿已插入回复框；尚未发送，请人工核验内容与来源。");
     } catch (reason) {
-      if (selectedRef === conversation) {
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) {
         setCopilotError(reason instanceof Error ? reason.message : String(reason));
       }
     }
@@ -641,6 +1041,11 @@ export function Workbench() {
     setError(null);
     setNotice(null);
     setMobileQueue(false);
+    setMenuOpen(false);
+    setEmojiOpen(false);
+    setCannedOpen(false);
+    setTransferOpen(false);
+    setConfirmClose(false);
     // The queue view is encoded in the URL, and a conversation is the second
     // half of that same view. Dropping search here made refresh/back from
     // “我的会话” silently jump to an empty “待认领” queue.
@@ -649,36 +1054,104 @@ export function Workbench() {
       search: window.location.search,
     });
   }
+  function adoptOtherTabDraft() {
+    if (!canReply) return;
+    const incoming = otherTabDraft;
+    if (incoming) {
+      updateDraft(incoming.body, { dirty: true, broadcast: true, updatedAtMs: Date.now() });
+      setOrigin(incoming.origin);
+      setCannedId(incoming.canned_reply_id);
+      setDraftCopilotJobId(incoming.copilot_job_id);
+      setNotice("已采用另一标签页的回复草稿。");
+    } else if (otherTabClearedDraft) {
+      updateDraft("", { dirty: false, broadcast: true, updatedAtMs: Date.now() });
+      setOrigin("free");
+      setCannedId(null);
+      setDraftCopilotJobId(null);
+      setNotice("已同步另一标签页的草稿清空状态。");
+    }
+    setOtherTabDraft(null);
+    setOtherTabClearedDraft(false);
+  }
+  function keepThisTabDraft() {
+    setOtherTabDraft(null);
+    setOtherTabClearedDraft(false);
+  }
   function selectTab(next: Tab) {
     setTab(next);
     setOffset(0);
     setMobileQueue(true);
   }
+  async function submitEmotionCorrection() {
+    const advice = detail?.emotion_advice;
+    if (!detailIsCurrent || !detail || !advice || !detail.can_review_emotion_advice || emotionReviewPending) return;
+    const conversation = detail.conversation_ref;
+    const signature = JSON.stringify([advice.advice_id, emotionCorrectionLevel, emotionCorrectionReason]);
+    const attempt = emotionReviewIdempotency.current?.signature === signature
+      ? emotionReviewIdempotency.current
+      : { signature, key: newIdempotencyKey() };
+    emotionReviewIdempotency.current = attempt;
+    setEmotionReviewPending(true);
+    setError(null);
+    try {
+      await apiPost(
+        `/v1/workbench/conversations/${conversation}/emotion-advice/reviews`,
+        {
+          advice_id: advice.advice_id,
+          corrected_level: emotionCorrectionLevel,
+          reason_code: emotionCorrectionReason,
+        },
+        attempt.key,
+      );
+      if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
+      emotionReviewIdempotency.current = null;
+      setNotice("主管更正已写入审计记录；工单优先级、SLA 和会话归属未被修改。");
+      await Promise.all([loadQueue(true), loadDetail(conversation, true)]);
+    } catch (reason) {
+      if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
+      const code = reason instanceof ApiError ? reason.code : "";
+      if (code === "EMOTION_ADVICE_STALE") {
+        emotionReviewIdempotency.current = null;
+        setError("会话内容已更新，建议已刷新；请基于最新证据重新复核。");
+        await loadDetail(detail.conversation_ref, true);
+      } else {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
+    } finally {
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) setEmotionReviewPending(false);
+    }
+  }
   async function loadOlder() {
-    if (!selectedRef || !olderBefore || busy) return;
+    if (!detailIsCurrent || !selectedRef || !olderBefore || busy) return;
+    const conversation = selectedRef;
     setBusy(true);
     try {
       const result = await apiGet<{ items: Turn[]; older_before: string | null }>(
-        `/v1/workbench/conversations/${selectedRef}/timeline?before=${olderBefore}`,
+        `/v1/workbench/conversations/${conversation}/timeline?before=${olderBefore}`,
       );
+      if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
       setOlderTurns((previous) => uniqueTurns(result.items, previous));
       setOlderBefore(result.older_before);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
-      setBusy(false);
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) setBusy(false);
     }
   }
   async function runAction(operation: Action, targetRef?: string) {
-    if (!detail || busy) return;
+    if (!detailIsCurrent || !detail || busy) return;
+    const conversation = detail.conversation_ref;
     setBusy(true);
     setError(null);
     try {
       await apiPost(
-        `/v1/workbench/conversations/${detail.conversation_ref}/actions`,
+        `/v1/workbench/conversations/${conversation}/actions`,
         { operation, expected_version: detail.lease.version, target_ref: targetRef ?? null },
         newIdempotencyKey(),
       );
+      if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
       const messages: Record<Action, string> = {
         claim: "已接入会话。", release: "会话已返回待认领队列。",
         transfer: "会话已转交给指定坐席。", close: "会话已结束；有人工回复时客户可以评价服务。",
@@ -687,31 +1160,38 @@ export function Workbench() {
       setConfirmClose(false);
       setTransferOpen(false);
       setMenuOpen(false);
-      await Promise.all([loadQueue(true), loadDetail(detail.conversation_ref, true)]);
+      await Promise.all([loadQueue(true), loadDetail(conversation, true)]);
+      if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
       if (operation === "release" || operation === "transfer" || operation === "close") {
         setTab("queue");
       } else {
         setTab("mine");
       }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-      await loadDetail(detail.conversation_ref, true);
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+        await loadDetail(conversation, true);
+      }
     } finally {
-      setBusy(false);
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) setBusy(false);
     }
   }
   async function sendReply() {
-    if (!detail || !canReply || busy) return;
+    if (!detailIsCurrent || !detail || !canReply || busy) return;
+    const conversation = detail.conversation_ref;
     const text = draft.trim();
     if (!text || text.length > 4000) return;
-    const previous = pendingSend.current;
-    const key = previous?.text === text ? previous.key : newIdempotencyKey();
-    pendingSend.current = { text, key };
+    const submittedDraftBody = draft;
+    const submittedDraftUpdatedAtMs = draftUpdatedAtRef.current;
+    const submittedActorRef = myRef;
+    const submittedTabId = draftTabId;
+    const submittedDraftRevision = draftRevision.current;
+    const key = pendingReplyIdempotencyKey(pendingSend.current, conversation, text, newIdempotencyKey);
     setBusy(true);
     setError(null);
     try {
       await apiPost(
-        `/v1/conversations/${detail.conversation_ref}/replies`,
+        `/v1/conversations/${conversation}/replies`,
         {
           text,
           origin,
@@ -720,52 +1200,81 @@ export function Workbench() {
         },
         key,
       );
-      pendingSend.current = null;
-      setDraft("");
-      setOrigin("free");
-      setCannedId(null);
-      if (draftCopilotJobId) {
-        setCopilotJob((previous) => previous?.job.job_id === draftCopilotJobId
-          ? { ...previous, job: { ...previous.job, status: "stale", error_code: "COPILOT_TIMELINE_MOVED", can_insert: false } }
-          : previous);
+      forgetPendingReply(pendingSend.current, conversation, key);
+      clearSubmittedDraftSnapshot(
+        submittedActorRef,
+        conversation,
+        submittedDraftBody,
+        submittedDraftUpdatedAtMs,
+        submittedTabId,
+      );
+      if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
+      if (canClearSubmittedDraft(submittedDraftRevision, draftRevision.current)) {
+        updateDraft("", { dirty: false, broadcast: true });
+        setOrigin("free");
+        setCannedId(null);
+        if (draftCopilotJobId) {
+          setCopilotJob((previous) => previous?.job.job_id === draftCopilotJobId
+            ? { ...previous, job: { ...previous.job, status: "stale", error_code: "COPILOT_TIMELINE_MOVED", can_insert: false } }
+            : previous);
+        }
+        setDraftCopilotJobId(null);
+        setOtherTabDraft(null);
+        setOtherTabClearedDraft(false);
+        setNotice("回复已记录并提交投递。");
+      } else {
+        setNotice("回复已记录；当前编辑中的新草稿已保留。");
       }
-      setDraftCopilotJobId(null);
-      setNotice("回复已记录并提交投递。");
       await Promise.all([loadDetail(detail.conversation_ref, true), loadQueue(true)]);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
-      setBusy(false);
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) setBusy(false);
     }
   }
   async function insertCanned(reply: CannedReply) {
+    if (!detailIsCurrent || !detail || !canReply) return;
+    const conversation = detail.conversation_ref;
     try {
       const used = await apiPost<CannedReply>(`/v1/canned-replies/${reply.id}/use`, undefined);
-      setDraft(used.body);
+      if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
+      updateDraft(used.body);
       setOrigin("canned");
       setCannedId(reply.id);
       setDraftCopilotJobId(null);
       setCannedOpen(false);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     }
   }
   async function uploadAttachment(file: File) {
-    if (!detail?.case || busy) return;
+    if (!detailIsCurrent || !detail?.case || !canReply || busy) return;
+    const conversation = detail.conversation_ref;
+    const caseId = detail.case.case_id;
     const form = new FormData();
     form.append("file", file);
     setBusy(true);
     try {
-      await apiUpload(`/v1/cases/${detail.case.case_id}/attachments`, form, newIdempotencyKey());
-      const data = await apiGet<{ items: Attachment[] }>(`/v1/cases/${detail.case.case_id}/attachments`);
+      await apiUpload(`/v1/cases/${caseId}/attachments`, form, newIdempotencyKey());
+      if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
+      const data = await apiGet<{ items: Attachment[] }>(`/v1/cases/${caseId}/attachments`);
+      if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
       setAttachments(data.items);
       setRightTab("tools");
       setNotice("文件已添加到工单证据；不会作为聊天消息发送给客户。");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
-      setBusy(false);
-      if (fileRef.current) fileRef.current.value = "";
+      if (isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) {
+        setBusy(false);
+        if (fileRef.current) fileRef.current.value = "";
+      }
     }
   }
 
@@ -774,7 +1283,7 @@ export function Workbench() {
       <header className="wb-topbar">
         <div className="wb-topbar-title">
           <button className="wb-mobile-back" type="button" onClick={() => {
-            if (detail?.lease.owner === "human" && detail.lease.owner_ref === myRef) {
+            if (detailIsCurrent && detail?.lease.owner === "human" && detail.lease.owner_ref === myRef) {
               setTab(detail.lease.mode === "HUMAN_WAITING_CUSTOMER" ? "waiting" : "mine");
             } else {
               setTab("queue");
@@ -820,19 +1329,48 @@ export function Workbench() {
         <section className="wb-queue" aria-label="会话队列">
           <div className="wb-queue-heading"><h2>会话队列</h2><Filter size={18} aria-hidden="true" /></div>
           <div className="wb-queue-tabs" role="tablist" aria-label="会话分类">
-            {(["queue", "mine", "waiting"] as const).map((key) => (
-              <button key={key} type="button" role="tab" aria-selected={tab === key} className={tab === key ? "active" : ""} onClick={() => selectTab(key)}>
+            {WORKBENCH_QUEUE_TABS.map((key) => (
+              <button
+                key={key}
+                id={`wb-queue-tab-${key}`}
+                type="button"
+                role="tab"
+                aria-controls="wb-queue-panel"
+                aria-selected={tab === key}
+                tabIndex={tab === key ? 0 : -1}
+                className={tab === key ? "active" : ""}
+                onClick={() => selectTab(key)}
+                onKeyDown={(event) => {
+                  const next = nextWorkbenchQueueTab(key, event.key, event);
+                  if (!next) return;
+                  event.preventDefault();
+                  selectTab(next);
+                  document.getElementById(`wb-queue-tab-${next}`)?.focus();
+                }}
+              >
                 {key === "queue" ? "待认领" : key === "mine" ? "我的会话" : "等待中"}
                 <span>{queue?.counts[key] ?? 0}</span>
               </button>
             ))}
           </div>
+          {queue?.emotion_advice_enabled ? <div className="wb-emotion-sort" aria-label="会话排序">
+            <span>队列排序</span>
+            <button type="button" aria-pressed={sortMode === "activity"} className={sortMode === "activity" ? "active" : ""} onClick={() => { setSortParam("activity"); setOffset(0); }}>最近活动</button>
+            <button type="button" aria-pressed={sortMode === "emotion"} className={sortMode === "emotion" ? "active" : ""} onClick={() => { setSortParam("emotion"); setOffset(0); }}>优先关注</button>
+            <small>{sortMode === "emotion" ? "仅重排当前页 · 不改工单优先级" : "情绪建议仅供人工参考"}</small>
+          </div> : null}
           <label className="wb-queue-search">
             <Search size={16} aria-hidden="true" />
             <span className="sr-only">搜索当前队列</span>
             <input value={query} onChange={(event) => { setQuery(event.target.value); setOffset(0); }} placeholder="搜索会话、客户或订单号…" />
           </label>
-          <div className="wb-queue-scroll">
+          <div
+            id="wb-queue-panel"
+            className="wb-queue-scroll"
+            role="tabpanel"
+            aria-labelledby={`wb-queue-tab-${tab}`}
+            tabIndex={0}
+          >
             {loadingQueue && !queue ? <p className="wb-muted wb-padding">正在加载会话…</p> : null}
             {!loadingQueue && queue?.items.length === 0 ? <div className="wb-queue-empty"><MessageCircle size={25} /><p>{query ? "没有匹配的会话" : "当前队列暂无会话"}</p></div> : null}
             {queue?.items.map((item) => {
@@ -847,6 +1385,9 @@ export function Workbench() {
                     <span className="wb-queue-row-top"><strong>{item.title}</strong><time>{clock(item.last_at)}</time></span>
                     <span className="wb-queue-row-meta"><span className={urgent ? "is-urgent" : ""}>{item.lease.owner === "queue" ? "待回复" : item.lease.mode === "HUMAN_WAITING_CUSTOMER" ? "等待客户" : "进行中"}</span>{item.contact_ref ? ` · ${item.contact_ref}` : ""}</span>
                     <span className="wb-queue-row-preview">{item.preview || "等待客户消息"}</span>
+                    {item.emotion_advice ? <span className={`wb-emotion-queue is-${item.emotion_advice.attention}`}>
+                      {EMOTION_ATTENTION_LABEL[item.emotion_advice.attention]} · {EMOTION_LABEL[item.emotion_advice.current_level]}{item.emotion_advice.reason_codes[0] ? ` · ${EMOTION_REASON_LABEL[item.emotion_advice.reason_codes[0]] ?? "结合消息内容判断"}` : " · 未见明确风险信号"}
+                    </span> : null}
                     <span className="wb-queue-row-foot"><span>{channelName(item.channel)}</span>{sla ? <span className={sla.startsWith("超时") ? "is-urgent" : ""}>{sla}</span> : null}</span>
                   </span>
                 </button>
@@ -861,7 +1402,7 @@ export function Workbench() {
 
         <section className="wb-conversation" aria-label="当前会话">
           {!selectedRef ? <div className="wb-center-empty"><Headset size={36} /><h2>选择一条会话开始接待</h2><p>待认领的对话会出现在左侧队列。</p></div> : null}
-          {selectedRef && loadingDetail && !detail ? <div className="wb-center-empty">正在打开会话…</div> : null}
+          {selectedRef && (loadingDetail || !detailIsCurrent) ? <div className="wb-center-empty" role="status" aria-live="polite">正在打开会话…</div> : null}
           {detail && selectedRef === detail.conversation_ref ? <>
             <header className="wb-conversation-head">
               <div className="wb-contact-icon"><UsersRound size={19} /></div>
@@ -883,7 +1424,16 @@ export function Workbench() {
                 <button className="wb-secondary-small" type="button" onClick={() => { setTransferOpen(true); setTargetAgent(""); }}>转接</button>
                 <button className="wb-secondary-small" type="button" onClick={() => setConfirmClose(true)}>结束会话</button>
               </> : null}
-              <button className="wb-icon-btn wb-right-toggle" type="button" onClick={() => setRightOpen((open) => !open)} aria-label={rightOpen ? "收起 AI 副驾" : "展开 AI 副驾"}><Sparkles size={20} /></button>
+              <button
+                ref={rightToggleRef}
+                className="wb-icon-btn wb-right-toggle"
+                type="button"
+                onClick={() => (rightOpen ? closeRightPanel() : setRightOpen(true))}
+                aria-label={rightOpen
+                  ? (lang === "zh" ? "收起 AI 副驾" : "Close AI assistant")
+                  : (lang === "zh" ? "展开 AI 副驾" : "Open AI assistant")}
+                aria-expanded={rightOpen}
+              ><Sparkles size={20} /></button>
             </header>
             <div className="wb-transcript" role="log" aria-label="对话记录" aria-live="polite" ref={transcriptRef}>
               {olderBefore ? <button type="button" className="wb-load-history" disabled={busy} onClick={() => void loadOlder()}>查看更早消息</button> : null}
@@ -900,18 +1450,24 @@ export function Workbench() {
               })}
             </div>
             <div className="wb-compose-area">
+              {canReply && (otherTabDraft || otherTabClearedDraft) ? <div className="wb-draft-sync" role="status" aria-live="polite">
+                <span>{otherTabDraft ? "另一标签页更新了本会话草稿。" : "另一标签页已清空本会话草稿。"} 当前编辑内容已保留。</span>
+                <button type="button" onClick={adoptOtherTabDraft}>同步另一标签页</button>
+                <button type="button" onClick={keepThisTabDraft}>保留本页</button>
+              </div> : null}
               {detail.lease.owner === "closed" ? <div className="wb-ownership-note">会话已结束。已发生人工回复的服务可由客户评价。</div>
                 : detail.lease.owner === "queue" ? <div className="wb-ownership-note">客户正在等待人工接入。点击“接入会话”后即可发送回复。</div>
+                : ownsConversation && !draftHydrated ? <div className="wb-ownership-note" role="status" aria-live="polite">正在恢复本会话未发送的草稿…</div>
                 : !canReply ? <div className="wb-ownership-note">当前由其他坐席接待，回复区为只读。</div> : null}
               <div className="wb-composer">
                 <label className="sr-only" htmlFor="wb-reply-input">回复客户</label>
-                <textarea id="wb-reply-input" value={draft} onChange={(event) => { setDraft(event.target.value); if (origin === "canned") { setOrigin("free"); setCannedId(null); } }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendReply(); } }} placeholder="输入回复…  Shift + Enter 换行" maxLength={4000} disabled={!canReply || busy} />
+                <textarea id="wb-reply-input" value={canShowDraft ? draft : ""} onChange={(event) => { updateDraft(event.target.value); if (origin === "canned") { setOrigin("free"); setCannedId(null); } }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendReply(); } }} placeholder="输入回复…  Shift + Enter 换行" maxLength={4000} disabled={!canReply || busy} />
                 <div className="wb-composer-bar">
                   <div className="wb-composer-tools">
                     <input ref={fileRef} type="file" hidden accept=".pdf,.png,.jpg,.jpeg,.txt,.docx" onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadAttachment(file); }} />
                     <button type="button" aria-label="上传工单证据" title={detail.case ? "上传工单证据，不会发送到客户聊天" : "此会话无关联工单，暂不能上传证据"} disabled={!canReply || !detail.case || busy} onClick={() => fileRef.current?.click()}><Paperclip size={19} /></button>
                     <button type="button" aria-label="上传工单图片" title="上传工单图片，不会发送到客户聊天" disabled={!canReply || !detail.case || busy} onClick={() => fileRef.current?.click()}><ImagePlus size={19} /></button>
-                    <div className="wb-popover-anchor"><button type="button" aria-label="插入表情" disabled={!canReply} onClick={() => setEmojiOpen((open) => !open)}><Smile size={19} /></button>{emojiOpen ? <div className="wb-emoji-popover">{EMOJIS.map((emoji) => <button key={emoji} type="button" onClick={() => { setDraft((text) => text + emoji); setEmojiOpen(false); }}>{emoji}</button>)}</div> : null}</div>
+                    <div className="wb-popover-anchor"><button type="button" aria-label="插入表情" disabled={!canReply} onClick={() => setEmojiOpen((open) => !open)}><Smile size={19} /></button>{emojiOpen ? <div className="wb-emoji-popover">{EMOJIS.map((emoji) => <button key={emoji} type="button" onClick={() => { updateDraft((text) => text + emoji); setEmojiOpen(false); }}>{emoji}</button>)}</div> : null}</div>
                   </div>
                   <div className="wb-composer-send">
                     <div className="wb-popover-anchor"><button className="wb-canned-btn" type="button" disabled={!canReply} onClick={() => setCannedOpen((open) => !open)}>插入话术 <ChevronDown size={15} /></button>{cannedOpen ? <div className="wb-canned-popover"><strong>常用话术</strong>{canned.length ? canned.map((reply) => <button key={reply.id} type="button" onClick={() => void insertCanned(reply)}><span>{reply.title}</span><small>{reply.shortcut || ""}</small></button>) : <p>暂无可用话术</p>}</div> : null}</div>
@@ -923,10 +1479,44 @@ export function Workbench() {
           </> : null}
         </section>
 
-        {detail && rightOpen ? <aside className="wb-right" aria-label="AI 副驾与客户上下文">
-          <div className="wb-right-header"><Sparkles size={20} /><strong>AI 副驾</strong><button type="button" className="wb-right-close" aria-label="收起 AI 副驾" onClick={() => setRightOpen(false)}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label="副驾内容">{WORKBENCH_RIGHT_TABS.map((key) => <button type="button" role="tab" id={`wb-right-tab-${key}`} aria-controls="wb-right-panel" aria-selected={rightTab === key} tabIndex={rightTab === key ? 0 : -1} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)} onKeyDown={(event) => { const next = nextWorkbenchRightTab(key, event.key); if (!next) return; event.preventDefault(); setRightTab(next); document.getElementById(`wb-right-tab-${next}`)?.focus(); }}>{RIGHT_TAB_LABEL[key]}</button>)}</div></div>
+        {detail && detailIsCurrent && rightOpen ? <aside className="wb-right" aria-label={lang === "zh" ? "AI 副驾与客户上下文" : "AI assistant and customer context"}>
+          <div className="wb-right-header"><Sparkles size={20} /><strong>{lang === "zh" ? "AI 副驾" : "AI assistant"}</strong><button type="button" className="wb-right-close" aria-label={lang === "zh" ? "收起 AI 副驾" : "Close AI assistant"} onClick={closeRightPanel}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label={lang === "zh" ? "副驾内容" : "Assistant panels"}>{WORKBENCH_RIGHT_TABS.map((key) => <button type="button" role="tab" id={`wb-right-tab-${key}`} aria-controls="wb-right-panel" aria-selected={rightTab === key} tabIndex={rightTab === key ? 0 : -1} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)} onKeyDown={(event) => { const next = nextWorkbenchRightTab(key, event.key, event); if (!next) return; event.preventDefault(); setRightTab(next); document.getElementById(`wb-right-tab-${next}`)?.focus(); }}>{RIGHT_TAB_LABEL[lang][key]}</button>)}</div></div>
           <div className="wb-right-scroll" id="wb-right-panel" role="tabpanel" aria-labelledby={`wb-right-tab-${rightTab}`} tabIndex={0}>
             {rightTab === "reply" ? <>
+              {detail.emotion_advice ? <section className={`wb-panel wb-emotion-panel is-${detail.emotion_advice.attention}`} aria-labelledby="wb-emotion-heading">
+                <h3 id="wb-emotion-heading"><Sparkles size={18} />情绪趋势建议<span className="wb-advisory-tag">人工参考</span></h3>
+                <p className="wb-muted">基于最近 {detail.emotion_advice.analyzed_customer_turns} 条客户消息。不会自动修改工单优先级、SLA、会话归属或客户回复。</p>
+                <div className="wb-emotion-summary">
+                  <span>当前信号 <strong>{EMOTION_LABEL[detail.emotion_advice.current_level]}</strong></span>
+                  <span>趋势 <strong>{EMOTION_TREND_LABEL[detail.emotion_advice.trend]}</strong></span>
+                  <span className={`wb-emotion-attention is-${detail.emotion_advice.attention}`}>{EMOTION_ATTENTION_LABEL[detail.emotion_advice.attention]}</span>
+                </div>
+                {detail.emotion_advice.reason_codes.length ? <ul className="wb-emotion-reasons">
+                  {detail.emotion_advice.reason_codes.map((code) => <li key={code}>{EMOTION_REASON_LABEL[code] ?? "建议坐席结合上下文判断"}</li>)}
+                </ul> : <p className="wb-emotion-no-signal">当前规则未发现明确情绪信号。</p>}
+                {detail.emotion_advice.evidence.length ? <div className="wb-emotion-evidence">
+                  <strong>证据消息</strong>
+                  {detail.emotion_advice.evidence.map((evidence, index) => <button key={`${evidence.turn_id}-${evidence.start}-${index}`} type="button" onClick={() => jumpToTurn(evidence.turn_id)}>
+                    定位客户消息 · {EMOTION_LABEL[evidence.level]} · 片段 {evidence.start + 1}–{evidence.end}
+                  </button>)}
+                </div> : null}
+                {detail.emotion_advice.suppressed_evidence_count > 0 ? <p className="wb-emotion-footnote">已排除 {detail.emotion_advice.suppressed_evidence_count} 处引用、否定或不确定表达。</p> : null}
+                {detail.can_review_emotion_advice ? <div className="wb-emotion-review">
+                  <h4>主管分类复核</h4>
+                  <label>复核后的级别
+                    <select value={emotionCorrectionLevel} onChange={(event) => setEmotionCorrectionLevel(event.target.value as EmotionLevel)}>
+                      {(Object.keys(EMOTION_LABEL) as EmotionLevel[]).map((level) => <option key={level} value={level}>{EMOTION_LABEL[level]}</option>)}
+                    </select>
+                  </label>
+                  <label>复核原因
+                    <select value={emotionCorrectionReason} onChange={(event) => setEmotionCorrectionReason(event.target.value as EmotionReason)}>
+                      {EMOTION_REVIEW_REASONS.map((reason) => <option key={reason.value} value={reason.value}>{reason.label}</option>)}
+                    </select>
+                  </label>
+                  <button className="wb-secondary-small" type="button" disabled={emotionReviewPending} onClick={() => void submitEmotionCorrection()}>{emotionReviewPending ? "正在记录…" : "记录复核结果"}</button>
+                  <small>仅保存分类、原因和建议版本，不复制客户原话，也不参与自动训练。</small>
+                </div> : null}
+              </section> : null}
               <section className="wb-panel wb-copilot-panel">
                 <h3><Sparkles size={18} />副驾草稿</h3>
                 <p className="wb-muted">仅生成工作草稿，不会自动发送。请核验事实和来源后再回复。</p>
@@ -934,7 +1524,7 @@ export function Workbench() {
                   {(["reply", "summary"] as const).map((kind) => <button key={kind} type="button" aria-pressed={copilotKind === kind} disabled={copilotIsActive} className={copilotKind === kind ? "active" : ""} onClick={() => { setCopilotKind(kind); setCopilotError(null); }}>{kind === "reply" ? "建议回复" : "会话摘要"}</button>)}
                 </div>
                 <div className={`wb-copilot-ownership${canReply ? " is-owned" : ""}`}>
-                  {canReply ? "当前由你接待，可生成并插入到自己的草稿。" : detail.lease.owner === "queue" ? "先接入会话，再生成副驾草稿。" : "只有当前接待坐席可以生成或插入草稿。"}
+                  {ownsConversation && !draftHydrated ? "正在恢复本会话草稿…" : canReply ? "当前由你接待，可生成并插入到自己的草稿。" : detail.lease.owner === "queue" ? "先接入会话，再生成副驾草稿。" : "只有当前接待坐席可以生成或插入草稿。"}
                 </div>
                 {!copilotSourceTurnIds.length ? <p className="wb-copilot-hint">需要至少一条客户消息作为依据。</p> : null}
                 <button className="wb-copilot-generate" type="button" disabled={!canReply || copilotPending || copilotIsActive || !copilotSourceTurnIds.length} onClick={() => void requestCopilot(copilotKind)}>
@@ -958,11 +1548,17 @@ export function Workbench() {
                   </> : copilotJob.job.status === "failed" || copilotJob.job.status === "stale" || copilotJob.job.status === "expired" ? <p className="wb-copilot-blocked">{copilotBlockReason(copilotJob.job.error_code)}</p> : null}
                 </div> : null}
               </section>
-              <section className="wb-panel"><h3><FileText size={18} />历史建议回复</h3>{detail.ai_suggestion?.text ? <><div className="wb-suggestion">{detail.ai_suggestion.text}</div><div className="wb-panel-actions"><button className="wb-secondary-small" type="button" disabled={!canReply} onClick={() => { setDraft(detail.ai_suggestion?.text ?? ""); setOrigin("ai_suggestion"); setCannedId(null); setDraftCopilotJobId(null); }}>插入旧版建议</button><button type="button" className="wb-secondary-small" onClick={() => void loadDetail(detail.conversation_ref)}>刷新</button></div></> : <p className="wb-muted">暂无历史建议。</p>}</section>
+              <section className="wb-panel"><h3><FileText size={18} />历史建议回复</h3>{detail.ai_suggestion?.text ? <><div className="wb-suggestion">{detail.ai_suggestion.text}</div><div className="wb-panel-actions"><button className="wb-secondary-small" type="button" disabled={!canReply} onClick={() => { updateDraft(detail.ai_suggestion?.text ?? ""); setOrigin("ai_suggestion"); setCannedId(null); setDraftCopilotJobId(null); }}>插入旧版建议</button><button type="button" className="wb-secondary-small" onClick={() => void loadDetail(detail.conversation_ref)}>刷新</button></div></> : <p className="wb-muted">暂无历史建议。</p>}</section>
               <Sources sources={detail.ai_suggestion?.sources ?? []} />
               <CustomerPanel detail={detail} />
             </> : null}
-            {rightTab === "tasks" ? (
+            {rightTab === "tasks" ? <>
+              <StandardFlowCatalog
+                conversationRef={detail.conversation_ref}
+                leaseVersion={detail.lease.version}
+                isOwner={detail.lease.owner === "human" && detail.lease.owner_ref === myRef}
+                onStarted={() => void loadDetail(detail.conversation_ref)}
+              />
               <TaskPanel
                 conversationRef={detail.conversation_ref}
                 leaseVersion={detail.lease.version}
@@ -970,7 +1566,7 @@ export function Workbench() {
                 leaseOwnerRef={detail.lease.owner_ref}
                 onChanged={() => void loadDetail(detail.conversation_ref)}
               />
-            ) : null}
+            </> : null}
             {rightTab === "knowledge" ? <><Sources sources={detail.ai_suggestion?.sources ?? []} /><section className="wb-panel"><h3><Ticket size={18} />相似工单</h3>{related.length ? related.map((item) => <Link className="wb-resource-row" key={item.case_id} to={`/admin/cases?case=${item.case_id}`}><span><strong>{item.subject}</strong><small>{item.match === "subject" ? "标题相似" : "同类目"} · {STATUS[item.status] ?? item.status}</small></span><ChevronRight size={16} /></Link>) : <p className="wb-muted">暂无相似工单。</p>}</section></> : null}
             {rightTab === "tools" ? <><section className="wb-panel"><h3><CircleHelp size={18} />已查业务数据</h3>{turns.some((turn) => turn.card) ? turns.filter((turn) => turn.card).map((turn) => <div className="wb-right-tool" key={turn.turn_id}><ToolCard card={turn.card!} /></div>) : <p className="wb-muted">当前会话没有业务数据卡片。</p>}</section><section className="wb-panel"><h3><Paperclip size={18} />工单证据</h3>{attachments.length ? attachments.map((item) => item.url ? <a className="wb-resource-row" href={item.url} target="_blank" rel="noreferrer" key={item.attachment_id}><span>{item.filename}</span><ChevronRight size={16} /></a> : <p key={item.attachment_id}>{item.filename}</p>) : <p className="wb-muted">暂无附件。上传文件只保存为工单证据。</p>}</section><Link className="wb-panel-link" to="/admin/approvals">查看待审批操作 <ChevronRight size={16} /></Link></> : null}
           </div>
@@ -978,7 +1574,7 @@ export function Workbench() {
       </div>
 
       <Dialog
-        open={transferOpen}
+        open={transferOpen && detailIsCurrent}
         onClose={closeTransferDialog}
         label="转接会话"
         className="wb-modal"
@@ -1012,7 +1608,7 @@ export function Workbench() {
         </div>
       </Dialog>
       <Dialog
-        open={confirmClose}
+        open={confirmClose && detailIsCurrent}
         onClose={closeConversationDialog}
         label="结束会话"
         className="wb-modal"

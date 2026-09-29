@@ -110,6 +110,8 @@ DOMAIN_ERROR_STATUS: dict[str, int] = {
     "TEMPLATE_MISMATCH": 400,
     # Resource does not exist (or is not visible to this tenant).
     "NOT_FOUND": 404,
+    "KNOWLEDGE_SPACE_NOT_FOUND": 404,
+    "RELEASE_CANDIDATE_NOT_FOUND": 404,
     # The resource exists but is in a state that forbids the action.
     "ALREADY_ACTIVE": 409,
     "ALREADY_EXISTS": 409,
@@ -117,11 +119,20 @@ DOMAIN_ERROR_STATUS: dict[str, int] = {
     "ALREADY_RESOLVED": 409,
     "ALREADY_REVIEWED": 409,
     "DRAFT_NOT_APPROVED": 409,
+    "DRAFT_CONTENT_MOVED": 409,
+    "DRAFT_SPACE_MISMATCH": 409,
+    "EVAL_BASELINE_STALE": 409,
+    "EVAL_DATASET_NOT_APPROVED": 409,
+    "EVAL_KNOWLEDGE_SNAPSHOT_MOVED": 409,
+    "IDEMPOTENCY_CONFLICT": 409,
     "NO_ACTIVE_VERSION": 409,
+    "RELEASE_CANDIDATE_MOVED": 409,
+    "RELEASE_GATE_DISABLED": 409,
     "SELF_APPROVAL": 409,
     "SELF_TARGET": 409,
     # Well-formed request, refused by a release gate.
     "EVALUATION_REQUIRED": 422,
+    "RELEASE_EVALUATION_REQUIRED": 422,
     "P0_REGRESSION": 422,
     "PLATFORM_GATE_FAILED": 422,
 }

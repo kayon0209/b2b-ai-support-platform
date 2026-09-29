@@ -1,7 +1,7 @@
 # Codex 最终验收协议
 
 状态：验收标准为持续有效的门槛；逐项当前结论与绑定提交的证据见
-[交付/验收报告](delivery-report.md) §8。下表状态按 2026-09-27 本地隔离环境复核结果更新；未执行或阻塞项不得作为通过发布的依据。
+[交付/验收报告](delivery-report.md) 的最新 R2/R3 continuation 及 §9 的 R1 follow-up。下表状态按 2026-09-29 本地隔离环境复核结果更新；未执行或阻塞项不得作为通过发布的依据。
 
 ## 1. 交付与独立复核
 
@@ -22,30 +22,34 @@ WorkBuddy 自检完成后交付 PR/commit、启动方式、开关、脱敏证据
 | SHD-01 | 同批输入在 off 与 shadow 下客户消息、owner、业务工具次数和 Case 状态相同；shadow 可新增评估/队列记录 | PostgreSQL 集成负例 | 通过（代码边界） |
 | TASK-01 | 多意图任务拆解保留所有可识别需求；只读成功、缺参、未支持写入均有独立状态与原因 | 旅程 API/DB 集成 | 通过（stub） |
 | TASK-02 | 条件依赖、不满足条件、矛盾参数、重复字段、多轮纠正和取消有确定结果；最多 5 任务、深度 3、拒绝环 | 状态机与边界用例 | 通过 |
-| TASK-03 | 重复点击、消息重放、Worker 崩溃恢复、两个消费者竞争只产生一个逻辑执行；unknown 经对账处理 | 幂等/竞争集成与子进程崩溃后新 Worker 恢复 | 部分完成（隔离库子进程 hard-exit 后 stale claim 被新 Worker 回收；多主机生产拓扑与真实外部 write unknown 对账仍待演练） |
+| TASK-03 | 重复点击、消息重放、Worker 崩溃恢复、两个消费者竞争只产生一个逻辑执行；unknown 经对账处理 | `test_collect_fields_persistence.py` 同键同请求回放/同键异请求冲突；隔离库子进程 hard-exit 后新 Worker 恢复；重复 event 仅一条账务行 | 本地命令回放与 Worker 恢复控制通过；多主机生产拓扑与真实外部 write unknown 对账仍待演练 |
+| FLOW-01 | 坐席发起 task 绑定 server-resolved turn/tenant/owner/flow version；幂等/RLS；读任务仅用 verified receipt 完成，写提案经人工确认；其它 flow 不误入 scheduler | `test_standard_flow_instances.py`、`test_task_state_machine.py`、RLS/cross-tenant suite；订单 Demo read receipt；质量/技术 Demo 产品归属、PII 脱敏、活跃部门路由、执行时重核 | 本地通过（订单状态只在合成 Demo ERP 可查询；质量/技术只创建平台内部 Case；真实 ERP、质量/工程系统执行仍未实现） |
+| KNOW-01 | 可信 evaluator 必须对发布 candidate version 做 candidate-aware retrieval，并绑定固定期望引用数据集 | 候选发布集成用例 1 passed；合成语义数据集、runner、release gates 与 visitor ownership 共 33 passed。测试使用 fake answerer、确定性 embedder、合成 manifest/文档和测试密钥；未发送真实模型请求 | 合成代码路径和无来源自报拒绝已验证；数据集仍待独立人工复核/批准，真实模型分数和费用证据不存在，自动评测/发布 flag 保持关闭 |
 | TOOL-01 | 名称/参数建议必须在租户允许能力内；缺参先问；模型不能把只读任务变成写动作 | 权限过滤与负例 | 通过（stub） |
 | TOOL-02 | 写任务仅提案/人工处理；参数改变使原确认失效；同键不同 payload 冲突；审批人与客户确认角色不混用 | 提案、确认、执行集成 | 通过（stub / 测试数据库） |
 | TOOL-03 | 回执 unknown/失败/记录不属于客户时不展示已办结/已核验；没有 connector 不制造成功卡片 | 回执契约与负例 | 通过（测试边界；无真实连接器沙箱） |
+| R3-01 | 外部事实必须来自 tenant/domain 已批准 authority；返回记录引用与请求一致，connector/binding 版本和有效期有效；客户范围事实必须通过账户归属证明 | R3 canonical fake-provider negative tests；local/test `DemoCanonicalBusinessAdapter` 对九域合成样例通过 `read_verified_fact()`；`scripts/demo_r3_authorities.py` 可运行且明确标 synthetic；Demo ERP Tool Gateway 订单/库存回执标记 `source=demo` | 契约与合成 adapter/fail-closed 归属已验证；无真实 ERP/MES/WMS/CRM、已批准 authority mapping 或授权 sandbox，不作为真实业务系统验收 |
+| R3-02 | 售前证据须同时绑定产品规格、库存账户归属、客户报价版本/有效期；无证据或过期时转人工；CRM 写入需独立 Tool Gateway 确认与读回 | 只读证据 API/权限用例；`test_demo_crm_tool_gateway.py` 验证并发同键提案重放、不同 payload 冲突、权限拒绝、确认前拒绝执行、人工确认、执行读回和执行幂等 | local/test 合成 CRM 写入闭环通过；`crm.create_opportunity` 经 Tool Gateway 且强制确认、幂等、读回，记录标记 `synthetic=true` / `customer_contacted=false`。不访问或代表真实 CRM，真实 authority/sandbox 仍未提供 |
 | COP-01 | 摘要和回复有当前可见来源；生成不发消息；插入后可编辑，最终人工发送仍检查 owner/idempotency | stub worker + 浏览器来源/插入 + API 发送测试 | 通过（非真实模型） |
-| COP-02 | 切换会话、新消息、租约变化使旧 job stale；用户已编辑内容不被自动覆盖；相同请求重放不重复计费执行 | worker/API 集成、浏览器保稿 | 通过（无双坐席并发） |
-| SEC-01 | 新表强制 RLS，运行角色无 BYPASSRLS；跨租户 ID、任务引用、缓存、job、分页、引用和导出均不可读写 | 隔离 PostgreSQL 全表租户负例 | 通过（R1 表） |
-| SEC-02 | 权限撤销/错误角色/非 owner/会话结束/版本过期时拒绝动作；访客不可访问坐席 job | API 403/404/409 与 RLS 集成 | 部分完成（真实身份撤权未演练） |
-| SEC-03 | AI 派发前与回复前复核 lease；在途外部调用有明确结果/unknown，接管后无新 AI 派发 | stale worker 与回复前 lease 校验 | 部分完成（无真实双窗口在途故障） |
+| COP-02 | 切换会话、新消息、租约变化使旧 job stale；用户已编辑内容不被自动覆盖；相同请求重放不重复计费执行 | worker/API 集成、浏览器保稿；`test_orchestrator_lease_race.py::test_human_takeover_mid_generation_blocks_outbound_send` 使用独立 PostgreSQL 应用会话，在生成屏障期间完成真实并发接管 | 本地通过（数据库并发控制已验证；双浏览器坐席旅程仍未执行） |
+| SEC-01 | 新表强制 RLS，运行角色无 BYPASSRLS；跨租户 ID、任务引用、缓存、job、分页、引用和导出均不可读写 | 隔离 PostgreSQL 全表租户负例 | 通过（包含 `standard_flow_start_requests`；`platform_app` 仅获 SELECT/INSERT） |
+| SEC-02 | 权限撤销/错误角色/非 owner/会话结束/版本过期时拒绝动作；访客不可访问坐席 job | API 403/404/409 与 RLS 集成；本地 Keycloak 实签 JWT：active membership 请求 200；暂停 membership 后复用同一 JWT，请求 401。报告：`evidence/local-keycloak-2026-09-29/keycloak-membership-revocation.json` | 本地 Keycloak 与应用侧 membership 撤权模拟通过；真实企业 IdP access/session token 撤销和企业身份环境仍未演练 |
+| SEC-03 | AI 派发前与回复前复核 lease；在途外部调用有明确结果/unknown，接管后无新 AI 派发 | AI 生成屏障期间由第二个 PostgreSQL 应用会话接管后零 transport send；两个独立 Chrome origin/token 并发认领同一队列项，恰好一席成功、一席收到冲突，lease 最终为 human/version 2 | 部分完成（本地数据库/双浏览器竞争通过；真实外部 transport timeout/unknown 对账和 OIDC 撤权仍未执行） |
 | SEC-04 | 日志、追踪、指标、评测报告无原始提示/客户文本/槽位值/凭据；失败 provider 输出同样受限 | 日志/PII 测试 | 通过（合成数据） |
-| UI-01 | 1536×1024/1280×800/390×844/200% 缩放无页面横向溢出；桌面对话仍为最大工作区域，输入区可见 | 1536/1280/768/390 CSS 宽度 DOM 测量与浏览器检查 | 部分完成（宽度矩阵通过；真实 200% 浏览器缩放与逐规格截图留档待做） |
-| UI-02 | 任务、状态、来源、失败原因可读；键盘路径完整、焦点恢复、动态状态可访问；无仅颜色编码 | AX 状态/动态状态/来源按钮检查 | 部分完成（右侧标签键盘导航、对话框焦点圈与 Escape 已验证；屏幕阅读器及全页面键盘走查待做） |
+| UI-01 | 1536×1024/1280×800/390×844/200% 缩放无页面横向溢出；桌面对话仍为最大工作区域，输入区可见 | 非空会话桌面/移动视口及 CSS 200% 模拟共 6 张 PNG，均无横向溢出；`evidence/local-browser-review-final-2026-09-29/accessibility-report.json` | 本地浏览器视口矩阵通过且 PNG 已归档；200% 为 CSS 缩放模拟，不是原生浏览器缩放 |
+| UI-02 | 任务、状态、来源、失败原因可读；键盘路径完整、焦点恢复、动态状态可访问；无仅颜色编码 | 非空 transcript 与任务行；桌面、暗色、移动、英文共 4 组 axe WCAG 2/2.1 A/AA 均 0 violations；键盘焦点恢复、禁用任务动作、输入 label/description 和 live region 检查；ARIA snapshot 与 PNG 已归档 | 自动化键盘/AX/对比度检查通过；完整 macOS VoiceOver 朗读、键盘遍历与弹层焦点仍需真人复核 |
 | UX-01 | 缺字段一次问必要内容，已核验值不重复问；矛盾值需确认；部分任务完成时不误关整个会话 | 合成坐席旅程与任务 API | 部分完成（非全业务连接器旅程） |
 | UX-02 | 模型/连接器不可用、拒绝与重试均保留草稿；提案确认与聊天发送清楚区分 | stale 失败态/草稿保留浏览器检查 | 部分完成（未测真实 provider/连接器故障） |
-| UX-03 | 会话切换、刷新、多标签页并发无串稿/串任务；断线恢复读服务端状态 | 浏览器切换、刷新恢复 job、query 保留 | 部分完成（未做双浏览器并发） |
+| UX-03 | 会话切换、刷新、多标签页并发无串稿/串任务；断线恢复读服务端状态 | 草稿同步拒绝较旧版本；发送成功后清除匹配的原会话快照并广播版本化清除，同时保留发送期间产生的新草稿；已有本地双标签与 API outage/recovery 演练 | 本地同一 actor/同一会话和 API outage/recovery 模拟通过；跨设备、多坐席真实 OIDC、Copilot job 跨标签和外部 connector unknown 对账仍未验收 |
 | EVAL-01 | 样本来源合规、标注说明和冻结划分明确；同一会话/近似改写不跨训练与保留集 | 1,700 条合成语料、150 个 phrase families、哈希绑定文本/历史/标签/能力；测试验证 1020/340/340 划分、八类主意图 holdout 最低数和额外 100 条高风险 holdout | 部分完成（语料与划分结构已冻结；双人独立标注、裁决和签字待做） |
 | EVAL-02 | 真实模型对固定保留集达成约定质量；每意图/多意图/槽位/反讽否定均有切片，失败样例脱敏 | 当前 prompt/schema 与冻结人工审核 holdout 的脱敏报告 | 阻塞（独立标注未完成；历史合成模型结果的 prompt 版本元数据不一致，不作为当前 v7 验收；此前延迟已明显超过 2 秒） |
-| PERF-01 | off/shadow 客户路径与基线对比；shadow 不等待模型，队列可限流、过期与清理，数据库池不超预算 | 生产近似负载与分位数 | 未执行 |
+| PERF-01 | off/shadow 客户路径与基线对比；shadow 不等待模型，队列可限流、过期与清理，数据库池不超预算 | 原 off/shadow 12 轮报告；Worker 演练持久化 1/10/50 排空和 pool 5/50 P50 比值，连接池相对退化超过 10 倍会失败；`evidence/local-worker-drill-review-final-2026-09-29/worker-drill-report.json` | 多轮单机合成基线与队列演练已通过；仍不覆盖 10k 会话/租户、50/100 持续 30 分钟、生产近似拓扑、真实模型或 Workbench 队列 p95 |
 | PERF-02 | 分类/副驾 p95、超时率、token/费用与预算拦截可量化，响应时间含排队和失败请求 | 真实模型固定配置报告 | 阻塞（仅有合成探测；延迟超标，未测 p95 与生产负载） |
-| MIG-01 | 清洁库升级、带合成业务数据升级、回滚到上版应用可读写、隔离库迁移往返；新表 RLS/索引/外键完整 | 迁移全链回滚/重建、RLS 测试、master API 在 0065 扩展 schema 上读写 smoke | 通过（本机专用合成数据库；非 staging/生产回滚演练） |
-| OPS-01 | 持久任务超时、Worker 重启、provider 429/5xx、连接器断连、重复 outbox 可恢复；无孤儿 executing | 子进程 hard-exit 后新 Worker stale-claim 恢复、重复 outbox/过期恢复测试 | 部分完成（本地 OS 子进程故障恢复通过；未做多主机拓扑及真实 provider/connector 故障演练） |
-| OPS-02 | 租户开关/kill switch 生效，旧应用回滚保留数据；待确认动作不被自动执行 | kill switch 测试；扩展 schema 上的上版应用读写 smoke | 部分完成（本地应用回滚 smoke 通过；未做 staging 回滚、降级演练和待确认动作故障注入） |
-| CI-01 | 当前分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | [Release Evidence run #36295891831](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36295891831)，实现 head `247290e5df86c529dde17465efaab64765439764` | 通过（unit、integration、Release Evidence、Web、typecheck、lint、secret/dependency scan 和 concurrency guard 全通过） |
-| DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一 commit | 更新后的验收/交付报告、语义标注指南、commit 证据包和 Release Evidence run #36295891831 | 部分完成（文档、CI 与本地回滚 smoke 齐备；staging/生产证据待补） |
+| MIG-01 | 清洁库升级、带合成业务数据升级、回滚到上版应用可读写、隔离库迁移往返；新表 RLS/索引/外键完整 | migration test 从 base 到 head、单步 downgrade/re-upgrade、完整 downgrade/re-upgrade；全表 FORCE RLS 扫描；`0071_task_command_idempotency` 往返后保留账务行 | 通过（本机专用合成数据库；非 staging/生产回滚演练） |
+| OPS-01 | 持久任务超时、Worker 重启、provider 429/5xx、连接器断连、重复 outbox 可恢复；无孤儿 executing | 独立 Docker Compose Postgres/Redis、2 个同类 Worker；杀死持有进行中事务的 Worker，peer 完成重投；重复 event 保持单条 billing row；1/10/50 项批次排空；80 项集成/单测通过；0071 downgrade/upgrade 保留数据 | 本地多 Worker、故障恢复、重复投递、队列延迟与单步迁移回滚演练通过；多主机拓扑、真实 provider/connector 429/5xx 与外部 unknown 对账仍待真实环境 |
+| OPS-02 | 租户开关/kill switch 生效，旧应用回滚保留数据；待确认动作不被自动执行 | 既有 R1 API 扩展 schema smoke；本轮在隔离库上并行运行候选 UI 与 `68de17e` 基线 UI，基线仍读到 2 个 synthetic cases 和 3 条 B 会话 turns，切回候选后草稿保留；另完成 API 停止、页面重试和恢复 | 本地 staging 模拟与 UI 回退 smoke 通过；未进行真实 staging/Kubernetes 多实例、数据库降级、Worker 重启或待确认外部写入回滚 |
+| CI-01 | 当前代码实现分支完整 CI 通过，未扩大忽略/跳过门禁；新增高风险路径有真实边界覆盖 | 远端 PR #27 head `b45b846` 的 [run #36415996078](https://github.com/kayon0209/b2b-ai-support-platform/actions/runs/36415996078) 九个 job 全通过；本地隔离分支及本轮改动较该 head 更新，尚无绑定当前改动的 CI | 部分完成（已有远端 CI 不覆盖当前本地代码；需提交后为最新 head 重跑）
+| DOC-02 | 用户可从交付说明独立启动、演示、检查与回滚；限制准确，证据绑定同一代码状态 | `delivery-report.md` §20–§21；最终 Playwright/axe 与 Worker 报告、PNG 和 ARIA snapshot 已绑定当前本地 source digest 并保存在 `evidence/` 子目录 | 本地模拟证据可独立复核；真实 staging、获批评测数据和企业系统证据仍阻塞 |
 
 ## 3. 质量阈值：R1 提议的启用门槛
 

@@ -1,0 +1,93 @@
+{
+  "evidenceType": "synthetic local/test browser run",
+  "implementationCommit": "35195b4+source:fe0617b5b732",
+  "conversationRef": "0190f000-0000-7000-8000-000000000010",
+  "automatedChecks": {
+    "nonEmptyTranscriptTurns": 3,
+    "keyboardEnterLoadsEvidence": true,
+    "productInputHasLabelAndDescription": true,
+    "dynamicStatusUsesPoliteLiveRegion": true,
+    "customerQuoteAllowed": false,
+    "crmWritePerformed": false,
+    "pageErrors": [],
+    "failedChecks": []
+  },
+  "axeRuns": [
+    {
+      "viewport": "desktop-1536x1024",
+      "theme": "light",
+      "violations": [],
+      "passes": 31,
+      "incomplete": 1
+    },
+    {
+      "viewport": "desktop-1536x1024",
+      "theme": "dark",
+      "violations": [],
+      "passes": 31,
+      "incomplete": 1
+    },
+    {
+      "viewport": "mobile-390x844",
+      "theme": "light",
+      "violations": [],
+      "passes": 29,
+      "incomplete": 1
+    },
+    {
+      "viewport": "desktop-1536x1024",
+      "theme": "light",
+      "locale": "en",
+      "violations": [],
+      "passes": 28,
+      "incomplete": 1
+    }
+  ],
+  "screenshots": [
+    {
+      "file": "desktop-1536x1024.png",
+      "name": "desktop-1536x1024",
+      "width": 1536,
+      "height": 1024,
+      "horizontalOverflowPx": 0
+    },
+    {
+      "file": "desktop-1280x800.png",
+      "name": "desktop-1280x800",
+      "width": 1280,
+      "height": 800,
+      "horizontalOverflowPx": 0
+    },
+    {
+      "file": "mobile-390x844.png",
+      "name": "mobile-390x844",
+      "width": 390,
+      "height": 844,
+      "horizontalOverflowPx": 0
+    },
+    {
+      "file": "mobile-320x844.png",
+      "name": "mobile-320x844",
+      "width": 320,
+      "height": 844,
+      "horizontalOverflowPx": 0
+    },
+    {
+      "file": "desktop-1536x1024-en.png",
+      "name": "desktop-1536x1024-en",
+      "width": 1536,
+      "height": 1024,
+      "locale": "en",
+      "horizontalOverflowPx": 0
+    },
+    {
+      "file": "simulated-200-percent-768x512.png",
+      "name": "simulated-200-percent-768x512",
+      "width": 768,
+      "height": 512,
+      "horizontalOverflowPx": 0,
+      "simulatedCssZoom": 2
+    }
+  ],
+  "manualVoiceOverConfirmed": false
+}

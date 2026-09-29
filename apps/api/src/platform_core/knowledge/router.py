@@ -36,7 +36,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, or_, select
 
 from platform_core.api import error_response, require_write_idempotency, tenant_session
 from platform_core.config import get_settings
@@ -252,7 +252,17 @@ async def list_documents(
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
 
-    stmt = select(Document).where(Document.tenant_id == ctx.tenant_id)
+    candidate_is_active = exists(
+        select(DocumentVersion.id).where(
+            DocumentVersion.tenant_id == ctx.tenant_id,
+            DocumentVersion.document_id == Document.id,
+            DocumentVersion.status == "active",
+        )
+    )
+    stmt = select(Document).where(
+        Document.tenant_id == ctx.tenant_id,
+        or_(~Document.canonical_uri.like("gap-candidate://%"), candidate_is_active),
+    )
     if space_id:
         try:
             stmt = stmt.where(Document.space_id == _uuid(space_id, "space"))
@@ -432,7 +442,7 @@ async def mark_version_ready(request: Request, version_id: str, body: ReadyIn | 
 
     async with tenant_session(ctx) as session:
         try:
-            row = await service.mark_ready(session, tenant_id=ctx.tenant_id, version_id=vid)
+            row = await service.mark_ready(session, ctx=ctx, version_id=vid)
         except service.KnowledgeError as exc:
             return _error(exc)
         except Exception as exc:

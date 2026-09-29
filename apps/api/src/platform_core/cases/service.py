@@ -111,6 +111,41 @@ async def workbench_cases_for_conversations(
     return result
 
 
+async def verified_account_for_conversation(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    conversation_ref_id: uuid.UUID,
+) -> uuid.UUID | None:
+    """Resolve one unambiguous account from tenant-owned linked Cases.
+
+    This is a narrow source-of-truth read for workflows that need an account
+    id. An unlinked conversation, a linked Case without an account, or
+    conflicting account links all fail closed. The caller never accepts an
+    account id typed by the browser as verification evidence.
+    """
+    account_ids = list(
+        (
+            await session.execute(
+                select(Case.enterprise_account_id)
+                .join(CaseConversation, CaseConversation.case_id == Case.id)
+                .where(
+                    Case.tenant_id == tenant_id,
+                    CaseConversation.tenant_id == tenant_id,
+                    CaseConversation.conversation_ref_id == conversation_ref_id,
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not account_ids or any(account_id is None for account_id in account_ids):
+        return None
+    resolved = set(account_ids)
+    return next(iter(resolved)) if len(resolved) == 1 else None
+
+
 async def search_case_conversation_refs(
     session: AsyncSession, *, tenant_id: uuid.UUID, term: str
 ) -> set[uuid.UUID]:
@@ -190,6 +225,7 @@ class CaseService:
         actor_id: uuid.UUID | None = None,
         enterprise_account_id: uuid.UUID | None = None,
         conversation_ref_id: uuid.UUID | None = None,
+        team_ref: str | None = None,
     ) -> Case:
         """Open a Case, deriving its SLA clocks from the account's contract.
 
@@ -229,6 +265,15 @@ class CaseService:
                 raise CaseError("ACCOUNT_NOT_FOUND", str(enterprise_account_id))
             tier, contract_status = facts
 
+        if team_ref is not None:
+            from platform_core.identity.org import department_slug_exists
+
+            team_ref = team_ref.strip().lower()
+            if not team_ref or not await department_slug_exists(
+                self._session, tenant_id=tenant_id, slug=team_ref
+            ):
+                raise CaseError("TEAM_NOT_FOUND")
+
         # Configured targets if the tenant set any, else the code default -
         # `resolve_sla_policy` delegates to `sla_policy_for_tier` when there is
         # no row, so a tenant with no configuration is unaffected.
@@ -250,6 +295,7 @@ class CaseService:
             opened_at=now,
             last_state_changed_at=now,
             enterprise_account_id=enterprise_account_id,
+            team_ref=team_ref,
             # Snapshotted, not resolved later: the deadline is recomputed on a
             # priority change, and re-reading the account then would let a
             # mid-Case contract change move a clock that is already running.

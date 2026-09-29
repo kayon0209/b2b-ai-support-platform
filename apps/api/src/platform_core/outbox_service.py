@@ -7,6 +7,7 @@ multiple relay workers never double-send.
 
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select, update
@@ -14,6 +15,56 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.outbox import OutboxEvent, OutboxStatus
+
+
+@dataclass(frozen=True)
+class OutboxReceipt:
+    """Minimal application view of an enqueued event."""
+
+    event_id: uuid.UUID
+    status: str
+    payload: dict[str, Any]
+
+
+async def get_receipt(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    event_id: uuid.UUID,
+) -> OutboxReceipt | None:
+    row = (
+        await session.execute(
+            select(OutboxEvent).where(
+                OutboxEvent.tenant_id == tenant_id,
+                OutboxEvent.event_id == event_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    return OutboxReceipt(event_id=row.event_id, status=str(row.status), payload=row.payload or {})
+
+
+async def latest_status_for_aggregate(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    event_type: str,
+    aggregate_id: str,
+) -> str | None:
+    status = (
+        await session.execute(
+            select(OutboxEvent.status)
+            .where(
+                OutboxEvent.tenant_id == tenant_id,
+                OutboxEvent.event_type == event_type,
+                OutboxEvent.aggregate_id == aggregate_id,
+            )
+            .order_by(OutboxEvent.created_at.desc(), OutboxEvent.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return str(status) if status is not None else None
 
 
 async def enqueue(
@@ -53,6 +104,39 @@ async def enqueue(
     )
     await session.execute(stmt)
     return eid
+
+
+async def enqueue_once(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    event_type: str,
+    aggregate_type: str,
+    aggregate_id: str,
+    payload: dict[str, Any],
+    event_id: uuid.UUID,
+    trace_id: str | None = None,
+) -> bool:
+    """Insert one event and report whether this call created it."""
+    stmt = (
+        pg_insert(OutboxEvent)
+        .values(
+            tenant_id=tenant_id,
+            event_id=event_id,
+            event_type=event_type,
+            event_version=1,
+            aggregate_type=aggregate_type,
+            aggregate_id=aggregate_id,
+            payload=payload,
+            status=OutboxStatus.QUEUED.value,
+            created_at=int(time.time()),
+            trace_id=trace_id or "",
+        )
+        .on_conflict_do_nothing(index_elements=["event_id"])
+        .returning(OutboxEvent.id)
+    )
+    inserted_id = (await session.execute(stmt)).scalar_one_or_none()
+    return inserted_id is not None
 
 
 async def claim_pending(

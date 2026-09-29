@@ -8,6 +8,10 @@ from sqlalchemy.dialects import postgresql
 from platform_core.agent_runtime.copilot import COPILOT_EVENT_TYPE
 from platform_core.agent_runtime.semantic.shadow import SHADOW_EVENT_TYPE
 from platform_core.agent_runtime.tasks.planning_seam import TASK_PLANNING_EVENT_TYPE
+from platform_core.knowledge.release_evaluator import (
+    RELEASE_EVALUATION_REQUEST_EVENT,
+    RELEASE_POST_TEST_REQUEST_EVENT,
+)
 
 
 class _Rows:
@@ -33,6 +37,8 @@ def test_default_relay_leaves_dedicated_events_to_the_semantic_worker() -> None:
         SHADOW_EVENT_TYPE,
         COPILOT_EVENT_TYPE,
         TASK_PLANNING_EVENT_TYPE,
+        RELEASE_EVALUATION_REQUEST_EVENT,
+        RELEASE_POST_TEST_REQUEST_EVENT,
     }
 
 

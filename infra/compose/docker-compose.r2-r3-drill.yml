@@ -1,0 +1,57 @@
+# Disposable local-only stack for the R2/R3 worker drill.
+# Use a unique Compose project and `down -v` after each run; never point these
+# services at the shared `platform` database or production infrastructure.
+services:
+  drill-postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: platform
+      POSTGRES_DB: platform
+    ports:
+      - "127.0.0.1:${DRILL_POSTGRES_PORT:-55435}:5432"
+    volumes:
+      - drill_postgres_data:/var/lib/postgresql/data
+      - ./postgres-init/01-platform-app-role.sql:/docker-entrypoint-initdb.d/01-platform-app-role.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform -d platform"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  drill-redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  drill-outbox-worker:
+    build:
+      context: ../..
+      dockerfile: infra/compose/api.Dockerfile
+    image: codex-r2r3-drill-worker
+    command: ["python", "-m", "worker.runner", "--outbox-only"]
+    environment:
+      APP_ENVIRONMENT: test
+      APP_ALLOW_BOOTSTRAP_TOKENS: "true"
+      APP_BUSINESS_API_ADAPTER: demo
+      APP_DATABASE_URL: postgresql+psycopg://platform:platform@drill-postgres:5432/${DRILL_DATABASE:-codex_r2r3_drill}
+      APP_DATABASE_APP_URL: postgresql+psycopg://platform_app:platform_app@drill-postgres:5432/${DRILL_DATABASE:-codex_r2r3_drill}
+      APP_DATABASE_POOL_SIZE: 2
+      APP_DATABASE_MAX_OVERFLOW: 0
+      APP_DATABASE_APP_POOL_SIZE: 2
+      APP_DATABASE_APP_MAX_OVERFLOW: 0
+      APP_REDIS_URL: redis://drill-redis:6379/0
+      APP_SECRET_KEY: local-drill-only-secret
+      PGAPPNAME: r2r3-drill-worker
+    depends_on:
+      drill-postgres:
+        condition: service_healthy
+      drill-redis:
+        condition: service_healthy
+
+volumes:
+  drill_postgres_data:
+  drill_redis_data:

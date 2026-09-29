@@ -27,7 +27,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.audit import service as audit_service
@@ -45,6 +45,7 @@ from platform_core.knowledge.models import (
     DocumentVersion,
     IngestionStatus,
     KnowledgeSource,
+    KnowledgeSpace,
 )
 
 logger = logging.getLogger(__name__)
@@ -275,6 +276,7 @@ async def create_draft(
         conversation_ref_id=conversation_ref_id,
         title=title.strip()[:512],
         body=body,
+        author_id=ctx.actor_id,
         status=DraftStatus.PENDING.value,
         author_kind="human",
     )
@@ -304,7 +306,7 @@ async def review_draft(
     notes: str = "",
 ) -> KnowledgeDraft:
     """Approve or reject a draft. Approval alone does not publish."""
-    draft = await _load_draft(session, ctx=ctx, draft_id=draft_id)
+    draft = await _load_draft(session, ctx=ctx, draft_id=draft_id, for_update=True)
     if draft.status != DraftStatus.PENDING.value:
         raise GapError("ALREADY_REVIEWED", "this draft already has a review decision")
 
@@ -334,6 +336,181 @@ async def review_draft(
     return draft
 
 
+async def prepare_release_candidate(
+    session: AsyncSession,
+    *,
+    ctx: TenantContext,
+    draft_id: uuid.UUID,
+    space_id: uuid.UUID,
+    idempotency_key: str,
+) -> tuple[DocumentVersion, bool]:
+    """Stage an approved draft for evaluation without making it retrievable."""
+    if not idempotency_key or len(idempotency_key) > 255:
+        raise GapError("IDEMPOTENCY_KEY_INVALID", "candidate staging needs a valid idempotency key")
+
+    draft = await _load_draft(session, ctx=ctx, draft_id=draft_id, for_update=True)
+    if draft.status != DraftStatus.APPROVED.value:
+        raise GapError("DRAFT_NOT_APPROVED", "only an approved draft may be evaluated")
+    if draft.author_id is None:
+        raise GapError("DRAFT_AUTHOR_MISSING", "the draft author is not recorded")
+    gap = await _load_gap(session, ctx=ctx, gap_id=draft.gap_id)
+    if gap.target_space_id is not None and gap.target_space_id != space_id:
+        raise GapError(
+            "DRAFT_SPACE_MISMATCH", "the requested space differs from the reviewed target"
+        )
+    space = (
+        await session.execute(
+            select(KnowledgeSpace).where(
+                KnowledgeSpace.tenant_id == ctx.tenant_id,
+                KnowledgeSpace.id == space_id,
+                KnowledgeSpace.status == "active",
+            )
+        )
+    ).scalar_one_or_none()
+    if space is None:
+        raise GapError("KNOWLEDGE_SPACE_NOT_FOUND", "no active knowledge space for this tenant")
+
+    draft_bytes = draft.body.encode("utf-8")
+    content_sha256 = hashlib.sha256(draft_bytes).hexdigest()
+    request_hash = hashlib.sha256(f"{draft.id}:{space_id}:{content_sha256}".encode()).hexdigest()
+    idempotency_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"knowledge-release-candidate:{ctx.tenant_id}:{idempotency_hash}"},
+    )
+    candidate_id = uuid.uuid5(
+        ctx.tenant_id,
+        f"knowledge-release-candidate:{draft.id}:{space_id}:{content_sha256}",
+    )
+    candidate_uri = f"gap-candidate://{draft.id}/{space_id}/{content_sha256}"
+    same_key = (
+        await session.execute(
+            select(DocumentVersion).where(
+                DocumentVersion.tenant_id == ctx.tenant_id,
+                DocumentVersion.metadata_json["release_candidate_idempotency_hash"].as_string()
+                == idempotency_hash,
+            )
+        )
+    ).scalar_one_or_none()
+    if same_key is not None and same_key.id != candidate_id:
+        raise GapError("IDEMPOTENCY_CONFLICT", "candidate request key was reused")
+
+    candidate = (
+        await session.execute(
+            select(DocumentVersion).where(
+                DocumentVersion.tenant_id == ctx.tenant_id,
+                DocumentVersion.id == candidate_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if candidate is not None:
+        document = (
+            await session.execute(
+                select(Document).where(
+                    Document.tenant_id == ctx.tenant_id,
+                    Document.id == candidate.document_id,
+                )
+            )
+        ).scalar_one_or_none()
+        metadata = dict(candidate.metadata_json or {})
+        if (
+            document is None
+            or document.space_id != space_id
+            or document.canonical_uri != candidate_uri
+            or candidate.content_hash != content_sha256
+            or metadata.get("release_candidate_request_hash") != request_hash
+            or metadata.get("release_candidate_idempotency_hash") != idempotency_hash
+        ):
+            raise GapError("IDEMPOTENCY_CONFLICT", "candidate request key or snapshot was reused")
+        return candidate, True
+
+    from platform_core.knowledge.scanning import ContentScanner, ScanVerdict, run_scan
+
+    scan_verdict = run_scan(
+        ContentScanner(),
+        key=f"gap-release-candidate:{candidate_id}",
+        data=draft_bytes,
+        declared_type="text/markdown",
+    )
+    if scan_verdict is not ScanVerdict.CLEAN:
+        raise GapError("DRAFT_CONTENT_REJECTED", "candidate content did not pass scanning")
+
+    source = await _ensure_gap_source(session, ctx=ctx, space_id=space_id)
+    document = (
+        await session.execute(
+            select(Document).where(
+                Document.tenant_id == ctx.tenant_id,
+                Document.canonical_uri == candidate_uri,
+            )
+        )
+    ).scalar_one_or_none()
+    if document is None:
+        document = Document(
+            tenant_id=ctx.tenant_id,
+            space_id=space_id,
+            source_id=source.id,
+            canonical_uri=candidate_uri,
+            title=draft.title,
+            owner_ref=str(draft.author_id),
+            classification="internal",
+        )
+        session.add(document)
+        await session.flush()
+    elif document.space_id != space_id:
+        raise GapError("DRAFT_SPACE_MISMATCH", "candidate URI belongs to another space")
+
+    version = DocumentVersion(
+        id=candidate_id,
+        tenant_id=ctx.tenant_id,
+        document_id=document.id,
+        version_label=f"candidate-{content_sha256[:16]}",
+        content_hash=content_sha256,
+        status="draft",
+        scan_status=scan_verdict.as_status().value,
+        object_uri="",
+        parser_version="gap-draft-v1",
+        ingestion_status=IngestionStatus.UPLOADED.value,
+        metadata_json={
+            "content_type": "text/markdown",
+            "size_bytes": len(draft_bytes),
+            "release_candidate": True,
+            "release_candidate_request_hash": request_hash,
+            "release_candidate_idempotency_hash": idempotency_hash,
+        },
+    )
+    session.add(version)
+    await session.flush()
+
+    from platform_core.knowledge.service import upload_object
+    from platform_core.knowledge.storage import ObjectKey
+
+    key = ObjectKey(
+        tenant_id=str(ctx.tenant_id),
+        document_version_id=str(version.id),
+        filename=f"gap-release-candidate-{draft.id}.md",
+    ).to_key()
+    version.object_uri = key
+    await session.flush()
+    upload_object(key, draft_bytes, "text/markdown")
+
+    await audit_service.record(
+        session,
+        ctx=ctx,
+        action="knowledge.release_candidate_staged",
+        resource_type="knowledge_release_candidate",
+        resource_id=version.id,
+        after={
+            "draft_id": str(draft.id),
+            "knowledge_space_id": str(space_id),
+            "content_sha256": content_sha256,
+            "status": version.status,
+            "ingestion_status": version.ingestion_status,
+        },
+    )
+    await session.flush()
+    return version, False
+
+
 async def publish_draft(
     session: AsyncSession,
     *,
@@ -341,24 +518,61 @@ async def publish_draft(
     draft_id: uuid.UUID,
     space_id: uuid.UUID,
     version_label: str = "v1",
+    release_gate_enabled: bool = False,
+    release_evaluation_id: uuid.UUID | None = None,
+    idempotency_key: str | None = None,
 ) -> DocumentVersion:
     """Publish an approved draft as real, retrievable knowledge.
 
-    Creates a `Document` + `DocumentVersion` in `processing` state through
-    the same tables the normal upload path uses, so the content is subject
-    to the usual parsing, chunking, and versioning rules. The gap is marked
-    resolved only once the document exists.
+    A verified release activates its already-indexed staged candidate in the
+    same transaction as the gap and audit writes. The legacy flag-off path
+    creates a processing version for the normal ingestion pipeline.
     """
-    draft = await _load_draft(session, ctx=ctx, draft_id=draft_id)
+    draft = await _load_draft(session, ctx=ctx, draft_id=draft_id, for_update=True)
+
+    from platform_core.knowledge import release_service
+
+    if draft.published_document_id is not None:
+        if release_evaluation_id is not None:
+            published = await release_service.find_published_release_version(
+                session,
+                ctx=ctx,
+                draft=draft,
+                evaluation_id=release_evaluation_id,
+            )
+            if published is not None:
+                return published
+        raise GapError("ALREADY_PUBLISHED", "this draft was already published")
+
+    release_evaluation = None
+    if release_gate_enabled:
+        if release_evaluation_id is None:
+            raise GapError(
+                "RELEASE_EVALUATION_REQUIRED",
+                "a passing knowledge release evaluation is required",
+            )
+        if idempotency_key is None:
+            raise GapError("IDEMPOTENCY_KEY_REQUIRED", "publish requires an idempotency key")
+        try:
+            release_evaluation = await release_service.require_publish_evaluation(
+                session,
+                ctx=ctx,
+                draft_id=draft.id,
+                space_id=space_id,
+                evaluation_id=release_evaluation_id,
+            )
+        except release_service.KnowledgeReleaseError as exc:
+            raise GapError(exc.code, exc.detail) from exc
+    elif release_evaluation_id is not None:
+        raise GapError(
+            "RELEASE_GATE_DISABLED", "enable the tenant release gate before using evidence"
+        )
 
     if draft.status != DraftStatus.APPROVED.value:
         raise GapError(
             "DRAFT_NOT_APPROVED",
             "only an approved draft may be published",
         )
-    if draft.published_document_id is not None:
-        raise GapError("ALREADY_PUBLISHED", "this draft was already published")
-
     # Four-eyes: an author cannot approve-and-publish their own answer
     # unnoticed. Checking here as well as at review time covers the path
     # where a reviewer approves and a different actor publishes.
@@ -369,6 +583,63 @@ async def publish_draft(
         )
 
     gap = await _load_gap(session, ctx=ctx, gap_id=draft.gap_id)
+
+    if release_evaluation is not None and idempotency_key is not None:
+        staged = (
+            await session.execute(
+                select(DocumentVersion, Document)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(
+                    DocumentVersion.tenant_id == ctx.tenant_id,
+                    DocumentVersion.id == release_evaluation.candidate_version_id,
+                    Document.tenant_id == ctx.tenant_id,
+                    Document.space_id == space_id,
+                )
+                .with_for_update()
+            )
+        ).one_or_none()
+        if staged is None:
+            raise GapError("RELEASE_CANDIDATE_NOT_FOUND", "evaluated candidate is not staged")
+        version, document = staged
+        expected_hash = hashlib.sha256(draft.body.encode("utf-8")).hexdigest()
+        expected_uri = f"gap-candidate://{draft.id}/{space_id}/{expected_hash}"
+        if (
+            document.canonical_uri != expected_uri
+            or version.content_hash != expected_hash
+            or version.status != "draft"
+            or version.ingestion_status != IngestionStatus.READY.value
+            or version.scan_status != "clean"
+            or (version.metadata_json or {}).get("release_candidate") is not True
+            or not version.object_uri
+        ):
+            raise GapError("RELEASE_CANDIDATE_MOVED", "evaluated candidate is no longer ready")
+
+        version.status = "active"
+        version.version_label = version_label
+        draft.published_document_id = document.id
+        gap.status = GapStatus.RESOLVED.value
+        gap.target_space_id = space_id
+        await session.flush()
+        await release_service.record_publish_requested(
+            session,
+            ctx=ctx,
+            evaluation=release_evaluation,
+            idempotency_key=idempotency_key,
+        )
+        await release_service.record_activation(session, ctx=ctx, version_id=version.id)
+        await audit_service.record(
+            session,
+            ctx=ctx,
+            action="knowledge_draft.published",
+            resource_type="knowledge_draft",
+            resource_id=draft.id,
+            after={
+                "gap_id": str(gap.id),
+                "document_id": str(document.id),
+                "document_version_id": str(version.id),
+            },
+        )
+        return version
 
     source = await _ensure_gap_source(session, ctx=ctx, space_id=space_id)
 
@@ -389,13 +660,26 @@ async def publish_draft(
     session.add(document)
     await session.flush()
 
-    content_hash = hashlib.sha256(draft.body.encode("utf-8")).hexdigest()
+    draft_bytes = draft.body.encode("utf-8")
+    from platform_core.knowledge.scanning import ContentScanner, ScanVerdict, run_scan
+
+    scan_verdict = run_scan(
+        ContentScanner(),
+        key=f"gap-draft:{draft.id}",
+        data=draft_bytes,
+        declared_type="text/markdown",
+    )
+    if scan_verdict is ScanVerdict.INFECTED:
+        raise GapError("DRAFT_CONTENT_REJECTED", "draft content does not match text/markdown")
+    content_hash = hashlib.sha256(draft_bytes).hexdigest()
     version = DocumentVersion(
+        id=uuid.uuid4(),
         tenant_id=ctx.tenant_id,
         document_id=document.id,
         version_label=version_label,
         content_hash=content_hash,
         status=IngestionStatus.PROCESSING.value,
+        scan_status=scan_verdict.as_status().value,
         object_uri="",  # filled in after the key is derived from version.id
         parser_version="gap-draft-v1",
         ingestion_status=IngestionStatus.UPLOADED.value,
@@ -431,7 +715,7 @@ async def publish_draft(
     # knowledge router uploads before returning, but publish_draft lives in
     # the service layer where a storage outage must not be fatal.)
     try:
-        upload_object(key, draft.body.encode("utf-8"), "text/markdown")
+        upload_object(key, draft_bytes, "text/markdown")
     except Exception as exc:
         logger.warning(
             "gap_draft_upload_pending gap_id=%s version_id=%s error=%s",
@@ -550,12 +834,18 @@ async def _load_gap(
 
 
 async def _load_draft(
-    session: AsyncSession, *, ctx: TenantContext, draft_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    ctx: TenantContext,
+    draft_id: uuid.UUID,
+    for_update: bool = False,
 ) -> KnowledgeDraft:
     stmt = select(KnowledgeDraft).where(
         KnowledgeDraft.id == draft_id,
         KnowledgeDraft.tenant_id == ctx.tenant_id,
     )
+    if for_update:
+        stmt = stmt.with_for_update()
     row = (await session.execute(stmt)).scalars().first()
     if row is None:
         raise GapError("NOT_FOUND", "no such knowledge draft for this tenant")
@@ -571,6 +861,7 @@ __all__ = [
     "gap_stats",
     "list_drafts",
     "list_gaps",
+    "prepare_release_candidate",
     "publish_draft",
     "record_gap",
     "review_draft",

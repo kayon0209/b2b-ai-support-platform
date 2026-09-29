@@ -123,6 +123,18 @@ def test_tenant_owner_has_all_actions(engine: PolicyEngine) -> None:
         assert engine.check(owner, action).decision == Decision.ALLOW
 
 
+def test_emotion_advice_correction_is_reserved_for_support_supervisors(
+    engine: PolicyEngine,
+) -> None:
+    supervisor = Principal(tenant_id="t1", actor_id="u5", role="support_admin")
+    agent = _agent()
+    viewer = Principal(tenant_id="t1", actor_id="u6", role="support_viewer")
+
+    assert engine.check(supervisor, Action.CASE_REVIEW).decision == Decision.ALLOW
+    assert engine.check(agent, Action.CASE_REVIEW).decision == Decision.DENY
+    assert engine.check(viewer, Action.CASE_REVIEW).decision == Decision.DENY
+
+
 def test_agent_role_may_propose_a_confirmed_write_but_not_approve_one(
     engine: PolicyEngine,
 ) -> None:

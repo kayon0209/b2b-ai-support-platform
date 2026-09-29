@@ -1,0 +1,16 @@
+{
+  "evidenceType": "local Keycloak signed-token and membership-revocation simulation",
+  "implementationRevision": "35195b4+source:b04388b61c95",
+  "issuer": "http://127.0.0.1:8081/realms/r2r3-local-229d0724",
+  "signedJwtIssuedByLocalKeycloak": true,
+  "apiStatusBeforeMembershipSuspension": 200,
+  "apiStatusAfterMembershipSuspension": 401,
+  "sameJwtReusedAfterSuspension": true,
+  "enterpriseIdpSessionOrTokenRevocationTested": false,
+  "tokenOrPasswordIncluded": false,
+  "limitations": [
+    "Local Keycloak dev realm and synthetic identity only.",
+    "The platform re-checks membership on each API request; this does not prove an enterprise IdP invalidates an already-issued JWT."
+  ],
+  "completedAtUtc": "2026-09-29T04:18:47.440419+00:00"
+}
