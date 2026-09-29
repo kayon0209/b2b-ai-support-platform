@@ -29,7 +29,7 @@ sqlalchemy>=2.0.36
 psycopg[binary,pool]>=3.2
 alembic>=1.14
 greenlet>=3.1          # SQLAlchemy's async bridge; required explicitly on 3.12
-pgvector>=0.3.6
+pgvector>=0.5.0
 
 # --- Async work and caching ------------------------------------------------
 # The custom platform owns its own Redis. It is never shared with Chatwoot
