@@ -62,6 +62,9 @@ Tool Gateway 把“模型提出动作”和“系统执行动作”分开：
 - Inbox/Outbox 将业务提交与异步工作解耦；Worker 按队列处理交互运行、知识摄取、事件投递、SLA 与保留任务。
 - 评估流程包含引用支持、答案质量、拒答与高风险动作样例；Release Evidence job 对发布证据做门禁检查。
 - API 暴露健康与运行指标；日志和追踪遵循敏感数据最小化要求。
+- 最近完成的 R2/R3 扩展包括默认关闭的情绪建议、坐席发起的四种标准流程，以及带候选评测、签名证据、双人审批、发布后检查和回滚的知识发布门禁。情绪建议不会自动修改 Case 优先级、SLA、负责人或客户回复；订单/质量/技术演练只在 `local`/`test` 使用合成数据，发票流程只创建平台内部申请 Case。
+- `local`/`test` 还提供合成预售资料和 Demo CRM 商机写入演练，经 Tool Gateway 展示权限校验、人工确认、幂等和读回验证；这不代表接入真实 CRM/ERP，合成报价不能作为客户报价。
+- 真实评测集、密钥、费用预算和 staging 演练尚未配置，知识发布及相关生产开关保持关闭。完整实现边界与逐项验收见[AI 能力增强实施包](docs/implementation/ai-support-v2/README.md)。
 
 ## 核心架构
 
@@ -166,6 +169,7 @@ kubectl kustomize infra/kubernetes
 
 | 主题 | 文档 |
 |---|---|
+| AI 能力增强执行包、WorkBuddy 任务与 Codex 验收 | [实施执行包](docs/implementation/ai-support-v2/README.md) |
 | 当前架构与系统边界 | [docs/architecture.md](docs/architecture.md) |
 | Agent Runtime 与安全运行方式 | [docs/agent.md](docs/agent.md) |
 | 多租户安全、身份与威胁模型 | [docs/security.md](docs/security.md) |
