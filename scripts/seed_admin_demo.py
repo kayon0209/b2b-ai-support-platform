@@ -326,7 +326,10 @@ def main() -> None:
     print(f"role      = {ROLE}")
     print()
     print(f"VITE_API_TOKEN={token}")
-    print("Demo CRM: synthetic only; CRM opportunity proposals still require Tool Gateway confirmation.")
+    print(
+        "Demo CRM: synthetic only; CRM opportunity proposals still require "
+        "Tool Gateway confirmation."
+    )
     print()
     print("# and the API is reachable as this tenant (expect 200, not 401):")
     print(
