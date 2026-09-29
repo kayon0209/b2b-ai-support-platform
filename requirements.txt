@@ -35,7 +35,7 @@ pgvector>=0.3.6
 # The custom platform owns its own Redis. It is never shared with Chatwoot
 # (see AGENTS.md, "Prohibited shortcuts").
 redis>=5.2
-celery>=5.4
+celery>=5.6.3
 
 # --- Object storage --------------------------------------------------------
 minio>=7.2
