@@ -31,12 +31,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.agent_runtime.semantic.contracts import SemanticTaskKind
 from platform_core.agent_runtime.semantic.validator import CapabilityView
-from platform_core.tool_gateway.models import ToolDefinition, ToolRisk
+from platform_core.tool_gateway.catalog import list_tenant_tools
 
 # Risk classes that may serve a read task.
 READ_RISKS = frozenset({"read", "low_risk"})
@@ -92,18 +91,7 @@ async def tenant_capabilities(
     """
     from platform_policy import Action, Decision, Principal
 
-    # Platform-catalog tools have tenant_id IS NULL and are available to
-    # every tenant; SQL IN does not match NULL, hence the explicit OR.
-    # Highest version per name wins, which is how a tenant's upgraded
-    # definition shadows the catalog row.
-    stmt = (
-        select(ToolDefinition)
-        .where(
-            (ToolDefinition.tenant_id == tenant_id) | ToolDefinition.tenant_id.is_(None),
-        )
-        .order_by(ToolDefinition.name, ToolDefinition.version.desc())
-    )
-    rows = (await session.execute(stmt)).scalars().all()
+    rows = await list_tenant_tools(session, tenant_id=tenant_id)
 
     result = CapabilityFilter()
     principal = Principal(tenant_id=str(tenant_id), actor_id=principal_id, role=actor_role)
@@ -207,8 +195,3 @@ __all__ = [
     "tenant_capabilities",
     "tools_for_conversation",
 ]
-
-
-# Imported for the risk enum's documentation value: the string literals above
-# must match `ToolRisk`, and referencing it here keeps the two in one file.
-_RISK_VALUES = tuple(ToolRisk)

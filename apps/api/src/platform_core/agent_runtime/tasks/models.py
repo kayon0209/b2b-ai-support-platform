@@ -162,6 +162,12 @@ class ConversationTaskEvent(Base, PkMixin, TenantMixin):
     __tablename__ = "conversation_task_events"
     __table_args__ = (
         UniqueConstraint("tenant_id", "task_id", "sequence", name="uq_conversation_task_event_seq"),
+        UniqueConstraint(
+            "tenant_id",
+            "task_id",
+            "idempotency_key_hash",
+            name="uq_conversation_task_event_idempotency",
+        ),
         Index("ix_conversation_task_events_task", "tenant_id", "task_id", "sequence"),
         # Composite, tenancy-carrying. A two-column (tenant_id, task_id) FK
         # cannot be created unless (tenant_id, id) is unique on the parent,
@@ -187,6 +193,8 @@ class ConversationTaskEvent(Base, PkMixin, TenantMixin):
     actor_ref: Mapped[str | None] = mapped_column(String(63), nullable=True)
     reason_code: Mapped[str] = mapped_column(String(63), nullable=False, server_default="")
     trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    idempotency_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     from_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     to_version: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

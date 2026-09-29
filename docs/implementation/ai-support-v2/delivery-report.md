@@ -601,6 +601,60 @@ GitHub Actions [run #36295891831](https://github.com/kayon0209/b2b-ai-support-pl
 - **PostgreSQL 集成复验**：随机隔离数据库从空库迁移到 `0070_outbox_processing_fence`，运行标准流程、知识发布 gate、客户旅程任务规划、shadow side-effect 和 Demo authority 测试：**73 passed**，1 条 Starlette/httpx deprecation warning。随后在另一新隔离库重跑标准流程及售前权限显隐用例：**25 passed**。临时库随后删除，共用 `platform` 数据库未迁移。
 - **前端与静态检查**：Admin Web 测试通过（12、7、10 项三个小套件，WorkBench tabs 21 项，身份/幂等/版本/草稿同步保护通过）；`npm run typecheck`、`npm run build`、`npm run check:runtime` 通过。7 个变更 Python 文件 Ruff check/format 通过；Mypy 全仓 258 个源文件通过。
 - **R3 Demo 脚本**：`scripts/demo_r3_authorities.py` 成功列出九个固定 synthetic domain facts 和组合证据；结果标明没有人类 authority approval、客户报价禁止、没有 CRM write。
-- **仍未关闭的门禁**：真实 ERP/MES/WMS/CRM/质量/工程 sandbox 与 authority 映射、经人工批准的评测集/主体映射、真实模型质量及费用上限、企业 IdP 撤权、真实 staging 多实例/回滚和外部写入 unknown 对账仍需相应人员/环境。完整原生 macOS VoiceOver 浏览器与弹层朗读/键盘验收仍需真人；PNG 归档未绕过浏览器安全限制。生产发布、评测和标准流程 feature flags 保持默认关闭。
+- **仍未关闭的门禁**：真实 ERP/MES/WMS/CRM/质量/工程 sandbox 与 authority 映射、经人工批准的评测集/主体映射、真实模型质量及费用上限、企业 IdP 撤权、真实 staging 多实例/回滚和外部写入 unknown 对账仍需相应人员/环境。完整原生 macOS VoiceOver 浏览器与弹层朗读/键盘验收仍需真人。本节记录时 PNG 尚未归档；后续本地 Playwright 截图见 §20。生产发布、评测和标准流程 feature flags 保持默认关闭。
 
 **Jev 使用记录**：本轮未使用 Jev；Codex 核对 PR/CI、实现售前只读面板与权限边界，修复全仓类型错误并完成本地复验。
+
+---
+
+## 20. Codex follow-up：R3 Demo CRM、Worker/性能演练、Keycloak 与可访问性证据（2026-09-29）
+
+### 本轮实现
+
+- **R3 Demo CRM 写入闭环**：新增 `crm.create_opportunity`，风险级别为 `confirmed_write`，要求 `tool.write.confirmed` 和坐席人工确认。执行器仅在 `APP_ENVIRONMENT=local|test`、`APP_BUSINESS_API_ADAPTER=demo` 且 connector 配置为 `mode=synthetic` 时建立。模拟机会保存在进程内，不访问网络或外部数据库；记录标记 `synthetic=true`、`customer_contacted=false`，不生成价格。执行后从模拟记录读回并由 Tool Gateway 验证。提案幂等按 tenant/key 加事务 advisory lock，重复相同行为回放原提案，不同 payload 返回 `IDEMPOTENCY_CONFLICT` 并审计。
+- **可重复多 Worker 演练**：`infra/compose/docker-compose.r2-r3-drill.yml` 启动独立临时 PostgreSQL、Redis 与两个同类 outbox Worker。脚本在账务处理事务中杀死一个 Worker，验证另一 Worker 恢复同一 event；随后重放 event 确认只有一条账务行，并测量 1/10/50 个 synthetic usage event 的队列排空时间。最后运行目标集成套件及 `0070_outbox_processing_fence` 单步 downgrade/upgrade。
+- **本地 off/shadow 性能对照**：新增 `scripts/run_local_synthetic_performance.py`，独立数据库上两种模式、并发 50/100、每格 3 轮；分别测量 warm-pool inbox persistence 与真实 shadow enqueue gate，不调用模型。该对照的影子 outbox 数为 off 0、shadow 450。原 pool 5/50 性能断言与本机 macOS 测量方向相反，现改为记录主机实测结果并保留 1500ms 本地宽松上限，避免把 Windows 的单机观测硬编码成跨主机门禁。
+- **本地 Keycloak membership 撤权**：新增 `scripts/run_local_keycloak_revocation.py`。临时 realm 签发的真实 JWT 经平台 OIDC/JWKS 验证；active membership 下 `/v1/cases` 返回 200，membership 暂停后复用同一 JWT 返回 401。realm 与隔离数据库由脚本清理；不会保存 token 或密码。
+- **截图与自动可访问性**：新增 `scripts/run_local_browser_acceptance.py` 与 Playwright/axe 检查；用 3 条合成消息打开非空 Workbench，键盘 Enter 读取证据并检查控件名称、描述及 `aria-live`。修复 axe 检出的状态、空队列、渠道标签和页签低对比度颜色。已生成 1536×1024、1280×800、390×844、320×844、768×512 CSS 200% 模拟共 5 张截图，以及 ARIA snapshot/JSON 报告。
+
+### 本地复验结果
+
+- Worker 故障恢复演练：两个 Worker 启动；被杀 Worker 的同一 event 被 peer 恢复，重复重放仍只有 1 条账务记录。1/10/50 个队列项排空分别约 1021ms/1018ms/1055ms。定向集成和 CRM 用例 **49 passed**；`0070_outbox_processing_fence` downgrade/upgrade 往返通过且保留账务行。
+- off/shadow 对照共 12 轮。Inbox persistence P95（ms）：off/50 并发 `51.476, 18.642, 23.588`；off/100 并发 `37.321, 36.629, 36.258`；shadow/50 并发 `18.896, 41.440, 18.411`；shadow/100 并发 `35.768, 35.862, 34.983`。该路径测量 inbox 持久化函数，不含真实 HTTP socket、签名验证、模型调用或生产网络；数值是本机合成观测，不用于容量承诺。
+- Keycloak 演练：已签 token 200 → membership suspended 后同 token 401。它证明平台每次请求复核 membership；**不**证明企业 IdP 会吊销已签发 token/session。
+- Workbench 浏览器：5 个截图视口均为 0px 横向溢出；桌面 1536×1024 和移动 390×844 的 axe WCAG 2/2.1 A/AA 扫描均为 0 violations；键盘路径、输入 label/description 和 polite live region 检查通过。报告中的 `manualVoiceOverConfirmed=false`；完整原生 VoiceOver 朗读/键盘走查仍待真人。
+- Admin Web `npm run test`、`npm run typecheck`、`npm run check:runtime` 与 `npm run build` 通过；Ruff check/format 通过，Mypy 全仓 259 个 Python source 文件通过。
+
+### 证据位置与仍未关闭项
+
+- Worker：`evidence/local-worker-drill-2026-09-29/worker-drill-report.json`
+- 性能：`evidence/local-perf-2026-09-29/performance-comparison.json`
+- Keycloak：`evidence/local-keycloak-2026-09-29/keycloak-membership-revocation.json`
+- 浏览器：`evidence/local-browser-2026-09-29/accessibility-report.json`、`workbench-aria-snapshot.yml` 与五张 PNG。
+
+仍未完成的边界包括真实 ERP/MES/WMS/CRM、真实外部写入超时后的 unknown 对账、生产近似多主机 staging、获批评测数据/真实模型质量与费用、企业 IdP token/session 撤销和完整真人 VoiceOver。所有生产发布开关仍关闭；这些本地合成演练不作为生产容量或企业连接验收。
+
+**Jev 使用记录**：本轮未使用 Jev；Codex 负责实现 Tool Gateway Demo 写入、演练脚本、浏览器修复、验证和验收状态同步。
+
+## 21. 代码评审修复与最终复验（2026-09-29）
+
+本节记录对近期前端与工程代码评审中可在本地完成的问题的修复。企业业务数据源、connector 和外部系统接入代码按用户要求不在本轮修改范围内。
+
+- **任务数据隐私**：标准流程 `FlowField.sensitive` 会在收集和响应投影中生效；任务自由文本统一执行 PII 形状脱敏，历史行在响应前再次净化。电话正则现保留并完整替换国际区号前缀。
+- **草稿一致性**：回复成功后按原会话和提交快照版本清理 sessionStorage；广播带新版本的清除消息，不覆盖发送期间新编辑的内容。跨标签接收端拒绝较旧时间戳。任务命令在前端同一请求重试时复用幂等键。
+- **任务命令幂等**：新增 `0071_task_command_idempotency`，在 append-only task event 中保存幂等键哈希及请求哈希。同键同请求返回当前任务作为重放结果；同键不同请求返回冲突。隔离集成测试覆盖这两条路径。
+- **模块接口**：Task 模块通过 Tool Gateway 的 catalog/receipt/proposal-ID 接口工作；Knowledge 路由通过 Outbox service 读取回执和幂等入队，不再直接访问这些模块的 ORM 模型。
+- **工作台 UI**：任务操作错误与列表加载错误分离；标准流程目录有重试；任务和流程按钮有一致状态样式；暗色任务/流程/队列/对话元数据/页签对比度修复；移动抽屉公开 `aria-expanded` 并在关闭时恢复焦点。TaskPanel、标准流程、售前证据及副驾页签支持中英文，用户文案不再显示字段 key 或报价布尔字段。
+- **本地性能证据**：Worker 演练报告现在包含 pool 5/50 对比结果；两种 pool 的本机 P50 绝对上限保留，并新增 pool 50 相对 pool 5 不得慢超过 10 倍的宽松异常保护。报告仍明确标记为单机合成数据。
+
+### 最终本地验证
+
+- Admin Web：`npm test` 通过（12 + 7 + 10 组件/状态测试，21 项页签键盘检查，19 项草稿同步检查）；`npm run typecheck` 通过。
+- API：任务隐私和规划器单测 **18 passed**；全仓 Mypy **260 source files** 通过；涉及的 16 个 Python 文件 Ruff check/format 通过。
+- 隔离 Docker Worker 演练：**80 passed**；Worker 崩溃恢复后保持单条账务记录；1/10/50 任务队列均排空；`0071` downgrade/upgrade 往返后数据保留。
+- Playwright/axe：中文桌面亮色、桌面暗色、移动端和英文桌面共 4 组 axe 扫描，均为 **0 violations**；6 张截图，页面横向溢出均为 0；键盘焦点恢复、非空任务行和禁用操作检查通过。
+- 截图、ARIA snapshot 与报告：`evidence/local-browser-review-final-2026-09-29/`。Worker/migration/幂等/池对比报告：`evidence/local-worker-drill-review-final-2026-09-29/worker-drill-report.json`。
+
+真人 macOS VoiceOver 完整朗读/弹层走查仍需人工完成；真实企业 IdP、外部连接器、staging 和生产容量门禁仍按各自验收条件处理。本节报告绑定本地隔离 worktree，尚无覆盖当前未提交改动的远端 CI。
+
+**Jev 使用记录**：未使用 Jev；Codex 负责代码实现、隔离数据库/浏览器复验和证据归档。

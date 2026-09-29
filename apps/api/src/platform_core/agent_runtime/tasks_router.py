@@ -87,8 +87,7 @@ from platform_core.identity.control_lease import LeaseConflict
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.integrations.readiness import active_connector_capabilities
 from platform_core.knowledge import flag_service
-from platform_core.outbox import OutboxEvent
-from platform_core.outbox_service import enqueue
+from platform_core.outbox_service import enqueue, latest_status_for_aggregate
 from platform_policy import Action
 
 router = APIRouter(prefix="/v1/workbench", tags=["workbench-tasks"])
@@ -207,7 +206,7 @@ def _task_out(
         "sequence": row.sequence,
         "version": row.version,
         "action_revision": row.action_revision,
-        "slots": row.slots,
+        "slots": _sanitize_task_slots(row.flow_key, row.slots),
         "missing_slots": row.missing_slots,
         "depends_on": row.depends_on,
         "condition": row.condition,
@@ -224,6 +223,51 @@ def _task_out(
         "flow_can_query_order": bool(row.flow_key in DEMO_ORDER_FLOWS and can_query_order_flow),
         "updated_at": row.updated_at,
     }
+
+
+def _flow_sensitive_fields(flow_key: str | None) -> set[str]:
+    if not flow_key:
+        return set()
+    template = get_standard_flow(flow_key)
+    if template is None:
+        return set()
+    return {
+        field.name
+        for field in (*template.required_fields, *template.optional_fields)
+        if field.sensitive
+    }
+
+
+def _sanitize_task_slots(flow_key: str | None, slots: Any) -> list[dict[str, Any]]:
+    """Remove sensitive values and redact PII from slots, including old rows.
+
+    The projection is a second privacy boundary: historical rows may have
+    been written before collection redaction was made comprehensive.
+    """
+    sensitive_fields = _flow_sensitive_fields(flow_key)
+    safe_slots: list[dict[str, Any]] = []
+    for raw_slot in slots if isinstance(slots, list) else []:
+        if not isinstance(raw_slot, dict):
+            continue
+        slot = dict(raw_slot)
+        name = str(slot.get("name", ""))
+        origin = slot.get("origin")
+        sensitive = (
+            name in sensitive_fields
+            or name.lower() in SENSITIVE_FIELD_NAMES
+            or should_withhold_value(name)
+        )
+        if sensitive:
+            if "value" in slot:
+                slot.pop("value", None)
+                slot["value_withheld"] = True
+        elif isinstance(slot.get("value"), str) and origin in {
+            "customer_stated",
+            "agent_collected",
+        }:
+            slot["value"], _redaction_count = redact_text(slot["value"])
+        safe_slots.append(slot)
+    return safe_slots
 
 
 # --- tasks ------------------------------------------------------------------
@@ -680,6 +724,8 @@ async def command_conversation_task(
     missing = require_write_idempotency(request, Action.CASE_UPDATE)
     if missing is not None:
         return missing
+    idempotency_key = request.headers["Idempotency-Key"]
+    idempotency_key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
     if ctx.actor_id is None:
         return error_response(VALIDATION_FAILED, "an identified agent is required", status_code=400)
     if body.command not in ALLOWED_COMMANDS:
@@ -706,6 +752,17 @@ async def command_conversation_task(
 
     actor_ref = str(ctx.actor_id)
     trace_id = new_trace_id()
+    request_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "tenant_id": str(ctx.tenant_id),
+                "actor_id": str(ctx.actor_id),
+                "command": body.model_dump(mode="json"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     try:
         async with tenant_session(ctx) as session:
             # Ownership first, and re-read inside this transaction: the panel
@@ -749,11 +806,43 @@ async def command_conversation_task(
                 proposal_denied = require_policy(ctx, Action.TOOL_WRITE_CONFIRMED)
                 if proposal_denied is not None:
                     return proposal_denied
-
             if body.command == "query_order_status":
                 query_denied = require_policy(ctx, Action.TOOL_READ)
                 if query_denied is not None:
                     return query_denied
+
+            prior_request_hash = await task_store.command_request_hash(
+                session,
+                tenant_id=ctx.tenant_id,
+                task_id=task.id,
+                idempotency_key_hash=idempotency_key_hash,
+            )
+            if prior_request_hash is not None:
+                if prior_request_hash != request_hash:
+                    return error_response(
+                        "IDEMPOTENCY_CONFLICT",
+                        "Idempotency-Key was already used for a different task command",
+                        status_code=409,
+                    )
+                return ok_response(
+                    {
+                        "task": _task_out(
+                            task,
+                            can_prepare_flow_proposal=_can_prepare_flow_proposal(
+                                task.flow_key, ctx
+                            ),
+                            can_query_order_flow=_can_query_order_flow(
+                                task.flow_key,
+                                ctx,
+                                orders_read_available=orders_read_available,
+                            ),
+                        ),
+                        "replayed": True,
+                    },
+                    trace_id=trace_id,
+                )
+
+            if body.command == "query_order_status":
                 updated = await _run_demo_order_query(
                     session,
                     ctx=ctx,
@@ -762,6 +851,8 @@ async def command_conversation_task(
                     expected_version=body.expected_version,
                     actor_ref=actor_ref,
                     trace_id=trace_id,
+                    idempotency_key_hash=idempotency_key_hash,
+                    request_hash=request_hash,
                 )
             else:
                 command = await _build_command(
@@ -779,6 +870,11 @@ async def command_conversation_task(
                         "this command does not apply to the task's current state",
                         status_code=409,
                     )
+                command = replace(
+                    command,
+                    idempotency_key_hash=idempotency_key_hash,
+                    request_hash=request_hash,
+                )
 
                 if (
                     task.proposal_id is not None
@@ -848,7 +944,8 @@ async def command_conversation_task(
                     ctx,
                     orders_read_available=orders_read_available,
                 ),
-            )
+            ),
+            "replayed": False,
         },
         trace_id=trace_id,
     )
@@ -908,6 +1005,7 @@ async def _persist_collected(
     fields: dict[str, str],
     *,
     verified_fields: dict[str, dict[str, Any]] | None = None,
+    flow_key: str | None = None,
 ) -> list[dict[str, Any]]:
     """Persist operator-collected values with their actual provenance.
 
@@ -921,6 +1019,7 @@ async def _persist_collected(
         raise ValueError("an identified agent is required to collect task fields")
 
     slots: list[dict[str, Any]] = []
+    schema_sensitive_fields = _flow_sensitive_fields(flow_key)
     for name, value in fields.items():
         verification = (verified_fields or {}).get(name)
         if verification is not None:
@@ -937,7 +1036,11 @@ async def _persist_collected(
                 }
             )
             continue
-        sensitive = name.lower() in SENSITIVE_FIELD_NAMES or should_withhold_value(name)
+        sensitive = (
+            name in schema_sensitive_fields
+            or name.lower() in SENSITIVE_FIELD_NAMES
+            or should_withhold_value(name)
+        )
         slot: dict[str, Any] = {
             "name": name,
             "origin": "agent_collected",
@@ -948,9 +1051,7 @@ async def _persist_collected(
         if sensitive:
             slot["value_withheld"] = True
         else:
-            safe_value = value
-            if name in {"issue_summary", "question_or_symptom"}:
-                safe_value, _redaction_count = redact_text(safe_value)
+            safe_value, _redaction_count = redact_text(value)
             slot["value"] = safe_value
         slots.append(slot)
     return slots
@@ -1026,6 +1127,8 @@ async def _run_demo_order_query(
     expected_version: int,
     actor_ref: str,
     trace_id: str,
+    idempotency_key_hash: str,
+    request_hash: str,
 ) -> Any:
     """Run one explicit Demo order read through Tool Gateway and record its receipt."""
     if ctx.actor_id is None:
@@ -1099,7 +1202,6 @@ async def _run_demo_order_query(
         )
 
     from platform_core.tool_gateway.gateway import ToolDenied, ToolGateway, ToolGatewayError
-    from platform_core.tool_gateway.models import ToolExecution
     from platform_core.tool_gateway.registry import resolve_executors
 
     executors = await resolve_executors(
@@ -1118,7 +1220,7 @@ async def _run_demo_order_query(
     proposal_key = f"standard-flow:{task.id}:order-status:r{task.action_revision}"
     gateway = ToolGateway(session, executors)
     try:
-        proposal = await gateway.propose(
+        proposal_id = await gateway.propose_id(
             tenant_id=ctx.tenant_id,
             actor_id=ctx.actor_id,
             tool_name="order.get_status",
@@ -1144,32 +1246,26 @@ async def _run_demo_order_query(
             actor_ref=actor_ref,
             trace_id=trace_id,
             expected_version=expected_version,
-            proposal_id=proposal.id,
+            proposal_id=proposal_id,
         ),
     )
     try:
-        execution = await gateway.execute(
+        execution = await gateway.execute_receipt(
             tenant_id=ctx.tenant_id,
             actor_id=ctx.actor_id,
-            proposal_id=proposal.id,
+            proposal_id=proposal_id,
         )
     except ToolGatewayError as exc:
-        execution = (
-            await session.execute(
-                sa_select(ToolExecution)
-                .where(
-                    ToolExecution.tenant_id == ctx.tenant_id,
-                    ToolExecution.proposal_id == proposal.id,
-                )
-                .order_by(ToolExecution.started_at.desc(), ToolExecution.id.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if execution is None:
+        recovered_execution = await gateway.execution_receipt(
+            tenant_id=ctx.tenant_id,
+            proposal_id=proposal_id,
+        )
+        if recovered_execution is None:
             raise TaskCommandRefused(
                 "FLOW_ORDER_QUERY_FAILED",
                 "the Demo order query failed before an execution receipt was recorded",
             ) from exc
+        execution = recovered_execution
 
     output = execution.sanitized_output if isinstance(execution.sanitized_output, dict) else {}
     verified_owner = (
@@ -1253,6 +1349,8 @@ async def _run_demo_order_query(
             blocked_reason=blocked_reason,
             slots=slots,
             execution_id=execution.id,
+            idempotency_key_hash=idempotency_key_hash,
+            request_hash=request_hash,
         ),
     )
     await audit_service.record(
@@ -1286,7 +1384,7 @@ async def _build_command(
     body: TaskCommandIn,
     actor_ref: str,
     trace_id: str,
-) -> Any | None:
+) -> task_store.TaskCommand | None:
     """Map one command name to a `TaskCommand`, or None when it does not
     apply.
 
@@ -1378,6 +1476,7 @@ async def _build_command(
             ctx=ctx,
             fields=body.fields,
             verified_fields=verified_fields,
+            flow_key=task.flow_key,
         )
 
         remaining = [m for m in task.missing_slots if m not in requested]
@@ -1534,7 +1633,7 @@ async def _build_command(
             ),
             blocked_reason="",
             bump_action_revision=True,
-            proposal_id=proposal.id,
+            proposal_id=proposal,
             **base,
         )
 
@@ -1563,7 +1662,7 @@ async def _build_command(
         target=TaskStatus.AWAITING_CONFIRMATION,
         reason_code="TASK_PROPOSAL_PREPARED",
         bump_action_revision=True,
-        proposal_id=proposal.id,
+        proposal_id=proposal,
         **base,
     )
 
@@ -1575,7 +1674,7 @@ async def _create_proposal(
     task: Any,
     trace_id: str,
     verified_account_id: uuid.UUID | None = None,
-) -> Any | None:
+) -> uuid.UUID | None:
     """Create a real `ToolProposal` for a write task, or None when it cannot.
 
     The gateway is the only path to a business write, and this calls it rather
@@ -1592,27 +1691,15 @@ async def _create_proposal(
     rather than generated per request, so a double-clicked "准备提案" creates
     one proposal rather than two.
     """
-    from sqlalchemy import select as sa_select
-
+    from platform_core.tool_gateway.catalog import tool_risk
     from platform_core.tool_gateway.gateway import ToolDenied, ToolGateway, ToolGatewayError
-    from platform_core.tool_gateway.models import ToolDefinition, ToolProposal
 
     tool_name = _write_tool_for(task)
     if not tool_name:
         return None
 
-    tool = (
-        await session.execute(
-            sa_select(ToolDefinition)
-            .where(
-                (ToolDefinition.tenant_id == ctx.tenant_id) | ToolDefinition.tenant_id.is_(None),
-                ToolDefinition.name == tool_name,
-            )
-            .order_by(ToolDefinition.version.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if tool is None or tool.risk not in ("low_write", "confirmed_write", "human_approval"):
+    risk = await tool_risk(session, tenant_id=ctx.tenant_id, tool_name=tool_name)
+    if risk not in ("low_write", "confirmed_write", "human_approval"):
         return None
 
     arguments = _proposal_arguments(task, verified_account_id=verified_account_id)
@@ -1626,7 +1713,7 @@ async def _create_proposal(
         "low_write": "tool.write.low",
         "confirmed_write": "tool.write.confirmed",
         "human_approval": "tool.human_approval",
-    }[tool.risk]
+    }[risk]
 
     # The gateway's `propose` always inserts: it is a "freeze these arguments"
     # operation with no replay semantics of its own. So the replay check lives
@@ -1637,25 +1724,20 @@ async def _create_proposal(
     # from a deliberate re-proposal with changed arguments - which is the exact
     # distinction the action revision exists to make.
     key = f"task-{task.id}-r{task.action_revision}"
-    existing = (
-        await session.execute(
-            sa_select(ToolProposal).where(
-                ToolProposal.tenant_id == ctx.tenant_id,
-                ToolProposal.idempotency_key == key,
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing
-
     gateway = ToolGateway(session, {})
+    existing_id = await gateway.proposal_id_for_idempotency_key(
+        tenant_id=ctx.tenant_id,
+        idempotency_key=key,
+    )
+    if existing_id is not None:
+        return existing_id
     if ctx.actor_id is None:
         # The route refuses an unidentified caller before reaching here; this
         # is the type-level statement of the same rule, because a proposal
         # with no actor is a write nobody can be shown to have authorised.
         return None
     try:
-        return await gateway.propose(
+        proposal_id = await gateway.propose_id(
             tenant_id=ctx.tenant_id,
             actor_id=ctx.actor_id,
             tool_name=tool_name,
@@ -1668,6 +1750,7 @@ async def _create_proposal(
             permission_allowed=True,
             required_action=required_action,
         )
+        return proposal_id
     except (ToolGatewayError, ToolDenied) as exc:
         # Logged, not swallowed. The previous revision caught this and returned
         # None with nothing recorded, which is how a proposal that was never
@@ -2182,15 +2265,12 @@ async def read_copilot_job(request: Request, conversation_ref: uuid.UUID, job_id
                 payload["status"] = CopilotJobStatus.EXPIRED.value
                 payload["error_code"] = "COPILOT_JOB_EXPIRED"
             elif row.status == CopilotJobStatus.QUEUED.value:
-                event_status = (
-                    await session.execute(
-                        sa_select(OutboxEvent.status).where(
-                            OutboxEvent.tenant_id == ctx.tenant_id,
-                            OutboxEvent.event_type == COPILOT_EVENT_TYPE,
-                            OutboxEvent.aggregate_id == str(row.job_id),
-                        )
-                    )
-                ).scalar_one_or_none()
+                event_status = await latest_status_for_aggregate(
+                    session,
+                    tenant_id=ctx.tenant_id,
+                    event_type=COPILOT_EVENT_TYPE,
+                    aggregate_id=str(row.job_id),
+                )
                 if event_status == "processing":
                     payload["status"] = CopilotJobStatus.RUNNING.value
 

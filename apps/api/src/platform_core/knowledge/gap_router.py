@@ -27,7 +27,6 @@ enforced in `gap_service` so the HTTP path cannot bypass them.
 
 import hashlib
 import json
-import time
 import uuid
 from typing import Annotated, Any, Literal
 
@@ -41,6 +40,7 @@ from platform_contracts.release_attestation import (
     SignedReleaseEvaluationArtifact,
     SignedReleasePostTestArtifact,
 )
+from platform_core import outbox_service
 from platform_core.api import (
     domain_error_response,
     error_response,
@@ -67,7 +67,6 @@ from platform_core.knowledge.release_signatures import (
     configured_approved_release_datasets,
     configured_evaluator_public_keys,
 )
-from platform_core.outbox import OutboxEvent, OutboxStatus
 from platform_policy import Action, Decision, PolicyEngine, Principal
 
 router = APIRouter(prefix="/v1/knowledge", tags=["knowledge-gaps"])
@@ -485,44 +484,41 @@ async def publish_gap_draft(
                     ctx.tenant_id,
                     f"knowledge-release-post-test:{payload.release_evaluation_id}",
                 )
-                existing = (
-                    await session.execute(
-                        select(OutboxEvent).where(
-                            OutboxEvent.tenant_id == ctx.tenant_id,
-                            OutboxEvent.event_id == event_id,
-                        )
-                    )
-                ).scalar_one_or_none()
+                existing = await outbox_service.get_receipt(
+                    session, tenant_id=ctx.tenant_id, event_id=event_id
+                )
                 if existing is not None:
-                    if (existing.payload or {}).get("request_hash") != post_hash:
+                    if existing.payload.get("request_hash") != post_hash:
                         return error_response("IDEMPOTENCY_CONFLICT", status_code=409)
                 else:
-                    session.add(
-                        OutboxEvent(
-                            id=uuid.uuid4(),
-                            tenant_id=ctx.tenant_id,
-                            event_id=event_id,
-                            event_type=release_evaluator.RELEASE_POST_TEST_REQUEST_EVENT,
-                            event_version=1,
-                            aggregate_type="knowledge_release_evaluation",
-                            aggregate_id=str(payload.release_evaluation_id),
-                            payload={**post_payload, "request_hash": post_hash},
-                            status=OutboxStatus.QUEUED.value,
-                            created_at=int(time.time()),
-                            trace_id=getattr(request.state, "trace_id", "") or "",
-                        )
-                    )
-                    await audit_service.record(
+                    inserted = await outbox_service.enqueue_once(
                         session,
-                        ctx=ctx,
-                        action="knowledge.release_post_test_requested",
-                        resource_type="knowledge_release_evaluation",
-                        resource_id=payload.release_evaluation_id,
-                        metadata={
-                            "event_id": str(event_id),
-                            "dataset_sha256": post_approval.sha256,
-                        },
+                        tenant_id=ctx.tenant_id,
+                        event_id=event_id,
+                        event_type=release_evaluator.RELEASE_POST_TEST_REQUEST_EVENT,
+                        aggregate_type="knowledge_release_evaluation",
+                        aggregate_id=str(payload.release_evaluation_id),
+                        payload={**post_payload, "request_hash": post_hash},
+                        trace_id=getattr(request.state, "trace_id", "") or "",
                     )
+                    if not inserted:
+                        existing = await outbox_service.get_receipt(
+                            session, tenant_id=ctx.tenant_id, event_id=event_id
+                        )
+                        if existing is None or existing.payload.get("request_hash") != post_hash:
+                            return error_response("IDEMPOTENCY_CONFLICT", status_code=409)
+                    else:
+                        await audit_service.record(
+                            session,
+                            ctx=ctx,
+                            action="knowledge.release_post_test_requested",
+                            resource_type="knowledge_release_evaluation",
+                            resource_id=payload.release_evaluation_id,
+                            metadata={
+                                "event_id": str(event_id),
+                                "dataset_sha256": post_approval.sha256,
+                            },
+                        )
     except gap_service.GapError as exc:
         return _gap_error(exc)
     except release_service.KnowledgeReleaseError as exc:
@@ -792,36 +788,38 @@ async def request_internal_knowledge_release_evaluation(
             json.dumps(request_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         event_id = uuid.uuid5(ctx.tenant_id, f"knowledge-release-evaluation:{key_hash}")
-        existing = (
-            await session.execute(
-                select(OutboxEvent).where(
-                    OutboxEvent.tenant_id == ctx.tenant_id,
-                    OutboxEvent.event_id == event_id,
-                )
-            )
-        ).scalar_one_or_none()
+        existing = await outbox_service.get_receipt(
+            session, tenant_id=ctx.tenant_id, event_id=event_id
+        )
         if existing is not None:
-            if (existing.payload or {}).get("request_hash") != request_hash:
+            if existing.payload.get("request_hash") != request_hash:
                 return error_response("IDEMPOTENCY_CONFLICT", status_code=409)
             return {
                 "event_id": str(existing.event_id),
-                "status": str(existing.status),
+                "status": existing.status,
                 "replayed": True,
             }
-        event = OutboxEvent(
-            id=uuid.uuid4(),
+        inserted = await outbox_service.enqueue_once(
+            session,
             tenant_id=ctx.tenant_id,
             event_id=event_id,
             event_type=release_evaluator.RELEASE_EVALUATION_REQUEST_EVENT,
-            event_version=1,
             aggregate_type="knowledge_draft",
             aggregate_id=str(draft.id),
             payload={**request_payload, "request_hash": request_hash},
-            status=OutboxStatus.QUEUED.value,
-            created_at=int(time.time()),
             trace_id=getattr(request.state, "trace_id", "") or "",
         )
-        session.add(event)
+        if not inserted:
+            existing = await outbox_service.get_receipt(
+                session, tenant_id=ctx.tenant_id, event_id=event_id
+            )
+            if existing is None or existing.payload.get("request_hash") != request_hash:
+                return error_response("IDEMPOTENCY_CONFLICT", status_code=409)
+            return {
+                "event_id": str(existing.event_id),
+                "status": existing.status,
+                "replayed": True,
+            }
         await audit_service.record(
             session,
             ctx=ctx,
@@ -835,7 +833,11 @@ async def request_internal_knowledge_release_evaluation(
             },
         )
         await session.commit()
-    return {"event_id": str(event_id), "status": OutboxStatus.QUEUED.value, "replayed": False}
+    return {
+        "event_id": str(event_id),
+        "status": "queued",
+        "replayed": False,
+    }
 
 
 @router.post("/internal/drafts/{draft_id}/release-evaluations")

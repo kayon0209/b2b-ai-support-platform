@@ -24,6 +24,7 @@ import {
 import {
   parseWorkbenchComposerDraft,
   parseWorkbenchDraftSyncMessage,
+  isSubmittedDraftSnapshot,
   remoteDraftDecision,
   workbenchDraftChannelName,
   workbenchDraftStorageKey,
@@ -206,11 +207,9 @@ const STATUS: Record<string, string> = {
   waiting_vendor: "等待供应商", resolved: "已解决", closed: "已关闭",
   reopened: "重新打开",
 };
-const RIGHT_TAB_LABEL: Record<WorkbenchRightTab, string> = {
-  reply: "话术",
-  knowledge: "知识",
-  tools: "工具",
-  tasks: "任务",
+const RIGHT_TAB_LABEL: Record<"en" | "zh", Record<WorkbenchRightTab, string>> = {
+  zh: { reply: "话术", knowledge: "知识", tools: "工具", tasks: "任务" },
+  en: { reply: "Reply", knowledge: "Knowledge", tools: "Tools", tasks: "Tasks" },
 };
 const EMOTION_LABEL: Record<EmotionLevel, string> = {
   calm: "平稳", frustrated: "不满", angry: "愤怒", escalation_risk: "升级风险",
@@ -283,6 +282,47 @@ function workbenchDraftSnapshot(
     copilot_job_id: metadata.copilotJobId,
     updated_at_ms: updatedAtMs,
   };
+}
+
+function clearSubmittedDraftSnapshot(
+  actorRef: string | null,
+  conversationRef: string,
+  submittedBody: string,
+  submittedUpdatedAtMs: number,
+  senderTabId: string,
+): void {
+  if (!actorRef) return;
+  const key = workbenchDraftStorageKey(actorRef, conversationRef);
+  try {
+    const saved = parseWorkbenchComposerDraft(
+      window.sessionStorage.getItem(key),
+      actorRef,
+      conversationRef,
+    );
+    if (isSubmittedDraftSnapshot(saved, submittedBody, submittedUpdatedAtMs)) {
+      window.sessionStorage.removeItem(key);
+    }
+  } catch {
+    // Draft recovery is best-effort when browser storage is disabled.
+  }
+
+  if (typeof BroadcastChannel === "undefined") return;
+  try {
+    const channel = new BroadcastChannel(workbenchDraftChannelName(actorRef, conversationRef));
+    channel.postMessage({
+      schema_version: 1,
+      kind: "clear",
+      sender_tab_id: senderTabId,
+      actor_ref: actorRef,
+      conversation_ref: conversationRef,
+      // The clear supersedes the submitted version, while a draft created
+      // after this successful send has a later timestamp and remains intact.
+      updated_at_ms: Math.max(Date.now(), submittedUpdatedAtMs + 1),
+    });
+    channel.close();
+  } catch {
+    // A closed or unavailable channel cannot affect the successful send.
+  }
 }
 
 function copilotStorageKey(conversationRef: string): string {
@@ -384,6 +424,11 @@ export function Workbench() {
   const [copilotError, setCopilotError] = useState<string | null>(null);
   const [draftCopilotJobId, setDraftCopilotJobId] = useState<string | null>(null);
   const [rightOpen, setRightOpen] = useState(() => window.innerWidth > 1320);
+  const rightToggleRef = useRef<HTMLButtonElement | null>(null);
+  const closeRightPanel = useCallback(() => {
+    setRightOpen(false);
+    window.requestAnimationFrame(() => rightToggleRef.current?.focus());
+  }, []);
   const [mobileQueue, setMobileQueue] = useState(!conversationRef);
   const [menuOpen, setMenuOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
@@ -826,7 +871,13 @@ export function Workbench() {
         return;
       }
       const incomingBody = message.kind === "draft" ? message.draft?.body ?? "" : "";
-      const decision = remoteDraftDecision(draftTextRef.current, draftDirtyRef.current, incomingBody);
+      const decision = remoteDraftDecision(
+        draftTextRef.current,
+        draftDirtyRef.current,
+        incomingBody,
+        draftUpdatedAtRef.current,
+        message.updated_at_ms,
+      );
       if (decision === "ignore") return;
       if (decision === "conflict") {
         setOtherTabDraft(message.kind === "draft" ? message.draft ?? null : null);
@@ -1130,6 +1181,10 @@ export function Workbench() {
     const conversation = detail.conversation_ref;
     const text = draft.trim();
     if (!text || text.length > 4000) return;
+    const submittedDraftBody = draft;
+    const submittedDraftUpdatedAtMs = draftUpdatedAtRef.current;
+    const submittedActorRef = myRef;
+    const submittedTabId = draftTabId;
     const submittedDraftRevision = draftRevision.current;
     const key = pendingReplyIdempotencyKey(pendingSend.current, conversation, text, newIdempotencyKey);
     setBusy(true);
@@ -1146,6 +1201,13 @@ export function Workbench() {
         key,
       );
       forgetPendingReply(pendingSend.current, conversation, key);
+      clearSubmittedDraftSnapshot(
+        submittedActorRef,
+        conversation,
+        submittedDraftBody,
+        submittedDraftUpdatedAtMs,
+        submittedTabId,
+      );
       if (!isCurrentWorkbenchConversation(conversation, activeConversationRef.current)) return;
       if (canClearSubmittedDraft(submittedDraftRevision, draftRevision.current)) {
         updateDraft("", { dirty: false, broadcast: true });
@@ -1362,7 +1424,16 @@ export function Workbench() {
                 <button className="wb-secondary-small" type="button" onClick={() => { setTransferOpen(true); setTargetAgent(""); }}>转接</button>
                 <button className="wb-secondary-small" type="button" onClick={() => setConfirmClose(true)}>结束会话</button>
               </> : null}
-              <button className="wb-icon-btn wb-right-toggle" type="button" onClick={() => setRightOpen((open) => !open)} aria-label={rightOpen ? "收起 AI 副驾" : "展开 AI 副驾"}><Sparkles size={20} /></button>
+              <button
+                ref={rightToggleRef}
+                className="wb-icon-btn wb-right-toggle"
+                type="button"
+                onClick={() => (rightOpen ? closeRightPanel() : setRightOpen(true))}
+                aria-label={rightOpen
+                  ? (lang === "zh" ? "收起 AI 副驾" : "Close AI assistant")
+                  : (lang === "zh" ? "展开 AI 副驾" : "Open AI assistant")}
+                aria-expanded={rightOpen}
+              ><Sparkles size={20} /></button>
             </header>
             <div className="wb-transcript" role="log" aria-label="对话记录" aria-live="polite" ref={transcriptRef}>
               {olderBefore ? <button type="button" className="wb-load-history" disabled={busy} onClick={() => void loadOlder()}>查看更早消息</button> : null}
@@ -1408,8 +1479,8 @@ export function Workbench() {
           </> : null}
         </section>
 
-        {detail && detailIsCurrent && rightOpen ? <aside className="wb-right" aria-label="AI 副驾与客户上下文">
-          <div className="wb-right-header"><Sparkles size={20} /><strong>AI 副驾</strong><button type="button" className="wb-right-close" aria-label="收起 AI 副驾" onClick={() => setRightOpen(false)}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label="副驾内容">{WORKBENCH_RIGHT_TABS.map((key) => <button type="button" role="tab" id={`wb-right-tab-${key}`} aria-controls="wb-right-panel" aria-selected={rightTab === key} tabIndex={rightTab === key ? 0 : -1} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)} onKeyDown={(event) => { const next = nextWorkbenchRightTab(key, event.key, event); if (!next) return; event.preventDefault(); setRightTab(next); document.getElementById(`wb-right-tab-${next}`)?.focus(); }}>{RIGHT_TAB_LABEL[key]}</button>)}</div></div>
+        {detail && detailIsCurrent && rightOpen ? <aside className="wb-right" aria-label={lang === "zh" ? "AI 副驾与客户上下文" : "AI assistant and customer context"}>
+          <div className="wb-right-header"><Sparkles size={20} /><strong>{lang === "zh" ? "AI 副驾" : "AI assistant"}</strong><button type="button" className="wb-right-close" aria-label={lang === "zh" ? "收起 AI 副驾" : "Close AI assistant"} onClick={closeRightPanel}><X size={17} /></button><div className="wb-right-tabs" role="tablist" aria-label={lang === "zh" ? "副驾内容" : "Assistant panels"}>{WORKBENCH_RIGHT_TABS.map((key) => <button type="button" role="tab" id={`wb-right-tab-${key}`} aria-controls="wb-right-panel" aria-selected={rightTab === key} tabIndex={rightTab === key ? 0 : -1} className={rightTab === key ? "active" : ""} key={key} onClick={() => setRightTab(key)} onKeyDown={(event) => { const next = nextWorkbenchRightTab(key, event.key, event); if (!next) return; event.preventDefault(); setRightTab(next); document.getElementById(`wb-right-tab-${next}`)?.focus(); }}>{RIGHT_TAB_LABEL[lang][key]}</button>)}</div></div>
           <div className="wb-right-scroll" id="wb-right-panel" role="tabpanel" aria-labelledby={`wb-right-tab-${rightTab}`} tabIndex={0}>
             {rightTab === "reply" ? <>
               {detail.emotion_advice ? <section className={`wb-panel wb-emotion-panel is-${detail.emotion_advice.attention}`} aria-labelledby="wb-emotion-heading">

@@ -28,7 +28,7 @@ from typing import Any
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability_metrics import get_metrics
@@ -50,6 +50,9 @@ from platform_core.outbox_service import enqueue
 from platform_core.tool_gateway.gateway import (
     ToolGateway,
     ToolGatewayError,
+    compute_action_hash,
+    sanitize_arguments,
+    validate_against_schema,
 )
 from platform_core.tool_gateway.models import (
     ActionConfirmation,
@@ -286,6 +289,68 @@ async def propose_tool_call(request: Request, body: ToolProposeIn) -> Any:
         if denied is not None:
             return denied
 
+        # The proposal row is the durable confirmation target, so duplicate
+        # submissions must resolve to one frozen action. The transaction lock
+        # closes the select-then-insert race across API processes without a
+        # migration; the scope is tenant + caller-provided idempotency key.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:scope, 0))"),
+            {"scope": f"tool-proposal:{ctx.tenant_id}:{idem}"},
+        )
+        existing = (
+            await session.execute(
+                select(ToolProposal)
+                .where(
+                    ToolProposal.tenant_id == ctx.tenant_id,
+                    ToolProposal.idempotency_key == idem,
+                )
+                .order_by(ToolProposal.id.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            try:
+                validate_against_schema(body.arguments, tool.input_schema)
+            except ToolGatewayError as exc:
+                return gateway_error_response(exc, trace_id=trace_id)
+            expected_hash = compute_action_hash(
+                tool.name,
+                tool.version,
+                sanitize_arguments(body.arguments),
+            )
+            if existing.tool_definition_id != tool.id or existing.action_hash != expected_hash:
+                await audit_service.record(
+                    session,
+                    ctx=ctx,
+                    action="tool_proposal.idempotency_conflict",
+                    resource_type="tool_proposal",
+                    resource_id=existing.id,
+                    decision="denied",
+                    reason_code="IDEMPOTENCY_CONFLICT",
+                    trace_id=trace_id,
+                )
+                return error_response(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Idempotency-Key was already used for a different tool action",
+                    status_code=409,
+                    trace_id=trace_id,
+                )
+            await audit_service.record(
+                session,
+                ctx=ctx,
+                action="tool_proposal.replayed",
+                resource_type="tool_proposal",
+                resource_id=existing.id,
+                decision="completed",
+                reason_code="IDEMPOTENT_REPLAY",
+                trace_id=trace_id,
+            )
+            return ok_response(
+                {"proposal": _serialize_proposal(existing, tool), "replayed": True},
+                trace_id=trace_id,
+            )
+
         if ctx.actor_id is None:
             # The gateway records actor_id as a non-nullable column; an
             # unattributable write must not be proposed at all.
@@ -342,7 +407,7 @@ async def propose_tool_call(request: Request, body: ToolProposeIn) -> Any:
         )
         payload = _serialize_proposal(proposal, tool)
 
-    return ok_response({"proposal": payload}, trace_id=trace_id)
+    return ok_response({"proposal": payload, "replayed": False}, trace_id=trace_id)
 
 
 @router.post("/{proposal_id}/confirm")

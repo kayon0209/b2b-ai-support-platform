@@ -47,9 +47,23 @@ import argparse
 import json
 import os
 import re
+import sys
 import uuid
+from urllib.parse import urlparse
 
 from sqlalchemy import create_engine, text
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _source_root in (
+    "apps/api/src",
+    "apps/worker/src",
+    "packages/policy/src",
+    "packages/contracts/src",
+    "packages/observability/src",
+):
+    sys.path.insert(0, os.path.join(REPO_ROOT, _source_root))
+
+from platform_core.tool_gateway.registry import TOOL_CATALOG  # noqa: E402
 
 ADMIN_URL = os.environ.get(
     "APP_ADMIN_DATABASE_URL",
@@ -70,6 +84,12 @@ IDENTITY_FILE = os.path.join(LOCAL_DIR, "seed-identities.json")
 # tables the demo tenant actually fills are listed; a table added later and
 # not listed here is a gap in this script, not a failure of the purge.
 PURGE_TABLES = (
+    "tool_executions",
+    "action_confirmations",
+    "tool_proposals",
+    "dead_letter_items",
+    "tool_definitions",
+    "connectors",
     "billing_entries",
     "feature_flag_targets",
     "feature_flags",
@@ -148,6 +168,15 @@ def main() -> None:
         help="discard the cached demo user id and mint a new one",
     )
     args = parser.parse_args()
+
+    environment = os.environ.get("APP_ENVIRONMENT", "local").strip().lower()
+    database_host = urlparse(ADMIN_URL).hostname
+    if environment not in {"local", "test"} or database_host not in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }:
+        raise SystemExit("seed_admin_demo.py only targets a local/test database on localhost")
 
     tenant_id = uuid.uuid5(uuid.NAMESPACE_URL, f"tenant:{SLUG}")
     user_id = load_user_id(SLUG, reset=args.reset_identity)
@@ -248,6 +277,48 @@ def main() -> None:
             {"tid": str(tenant_id)},
         )
 
+        # The synthetic CRM opportunity tool is a separate local/test-only
+        # provider. The registry schema stays the source of truth; this seed
+        # only enables that fixed demo tool for the disposable admin tenant.
+        tool_name = "crm.create_opportunity"
+        risk, input_schema, required_permissions, requires_confirmation = TOOL_CATALOG[tool_name]
+        conn.execute(
+            text(
+                "INSERT INTO tool_definitions "
+                "(id, tenant_id, name, version, risk, input_schema, output_schema, "
+                "required_permissions, timeout_ms, idempotent, requires_confirmation) "
+                "VALUES (:id, :tid, :name, 1, :risk, CAST(:input_schema AS jsonb), "
+                "'{}'::jsonb, CAST(:permissions AS jsonb), 10000, true, :confirmation) "
+                "ON CONFLICT DO NOTHING"
+            ),
+            {
+                "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"tool:{SLUG}:{tool_name}")),
+                "tid": str(tenant_id),
+                "name": tool_name,
+                "risk": risk,
+                "input_schema": json.dumps(input_schema),
+                "permissions": json.dumps(required_permissions),
+                "confirmation": requires_confirmation,
+            },
+        )
+        demo_crm_id = uuid.uuid5(uuid.NAMESPACE_URL, f"connector:{SLUG}:demo_crm")
+        conn.execute(
+            text(
+                "INSERT INTO connectors (id, tenant_id, provider, name, status, capabilities, "
+                "configuration, credential_ref) VALUES (:id, :tid, 'demo_crm', "
+                "'Synthetic CRM', 'active', CAST(:capabilities AS jsonb), "
+                "CAST(:configuration AS jsonb), NULL) "
+                "ON CONFLICT (id) DO UPDATE SET status='active', "
+                "capabilities=EXCLUDED.capabilities, configuration=EXCLUDED.configuration"
+            ),
+            {
+                "id": str(demo_crm_id),
+                "tid": str(tenant_id),
+                "capabilities": json.dumps(["opportunity_create"]),
+                "configuration": json.dumps({"mode": "synthetic"}),
+            },
+        )
+
     engine.dispose()
     token = f"pt_{SLUG}_{user_id}"
     print(f"tenant_id = {tenant_id}")
@@ -255,6 +326,7 @@ def main() -> None:
     print(f"role      = {ROLE}")
     print()
     print(f"VITE_API_TOKEN={token}")
+    print("Demo CRM: synthetic only; CRM opportunity proposals still require Tool Gateway confirmation.")
     print()
     print("# and the API is reachable as this tenant (expect 200, not 401):")
     print(

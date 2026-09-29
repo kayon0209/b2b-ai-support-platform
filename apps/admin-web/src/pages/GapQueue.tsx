@@ -41,6 +41,22 @@ interface ReleaseEvaluationsResponse {
   can_approve: boolean;
 }
 
+const RELEASE_REASON_LABELS: Record<string, readonly [string, string]> = {
+  EVALUATOR_PROVENANCE_UNAVAILABLE: ["评测来源证明尚未生成", "Evaluator provenance is not available"],
+  EVALUATOR_PROVENANCE_INVALID: ["评测来源证明无效", "Evaluator provenance is invalid"],
+  EVAL_DATASET_NOT_APPROVED: ["评测集尚未获批", "The evaluation dataset is not approved"],
+  EVALUATION_BLOCKED: ["评测未达到发布条件", "The evaluation did not meet release criteria"],
+  RELEASE_GATE_DISABLED: ["知识发布门禁尚未启用", "The knowledge release gate is disabled"],
+  RELEASE_CANDIDATE_MOVED: ["候选内容已变化，需要重新评测", "The candidate changed and must be evaluated again"],
+  POST_TEST_RELEASE_NOT_ACTIVE: ["发布后验证时版本已不再生效", "The release was no longer active during post-test"],
+};
+
+function releaseReasonLabel(reasonCode: string, lang: "en" | "zh"): string {
+  const labels = RELEASE_REASON_LABELS[reasonCode];
+  if (labels) return lang === "zh" ? labels[0] : labels[1];
+  return lang === "zh" ? "尚有发布条件未满足" : "A release condition is not satisfied";
+}
+
 function toneForStatus(status: string): "neutral" | "info" | "warn" | "good" | "bad" {
   switch (status) {
     case "open":
@@ -60,7 +76,7 @@ function toneForStatus(status: string): "neutral" | "info" | "warn" | "good" | "
 }
 
 export function GapQueue() {
-  const { t } = useLang();
+  const { t, lang } = useLang();
   // The tab is part of the view, so it lives in the address: a refresh
   // keeps the reviewer on the drafts list rather than bouncing them back to
   // the gap queue.
@@ -495,7 +511,9 @@ export function GapQueue() {
               <div className="release-evidence-row" key={item.evaluation_id}>
                 <div>
                   <strong>{item.status === "eligible" ? t("gaps.releaseCandidateEligible") : t("gaps.releaseCandidateBlocked")}</strong>
-                  <p className="muted">{item.reason_code} · {item.candidate_fingerprint.slice(0, 16)}</p>
+                  <p className="muted" title={`${lang === "zh" ? "诊断代码" : "Diagnostic code"}: ${item.reason_code}`}>
+                    {releaseReasonLabel(item.reason_code, lang)} · {item.candidate_fingerprint.slice(0, 16)}
+                  </p>
                   <p className="muted">{t("gaps.releaseApprovedCount", { count: item.approval_count })}</p>
                   {item.post_test_status ? <p className="muted">{t(item.post_test_status === "passed" ? "gaps.releasePostTestPassed" : "gaps.releasePostTestBlocked")}</p> : null}
                 </div>

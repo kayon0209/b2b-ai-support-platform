@@ -134,7 +134,23 @@ export function remoteDraftDecision(
   currentBody: string,
   locallyEdited: boolean,
   incomingBody: string,
+  currentUpdatedAtMs = -1,
+  incomingUpdatedAtMs = 0,
 ): "ignore" | "apply" | "conflict" {
   if (currentBody === incomingBody) return "ignore";
+  if (incomingUpdatedAtMs < currentUpdatedAtMs) return "ignore";
+  if (incomingUpdatedAtMs === currentUpdatedAtMs) return "conflict";
   return locallyEdited ? "conflict" : "apply";
+}
+
+export function isSubmittedDraftSnapshot(
+  snapshot: WorkbenchComposerDraft | null,
+  submittedBody: string,
+  submittedUpdatedAtMs: number,
+): boolean {
+  return Boolean(
+    snapshot &&
+    snapshot.body === submittedBody &&
+    snapshot.updated_at_ms === submittedUpdatedAtMs,
+  );
 }

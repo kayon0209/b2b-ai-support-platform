@@ -8,6 +8,7 @@ import {
 import {
   parseWorkbenchComposerDraft,
   parseWorkbenchDraftSyncMessage,
+  isSubmittedDraftSnapshot,
   remoteDraftDecision,
   workbenchDraftChannelName,
   workbenchDraftStorageKey,
@@ -67,5 +68,11 @@ assert.equal(parseWorkbenchDraftSyncMessage({ ...message, kind: "clear", draft: 
 assert.equal(remoteDraftDecision("", false, "from another tab"), "apply");
 assert.equal(remoteDraftDecision("local edit", true, "remote edit"), "conflict");
 assert.equal(remoteDraftDecision("same", false, "same"), "ignore");
+assert.equal(remoteDraftDecision("newer local", false, "stale remote", now, now - 1), "ignore");
+assert.equal(remoteDraftDecision("same timestamp", false, "different", now, now), "conflict");
+assert.equal(remoteDraftDecision("older local", false, "new remote", now - 1, now), "apply");
+assert.equal(isSubmittedDraftSnapshot(storedDraft, storedDraft.body, storedDraft.updated_at_ms), true);
+assert.equal(isSubmittedDraftSnapshot(storedDraft, "revised body", storedDraft.updated_at_ms), false);
+assert.equal(isSubmittedDraftSnapshot(storedDraft, storedDraft.body, storedDraft.updated_at_ms + 1), false);
 
-console.log("workbench guards: 4 identity, 6 idempotency, 2 revision, and 13 draft sync checks passed");
+console.log("workbench guards: 4 identity, 6 idempotency, 2 revision, and 19 draft sync checks passed");

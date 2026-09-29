@@ -1,0 +1,128 @@
+- link "跳到主要内容":
+  - /url: "#main"
+- complementary "主导航":
+  - link "B2B 智能客服":
+    - /url: /admin/workbench
+  - navigation "主导航":
+    - link "坐席工作台":
+      - /url: /admin/workbench
+    - link "客户":
+      - /url: /admin/customers
+    - link "知识库":
+      - /url: /admin/knowledge
+    - link "工单与 SLA":
+      - /url: /admin/cases
+    - link "质量看板":
+      - /url: /admin/quality
+  - button "更多页面"
+  - link "设置":
+    - /url: /admin/branding
+- main:
+  - heading "坐席工作台" [level=1]
+  - text: 未登记坐席 搜索会话、订单或关键词
+  - textbox "搜索会话、订单或关键词":
+    - /placeholder: 搜索会话、订单或关键词…
+  - button "查看待处理提醒"
+  - strong: 坐席 4d2e6579
+  - text: 客服坐席
+  - region "会话队列":
+    - heading "会话队列" [level=2]
+    - tablist "会话分类":
+      - tab "待认领0" [selected]
+      - tab "我的会话1"
+      - tab "等待中0"
+    - text: 搜索当前队列
+    - textbox "搜索当前队列":
+      - /placeholder: 搜索会话、客户或订单号…
+    - tabpanel "待认领0":
+      - paragraph: 当前队列暂无会话
+  - region "当前会话":
+    - strong: Synthetic Demo Account
+    - text: Synthetic Demo Account 网页 优先级 P2
+    - button "更多会话操作"
+    - button "转接"
+    - button "结束会话"
+    - log "对话记录":
+      - article:
+        - text: 客
+        - strong: 客户
+        - time: 14:48
+        - text: 我们要核验 PCB-DEMO-100 的规格和演示库存。
+      - article:
+        - strong: AI 助手
+        - time: 14:49
+        - text: 我会检查本地合成资料，不会把样例当成客户承诺。 AI
+      - article:
+        - text: 客
+        - strong: 客户
+        - time: 14:50
+        - text: 请再让销售人工复核报价有效期。
+    - text: 回复客户
+    - textbox "回复客户":
+      - /placeholder: 输入回复…  Shift + Enter 换行
+    - button "上传工单证据"
+    - button "上传工单图片"
+    - button "插入表情"
+    - button "插入话术"
+    - button "发送" [disabled]
+  - complementary "AI 副驾与客户上下文":
+    - strong: AI 副驾
+    - tablist "副驾内容":
+      - tab "话术"
+      - tab "知识"
+      - tab "工具"
+      - tab "任务" [selected]
+    - tabpanel "任务":
+      - region "标准服务流程":
+        - heading "标准服务流程" [level=3]
+        - paragraph: 发起后绑定当前会话最新客户消息。local/test Demo 配置读取能力后可查合成订单；质量、技术和发票流程只会准备需确认的平台内部 Case，不调用真实业务系统。
+        - status
+        - group:
+          - strong: 订单进度查询
+          - text: 元器件采购 · PCB · PCBA · 供应链 需人工处理
+        - group:
+          - strong: PCB/PCBA 报修与质量问题受理
+          - text: PCB · PCBA · 元器件 需人工处理
+        - group:
+          - strong: 发票申请与问题登记
+          - text: 元器件采购 · PCB · PCBA 需人工处理
+        - group:
+          - strong: 制造与技术问题升级
+          - text: PCB · PCBA · 元器件 需人工处理
+      - group "会话任务":
+        - status
+        - region "合成售前资料（仅供销售复核）":
+          - heading "合成售前资料（仅供销售复核）" [level=3]
+          - paragraph: local/test Demo 样例；不是客户报价，不会创建 CRM 商机或发送消息。
+          - status: 已核验产品规格、账户库存和报价样例三份合成来源，必须由销售人工复核。
+          - text: 产品编号
+          - textbox "产品编号": PCB-DEMO-100
+          - button "查看合成预售依据"
+          - region "经来源校验的合成证据":
+            - paragraph: Demo controller board / PCB-DEMO-100 / 版本 A
+            - term: 规格
+            - definition: 层数：8 · 板厚（μm）：1600 · 表面处理：ENIG
+            - term: 演示库存
+            - definition: 120 pcs · WH-DEMO-1
+            - term: 合成参考报价
+            - definition: 12.50 CNY / 件；起订量 100；示例交期 12 个工作日
+            - term: 报价样例有效期
+            - definition: 2026-10-13T06:50:48.088784Z
+            - term: 来源版本
+            - definition: 产品 demo-fixture-v1 · 库存 demo-fixture-v1 · 报价 demo-fixture-v1
+            - note: 必须转销售人工确认；客户报价不允许。
+        - region "进行中的任务":
+          - heading "进行中（1）" [level=3]
+          - list:
+            - listitem:
+              - text: 等待客户补充 查询
+              - paragraph: 待补充：
+              - list:
+                - listitem:
+                  - text: 订单编号（提交后由 Demo ERP 核验）
+                  - textbox "订单编号（提交后由 Demo ERP 核验）":
+                    - /placeholder: 例如 SO-9001
+              - button "详情"
+              - button "记录补充" [disabled]
+              - button "转人工"
+              - button "取消"

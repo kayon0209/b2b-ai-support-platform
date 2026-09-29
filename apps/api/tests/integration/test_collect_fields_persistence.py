@@ -274,6 +274,22 @@ def test_a_sensitive_value_is_withheld_but_the_collection_is_recorded() -> None:
     assert "value" not in street
 
 
+def test_task_command_replays_same_key_and_rejects_changed_payload() -> None:
+    _seed_waiting_for("street", "city")
+    first = _collect({"street": "上海南京西路 100 号"}, key="stable-command-key")
+    assert first.status_code == 200, first.text
+
+    replay = _collect({"street": "上海南京西路 100 号"}, key="stable-command-key")
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True
+    assert replay.json()["task"]["version"] == first.json()["task"]["version"]
+
+    changed_payload = _collect({"city": "北京"}, key="stable-command-key")
+    assert changed_payload.status_code == 409, changed_payload.text
+    assert changed_payload.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert all(slot["name"] != "city" for slot in _task_row()["slots"])
+
+
 @pytest.mark.parametrize("field_name", ["new_address", "bank_account_number"])
 def test_alias_sensitive_values_are_withheld_when_collected(field_name: str) -> None:
     _seed_waiting_for(field_name)

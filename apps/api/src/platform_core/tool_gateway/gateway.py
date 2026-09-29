@@ -23,6 +23,7 @@ import hashlib
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from jsonschema import ValidationError
@@ -49,6 +50,14 @@ class ToolGatewayError(Exception):
 
 class ToolDenied(ToolGatewayError):
     pass
+
+
+@dataclass(frozen=True)
+class ToolExecutionReceipt:
+    id: uuid.UUID
+    status: str
+    verification_status: str | None
+    sanitized_output: dict[str, Any]
 
 
 # Errors that are the upstream provider's fault, not ours. The read-tool
@@ -202,6 +211,100 @@ class ToolGateway:
     def __init__(self, session: AsyncSession, executors: dict[str, ToolExecutor]) -> None:
         self._session = session
         self._executors = executors
+
+    async def propose_id(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        tool_name: str,
+        arguments: dict[str, Any],
+        role: str,
+        idempotency_key: str,
+        permission_allowed: bool,
+        permission_reason: str = "OK",
+        required_action: str | None = None,
+    ) -> uuid.UUID:
+        """Create a proposal and return its identifier across module boundaries."""
+        proposal = await self.propose(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            role=role,
+            idempotency_key=idempotency_key,
+            permission_allowed=permission_allowed,
+            permission_reason=permission_reason,
+            required_action=required_action,
+        )
+        return proposal.id
+
+    async def proposal_id_for_idempotency_key(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        idempotency_key: str,
+    ) -> uuid.UUID | None:
+        proposal_id = (
+            await self._session.execute(
+                select(ToolProposal.id).where(
+                    ToolProposal.tenant_id == tenant_id,
+                    ToolProposal.idempotency_key == idempotency_key,
+                )
+            )
+        ).scalar_one_or_none()
+        return proposal_id
+
+    async def execution_receipt(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        proposal_id: uuid.UUID,
+    ) -> ToolExecutionReceipt | None:
+        row = (
+            await self._session.execute(
+                select(
+                    ToolExecution.id,
+                    ToolExecution.status,
+                    ToolExecution.verification_status,
+                    ToolExecution.sanitized_output,
+                )
+                .where(
+                    ToolExecution.tenant_id == tenant_id,
+                    ToolExecution.proposal_id == proposal_id,
+                )
+                .order_by(ToolExecution.started_at.desc(), ToolExecution.id.desc())
+                .limit(1)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return ToolExecutionReceipt(
+            id=row.id,
+            status=row.status,
+            verification_status=row.verification_status,
+            sanitized_output=row.sanitized_output if isinstance(row.sanitized_output, dict) else {},
+        )
+
+    async def execute_receipt(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        proposal_id: uuid.UUID,
+    ) -> ToolExecutionReceipt:
+        """Execute through the gateway and return a model-independent receipt."""
+        row = await self.execute(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            proposal_id=proposal_id,
+        )
+        return ToolExecutionReceipt(
+            id=row.id,
+            status=row.status,
+            verification_status=row.verification_status,
+            sanitized_output=row.sanitized_output if isinstance(row.sanitized_output, dict) else {},
+        )
 
     async def propose(
         self,

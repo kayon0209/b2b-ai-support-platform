@@ -12,10 +12,10 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 |---|---|---|
 | DOC-01 / ADR | Proposed | 产品/安全负责人正式接受或修改 ADR |
 | EVAL-01 / EVAL-02 | 阻塞 | 两位独立领域/安全审阅人复核语料、分歧裁决；锁定后运行当前 `semantic-v7` holdout |
-| PERF-01 / PERF-02 | 未执行/阻塞 | 批准的生产近似拓扑、负载目标、真实模型延迟与成本观测 |
-| SEC-02 / SEC-03 | 部分完成 | `test_auth_http_entry.py` 模拟 OIDC identity 请求，tenant membership 从 active 改为 suspended 后下一请求立即 401；`test_orchestrator_lease_race.py` 验证“生成挂起时人工接管、恢复后无 AI 外发”；另有两个 Chrome origin/token 并发认领 smoke，一席成功、一席冲突，lease 唯一归属与 version 递增。真实 IdP token/session 撤销与外部 transport timeout/unknown 对账仍待演练 |
-| OPS-01 / OPS-02 | 部分完成 | 新增本地 staging 模拟：候选 UI 与 `68de17e` 基线 UI 指向同一隔离 API/数据库；基线读取 2 个合成会话和非空详情，切回候选后草稿仍在。API 停止/刷新/重试/恢复通过；真实 staging、多实例 Worker、数据库降级和外部写入 unknown 对账仍待授权环境 |
-| UI-01 / UI-02 / UX-03 | 部分完成 | 非空 Safari 合成 A/B 会话、transcript/composer/Copilot AX tree、同源多标签草稿冲突策略、跨会话隔离、刷新和 API outage recovery 已实测；VoiceOver 已启用并读取 AX 结构，但自动化无法可靠区分 VO 修饰键与页面箭头，完整原生 VO 朗读/键盘走查仍待真人复核。逐规格 PNG 归档仍被浏览器安全策略阻止 |
+| PERF-01 / PERF-02 | 本地部分通过 / 生产阻塞 | 本地 off/shadow 各 3 轮、并发 50/100 的 warm-pool inbox 与 shadow enqueue 对照已归档；真实模型 p95/成本、10k 会话/租户、持续负载与生产近似拓扑仍需环境和预算 |
+| SEC-02 / SEC-03 | 部分完成 | 本地 Keycloak 实签 JWT 在 active membership 下请求 200；暂停 membership 后复用同一 JWT，下一请求 401。`test_orchestrator_lease_race.py` 与两个 Chrome origin/token 并发认领 smoke 继续通过。真实企业 IdP token/session 撤销与外部 transport timeout/unknown 对账仍待演练 |
+| OPS-01 / OPS-02 | 部分完成 | 新增隔离 Docker Compose 两 Worker 演练：处理中的 Worker 被杀后 peer 恢复；重复 outbox 仅一条账务行；1/10/50 事件批次排空；49 项集成/单测通过；0070 单步回滚往返保留数据。真实 staging、多主机 Worker、provider/connector 故障和外部 unknown 对账仍待授权环境 |
+| UI-01 / UI-02 / UX-03 | 部分完成 | 非空合成 Workbench 的桌面/移动/320px/CSS 200% 截图已归档，均无水平溢出；桌面与移动 axe WCAG 2/2.1 A/AA 为 0 violations，键盘 Enter、输入名称/描述和 live status 通过。完整原生 VoiceOver 朗读/键盘走查与弹层焦点仍需真人复核 |
 | TOOL-03 / R3 | 无真实业务连接器 | 由用户提供授权的 ERP/CRM sandbox、字段契约和归属证明 |
 
 ## R2：服务流程与运营能力
@@ -61,7 +61,19 @@ R1 的实现 head `247290e5df86c529dde17465efaab64765439764` 和文档 head `5a0
 - 定义产品目录、规格、库存、报价版本/有效期和销售交接契约；每个建议带来源与抓取时间，缺失或过期时转人工。
 - 仅使用企业授权的权威产品/ERP/PLM 数据；现有公开参考价不能伪装成客户报价，不允许模型生成折扣、交期或库存承诺。
 - CRM 商机创建是受控写入，经 Tool Gateway proposal/confirmation/idempotency/读回；没有真实 sandbox 时仅测 canonical contract，不宣称真实落地。
-- 当前：契约禁止无来源的客户报价、库存和交期承诺；local/test Demo canonical facts 可在 Workbench 只读查看，证据包同时绑定产品、账户库存、客户报价有效期，且只有具备 `case.read` 与 `tool.read` 的坐席可查看。非空浏览器已核对三份来源、人工复核提示和键盘触发的 live status。它不自动判断适配度，也没有 CRM opportunity 写入；真实权威目录、客户报价绑定和 CRM sandbox 仍未选定。
+- 当前：契约禁止无来源的客户报价、库存和交期承诺；local/test Demo canonical facts 可在 Workbench 只读查看，证据包同时绑定产品、账户库存、客户报价有效期，且只有具备 `case.read` 与 `tool.read` 的坐席可查看。另增加仅限 local/test + `business_api_adapter=demo` 的 `crm.create_opportunity` 模拟工具，经 Tool Gateway 执行权限检查、人工确认、幂等提案/执行、异 payload 冲突拒绝和模拟 CRM 读回。回执明确 `synthetic=true`、不联系客户且不含报价金额；这不代表真实 CRM 集成、真实 authority 或 sandbox。
+
+## 2026-09-29 本地合成模拟结果
+
+| 工作 | 结果 | 仍需真实/人工证据 |
+|---|---|---|
+| CRM 写入闭环 | Tool Gateway 模拟机会创建：权限、确认、幂等、读回与审计路径已集成验证 | 真实 CRM、获批 authority 与 sandbox |
+| Worker 与恢复 | 两个 Compose Worker；中断恢复、重复投递、1/10/50 队列批次及单步迁移回滚；49 项用例通过 | 多主机 staging、真实 provider/connector 失败与 unknown 对账 |
+| off/shadow 性能 | 两种模式、50/100 并发、每组 3 轮；off 未新增影子项，shadow 新增 450 条 synthetic outbox 请求 | 生产拓扑/容量、真实模型和持续负载 |
+| Keycloak 撤权模拟 | 本地签名 token 的请求从 200 变成 401（暂停 membership 后复用原 token） | 企业 IdP 自身 token/session 撤销 |
+| 浏览器与无障碍 | 5 张 PNG、ARIA snapshot、两视口 axe 0 项违规；横向溢出均为 0 | 完整真人 VoiceOver 走查 |
+
+证据目录：`evidence/local-worker-drill-2026-09-29/`、`evidence/local-perf-2026-09-29/`、`evidence/local-keycloak-2026-09-29/`、`evidence/local-browser-2026-09-29/`。
 
 ## 集成发布顺序
 

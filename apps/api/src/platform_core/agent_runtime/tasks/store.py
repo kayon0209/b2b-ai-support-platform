@@ -162,6 +162,8 @@ class TaskCommand:
     actor_ref: str | None = None
     trace_id: str | None = None
     expected_version: int | None = None
+    idempotency_key_hash: str | None = None
+    request_hash: str | None = None
     completion_evidence: str | None = None
     blocked_reason: str | None = None
     missing_slots: list[str] | None = None
@@ -315,6 +317,8 @@ async def append_event(
     actor_type: str,
     actor_ref: str | None = None,
     trace_id: str | None = None,
+    idempotency_key_hash: str | None = None,
+    request_hash: str | None = None,
 ) -> ConversationTaskEvent:
     """Append one transition. The only writer of the event log."""
     current_max = (
@@ -339,6 +343,8 @@ async def append_event(
         actor_ref=actor_ref,
         reason_code=reason_code,
         trace_id=trace_id,
+        idempotency_key_hash=idempotency_key_hash,
+        request_hash=request_hash,
         from_version=task.version,
         to_version=task.version + 1,
         created_at=int(time.time()),
@@ -346,6 +352,27 @@ async def append_event(
     session.add(event)
     await session.flush()
     return event
+
+
+async def command_request_hash(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    task_id: uuid.UUID,
+    idempotency_key_hash: str,
+) -> str | None:
+    """Return the request digest recorded for a task-command replay key."""
+    return (
+        await session.execute(
+            select(ConversationTaskEvent.request_hash)
+            .where(
+                ConversationTaskEvent.tenant_id == tenant_id,
+                ConversationTaskEvent.task_id == task_id,
+                ConversationTaskEvent.idempotency_key_hash == idempotency_key_hash,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
 
 
 async def transition(
@@ -452,6 +479,8 @@ async def transition(
         actor_type=command.actor_type,
         actor_ref=command.actor_ref,
         trace_id=command.trace_id,
+        idempotency_key_hash=command.idempotency_key_hash,
+        request_hash=command.request_hash,
     )
     return task
 

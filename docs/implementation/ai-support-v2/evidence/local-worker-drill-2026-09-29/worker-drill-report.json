@@ -1,0 +1,66 @@
+{
+  "evidenceType": "local synthetic multi-worker drill",
+  "implementationRevision": "35195b4+source:b04388b61c95",
+  "startedAtUtc": "2026-09-29T04:18:57.298942+00:00",
+  "finishedAtUtc": "2026-09-29T04:20:09.965695+00:00",
+  "composeProject": "codex-r2r3-worker-drill-1448c463",
+  "isolatedDatabase": "codex_r2r3_drill_5d4dfb41",
+  "initialWorkerReplicas": 2,
+  "faultInjection": {
+    "inFlightWorkerKilled": true,
+    "recoveredEventStatus": "sent",
+    "recoveredEventAttempts": 2,
+    "billingRowsAfterDuplicateReplay": 1,
+    "duplicateDeliveryCreatedOneBillingRow": true
+  },
+  "queueDrainRuns": [
+    {
+      "batchSize": 1,
+      "enqueueToDrainMs": 1020.588,
+      "billingRows": 1
+    },
+    {
+      "batchSize": 10,
+      "enqueueToDrainMs": 1018.443,
+      "billingRows": 10
+    },
+    {
+      "batchSize": 50,
+      "enqueueToDrainMs": 1054.987,
+      "billingRows": 50
+    }
+  ],
+  "integrationSuiteExitCode": 0,
+  "integrationSuiteSummary": "49 passed",
+  "performanceSmoke": {
+    "concurrency": 100,
+    "pool_size": 10,
+    "p50_ms": 28.008,
+    "p95_ms": 41.672,
+    "p99_ms": 41.722,
+    "target_p95_ms": 300,
+    "target_scope": "webhook acknowledgement, warm pool. Connection setup is excluded: one connect costs ~28ms solo but ~444ms when 50 are issued concurrently on this host, so a cold pool reports connect serialisation rather than ingest latency.",
+    "persisted_rows": 100,
+    "duplicate_replay_detected": true,
+    "_artifact": {
+      "artifact": "performance_report",
+      "run_id": "50391-1790655587",
+      "produced_at": 1790655608,
+      "code_version": "35195b4-dirty",
+      "derived_from": [
+        "release_gate_evidence"
+      ],
+      "version": 1
+    }
+  },
+  "migrationRollback": {
+    "downgradeOneRevisionThenUpgradeHead": true,
+    "headVersion": "0070_outbox_processing_fence",
+    "billingRowsPreserved": 1
+  },
+  "limitations": [
+    "Synthetic data and one local Docker host; not a multi-host production drill.",
+    "Fake/local handlers only; no external ERP, CRM, or provider failure was run.",
+    "Queue latency is enqueue-to-drain time for synthetic usage events on this host."
+  ]
+}

@@ -83,7 +83,7 @@ class RedactionReport:
 _VALUE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b"), "[EMAIL]"),
     (re.compile(r"\b(?:\d[ -]?){13,19}\b"), "[CARD]"),
-    (re.compile(r"\b\+?\d[\d\s-]{7,14}\d\b"), "[PHONE]"),
+    (re.compile(r"(?<!\w)\+?\d[\d\s-]{7,14}\d(?!\w)"), "[PHONE]"),
 ]
 
 
