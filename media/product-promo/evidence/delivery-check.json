@@ -1,0 +1,155 @@
+{
+  "errors": [],
+  "warnings": [
+    "intro has no recorded action beats",
+    "workbench has custom/missing type; review shot variety",
+    "Mix inputs/stem/master verified; listen to SFX audibility and verify this master was used in the final export",
+    "Audio stream exists; loudness, audibility and synchronization still need review"
+  ],
+  "limits": [
+    "No semantic verification of feature claims",
+    "No visual clipping or taste assessment",
+    "No listening or sound cue alignment assessment",
+    "Pacing numbers are hints for where to look, not a quality score"
+  ],
+  "media": {
+    "format": {
+      "filename": "renders/final.mp4",
+      "nb_streams": 2,
+      "nb_programs": 0,
+      "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+      "format_long_name": "QuickTime / MOV",
+      "start_time": "0.000000",
+      "duration": "26.000000",
+      "size": "4938598",
+      "bit_rate": "1519568",
+      "probe_score": 100,
+      "tags": {
+        "major_brand": "isom",
+        "minor_version": "512",
+        "compatible_brands": "isomiso2avc1mp41",
+        "encoder": "Lavf60.3.100"
+      }
+    },
+    "video": [
+      {
+        "index": 0,
+        "codec_name": "h264",
+        "codec_long_name": "H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10",
+        "profile": "High",
+        "codec_type": "video",
+        "codec_tag_string": "avc1",
+        "codec_tag": "0x31637661",
+        "width": 1920,
+        "height": 1080,
+        "coded_width": 1920,
+        "coded_height": 1080,
+        "closed_captions": 0,
+        "has_b_frames": 2,
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "16:9",
+        "pix_fmt": "yuv420p",
+        "level": 40,
+        "color_range": "tv",
+        "color_space": "bt470bg",
+        "chroma_location": "center",
+        "refs": 1,
+        "is_avc": "true",
+        "nal_length_size": "4",
+        "r_frame_rate": "30/1",
+        "avg_frame_rate": "30/1",
+        "time_base": "1/15360",
+        "start_pts": 0,
+        "start_time": "0.000000",
+        "duration_ts": 399360,
+        "duration": "26.000000",
+        "bit_rate": "1256188",
+        "bits_per_raw_sample": "8",
+        "nb_frames": "780",
+        "disposition": {
+          "default": 1,
+          "dub": 0,
+          "original": 0,
+          "comment": 0,
+          "lyrics": 0,
+          "karaoke": 0,
+          "forced": 0,
+          "hearing_impaired": 0,
+          "visual_impaired": 0,
+          "clean_effects": 0,
+          "attached_pic": 0,
+          "timed_thumbnails": 0
+        },
+        "tags": {
+          "language": "und",
+          "handler_name": "VideoHandler",
+          "vendor_id": "[0][0][0][0]",
+          "encoder": "Lavc60.3.100 libx264"
+        }
+      }
+    ],
+    "audio": [
+      {
+        "index": 1,
+        "codec_name": "aac",
+        "codec_long_name": "AAC (Advanced Audio Coding)",
+        "profile": "LC",
+        "codec_type": "audio",
+        "codec_tag_string": "mp4a",
+        "codec_tag": "0x6134706d",
+        "sample_fmt": "fltp",
+        "sample_rate": "48000",
+        "channels": 2,
+        "channel_layout": "stereo",
+        "bits_per_sample": 0,
+        "r_frame_rate": "0/0",
+        "avg_frame_rate": "0/0",
+        "time_base": "1/48000",
+        "start_pts": 0,
+        "start_time": "0.000000",
+        "duration_ts": 1248000,
+        "duration": "26.000000",
+        "bit_rate": "254222",
+        "nb_frames": "1220",
+        "disposition": {
+          "default": 1,
+          "dub": 0,
+          "original": 0,
+          "comment": 0,
+          "lyrics": 0,
+          "karaoke": 0,
+          "forced": 0,
+          "hearing_impaired": 0,
+          "visual_impaired": 0,
+          "clean_effects": 0,
+          "attached_pic": 0,
+          "timed_thumbnails": 0
+        },
+        "tags": {
+          "language": "und",
+          "handler_name": "SoundHandler",
+          "vendor_id": "[0][0][0][0]"
+        }
+      }
+    ]
+  },
+  "pacing": {
+    "frames": 779,
+    "stillRatio": 0.741,
+    "movingRatio": 0.169,
+    "hardChanges": 18,
+    "meanDiff": 0.965,
+    "longestStill": {
+      "seconds": 2.0,
+      "at": 0.57,
+      "shot": "intro"
+    },
+    "thresholds": {
+      "still": 0.15,
+      "moving": 1.5,
+      "hardChange": 12,
+      "note": "mean absolute luma difference between consecutive frames at 480px width"
+    }
+  },
+  "ok": true
+}

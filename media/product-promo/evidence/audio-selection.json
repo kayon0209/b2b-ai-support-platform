@@ -1,0 +1,43 @@
+{
+  "music": {
+    "source": "code-original",
+    "script": "score.py",
+    "duration": 26,
+    "bpm": 120,
+    "key": "D minor to F major",
+    "cost": 0
+  },
+  "sfx": [
+    {
+      "file": "assets/sfx/click.wav",
+      "source": "guizang-product-video-skill/assets/audio/sfx",
+      "license": "AGPL-3.0 skill originals",
+      "reason": "No user recording supplied; original skill SFX used without third-party download."
+    },
+    {
+      "file": "assets/sfx/pop.wav",
+      "source": "guizang-product-video-skill/assets/audio/sfx",
+      "license": "AGPL-3.0 skill originals",
+      "reason": "No user recording supplied; original skill SFX used without third-party download."
+    },
+    {
+      "file": "assets/sfx/typing.wav",
+      "source": "guizang-product-video-skill/assets/audio/sfx",
+      "license": "AGPL-3.0 skill originals",
+      "reason": "No user recording supplied; original skill SFX used without third-party download."
+    },
+    {
+      "file": "assets/sfx/success.wav",
+      "source": "guizang-product-video-skill/assets/audio/sfx",
+      "license": "AGPL-3.0 skill originals",
+      "reason": "No user recording supplied; original skill SFX used without third-party download."
+    },
+    {
+      "file": "assets/sfx/resolve.wav",
+      "source": "guizang-product-video-skill/assets/audio/sfx",
+      "license": "AGPL-3.0 skill originals",
+      "reason": "No user recording supplied; original skill SFX used without third-party download."
+    }
+  ],
+  "audition": "Not yet listened; quantitative mix and encoded output checks required."
+}

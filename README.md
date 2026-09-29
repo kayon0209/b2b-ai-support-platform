@@ -5,8 +5,12 @@
 面向 B2B 企业支持场景的生产导向型平台：把客户渠道、知识检索、业务工具、坐席工作台、租户安全和质量评估放进一条可观测、可审计的服务闭环。
 
 <p align="center">
-  <img src="docs/blueprints/platform-overview.svg" alt="企业级 AI 客服平台服务链路：渠道接入、证据驱动的 Agent Runtime、客户回复、人工接管和受控工具" width="100%" />
+  <a href="docs/media/product-promo.mp4"><img src="docs/media/product-promo-cover.webp" alt="观看 26 秒 B2B Support 宣传片：客户提问、人工接管和受控业务动作" width="100%" /></a>
 </p>
+
+<p align="center"><a href="docs/media/product-promo.mp4">▶ 观看 26 秒产品演示（含配乐与操作音效）</a></p>
+
+影片展示桌面网页客户入口、坐席工作台和内部审批；画面使用合成演示数据，移动端和服务端 API 操作不在影片范围内。可复现的[视频工程](media/product-promo/)包含功能来源、分镜、组件接入和音画验收记录。
 
 > **定位说明**：仓库展示的是可运行、可测试、带生产控制边界的平台实现。真实企业身份源、ERP、消息渠道、对象存储、静态托管和生产容量仍需部署配置与验收；代码合并和 CI 通过不代表任意环境已经生产就绪。当前逐项状态见[工作台验收记录](docs/workbench-redesign-acceptance.md)。
 
