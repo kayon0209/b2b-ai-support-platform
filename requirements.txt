@@ -17,7 +17,7 @@
 # --- Web framework and configuration ---------------------------------------
 fastapi>=0.141.1
 uvicorn[standard]>=0.32
-pydantic>=2.9
+pydantic>=2.13.5
 pydantic-settings>=2.6
 # Required by FastAPI to parse multipart/form-data, which the knowledge
 # document upload uses. Without it every Form/File route raises at import
