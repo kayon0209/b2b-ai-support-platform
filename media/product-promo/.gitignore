@@ -1,0 +1,17 @@
+node_modules/
+.build/
+dist/
+renders/
+assets/master.wav
+assets/music.wav
+assets/music-ducked.wav
+assets/sfx-stem.wav
+evidence/stills/
+evidence/contact*.png
+evidence/transitions/
+evidence/environment*.json
+evidence/stills*/
+evidence/component-imports.json
+evidence/cut-*.png
+covers/
+evidence/final-frames/
