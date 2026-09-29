@@ -4,11 +4,9 @@
 
 面向 B2B 企业支持场景的生产导向型平台：把客户渠道、知识检索、业务工具、坐席工作台、租户安全和质量评估放进一条可观测、可审计的服务闭环。
 
-<p align="center">
-  <a href="docs/media/product-promo.mp4"><img src="docs/media/product-promo-cover.webp" alt="观看 26 秒 B2B Support 宣传片：客户提问、人工接管和受控业务动作" width="100%" /></a>
-</p>
+https://github.com/user-attachments/assets/cc422933-2efc-4302-b3ee-a13b6db52d5f
 
-<p align="center"><a href="docs/media/product-promo.mp4">▶ 观看 26 秒产品演示（含配乐与操作音效）</a></p>
+<p align="center"><a href="docs/media/product-promo.mp4">下载 26 秒 MP4</a> · <a href="docs/media/product-promo-cover.webp">查看视频封面</a></p>
 
 影片展示桌面网页客户入口、坐席工作台和内部审批；画面使用合成演示数据，移动端和服务端 API 操作不在影片范围内。可复现的[视频工程](media/product-promo/)包含功能来源、分镜、组件接入和音画验收记录。
 
