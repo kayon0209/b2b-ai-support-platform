@@ -42,7 +42,7 @@ minio>=7.2
 
 # --- Security --------------------------------------------------------------
 pyjwt[crypto]>=2.14.0
-cryptography>=43
+cryptography>=50.0.2
 # SAML response signature verification. A vetted XML-DSig implementation
 # rather than a hand-rolled one: getting canonicalisation or the
 # signature-wrapping defence subtly wrong is how a SAML SP accepts a
