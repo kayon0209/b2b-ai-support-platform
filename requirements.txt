@@ -25,7 +25,7 @@ pydantic-settings>=2.6
 python-multipart>=0.0.9
 
 # --- Persistence -----------------------------------------------------------
-sqlalchemy>=2.0.36
+sqlalchemy>=2.1.1
 psycopg[binary,pool]>=3.2
 alembic>=1.14
 greenlet>=3.1          # SQLAlchemy's async bridge; required explicitly on 3.12
