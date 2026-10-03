@@ -54,7 +54,7 @@ lxml>=5
 structlog>=26.1.0
 # Imported by platform_core.http_metrics at module import, so the API cannot
 # start without it. This is the package the Dockerfile was missing.
-prometheus-client>=0.21
+prometheus-client>=0.26.0
 # Imported by `observability_tracing.build_tracer` as soon as
 # `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and the module handles the resulting
 # `ImportError` by falling back to an in-process ring buffer. That fallback is
