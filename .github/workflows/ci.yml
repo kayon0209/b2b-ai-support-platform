@@ -138,7 +138,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
       - name: Run unit tests
-        run: pytest apps/api/tests/unit packages/contracts/tests -m "not integration"
+        run: pytest apps/api/tests/unit apps/api/tests/contract packages/contracts/tests tests/unit -m "not integration"
         env:
           PYTHONPATH: apps/api/src:packages/contracts/src
           # There is no .env in a fresh checkout (it is gitignored), so the

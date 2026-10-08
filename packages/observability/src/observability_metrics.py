@@ -35,7 +35,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from prometheus_client import CollectorRegistry, Counter, Histogram
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 # --- Label vocabularies ----------------------------------------------------
 #
@@ -74,7 +74,17 @@ RUN_ROUTES = (
 # a runtime condition, so `observe_run` refuses to invent a label for it.
 CITATION_STATUSES = ("supported", "unsupported", "no_claims")
 
-WORKER_QUEUES = ("interactive", "ingestion", "outbox", "release_evaluator")
+WORKER_QUEUES = (
+    "interactive",
+    "semantic",
+    "ingestion",
+    "outbox",
+    "release_evaluator",
+    "retention",
+    "sla",
+)
+TOOL_COMPENSATION_ACTIONS = ("case_create_close_unmodified",)
+TOOL_COMPENSATION_OUTCOMES = ("succeeded", "failed")
 
 # Latency buckets. The upper bound matters: docs/development-plan.md sets a
 # first-token P95 budget of 2.5 s, so the buckets must be dense below 5 s or
@@ -100,6 +110,8 @@ _LABEL_RANGES: dict[str, tuple[str, ...]] = {
     "run_route": RUN_ROUTES,
     "citation_status": CITATION_STATUSES,
     "worker_queue": WORKER_QUEUES,
+    "tool_compensation_action": TOOL_COMPENSATION_ACTIONS,
+    "tool_compensation_outcome": TOOL_COMPENSATION_OUTCOMES,
 }
 
 
@@ -228,6 +240,31 @@ class PlatformMetrics:
             labelnames=("result",),
             registry=r,
         )
+        self.worker_cycles_total = Counter(
+            "platform_worker_cycles_total",
+            "Worker poll cycles by bounded queue role and result.",
+            labelnames=("queue", "result"),
+            registry=r,
+        )
+        self.worker_cycle_seconds = Histogram(
+            "platform_worker_cycle_seconds",
+            "Duration of one worker poll cycle by bounded queue role.",
+            labelnames=("queue",),
+            buckets=_LATENCY_BUCKETS,
+            registry=r,
+        )
+        self.worker_last_success_timestamp_seconds = Gauge(
+            "platform_worker_last_success_timestamp_seconds",
+            "Unix timestamp of the last successful worker poll cycle.",
+            labelnames=("queue",),
+            registry=r,
+        )
+        self.worker_process_up = Gauge(
+            "platform_worker_process_up",
+            "Whether this worker process has its metrics listener running.",
+            labelnames=("queue",),
+            registry=r,
+        )
         self.inbox_claim_age_seconds = Histogram(
             "platform_inbox_claim_age_seconds",
             "Time between an event being received and its agent run starting. "
@@ -254,6 +291,12 @@ class PlatformMetrics:
             "platform_knowledge_release_jobs_total",
             "Release evaluation jobs by bounded lifecycle outcome.",
             labelnames=("result",),
+            registry=r,
+        )
+        self.tool_compensations_total = Counter(
+            "platform_tool_compensations_total",
+            "Business compensator outcomes by code-owned action and result.",
+            labelnames=("action", "outcome"),
             registry=r,
         )
 

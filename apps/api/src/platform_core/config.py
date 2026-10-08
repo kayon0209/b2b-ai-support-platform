@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # an operator explicitly enables it and supplies a positive case ceiling.
     knowledge_evaluator_auto_run: bool = False
     knowledge_evaluator_max_cases_per_run: int = Field(default=0, ge=0, le=500)
+    # The dedicated release evaluator shares this finite external-call budget
+    # across each bounded outbox delivery attempt. The durable job deadline and
+    # three-attempt outbox cap bound the logical job across process restarts.
+    knowledge_evaluator_job_deadline_seconds: int = Field(default=900, ge=60, le=7200)
+    knowledge_evaluator_max_external_attempts: int = Field(default=600, ge=3, le=9000)
 
     # Local default matches infra/compose/docker-compose.yml (ai-postgres is
     # published on 5435 to avoid colliding with a host PostgreSQL on 5432).
@@ -362,6 +367,21 @@ class Settings(BaseSettings):
     # Hard deadline for one semantic classification call, including its single
     # transport retry. A design target pending real-provider measurement.
     semantic_classify_deadline_seconds: float = 2.0
+    # One inbound AgentRun shares these ceilings across nested model and
+    # connector retries. Inbox redelivery is separately capped by
+    # inbox_max_attempts, so process restarts cannot create an unbounded loop.
+    agent_run_deadline_seconds: float = Field(default=120.0, gt=0, le=600)
+    agent_run_max_external_attempts: int = Field(default=11, ge=1, le=30)
+    agent_run_max_model_attempts: int = Field(default=6, ge=1, le=20)
+    agent_run_max_tool_attempts: int = Field(default=3, ge=0, le=10)
+    inbox_max_attempts: int = Field(default=3, ge=1, le=10)
+    # One claimed transactional-outbox handler gets a small call ceiling;
+    # OutboxEvent attempts and its persisted absolute deadline supply the
+    # durable cross-process ceiling.
+    outbox_handler_deadline_seconds: float = Field(default=30.0, gt=0, le=180)
+    outbox_handler_max_external_attempts: int = Field(default=4, ge=1, le=12)
+    outbox_job_deadline_seconds: int = Field(default=1800, ge=30, le=3600)
+    outbox_event_max_external_attempts: int = Field(default=20, ge=1, le=100)
 
 
 @lru_cache

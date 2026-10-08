@@ -92,6 +92,10 @@ ALLOWED_LOG_FIELDS = {
     "max_cases_per_run",
     "tenants",
     "attempts",
+    # Outbox stale-claim recovery emits only aggregate counts; keep distinct
+    # names so these cannot be mistaken for one event's attempt state.
+    "requeued_count",
+    "failed_count",
     "consecutive_failures",
     "expired_versions",
     "pruned_dead_letters",

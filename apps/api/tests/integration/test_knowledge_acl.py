@@ -149,3 +149,72 @@ def test_open_document_visible_regardless_of_acl() -> None:
 def test_no_principal_scope_still_shows_open_documents() -> None:
     results = _search("standard warranty", [], [])
     assert any("Open policy" in r.excerpt for r in results)
+
+
+def test_grant_is_or_matched_and_revocation_applies_to_the_next_search() -> None:
+    from platform_core.db import create_engine as async_engine
+    from platform_core.knowledge.acl_service import can_read_document
+
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        doc_id = conn.execute(
+            text(
+                "SELECT resource_id FROM knowledge_acls WHERE tenant_id = :tenant "
+                "AND resource_type = 'document' AND principal_id = 'beta-team'"
+            ),
+            {"tenant": TENANT_A},
+        ).scalar_one()
+        grant_id = uuid.uuid4()
+        conn.execute(
+            text(
+                "INSERT INTO knowledge_acls (id, tenant_id, resource_type, resource_id, "
+                "principal_type, principal_id) VALUES "
+                "(:id, :tenant, 'document', :doc, 'user', 'operator-1')"
+            ),
+            {"id": grant_id, "tenant": TENANT_A, "doc": doc_id},
+        )
+    admin.dispose()
+
+    async def _can_read() -> bool:
+        engine = async_engine(APP_URL)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with factory() as session:
+                await session.execute(
+                    text("SELECT set_config('app.tenant_id', :tenant, true)"),
+                    {"tenant": TENANT_A},
+                )
+                return await can_read_document(
+                    session,
+                    tenant_id=uuid.UUID(TENANT_A),
+                    document_id=doc_id,
+                    principal_id="operator-1",
+                    role="",
+                )
+        finally:
+            await engine.dispose()
+
+    try:
+        before = _search("beta program pricing", ["user"], ["operator-1"])
+        assert any("Restricted" in result.excerpt for result in before)
+        assert _run(_can_read()) is True
+        mispaired_scope = _search(
+            "beta program pricing",
+            ["department", "user"],
+            ["operator-1", "beta-team"],
+        )
+        assert all("Restricted" not in result.excerpt for result in mispaired_scope)
+
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            conn.execute(text("DELETE FROM knowledge_acls WHERE id = :id"), {"id": grant_id})
+        admin.dispose()
+
+        after = _search("beta program pricing", ["user"], ["operator-1"])
+        assert all("Restricted" not in result.excerpt for result in after)
+        assert _run(_can_read()) is False
+    finally:
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            conn.execute(text("DELETE FROM knowledge_acls WHERE id = :id"), {"id": grant_id})
+        admin.dispose()

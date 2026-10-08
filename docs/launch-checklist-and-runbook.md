@@ -1,6 +1,6 @@
 # 上线验收清单与 Incident Runbook（迭代计划 4.7）
 
-日期：2026-09-19
+日期：2026-10-08
 对应门禁：`platform_core.evaluation.gates` + `scripts/release_check.py`。
 **清单里的每一条阈值都必须有一个对应的门禁或指标**——写在这里却没有门禁的项，
 视为未实现，不许在验收表上打勾。
@@ -38,6 +38,8 @@
 | 检索召回 recall@k | ≥ 0.90 | `min_retrieval_recall_at_k`（新增） |
 | 归因 | 每用例带归因标签 | 报告 `attribution_counts` |
 | judge 与人工一致性 | kappa ≥ 0.6 才启用 | `judge.cohens_kappa` + 人工标注子集 |
+| Prompt promotion 人工审核 | 最近 30 天；30 条或低流量全量；每层 5 条或该层全量；安全类 override = 0；加权 override ≤ 10% | `agent_runtime.prompt_release` + `test_prompt_release` / online review RLS tests |
+| 未发布 Prompt canary | 所有启用 A/B 实验累计 ≤ 10%；跨租户 Prompt UUID = 0 | `evaluation.ab_service.upsert_experiment` + `test_ab_experiments` |
 
 ### 1.3 成本与延迟
 
@@ -96,6 +98,27 @@
 | 日期 | 场景 | 结果 |
 |---|---|---|
 | 2026-09-18 | 备份恢复（backup_restore_drill.py） | 通过（见交付报告） |
-| （待办） | 模型宕机 → 降级链 → 弃权转人工 | 未执行：需要 fallback 模型配置 |
+| 2026-10-08 | 本地合成：主模型不可用 → 显式 fallback → 带有效引用的答案 | 单测通过；使用 fake provider，不产生外部模型请求 |
+| （外部待验收） | 真实主模型故障 → 获批备用模型 → 失败时弃权转人工 | 未执行：需要批准的主/备用模型端点和调用预算；本地 fake-provider 证据不替代生产故障演练 |
 
-> 如实标注：模型宕机演练需要配置一个真实备用模型端点，当前未执行。
+> 真实端点演练仍需授权和预算；默认 fallback 关闭，未配置时不重试同一故障模型。
+
+---
+
+## 3. Business compensation failed
+
+<a id="business-compensation-failed"></a>
+
+`PlatformToolCompensationFailed` means a human requested the case-specific
+`case.create` compensator, but the case was no longer in its original
+`NEW/version=1` state. The compensator leaves the case untouched and records a
+failed outcome; it never deletes the case or reverses later operator/customer
+work.
+
+1. Open the alert's audit trace and inspect the original verified ToolExecution
+   and the current Case version.
+2. Do not replay the compensator against a changed Case. Continue through the
+   ordinary case workflow and record the human decision there.
+3. For Jira, Linear, CRM, notifications, release confirmations, or any provider
+   action without a qualified compensator, use the provider's reconciliation
+   path. Do not infer that a failed later task authorizes a blind reverse write.

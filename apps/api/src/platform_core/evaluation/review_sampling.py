@@ -22,6 +22,7 @@ handed a row with no stated reason has to guess what they are checking for.
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,6 +68,26 @@ def _risk_stratum(status: str) -> str | None:
     return None
 
 
+def review_stratum(run: dict[str, Any]) -> str:
+    """Classify one run using the exact strata used by the sampler."""
+    status = str(run.get("status") or "")
+    stratum = _risk_stratum(status)
+    if stratum is not None:
+        return stratum
+    confidence = run.get("confidence")
+    try:
+        value = float(confidence) if confidence is not None else 1.0
+    except (TypeError, ValueError):
+        value = 1.0
+    return STRATUM_LOW_CONFIDENCE if value < LOW_CONFIDENCE else STRATUM_ROUTINE
+
+
+def review_population_counts(runs: list[dict[str, Any]]) -> dict[str, int]:
+    """Count the full population by the sampler's mutually exclusive strata."""
+    counts: Counter[str] = Counter(review_stratum(run) for run in runs)
+    return dict(sorted(counts.items()))
+
+
 def _stable_key(run_id: str, seed: str) -> str:
     """Deterministic shuffle key.
 
@@ -102,16 +123,7 @@ def select_review_sample(
         STRATUM_ROUTINE: [],
     }
     for run in runs:
-        status = str(run.get("status") or "")
-        stratum = _risk_stratum(status)
-        if stratum is None:
-            confidence = run.get("confidence")
-            try:
-                value = float(confidence) if confidence is not None else 1.0
-            except (TypeError, ValueError):
-                value = 1.0
-            stratum = STRATUM_LOW_CONFIDENCE if value < LOW_CONFIDENCE else STRATUM_ROUTINE
-        strata[stratum].append(run)
+        strata[review_stratum(run)].append(run)
 
     for rows in strata.values():
         rows.sort(key=lambda run: _stable_key(str(run.get("id") or ""), seed))
@@ -158,4 +170,11 @@ def select_review_sample(
     ]
 
 
-__all__ = ["LOW_CONFIDENCE", "RISKY_SHARE", "ReviewSample", "select_review_sample"]
+__all__ = [
+    "LOW_CONFIDENCE",
+    "RISKY_SHARE",
+    "ReviewSample",
+    "review_population_counts",
+    "review_stratum",
+    "select_review_sample",
+]

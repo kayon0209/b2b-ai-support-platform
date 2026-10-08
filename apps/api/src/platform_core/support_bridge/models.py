@@ -13,7 +13,7 @@ import enum
 import uuid
 from typing import Any
 
-from sqlalchemy import BigInteger, ForeignKey, Index, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -77,6 +77,12 @@ class InboxEvent(Base, PkMixin, TenantMixin):
     claimed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     heartbeat_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Durable worker claims count against the bounded per-delivery retry
+    # budget, including attempts abandoned by a process crash.
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # First worker start survives stale-claim recovery, giving one logical
+    # delivery a single absolute deadline across process restarts.
+    first_started_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     processed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     conversation_ref_id: Mapped[uuid.UUID | None] = mapped_column(

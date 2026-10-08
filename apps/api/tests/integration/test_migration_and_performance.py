@@ -85,6 +85,7 @@ TENANT_TABLES = (
     "conversation_turns",
     "copilot_drafts",
     "csat_responses",
+    "customer_resolution_feedback_events",
     "dead_letter_items",
     "departments",
     "document_versions",
@@ -96,6 +97,10 @@ TENANT_TABLES = (
     "external_resource_refs",
     "feature_flag_targets",
     "feature_flags",
+    "quality_review_batches",
+    "quality_review_items",
+    "quality_review_decisions",
+    "quality_review_evidence",
     "inbox_events",
     "issue_categories",
     "knowledge_acls",
@@ -122,6 +127,8 @@ TENANT_TABLES = (
     "tenant_domains",
     "tool_definitions",
     "tool_executions",
+    "tool_execution_reconciliations",
+    "tool_execution_compensations",
     "tool_proposals",
     "visitor_session_revocations",
 )
@@ -142,10 +149,11 @@ TENANT_TABLES = (
 # "how many revisions are registered", and a stray untracked file on one
 # machine must not be able to satisfy it.
 #
-# 70 as of 2026-09-29. `0071_task_command_idempotency` adds request receipts
-# to the append-only task event log; keep this synchronized with the tracked
-# revision set, excluding `.gitkeep` and local-only files.
-EXPECTED_MIGRATIONS = 70
+# 79 as of 2026-10-08. Revisions 0076-0080 persist job deadlines, customer
+# feedback, quality-review evidence, ordered contact memory and rerun
+# idempotency. Keep this synchronized with ScriptDirectory's registered
+# revisions, excluding `.gitkeep` and local-only files.
+EXPECTED_MIGRATIONS = 79
 
 # Sized to the benchmark's real concurrency. Deliberately NOT large: on this
 # host a bigger pool is slower under concurrency because per-connection

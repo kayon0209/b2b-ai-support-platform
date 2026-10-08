@@ -9,9 +9,11 @@ Covers the docs/testing-and-evaluation.md safety invariants:
 - sanitized inputs never contain credentials or PII
 """
 
+import time
 import uuid
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from platform_core.tool_gateway.gateway import (
@@ -21,7 +23,7 @@ from platform_core.tool_gateway.gateway import (
     compute_action_hash,
     sanitize_arguments,
 )
-from platform_core.tool_gateway.models import ToolDefinition
+from platform_core.tool_gateway.models import ToolDefinition, ToolExecution
 
 
 def _read_tool() -> ToolDefinition:
@@ -355,6 +357,55 @@ def test_confirmation_binds_to_action_hash(gateway_env) -> None:
     assert _run(scenario()) == "executed"
 
 
+def test_confirmation_expiring_during_pre_execution_check_blocks_dispatch(
+    gateway_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Expiry is checked again after a slow live guard, at the intent boundary."""
+    import platform_core.tool_gateway.gateway as gateway_module
+
+    clock = [int(time.time())]
+    monkeypatch.setattr(gateway_module.time, "time", lambda: clock[0])
+
+    async def scenario() -> tuple[str, int, int]:
+        executor = FakeExecutor()
+        gw, session, engine = await gateway_env(executor)
+        proposal = await gw.propose(
+            tenant_id=TENANT,
+            actor_id=ACTOR,
+            tool_name="crm.add_note",
+            arguments={"account_ref": "a1", "note": "approval must still be current"},
+            role="support_admin",
+            idempotency_key="expires-during-precheck",
+            permission_allowed=True,
+        )
+        confirmation = await gw.confirm(tenant_id=TENANT, proposal_id=proposal.id, actor_id=ACTOR)
+
+        async def expire_before_intent(*_args: object, **_kwargs: object) -> None:
+            clock[0] = confirmation.expires_at
+
+        try:
+            try:
+                await gw.execute(
+                    tenant_id=TENANT,
+                    actor_id=ACTOR,
+                    proposal_id=proposal.id,
+                    pre_execution_check=expire_before_intent,
+                )
+                code = "executed"
+            except ToolGatewayError as exc:
+                code = exc.code
+            execution_result = await session.execute(
+                select(func.count()).select_from(ToolExecution)
+            )
+            execution_count = int(execution_result.scalar_one())
+            return code, execution_count, len(executor.calls)
+        finally:
+            await session.close()
+            await engine.dispose()
+
+    assert _run(scenario()) == ("CONFIRMATION_EXPIRED", 0, 0)
+
+
 def test_duplicate_idempotency_key_executes_once(gateway_env) -> None:
     async def scenario() -> int:
         executor = FakeExecutor()
@@ -462,7 +513,7 @@ def test_adapter_crash_marks_execution_failed(gateway_env) -> None:
 # needs a human or a bounded retry.
 
 
-def _crashed_execution(session, proposal, idempotency_key):
+def _crashed_execution(session, proposal, idempotency_key, *, started_at=0):
     """The row a killed worker leaves behind: EXECUTING, never completed."""
     from platform_core.tool_gateway.models import ToolExecution
 
@@ -474,13 +525,17 @@ def _crashed_execution(session, proposal, idempotency_key):
         status="executing",
         idempotency_key=idempotency_key,
         sanitized_input={"account_ref": "a1"},
-        started_at=0,
+        started_at=started_at,
         completed_at=None,
     )
 
 
 def test_replay_of_a_crashed_execution_is_not_reported_as_a_result(gateway_env) -> None:
-    async def scenario() -> tuple[str, int]:
+    async def scenario() -> tuple[str, int, str]:
+        from sqlalchemy import select
+
+        from platform_core.tool_gateway.models import ToolExecution
+
         executor = FakeExecutor()
         gw, session, engine = await gateway_env(executor)
         proposal = await gw.propose(
@@ -495,27 +550,33 @@ def test_replay_of_a_crashed_execution_is_not_reported_as_a_result(gateway_env) 
         session.add(_crashed_execution(session, proposal, "crash-1"))
         await session.commit()
         try:
-            execution = await gw.execute(tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id)
-            # If the corpse is returned as a result, status is 'executing' -
-            # neither success nor failure, and the adapter was never called.
-            return execution.status, len(executor.calls)
+            with pytest.raises(ToolGatewayError) as raised:
+                await gw.execute(tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id)
+            status = await session.scalar(
+                select(ToolExecution.status).where(
+                    ToolExecution.tenant_id == TENANT,
+                    ToolExecution.idempotency_key == "crash-1",
+                )
+            )
+            return raised.value.code, len(executor.calls), str(status)
         finally:
             await session.close()
             await engine.dispose()
 
-    status, calls = _run(scenario())
-    assert status != "executing", (
-        "a replay of an interrupted execution returned the half-finished row "
-        "as though it were a result; the caller cannot tell it apart from a "
-        "completed one"
-    )
-    assert status in {"executed", "failed", "unknown"}
+    code, calls, status = _run(scenario())
+    assert code == "TOOL_EXECUTION_OUTCOME_UNKNOWN"
+    assert calls == 0, "an unresolved provider call must not be blindly replayed"
+    assert status == "unknown"
 
 
-def test_crashed_execution_does_not_invent_success(gateway_env) -> None:
-    """Running the replay must re-invoke the adapter, not silently succeed."""
+def test_recent_execution_intent_is_not_replayed(gateway_env) -> None:
+    """A recent intent may still be running, so a duplicate call only reports it."""
 
-    async def scenario() -> tuple[str, int]:
+    async def scenario() -> tuple[str, int, str]:
+        from sqlalchemy import select
+
+        from platform_core.tool_gateway.models import ToolExecution
+
         executor = FakeExecutor(output={"done": True})
         gw, session, engine = await gateway_env(executor)
         proposal = await gw.propose(
@@ -527,18 +588,111 @@ def test_crashed_execution_does_not_invent_success(gateway_env) -> None:
             idempotency_key="crash-2",
             permission_allowed=True,
         )
-        session.add(_crashed_execution(session, proposal, "crash-2"))
+        session.add(_crashed_execution(session, proposal, "crash-2", started_at=int(time.time())))
         await session.commit()
         try:
-            execution = await gw.execute(tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id)
-            return execution.status, len(executor.calls)
+            with pytest.raises(ToolGatewayError) as raised:
+                await gw.execute(tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id)
+            status = await session.scalar(
+                select(ToolExecution.status).where(
+                    ToolExecution.tenant_id == TENANT,
+                    ToolExecution.idempotency_key == "crash-2",
+                )
+            )
+            return raised.value.code, len(executor.calls), str(status)
         finally:
             await session.close()
             await engine.dispose()
 
-    status, calls = _run(scenario())
-    assert calls == 1, "the interrupted execution was never retried"
-    assert status == "executed"
+    code, calls, status = _run(scenario())
+    assert code == "TOOL_EXECUTION_IN_PROGRESS"
+    assert calls == 0
+    assert status == "executing"
+
+
+def test_execution_intent_is_committed_before_call_and_lost_ack_is_not_replayed(
+    gateway_env,
+) -> None:
+    async def scenario() -> tuple[str, int, str]:
+        from sqlalchemy import select
+
+        from platform_core.tool_gateway.models import ToolExecution
+
+        gw, session, engine = await gateway_env(FakeExecutor())
+
+        class _LostAckExecutor:
+            calls = 0
+            durable_status_before_call: str | None = None
+
+            async def execute(self, tool_name, parameters, idempotency_key):
+                self.calls += 1
+                observer_factory = async_sessionmaker(engine, expire_on_commit=False)
+                async with observer_factory() as observer:
+                    self.durable_status_before_call = await observer.scalar(
+                        select(ToolExecution.status).where(
+                            ToolExecution.tenant_id == TENANT,
+                            ToolExecution.idempotency_key == idempotency_key,
+                        )
+                    )
+                # Simulate the provider accepting a write, then the process
+                # dying before it records the response.
+                raise SystemExit("synthetic process exit after provider acceptance")
+
+            async def verify_postcondition(self, tool_name, parameters, output):
+                return None
+
+        executor = _LostAckExecutor()
+        gw = ToolGateway(session, {"crm.tag_account": executor})
+        proposal = await gw.propose(
+            tenant_id=TENANT,
+            actor_id=ACTOR,
+            tool_name="crm.tag_account",
+            arguments={"account_ref": "a1"},
+            role="support_admin",
+            idempotency_key="lost-ack-1",
+            permission_allowed=True,
+        )
+        with pytest.raises(SystemExit):
+            await gw.execute(tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id)
+        assert executor.durable_status_before_call == "executing"
+        await session.close()
+
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        recovery_session = factory()
+        try:
+            row = (
+                await recovery_session.execute(
+                    select(ToolExecution).where(
+                        ToolExecution.tenant_id == TENANT,
+                        ToolExecution.idempotency_key == "lost-ack-1",
+                    )
+                )
+            ).scalar_one()
+            assert row.status == "executing"
+            row.started_at = 0  # elapse the bounded in-progress grace in the test
+            await recovery_session.commit()
+
+            recovery_gateway = ToolGateway(recovery_session, {"crm.tag_account": executor})
+            with pytest.raises(ToolGatewayError) as raised:
+                await recovery_gateway.execute(
+                    tenant_id=TENANT, actor_id=ACTOR, proposal_id=proposal.id
+                )
+            await recovery_session.commit()
+            status = await recovery_session.scalar(
+                select(ToolExecution.status).where(
+                    ToolExecution.tenant_id == TENANT,
+                    ToolExecution.idempotency_key == "lost-ack-1",
+                )
+            )
+            return raised.value.code, executor.calls, str(status)
+        finally:
+            await recovery_session.close()
+            await engine.dispose()
+
+    code, calls, status = _run(scenario())
+    assert code == "TOOL_EXECUTION_OUTCOME_UNKNOWN"
+    assert calls == 1, "replaying after a lost provider response would duplicate the write"
+    assert status == "unknown"
 
 
 def test_completed_execution_still_short_circuits(gateway_env) -> None:

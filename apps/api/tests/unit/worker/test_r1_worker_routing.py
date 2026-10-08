@@ -67,12 +67,18 @@ async def test_owner_claim_selects_queue_metadata_without_payload(claim: str) ->
         claimed = await claim_task_planning_events(session)  # type: ignore[arg-type]
 
     assert claimed == []
-    statement = session.statements[0]
-    compiled = str(statement.compile(dialect=postgresql.dialect()))
+    compiled_queries = [
+        str(statement.compile(dialect=postgresql.dialect())) for statement in session.statements
+    ]
+    compiled = next(query for query in compiled_queries if query.lstrip().startswith("SELECT"))
     selected_columns = compiled.split(" FROM ", maxsplit=1)[0]
     assert "payload" not in selected_columns.lower()
     assert "event_id" in selected_columns
     assert "tenant_id" in selected_columns
+    if claim in {"shadow", "task-planning"}:
+        assert "first_attempt_at" in selected_columns
+        assert "deadline_at" in selected_columns
+        assert "external_attempt_limit" in selected_columns
 
 
 @pytest.mark.parametrize("consumer", ["shadow", "copilot", "task-planning"])
@@ -92,6 +98,9 @@ async def test_stale_reclaim_uses_claim_time_not_event_creation_time(consumer: s
 
         await reclaim_stale_task_planning(session)  # type: ignore[arg-type]
 
-    statement = str(session.statements[0].compile(dialect=postgresql.dialect()))
+    compiled = [
+        str(statement.compile(dialect=postgresql.dialect())) for statement in session.statements
+    ]
+    statement = next(query for query in compiled if "processing_started_at" in query)
     assert "processing_started_at" in statement
     assert "created_at" not in statement

@@ -15,6 +15,7 @@ from platform_core.agent_runtime.semantic.contracts import (
 )
 from platform_core.evaluation.semantic_eval import Split, assign_split
 
+from .metrics import ModelUsageSample, summarize_model_usage
 from .semantic_v2_dataset import semantic_v2_cases
 from .semantic_v2_manifest import FROZEN_DATASET_HASH
 from .semantic_v2_runner import (
@@ -171,3 +172,113 @@ def test_tool_report_scores_unique_reads_and_counts_unavailable_suggestions() ->
     assert report["unavailable_candidate_count"] == 1
     assert report["unavailable_candidate_by_slice"]["injection_attempt"] == 1
     assert report["execution_count"] == 0
+
+
+def test_model_usage_report_counts_retries_timeouts_and_token_cost() -> None:
+    report = summarize_model_usage(
+        [
+            ModelUsageSample(
+                prompt_tokens=1000,
+                completion_tokens=1000,
+                request_attempts=2,
+                valid_output=True,
+                exact_intent_match=True,
+                timed_out=False,
+            ),
+            ModelUsageSample(
+                prompt_tokens=500,
+                completion_tokens=500,
+                request_attempts=1,
+                valid_output=False,
+                exact_intent_match=False,
+                timed_out=True,
+            ),
+        ],
+        prompt_cost_cents_per_1k=0.15,
+        completion_cost_cents_per_1k=0.60,
+        max_retries=1,
+    )
+
+    assert report["model_request_attempts"] == 3
+    assert report["model_retry_attempts"] == 1
+    assert report["valid_outputs"] == 1
+    assert report["invalid_or_unavailable_outputs"] == 1
+    assert report["deadline_timeouts"] == 1
+    assert report["total_prompt_tokens"] == 1500
+    assert report["total_completion_tokens"] == 1500
+    assert report["prompt_tokens_per_exact_intent_match"] == 1500
+    assert report["completion_tokens_per_exact_intent_match"] == 1500
+    assert report["estimated_model_cost"] == {
+        "currency": "USD",
+        "minor_units": "cents",
+        "total_cents": 1,
+        "below_cent_resolution": False,
+        "rounding": "nearest_cent",
+        "prompt_rate_cents_per_1k": "0.15",
+        "completion_rate_cents_per_1k": "0.6",
+        "usage_scope": (
+            "provider-reported response tokens only; failed-request billing is unavailable"
+        ),
+    }
+
+
+def test_model_usage_report_leaves_success_cost_unmeasured_when_no_case_succeeds() -> None:
+    report = summarize_model_usage(
+        [],
+        prompt_cost_cents_per_1k=0.15,
+        completion_cost_cents_per_1k=0.60,
+        max_retries=0,
+    )
+
+    assert report["exact_intent_match_cases"] == 0
+    assert report["prompt_tokens_per_exact_intent_match"] is None
+    assert report["completion_tokens_per_exact_intent_match"] is None
+    assert report["estimated_model_cost"]["total_cents"] == 0
+    assert report["business_goal_cost"]["measured_cases"] == 0
+    assert report["business_goal_cost"]["estimated_cost_cents_per_successful_goal"] is None
+
+
+def test_model_usage_report_estimates_cost_per_verified_business_goal() -> None:
+    report = summarize_model_usage(
+        [
+            ModelUsageSample(
+                prompt_tokens=1000,
+                completion_tokens=1000,
+                request_attempts=1,
+                valid_output=True,
+                exact_intent_match=True,
+                timed_out=False,
+                business_goal_complete=True,
+            ),
+            ModelUsageSample(
+                prompt_tokens=3000,
+                completion_tokens=2000,
+                request_attempts=1,
+                valid_output=True,
+                exact_intent_match=False,
+                timed_out=False,
+                business_goal_complete=False,
+            ),
+            ModelUsageSample(
+                prompt_tokens=100,
+                completion_tokens=100,
+                request_attempts=1,
+                valid_output=True,
+                exact_intent_match=True,
+                timed_out=False,
+            ),
+        ],
+        prompt_cost_cents_per_1k=0.15,
+        completion_cost_cents_per_1k=0.60,
+        max_retries=0,
+    )
+
+    assert report["business_goal_cost"] == {
+        "measured_cases": 2,
+        "verified_successful_goals": 1,
+        "estimated_cost_cents_per_successful_goal": "0.7500",
+        "currency": "USD",
+        "minor_units": "cents",
+        "usage_scope": "provider-reported tokens for successful goals only",
+        "failed_request_billing": "unavailable from token totals",
+    }

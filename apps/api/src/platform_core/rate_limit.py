@@ -57,7 +57,7 @@ from observability_metrics import get_metrics
 logger = JsonLogger("platform.api")
 
 # Never limited, for the reasons in the module docstring.
-UNLIMITED_PATHS = frozenset({"/healthz", "/metrics", "/openapi.json", "/docs", "/redoc"})
+UNLIMITED_PATHS = frozenset({"/healthz", "/readyz", "/metrics", "/openapi.json", "/docs", "/redoc"})
 
 # A public-facing webhook is burstier than interactive API traffic: a provider
 # delivers a batch and retries on failure, and 429ing legitimate deliveries

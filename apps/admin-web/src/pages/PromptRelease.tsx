@@ -4,6 +4,7 @@ import { newIdempotencyKey } from "../lib/idempotency";
 import { useAction } from "../lib/useAction";
 import { usePrompt } from "../components/Prompt";
 import { useAsync } from "../lib/useAsync";
+import { parsePromotionEvidence } from "../lib/promptReleaseEvidence";
 import type { ActivePrompt, PromptVersion } from "../lib/types";
 import {
   ActionFeedback,
@@ -11,7 +12,7 @@ import {
   Card,
   EmptyState,
   PageHeader,
-  Spinner,
+  SkeletonRows,
   ListTotal,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
@@ -147,7 +148,7 @@ export function PromptRelease() {
       <ActionFeedback error={action.error} notice={action.notice} />
       {prompt.element}
       <LoadError error={list.error} status={list.errorStatus} onRetry={list.reload} />
-      {list.loading ? <Spinner label={t("prompts.loading" as DictKey)} /> : null}
+      {list.loading ? <SkeletonRows rows={5} label={t("prompts.loading" as DictKey)} /> : null}
       {list.data && sorted.length === 0 ? (
         <EmptyState message={t("prompts.empty")} />
       ) : null}
@@ -166,7 +167,12 @@ export function PromptRelease() {
           <tbody>
             {sorted.map((v) => (
               <tr key={v.id}>
-                <td className="cell-strong">v{v.version}</td>
+                <td className="cell-strong">
+                  v{v.version}
+                  <small className="prompt-version-id">
+                    {t("prompts.versionIdLabel")}: <code>{v.id}</code>
+                  </small>
+                </td>
                 <td>
                   {v.id === activeId ? (
                     <Badge tone="good">{t("prompts.stateServing")}</Badge>
@@ -201,12 +207,40 @@ export function PromptRelease() {
                     className="btn btn-primary"
                     disabled={v.id === activeId || activeUnknown}
                     onClick={async () => {
-                      const ok = await prompt.confirm(
-                        t("prompts.promoteConfirm", { version: v.version }),
-                        t("prompts.promote"),
-                        t("prompts.promoteDetail"),
-                      );
-                      if (ok) act(`/v1/prompts/${v.id}/promote`, undefined, t("prompts.promoted"));
+                      const values = await prompt.ask({
+                        title: t("prompts.promoteConfirm", { version: v.version }),
+                        confirmLabel: t("prompts.promote"),
+                        detail: t("prompts.promoteDetail"),
+                        fields: [
+                          {
+                            name: "eval_run_id",
+                            label: t("prompts.evalRunId"),
+                            required: true,
+                          },
+                          {
+                            name: "scores_json",
+                            label: t("prompts.scoresJson"),
+                            placeholder: t("prompts.scoresJsonHint"),
+                            required: true,
+                          },
+                          {
+                            name: "regressions_json",
+                            label: t("prompts.regressionsJson"),
+                            placeholder: "[]",
+                          },
+                        ],
+                      });
+                      if (!values) return;
+                      try {
+                        const evidence = parsePromotionEvidence(values);
+                        await act(
+                          `/v1/prompts/${v.id}/promote`,
+                          evidence,
+                          t("prompts.promoted"),
+                        );
+                      } catch {
+                        action.fail(t("prompts.evidenceInvalid"));
+                      }
                     }}
                   >
                     {t("prompts.promote")}

@@ -9,7 +9,7 @@ import {
   Badge,
   Card,
   PageHeader,
-  Spinner,
+  SkeletonRows,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { useLang } from "../lib/i18n";
@@ -106,7 +106,7 @@ export function Branding() {
       />
 
       <LoadError error={branding.error} status={branding.errorStatus} onRetry={branding.reload} />
-      {branding.loading ? <Spinner label={t("branding.loading")} /> : null}
+      {branding.loading ? <SkeletonRows rows={4} label={t("branding.loading")} /> : null}
 
       <div className="grid-2">
         <Card title={t("branding.settings")}>

@@ -370,6 +370,38 @@ h3 {
   gap: 16px;
 }
 
+.quality-review-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.quality-review-row > a {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.quality-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.quality-review-actions select {
+  min-height: 36px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
 .grid-case {
   display: grid;
   grid-template-columns: minmax(280px, 380px) 1fr;
@@ -974,8 +1006,22 @@ select:focus-visible {
    button on one line, so several arms can be read at a glance. */
 .arm-row {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+}
+
+.arm-prompt-version {
+  width: 20rem;
+}
+
+.prompt-version-id {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 400;
+  overflow-wrap: anywhere;
 }
 
 .text-input-narrow {

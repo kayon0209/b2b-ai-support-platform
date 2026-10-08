@@ -47,6 +47,9 @@ data:
   # Metrics are scraped from inside the cluster; the endpoint carries no
   # tenant-identifying labels, but it is still not exposed through the Ingress.
   APP_METRICS_ENABLED: "true"
+  APP_WORKER_METRICS_ENABLED: "true"
+  APP_WORKER_METRICS_HOST: "0.0.0.0"
+  APP_WORKER_METRICS_PORT: "8001"
   # OIDC is the production identity path. `APP_ALLOW_BOOTSTRAP_TOKENS` is
   # intentionally absent - see the header.
   APP_OIDC_ISSUER: "https://sso.example.com/realms/platform"

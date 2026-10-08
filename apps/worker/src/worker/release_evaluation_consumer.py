@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pydantic import SecretStr, ValidationError
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
@@ -28,6 +28,11 @@ from platform_contracts.knowledge_release_jobs import (
     ReleasePostTestRequested,
 )
 from platform_core.config import Settings, get_settings
+from platform_core.execution_budget import (
+    AttemptBudgetExhausted,
+    ExecutionBudget,
+    run_with_execution_budget,
+)
 from platform_core.identity.tenant_context import TenantContext, tenant_session
 from platform_core.knowledge.release_evaluator import (
     RELEASE_EVALUATION_REQUEST_EVENT,
@@ -77,6 +82,9 @@ class ClaimedReleaseJob:
     tenant_id: uuid.UUID
     processing_token: uuid.UUID
     attempt: int
+    first_attempt_at: int
+    deadline_at: int
+    external_attempt_limit: int
 
 
 @dataclass(frozen=True)
@@ -182,6 +190,27 @@ async def claim_release_jobs(
     """Claim metadata only; request payloads stay behind tenant RLS."""
     now = int(time.time())
     stale_cutoff = now - RELEASE_EVALUATION_STALE_SECONDS
+    settings = get_settings()
+    expired_queue = await session.execute(
+        update(OutboxEvent)
+        .where(
+            OutboxEvent.event_type.in_(
+                (RELEASE_EVALUATION_REQUEST_EVENT, RELEASE_POST_TEST_REQUEST_EVENT)
+            ),
+            OutboxEvent.status == OutboxStatus.QUEUED.value,
+            OutboxEvent.deadline_at <= now,
+        )
+        .values(
+            status=OutboxStatus.FAILED.value,
+            processing_started_at=None,
+            processing_token=None,
+            last_error="release_evaluator_deadline_exhausted",
+        )
+    )
+    expired_count = int(getattr(expired_queue, "rowcount", 0) or 0)
+    if expired_count:
+        get_metrics().knowledge_release_jobs_total.labels(result="failed").inc(expired_count)
+        logger.error("release_evaluator_deadline_exhausted", count=expired_count)
     eligible_status = or_(
         OutboxEvent.status == OutboxStatus.QUEUED.value,
         and_(
@@ -196,6 +225,9 @@ async def claim_release_jobs(
                 OutboxEvent.event_id,
                 OutboxEvent.tenant_id,
                 OutboxEvent.attempts,
+                OutboxEvent.first_attempt_at,
+                OutboxEvent.deadline_at,
+                OutboxEvent.external_attempt_limit,
             )
             .where(
                 OutboxEvent.event_type.in_(
@@ -203,6 +235,10 @@ async def claim_release_jobs(
                 ),
                 eligible_status,
                 OutboxEvent.attempts < RELEASE_EVALUATION_MAX_ATTEMPTS,
+                or_(
+                    OutboxEvent.deadline_at.is_(None),
+                    OutboxEvent.deadline_at > now,
+                ),
             )
             .order_by(OutboxEvent.created_at, OutboxEvent.id)
             .limit(batch)
@@ -212,6 +248,13 @@ async def claim_release_jobs(
     claims: list[ClaimedReleaseJob] = []
     for row in rows:
         token = uuid.uuid4()
+        first_attempt_at = int(row.first_attempt_at or now)
+        deadline_at = int(
+            row.deadline_at or first_attempt_at + settings.knowledge_evaluator_job_deadline_seconds
+        )
+        external_attempt_limit = int(
+            row.external_attempt_limit or settings.knowledge_evaluator_max_external_attempts
+        )
         await session.execute(
             update(OutboxEvent)
             .where(OutboxEvent.id == row.id)
@@ -219,6 +262,12 @@ async def claim_release_jobs(
                 status=RELEASE_EVALUATION_IN_FLIGHT,
                 processing_started_at=now,
                 processing_token=token,
+                first_attempt_at=func.coalesce(OutboxEvent.first_attempt_at, now),
+                deadline_at=func.coalesce(OutboxEvent.deadline_at, deadline_at),
+                external_attempt_limit=func.coalesce(
+                    OutboxEvent.external_attempt_limit,
+                    settings.knowledge_evaluator_max_external_attempts,
+                ),
                 attempts=OutboxEvent.attempts + 1,
             )
         )
@@ -228,6 +277,9 @@ async def claim_release_jobs(
                 tenant_id=row.tenant_id,
                 processing_token=token,
                 attempt=int(row.attempts) + 1,
+                first_attempt_at=first_attempt_at,
+                deadline_at=deadline_at,
+                external_attempt_limit=external_attempt_limit,
             )
         )
     return claims
@@ -235,7 +287,8 @@ async def claim_release_jobs(
 
 async def reclaim_stale_release_jobs(session: AsyncSession) -> tuple[int, int]:
     """Requeue stale claims or fail them once their bounded retry budget ends."""
-    cutoff = int(time.time()) - RELEASE_EVALUATION_STALE_SECONDS
+    now = int(time.time())
+    cutoff = now - RELEASE_EVALUATION_STALE_SECONDS
     base = and_(
         OutboxEvent.event_type.in_(
             (RELEASE_EVALUATION_REQUEST_EVENT, RELEASE_POST_TEST_REQUEST_EVENT)
@@ -243,9 +296,26 @@ async def reclaim_stale_release_jobs(session: AsyncSession) -> tuple[int, int]:
         OutboxEvent.status == RELEASE_EVALUATION_IN_FLIGHT,
         OutboxEvent.processing_started_at <= cutoff,
     )
+    deadline_failed = await session.execute(
+        update(OutboxEvent)
+        .where(base, OutboxEvent.deadline_at <= now)
+        .values(
+            status=OutboxStatus.FAILED.value,
+            processing_started_at=None,
+            processing_token=None,
+            last_error="release_evaluator_deadline_exhausted",
+        )
+    )
+    within_deadline = and_(
+        base,
+        or_(
+            OutboxEvent.deadline_at.is_(None),
+            OutboxEvent.deadline_at > now,
+        ),
+    )
     reclaimed = await session.execute(
         update(OutboxEvent)
-        .where(base, OutboxEvent.attempts < RELEASE_EVALUATION_MAX_ATTEMPTS)
+        .where(within_deadline, OutboxEvent.attempts < RELEASE_EVALUATION_MAX_ATTEMPTS)
         .values(
             status=OutboxStatus.QUEUED.value,
             processing_started_at=None,
@@ -255,7 +325,7 @@ async def reclaim_stale_release_jobs(session: AsyncSession) -> tuple[int, int]:
     )
     failed = await session.execute(
         update(OutboxEvent)
-        .where(base, OutboxEvent.attempts >= RELEASE_EVALUATION_MAX_ATTEMPTS)
+        .where(within_deadline, OutboxEvent.attempts >= RELEASE_EVALUATION_MAX_ATTEMPTS)
         .values(
             status=OutboxStatus.FAILED.value,
             processing_started_at=None,
@@ -263,7 +333,11 @@ async def reclaim_stale_release_jobs(session: AsyncSession) -> tuple[int, int]:
             last_error="release_evaluator_attempts_exhausted",
         )
     )
-    return int(getattr(reclaimed, "rowcount", 0) or 0), int(getattr(failed, "rowcount", 0) or 0)
+    return (
+        int(getattr(reclaimed, "rowcount", 0) or 0),
+        int(getattr(failed, "rowcount", 0) or 0)
+        + int(getattr(deadline_failed, "rowcount", 0) or 0),
+    )
 
 
 async def _load_job(claim: ClaimedReleaseJob) -> tuple[str, dict[str, Any]]:
@@ -421,14 +495,53 @@ async def _heartbeat(claim: ClaimedReleaseJob, stop: asyncio.Event) -> None:
             return
 
 
+def _release_attempt_budget(external_attempt_limit: int, attempt: int) -> int:
+    """Allocate the fixed external-call ceiling across the durable job retries."""
+    if attempt < 1 or attempt > RELEASE_EVALUATION_MAX_ATTEMPTS:
+        return 0
+    base, remainder = divmod(external_attempt_limit, RELEASE_EVALUATION_MAX_ATTEMPTS)
+    return base + (1 if attempt <= remainder else 0)
+
+
+def _budget_for_release_claim(
+    claim: ClaimedReleaseJob,
+    *,
+    now: int | None = None,
+) -> tuple[ExecutionBudget, float]:
+    """Rebuild a bounded per-delivery budget from the persisted job deadline."""
+    current = int(time.time()) if now is None else now
+    remaining = claim.deadline_at - current
+    if remaining <= 0:
+        raise TimeoutError("RELEASE_EVALUATION_DEADLINE_EXCEEDED")
+    attempts = _release_attempt_budget(claim.external_attempt_limit, claim.attempt)
+    if attempts <= 0:
+        raise AttemptBudgetExhausted("release_evaluator_attempt_budget_exhausted")
+    return (
+        ExecutionBudget.for_seconds(
+            deadline_seconds=float(remaining),
+            max_attempts=attempts,
+            operation_limits={"model": attempts, "tool": 0, "outbound": 0},
+        ),
+        float(remaining),
+    )
+
+
 async def _execute_with_heartbeat(
     claim: ClaimedReleaseJob,
     event_type: str,
     payload: dict[str, Any],
     runtime: ReleaseEvaluatorRuntime,
 ) -> str:
+    budget, remaining = _budget_for_release_claim(claim)
     stop = asyncio.Event()
-    work = asyncio.create_task(_execute_job(claim, event_type, payload, runtime))
+
+    async def run_bounded_job() -> str:
+        return await run_with_execution_budget(
+            budget,
+            asyncio.wait_for(_execute_job(claim, event_type, payload, runtime), timeout=remaining),
+        )
+
+    work = asyncio.create_task(run_bounded_job())
     heartbeat = asyncio.create_task(_heartbeat(claim, stop))
     done, _pending = await asyncio.wait({work, heartbeat}, return_when=asyncio.FIRST_COMPLETED)
     if heartbeat in done and not stop.is_set():
@@ -537,6 +650,10 @@ class ReleaseEvaluationWorker:
 
 
 def _safe_error_code(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError):
+        return "RELEASE_EVALUATION_DEADLINE_EXCEEDED"
+    if isinstance(exc, AttemptBudgetExhausted):
+        return "RELEASE_EVALUATION_ATTEMPT_BUDGET_EXHAUSTED"
     code = getattr(exc, "code", None)
     if isinstance(code, str) and _ERROR_CODE.fullmatch(code):
         return code

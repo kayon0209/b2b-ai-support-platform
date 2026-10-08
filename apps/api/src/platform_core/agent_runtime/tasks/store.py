@@ -176,6 +176,7 @@ class TaskCommand:
     # for an agent to confirm. The id is written here so the row and the
     # proposal cannot drift apart.
     proposal_id: uuid.UUID | None = None
+    proposal_lease_version: int | None = None
     execution_id: uuid.UUID | None = None
     # A pending ToolProposal must be withdrawn before its task can be
     # cancelled or handed off. The HTTP boundary sets this only after the
@@ -398,7 +399,16 @@ async def transition(
 
     # The state machine owns the transition rules, including the terminal
     # guarantee - re-checking here would be a second copy that could drift.
-    check_transition(current, command.target, kind)
+    # A ready -> ready transition exists only to durably record that a
+    # prerequisite has just been satisfied. It clears the stale waiting reason
+    # and appends an event; every other same-state command remains a conflict.
+    resolving_dependency = (
+        current is TaskStatus.READY
+        and command.target is TaskStatus.READY
+        and command.reason_code == "TASK_DEPENDENCY_SATISFIED"
+    )
+    if not resolving_dependency:
+        check_transition(current, command.target, kind)
 
     if command.target is TaskStatus.SUCCEEDED:
         _require_evidence(command.completion_evidence)
@@ -445,6 +455,8 @@ async def transition(
         values["completion_evidence"] = command.completion_evidence
     if command.proposal_id is not None:
         values["proposal_id"] = command.proposal_id
+    if command.proposal_lease_version is not None:
+        values["proposal_lease_version"] = command.proposal_lease_version
     if command.execution_id is not None:
         values["execution_id"] = command.execution_id
 

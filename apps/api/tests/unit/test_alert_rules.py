@@ -176,6 +176,8 @@ _LABEL_KIND_BY_METRIC = {
     ("platform_agent_runs_total", "outcome"): "run_outcome",
     ("platform_agent_run_latency_seconds", "outcome"): "run_outcome",
     ("platform_agent_citation_validation_total", "status"): "citation_status",
+    ("platform_tool_compensations_total", "action"): "tool_compensation_action",
+    ("platform_tool_compensations_total", "outcome"): "tool_compensation_outcome",
 }
 # The HTTP outcome vocabulary is not in `platform_range_labels` because it
 # belongs to `http_metrics`, not to this module. It is pinned here so a change
@@ -310,6 +312,7 @@ _REQUIRED_ALERTS = {
     # An outbox row retired with no handler is a business event that went
     # nowhere, and the row is still marked sent.
     "PlatformOutboxUnhandledEvents": "a business event with no consumer is otherwise invisible",
+    "PlatformToolCompensationFailed": "a rejected business compensator needs an operator",
     # Model errors mean answers are being produced by the fallback chain or not
     # at all; the runbook's first step assumes this is visible.
     "PlatformModelErrorsHigh": "model failure rate is the runbook's first diagnostic",
@@ -323,6 +326,7 @@ _REQUIRED_ALERTS = {
     "PlatformCitationValidationUnsupported": "the wrong-answer runbook's primary signal",
     # Availability: the API is the only thing serving the customer surface.
     "PlatformApiDown": "no customer can reach the platform at all",
+    "PlatformWorkerMetricsDown": "queue and recovery telemetry is unavailable",
 }
 
 
@@ -346,9 +350,10 @@ def test_the_availability_alert_is_not_a_no_op_expression() -> None:
     """
     down = next(r for r in _all_rules() if r["alert"] == "PlatformApiDown")
     assert "up{" in down["expr"]
-    monitors = _service_monitors()
-    assert monitors, "no ServiceMonitor: nothing scrapes /metrics, so no rule can ever fire"
-    for monitor in monitors:
+    api_monitor = next(
+        item for item in _service_monitors() if item["metadata"]["name"] == "platform-api-metrics"
+    )
+    for monitor in (api_monitor,):
         for endpoint in monitor["spec"]["endpoints"]:
             job = endpoint.get("job_name") or monitor["metadata"]["name"]
             assert f'job="{job}"' in down["expr"], (
@@ -362,27 +367,42 @@ def test_the_availability_alert_is_not_a_no_op_expression() -> None:
             assert endpoint["port"], monitor["metadata"]["name"]
 
 
+def test_the_worker_availability_alert_matches_its_service_monitor() -> None:
+    alert = next(rule for rule in _all_rules() if rule["alert"] == "PlatformWorkerMetricsDown")
+    monitor = next(
+        item
+        for item in _service_monitors()
+        if item["metadata"]["name"] == "platform-worker-metrics"
+    )
+    for endpoint in monitor["spec"]["endpoints"]:
+        job = endpoint.get("job_name") or monitor["metadata"]["name"]
+        assert f'job="{job}"' in alert["expr"]
+
+
 def test_the_scrape_target_is_the_metrics_service_port() -> None:
     """The Service names its port `metrics` (30-api.yaml). A monitor that says
     `http` would select a port that does not exist on this Service."""
-    service_ports = {
-        s["metadata"]["name"]: {p["name"] for p in s["spec"]["ports"]}
-        for s in [
-            doc
-            for path in sorted(K8S.glob("*.yaml"))
-            if not path.name.endswith(".example.yaml")
-            for doc in yaml.safe_load_all(path.read_text(encoding="utf-8"))
-            if doc and doc.get("kind") == "Service"
-        ]
-    }
-    assert "metrics" in service_ports.get("platform-api-metrics", set()), (
-        f"platform-api-metrics ports: {service_ports.get('platform-api-metrics')}"
-    )
+    services = [
+        doc
+        for path in sorted(K8S.glob("*.yaml"))
+        if not path.name.endswith(".example.yaml")
+        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8"))
+        if doc and doc.get("kind") == "Service"
+    ]
     for monitor in _service_monitors():
+        selector = monitor["spec"]["selector"]["matchLabels"]
+        service = next(
+            item for item in services if item["metadata"]["name"] == monitor["metadata"]["name"]
+        )
+        assert all(
+            service["metadata"].get("labels", {}).get(key) == value
+            for key, value in selector.items()
+        )
+        service_ports = {port["name"] for port in service["spec"]["ports"]}
         for endpoint in monitor["spec"]["endpoints"]:
-            assert endpoint["port"] in service_ports.get("platform-api-metrics", set()), (
+            assert endpoint["port"] in service_ports, (
                 f"{monitor['metadata']['name']} scrapes port {endpoint['port']!r}, which the "
-                "Service does not expose"
+                f"selected Service {service['metadata']['name']} does not expose"
             )
 
 
@@ -396,10 +416,11 @@ def test_a_service_monitor_exists_for_the_metrics_endpoint() -> None:
         assert monitor["spec"]["endpoints"][0]["path"] == "/metrics"
         # The namespace default, like every other object here.
         assert monitor["metadata"]["namespace"] == "b2b-support"
-        # It must select the API, not match everything in the namespace and
-        # scrape whatever answers 200 on /metrics.
+        # It must select one of the deliberate metric Services, not match
+        # everything in the namespace and scrape whatever answers 200.
         selector = monitor["spec"]["selector"]["matchLabels"]
         assert selector.get("app.kubernetes.io/name") == "platform", monitor["metadata"]["name"]
+        assert selector.get("app.kubernetes.io/component") in {"api", "worker-metrics"}
 
 
 # --- the tracing dependency is actually installed ----------------------------

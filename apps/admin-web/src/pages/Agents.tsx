@@ -11,7 +11,7 @@ import {
   EmptyState,
   ListTotal,
   PageHeader,
-  Spinner,
+  SkeletonRows,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { useLang } from "../lib/i18n";
@@ -172,7 +172,7 @@ export function Agents() {
 
       <ActionFeedback error={action.error} notice={action.notice} />
       <LoadError error={roster.error} status={roster.errorStatus} onRetry={roster.reload} />
-      {roster.loading ? <Spinner label={t("agents.loading")} /> : null}
+      {roster.loading ? <SkeletonRows rows={5} label={t("agents.loading")} /> : null}
       {roster.data && items.length === 0 ? <EmptyState message={t("agents.empty")} /> : null}
 
       {items.length > 0 ? (

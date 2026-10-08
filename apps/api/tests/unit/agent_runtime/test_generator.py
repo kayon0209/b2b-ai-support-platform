@@ -9,11 +9,15 @@ boundary safe:
 - excerpts are redacted and truncated before leaving the process.
 """
 
+import json
 import uuid
 
+import pytest
+
+from platform_core.agent_runtime.conversation import CompactedContext
 from platform_core.agent_runtime.generator import LlmAnswerGenerator
 from platform_core.agent_runtime.qa_path import validate_citations
-from platform_core.llm.provider import ChatResult
+from platform_core.llm.provider import ChatResult, ModelUnavailable
 from platform_core.retrieval.hybrid import RetrievedChunk
 
 
@@ -59,6 +63,34 @@ class _FakeChat:
         )
 
 
+class _PrimaryUnavailableChat:
+    def __init__(self, fallback_body: str) -> None:
+        self.fallback_body = fallback_body
+        self.requested_models: list[str | None] = []
+
+    async def complete(self, messages, *, max_tokens=1024, temperature=0.0, model=None):
+        self.requested_models.append(model)
+        if model is None:
+            raise ModelUnavailable("synthetic primary outage")
+        if model != "backup-model":
+            raise AssertionError("fallback request did not use the configured model")
+        return ChatResult(
+            text=self.fallback_body,
+            model=model,
+            prompt_tokens=10,
+            completion_tokens=4,
+        )
+
+
+class _UnavailableChat:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, *, max_tokens=1024, temperature=0.0, model=None):
+        self.calls += 1
+        raise ModelUnavailable("synthetic provider outage")
+
+
 async def test_grounded_claims_resolve_to_real_chunk_ids() -> None:
     chunk_a = _chunk("Refunds within 30 days.")
     chunk_b = _chunk("Refunds take 5 business days.")
@@ -76,6 +108,20 @@ async def test_grounded_claims_resolve_to_real_chunk_ids() -> None:
     assert draft.claims[1] == [chunk_b.chunk_id]
     # The validator agrees the answer is publishable.
     assert validate_citations(draft, [chunk_a, chunk_b]).ok is True
+
+
+async def test_chinese_retrieved_evidence_can_support_a_real_citation() -> None:
+    chunk = _chunk("设备型号 EC-500 网关的错误码 E504 表示散热风扇故障。")
+    body = json.dumps(
+        {"claims": [{"text": "E504 表示散热风扇故障。", "citations": [str(chunk.chunk_id)]}]},
+        ensure_ascii=False,
+    )
+    gen = LlmAnswerGenerator(_FakeChat(body))
+
+    draft = await gen.generate("错误码 E504 是什么？", [chunk])
+
+    assert draft.claims[0] == [chunk.chunk_id]
+    assert validate_citations(draft, [chunk]).ok is True
 
 
 async def test_invented_citation_id_is_dropped_then_claim_rejected() -> None:
@@ -161,6 +207,41 @@ async def test_long_excerpt_is_truncated() -> None:
     assert "x" * (MAX_EXCERPT_CHARS + 10) not in chat.last_prompt
 
 
+async def test_final_prompt_preserves_the_full_question_and_enforces_total_budget() -> None:
+    from platform_core.agent_runtime.generator import MAX_TOTAL_PROMPT_CHARS
+
+    chat = _FakeChat('{"claims": []}')
+    gen = LlmAnswerGenerator(chat)
+    question = "Do not update this preference without my approval. " + ("detail " * 120)
+
+    await gen.generate(question, [_chunk("The approved process is documented here.")])
+
+    assert question in chat.last_prompt
+    assert len(chat.last_prompt) <= MAX_TOTAL_PROMPT_CHARS + 1
+
+
+async def test_context_over_budget_abstains_without_cutting_a_pinned_obligation() -> None:
+    chat = _FakeChat('{"claims": []}')
+    gen = LlmAnswerGenerator(chat)
+    obligation = "negative_constraint: DO NOT remove this final marker: preserve-this"
+    context = CompactedContext(
+        recent=[],
+        summary="",
+        pinned=[obligation + ("x" * 13000)],
+        durable_facts=(),
+        dropped_turns=0,
+        topic_shift=False,
+        budget_chars=1500,
+        used_chars=13000,
+    )
+
+    draft = await gen.generate("What is the policy?", [_chunk("Policy evidence.")], context=context)
+
+    assert draft.claims == {}
+    assert chat.last_prompt == ""
+    assert obligation in gen._build_conversation(context, "", question="What is the policy?")
+
+
 async def test_generator_exposes_template_for_run_lineage() -> None:
     from platform_core.agent_runtime.prompts import KNOWLEDGE_QA_TEMPLATE_NAME
 
@@ -188,6 +269,31 @@ async def test_provider_token_usage_is_carried_on_the_draft() -> None:
     assert draft.usage["completion_tokens"] == 34
     assert draft.usage["model"] == "fake"
     assert draft.usage["raw"] == {"total": 154}
+
+
+async def test_primary_model_outage_uses_only_the_configured_fallback() -> None:
+    chunk = _chunk("Refunds within 30 days.")
+    fallback_body = json.dumps(
+        {"claims": [{"text": "Refunds within 30 days.", "citations": [str(chunk.chunk_id)]}]}
+    )
+    chat = _PrimaryUnavailableChat(fallback_body)
+    gen = LlmAnswerGenerator(chat, fallback_model="backup-model")
+
+    draft = await gen.generate("refund policy?", [chunk])
+
+    assert chat.requested_models == [None, "backup-model"]
+    assert draft.claims == {0: [chunk.chunk_id]}
+    assert validate_citations(draft, [chunk]).ok is True
+
+
+async def test_unconfigured_fallback_does_not_retry_the_failed_model() -> None:
+    chat = _UnavailableChat()
+    gen = LlmAnswerGenerator(chat)
+
+    with pytest.raises(ModelUnavailable):
+        await gen.generate("refund policy?", [_chunk("Refunds within 30 days.")])
+
+    assert chat.calls == 1
 
 
 async def test_malformed_output_still_reports_the_tokens_it_spent() -> None:

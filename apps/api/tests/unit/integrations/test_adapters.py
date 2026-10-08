@@ -5,6 +5,7 @@ import asyncio
 
 import httpx
 
+from platform_core.execution_budget import ExecutionBudget, use_execution_budget
 from platform_core.integrations.crm import CrmReadAdapter, CrmWriteAdapter
 from platform_core.integrations.im import ImNotificationAdapter
 from platform_core.integrations.jira import JiraAdapter
@@ -145,6 +146,48 @@ def test_jira_create_issue_returns_key_and_url(monkeypatch) -> None:
     assert result["url"] == "http://jira.test/browse/SUP-42"
 
 
+def test_jira_ambiguous_write_is_never_retried_without_provider_idempotency(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503)
+
+    _patch_transport(monkeypatch, handler)
+    adapter = JiraAdapter(_ctx({"base_url": "http://jira.test", "project_key": "SUP"}))
+    output = _run(adapter.execute("jira.create_issue", {"title": "x"}, "stable-key"))
+
+    assert calls == 1
+    assert output is not None and output["ambiguous"] is True
+    assert _run(adapter.verify_postcondition("jira.create_issue", {}, output)) is None
+
+
+def test_connector_retries_share_the_current_run_budget(monkeypatch) -> None:
+    calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503)
+
+    _patch_transport(monkeypatch, handler)
+    adapter = CrmReadAdapter(_ctx({"base_url": "http://crm.test"}))
+    budget = ExecutionBudget.for_seconds(
+        deadline_seconds=5,
+        max_attempts=1,
+        operation_limits={"model": 0, "tool": 1, "outbound": 0},
+    )
+    with use_execution_budget(budget):
+        assert _run(adapter.get_account("A1")) is None
+        assert _run(adapter.get_contact("C1")) is None
+
+    assert calls == 1
+    assert budget.total_attempts == 1
+
+
 def test_jira_postcondition_verified_by_read(monkeypatch) -> None:
     created_key = {}
 
@@ -178,9 +221,12 @@ def test_jira_postcondition_unknown_when_read_fails(monkeypatch) -> None:
 
 
 def test_jira_search_before_create(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
     def handler(req: httpx.Request) -> httpx.Response:
-        body = req.read().decode()
-        assert "summary" in body or "jql" in body
+        seen["method"] = req.method
+        seen["params"] = dict(req.url.params)
+        seen["body"] = req.read()
         return httpx.Response(
             200,
             json={
@@ -196,10 +242,16 @@ def test_jira_search_before_create(monkeypatch) -> None:
 
     _patch_transport(monkeypatch, handler)
     adapter = JiraAdapter(_ctx({"base_url": "http://jira.test", "project_key": "SUP"}))
-    issues = _run(adapter.search_issues("Export"))
+    issues = _run(adapter.search_issues('Export" OR project = OTHER OR summary ~ "', 7))
     assert len(issues) == 1
     assert issues[0].key == "SUP-7"
     assert issues[0].status == "Open"
+    assert seen["method"] == "GET"
+    assert seen["params"] == {
+        "jql": r'project = "SUP" AND summary ~ "Export\" OR project = OTHER OR summary ~ \""',
+        "maxResults": "7",
+    }
+    assert seen["body"] == b""
 
 
 # --- Jira sync cursor semantics ---

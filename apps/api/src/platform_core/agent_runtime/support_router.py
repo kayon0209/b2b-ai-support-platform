@@ -38,7 +38,7 @@ import uuid
 from collections.abc import Sequence
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -289,6 +289,13 @@ async def timeline(
         rating_eligible = owner == "closed" and await chat_service.has_human_reply(
             session, tenant_id=claim.tenant_id, ref_id=claim.conversation_ref
         )
+        from platform_core.evaluation.customer_feedback_service import feedback_state
+
+        resolution_feedback = await feedback_state(
+            session,
+            tenant_id=claim.tenant_id,
+            conversation_ref_id=claim.conversation_ref,
+        )
     return ok_response(
         {
             "items": items,
@@ -310,6 +317,8 @@ async def timeline(
             # already answered.
             "rating": rating,
             "rating_eligible": rating_eligible,
+            "resolution_feedback_requested": resolution_feedback["requested"],
+            "resolution_confirmation": resolution_feedback["confirmed"],
         },
         trace_id=new_trace_id(),
     )
@@ -487,6 +496,10 @@ class RatingIn(BaseModel):
     comment: str | None = Field(default=None, max_length=500)
 
 
+class ResolutionFeedbackIn(BaseModel):
+    confirmed: StrictBool
+
+
 @router.post("/rating")
 async def rate_conversation(request: Request, body: RatingIn) -> object:
     """Record this conversation's satisfaction score (feature 7.10).
@@ -554,6 +567,142 @@ async def rate_conversation(request: Request, body: RatingIn) -> object:
         )
 
     return ok_response({"score": score}, trace_id=new_trace_id())
+
+
+@router.post("/resolution-feedback/requested")
+async def request_resolution_feedback(request: Request) -> object:
+    """Record that the customer-facing resolution question was displayed."""
+    claim = _claim(request)
+    if not isinstance(claim, VisitorClaim):
+        return claim
+    idempotency_key = require_idempotency_key(request)
+    if not idempotency_key:
+        return error_response(
+            IDEMPOTENCY_KEY_REQUIRED,
+            "showing the resolution question requires an Idempotency-Key",
+            status_code=400,
+        )
+
+    from platform_core.audit import service as audit_service
+    from platform_core.cases import service as case_service
+    from platform_core.evaluation.customer_feedback_service import (
+        CustomerFeedbackError,
+        record_feedback_event,
+    )
+
+    ctx = _ctx_for(claim)
+    try:
+        async with tenant_session(ctx) as session:
+            ended = await _reject_if_ended(claim, session)
+            if ended is not None:
+                return ended
+            owner, _mode = await lease_service.current_owner(
+                session, tenant_id=claim.tenant_id, conversation_ref_id=claim.conversation_ref
+            )
+            if owner != "closed" or not await chat_service.has_human_reply(
+                session, tenant_id=claim.tenant_id, ref_id=claim.conversation_ref
+            ):
+                return error_response(
+                    "RESOLUTION_FEEDBACK_NOT_READY",
+                    "the interaction has not finished",
+                    status_code=409,
+                )
+            linked_cases = await case_service.cases_for_conversation(
+                session,
+                tenant_id=claim.tenant_id,
+                conversation_ref_id=claim.conversation_ref,
+            )
+            case_id = linked_cases[0] if len(linked_cases) == 1 else None
+            event, replayed = await record_feedback_event(
+                session,
+                tenant_id=claim.tenant_id,
+                conversation_ref_id=claim.conversation_ref,
+                case_id=case_id,
+                event_type="requested",
+                idempotency_key=idempotency_key,
+            )
+            if not replayed:
+                await audit_service.record(
+                    session,
+                    ctx=ctx,
+                    action="customer.resolution_feedback.requested",
+                    resource_type="conversation",
+                    resource_id=claim.conversation_ref,
+                    metadata={"case_link_available": case_id is not None},
+                )
+    except CustomerFeedbackError as exc:
+        status = 409 if exc.code in {"IDEMPOTENCY_CONFLICT", "FEEDBACK_NOT_REQUESTED"} else 400
+        return error_response(exc.code, exc.detail, status_code=status, trace_id=new_trace_id())
+
+    return ok_response(
+        {"requested": True, "requested_at": int(event.occurred_at), "replayed": replayed},
+        trace_id=new_trace_id(),
+    )
+
+
+@router.post("/resolution-feedback")
+async def answer_resolution_feedback(request: Request, body: ResolutionFeedbackIn) -> object:
+    """Record an explicit yes/no answer after the resolution question was shown."""
+    claim = _claim(request)
+    if not isinstance(claim, VisitorClaim):
+        return claim
+    idempotency_key = require_idempotency_key(request)
+    if not idempotency_key:
+        return error_response(
+            IDEMPOTENCY_KEY_REQUIRED,
+            "answering the resolution question requires an Idempotency-Key",
+            status_code=400,
+        )
+
+    from platform_core.audit import service as audit_service
+    from platform_core.evaluation.customer_feedback_service import (
+        CustomerFeedbackError,
+        record_feedback_event,
+    )
+
+    ctx = _ctx_for(claim)
+    event_type = "confirmed" if body.confirmed else "rejected"
+    try:
+        async with tenant_session(ctx) as session:
+            ended = await _reject_if_ended(claim, session)
+            if ended is not None:
+                return ended
+            owner, _mode = await lease_service.current_owner(
+                session, tenant_id=claim.tenant_id, conversation_ref_id=claim.conversation_ref
+            )
+            if owner != "closed" or not await chat_service.has_human_reply(
+                session, tenant_id=claim.tenant_id, ref_id=claim.conversation_ref
+            ):
+                return error_response(
+                    "RESOLUTION_FEEDBACK_NOT_READY",
+                    "the interaction has not finished",
+                    status_code=409,
+                )
+            event, replayed = await record_feedback_event(
+                session,
+                tenant_id=claim.tenant_id,
+                conversation_ref_id=claim.conversation_ref,
+                case_id=None,
+                event_type=event_type,
+                idempotency_key=idempotency_key,
+            )
+            if not replayed:
+                await audit_service.record(
+                    session,
+                    ctx=ctx,
+                    action="customer.resolution_feedback.answered",
+                    resource_type="conversation",
+                    resource_id=claim.conversation_ref,
+                    after={"confirmed": body.confirmed},
+                )
+    except CustomerFeedbackError as exc:
+        status = 409 if exc.code in {"IDEMPOTENCY_CONFLICT", "FEEDBACK_NOT_REQUESTED"} else 400
+        return error_response(exc.code, exc.detail, status_code=status, trace_id=new_trace_id())
+
+    return ok_response(
+        {"confirmed": body.confirmed, "recorded_at": int(event.occurred_at), "replayed": replayed},
+        trace_id=new_trace_id(),
+    )
 
 
 @router.post("/messages")

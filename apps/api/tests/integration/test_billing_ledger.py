@@ -162,10 +162,9 @@ def test_usage_recorded_is_aggregated_through_the_relay() -> None:
     async def drive(session):
         from worker.outbox_relay import build_default_relay
 
-        # `commit=True`: this caller owns the transaction. Without it the
-        # ledger insert and `mark_sent` are rolled back when the session
-        # closes, and the relay still reports `sent=1` - the failure mode
-        # that let an empty ledger look healthy.
+        # Queue claims commit before dispatch. The tenant-bound handler then
+        # commits the ledger row and `mark_sent` together; the outer
+        # bookkeeping session is not their transaction boundary.
         return await build_default_relay(batch=10).run_once(session, commit=True)
 
     stats = _run(_with_session(TENANT_A, drive))
@@ -224,15 +223,13 @@ def test_malformed_payload_fails_rather_than_silently_dropping() -> None:
 # --- The commit contract ----------------------------------------------------
 
 
-def test_run_once_without_commit_does_not_persist() -> None:
-    """`run_once` writes into the caller's transaction; the caller commits.
+def test_run_once_commits_claim_and_handler_receipt_without_outer_commit() -> None:
+    """The claim and tenant handler receipt survive outer session close.
 
-    This is the failure that hid for the life of the billing feature: the
-    relay ran every handler successfully and reported `sent`, while the
-    enclosing transaction was rolled back on close and the ledger stayed
-    empty. The two assertions below are the same call with and without
-    `commit=True`, so the contract is pinned rather than assumed - a future
-    reader cannot "simplify" the flag away without failing here.
+    The claim commits before dispatch so another worker cannot execute it in
+    parallel. The handler persists its business row and sent receipt together
+    in a separate RLS-bound transaction. Closing the bookkeeping session does
+    not undo those durable transitions.
     """
     event_id = uuid.uuid4()
     run_id = uuid.uuid4()
@@ -251,31 +248,27 @@ def test_run_once_without_commit_does_not_persist() -> None:
         )
     admin.dispose()
 
-    async def without_commit(session):
+    async def drive_without_outer_commit(session):
         from worker.outbox_relay import build_default_relay
 
-        # No commit=True: the session closes and rolls back.
         return await build_default_relay(batch=10).run_once(session)
 
-    stats = _run(_with_session(TENANT_A, without_commit))
+    stats = _run(_with_session(TENANT_A, drive_without_outer_commit))
     assert stats.sent == 1, "the handler did run - that is what makes this silent"
 
     async def rollup(session):
         return await monthly_rollup(session, tenant_id=uuid.UUID(TENANT_A))
 
-    assert _run(_with_session(TENANT_A, rollup)).usage_entries == 0, (
-        "without commit=True the write must not survive - if this fails the "
-        "commit contract changed and the flag is now meaningless"
-    )
+    assert _run(_with_session(TENANT_A, rollup)).usage_entries == 1
 
-    async def with_commit(session):
+    async def retry_sent_event(session):
         from worker.outbox_relay import build_default_relay
 
         return await build_default_relay(batch=10).run_once(session, commit=True)
 
-    # The same row is still queued (the rollback released the claim).
-    stats = _run(_with_session(TENANT_A, with_commit))
-    assert stats.sent == 1
+    # A later poll cannot dispatch or bill the sent event again.
+    stats = _run(_with_session(TENANT_A, retry_sent_event))
+    assert stats.sent == 0
     assert _run(_with_session(TENANT_A, rollup)).usage_entries == 1
 
 

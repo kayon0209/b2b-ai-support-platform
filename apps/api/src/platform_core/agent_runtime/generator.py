@@ -33,7 +33,9 @@ from platform_core.retrieval.hybrid import RetrievedChunk
 # limit how much customer-derived text crosses the model boundary.
 MAX_EXCERPT_CHARS = 700
 MAX_TOTAL_EVIDENCE_CHARS = 6000
+MAX_TOTAL_PROMPT_CHARS = 12000
 MAX_ANSWER_TOKENS = 900
+SYSTEM_INSTRUCTION = "You answer strictly from provided evidence."
 
 
 def _extract_json_object(raw: str) -> dict[str, Any] | None:
@@ -103,7 +105,12 @@ class LlmAnswerGenerator:
             fallback_model=self._fallback_model,
         )
 
-    def _build_evidence(self, evidence: list[RetrievedChunk]) -> tuple[str, dict[str, str]]:
+    def _build_evidence(
+        self,
+        evidence: list[RetrievedChunk],
+        *,
+        max_chars: int = MAX_TOTAL_EVIDENCE_CHARS,
+    ) -> tuple[str, dict[str, str]]:
         """Render evidence and build the id -> chunk_id resolution map.
 
         The model only ever sees sanitized excerpt text plus the citation id
@@ -112,14 +119,13 @@ class LlmAnswerGenerator:
         """
         pairs: list[tuple[str, str]] = []
         resolve: dict[str, str] = {}
-        total = 0
         for chunk in evidence:
             safe_excerpt, _ = redact_text(chunk.excerpt)
             excerpt = safe_excerpt[:MAX_EXCERPT_CHARS]
-            if total + len(excerpt) > MAX_TOTAL_EVIDENCE_CHARS:
-                break
-            total += len(excerpt)
             citation_id = str(chunk.chunk_id)
+            candidate = pairs + [(citation_id, excerpt)]
+            if len(format_evidence(candidate)) > min(max_chars, MAX_TOTAL_EVIDENCE_CHARS):
+                break
             pairs.append((citation_id, excerpt))
             resolve[citation_id] = str(chunk.chunk_id)
         return format_evidence(pairs), resolve
@@ -151,7 +157,7 @@ class LlmAnswerGenerator:
         if retrieval_query.strip() and retrieval_query.strip() != question.strip():
             rendered = f"{rendered}\nSearched for: {retrieval_query.strip()}"
         safe_block, _ = redact_text(rendered)
-        return format_conversation(safe_block[:MAX_TOTAL_EVIDENCE_CHARS])
+        return format_conversation(safe_block)
 
     async def generate(
         self,
@@ -181,18 +187,36 @@ class LlmAnswerGenerator:
         if not evidence:
             return DraftAnswer(text="", claims={}, route="knowledge_qa")
 
-        evidence_block, resolve = self._build_evidence(evidence)
         safe_question, _ = redact_text(question)
         conversation_block = self._build_conversation(context, retrieval_query, question=question)
-        prompt = self._template.render(
-            evidence=evidence_block,
-            question=safe_question[:MAX_EXCERPT_CHARS],
+        empty_prompt = self._template.render(
+            evidence="",
+            question=safe_question,
             conversation=conversation_block,
         )
+        empty_prompt_size = len(empty_prompt) + len(SYSTEM_INSTRUCTION)
+        if empty_prompt_size > MAX_TOTAL_PROMPT_CHARS:
+            # The context includes unconditional pins. Silently slicing it
+            # could erase an approval, human handoff, negative constraint, or
+            # unresolved commitment, so an over-budget run abstains instead.
+            return DraftAnswer(text="", claims={}, route="knowledge_qa")
+        evidence_budget = MAX_TOTAL_PROMPT_CHARS - empty_prompt_size
+        evidence_block, resolve = self._build_evidence(evidence, max_chars=evidence_budget)
+        if not resolve:
+            return DraftAnswer(text="", claims={}, route="knowledge_qa")
+        prompt = self._template.render(
+            evidence=evidence_block,
+            question=safe_question,
+            conversation=conversation_block,
+        )
+        if len(prompt) + len(SYSTEM_INSTRUCTION) > MAX_TOTAL_PROMPT_CHARS:
+            # Templates are immutable, but a custom tenant template can still
+            # repeat placeholders. Enforce the actual rendered boundary too.
+            return DraftAnswer(text="", claims={}, route="knowledge_qa")
         from platform_core.llm.provider import ModelError
 
         messages = [
-            ChatMessage(ProviderRole.SYSTEM, "You answer strictly from provided evidence."),
+            ChatMessage(ProviderRole.SYSTEM, SYSTEM_INSTRUCTION),
             ChatMessage(ProviderRole.USER, prompt),
         ]
         try:

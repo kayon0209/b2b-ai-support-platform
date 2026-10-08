@@ -44,6 +44,7 @@ TESTS = (
     "apps/api/tests/integration/test_collect_fields_persistence.py",
     "apps/api/tests/integration/test_inbox_worker_isolation.py",
     "apps/api/tests/integration/test_migration_and_performance.py",
+    "apps/api/tests/integration/test_agent_run_replay.py",
     "apps/api/tests/unit/agent_runtime/test_task_planner.py",
     "apps/api/tests/unit/agent_runtime/test_task_privacy.py",
     "apps/api/tests/integration/test_demo_crm_tool_gateway.py",
@@ -410,6 +411,19 @@ def main() -> int:
             connection.execute("UPDATE r2r3_drill_gate SET paused = false WHERE id = true")
         _run(["docker", "kill", active_container])
         print(f"interrupted_worker_ip={active_ip}; recovery_worker_count=1")
+        # The production stale-claim lease is ten minutes. The test should
+        # prove recovery without sleeping through that full lease, so advance
+        # only this disposable synthetic receipt past its cutoff after killing
+        # the worker. This models lease expiry; it does not change worker
+        # configuration or shorten the production recovery fence.
+        with psycopg.connect(admin_dsn) as connection:
+            expired_claim = connection.execute(
+                "UPDATE outbox_events SET processing_started_at = 0 "
+                "WHERE event_id = %s AND status = 'processing'",
+                (event_id,),
+            )
+            if expired_claim.rowcount != 1:
+                raise DrillError("expected the interrupted synthetic delivery to remain processing")
         status, attempts, rows = _wait_until(admin_dsn, event_id, expected_attempts=1)
         print(f"interrupted_delivery_recovered={status == 'sent'} billing_rows={rows}")
 

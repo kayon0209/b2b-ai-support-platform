@@ -107,8 +107,19 @@ def _respond(
     )
 
 
-@router.api_route("/{connector_id}", methods=["GET", "POST"])
-async def channel_webhook(request: Request, connector_id: uuid.UUID) -> Response:
+@router.get("/{connector_id}", operation_id="channel_webhook_challenge")
+async def channel_webhook_challenge(request: Request, connector_id: uuid.UUID) -> Response:
+    """Verify a WeChat server URL challenge."""
+    return await _handle_channel_webhook(request, connector_id)
+
+
+@router.post("/{connector_id}", operation_id="channel_webhook_delivery")
+async def channel_webhook_delivery(request: Request, connector_id: uuid.UUID) -> Response:
+    """Receive and persist a signed email or WeChat delivery."""
+    return await _handle_channel_webhook(request, connector_id)
+
+
+async def _handle_channel_webhook(request: Request, connector_id: uuid.UUID) -> Response:
     """Verify a channel delivery, persist the turn, then persist the event."""
     body = await request.body()
 

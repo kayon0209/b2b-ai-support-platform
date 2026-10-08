@@ -82,9 +82,10 @@ rule allows 443 anywhere (the providers' address ranges change and pinning them
 would break on their schedule), and the metadata-service exclusion is what stops
 that rule from being "everything".
 
-**`/metrics` is not routed.** It is scraped in-cluster through a separate
-Service. The endpoint carries no tenant-identifying labels, but publishing
-operational detail to the internet has no upside.
+**`/metrics` is not routed.** API and worker metrics are scraped in-cluster
+through separate Services. NetworkPolicy admits only the monitoring namespace.
+Workers expose their process-local Prometheus registry on port 8001; the
+worker role is attached as a bounded `worker_queue` target label.
 
 **No CPU limit on the API, a memory limit on everything.** A CFS quota makes a
 bursty request handler slower under load while it holds a connection; memory is

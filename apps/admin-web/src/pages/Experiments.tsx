@@ -11,7 +11,7 @@ import {
   EmptyState,
   ListTotal,
   PageHeader,
-  Spinner,
+  SkeletonRows,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { useLang } from "../lib/i18n";
@@ -39,9 +39,11 @@ import { useLang } from "../lib/i18n";
 interface ArmDraft {
   name: string;
   weight: string;
+  promptVersionId: string;
 }
 
 const MAX_ARMS = 8;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function Experiments() {
   const { t } = useLang();
@@ -50,8 +52,8 @@ export function Experiments() {
   const [description, setDescription] = useState("");
   const [enabled, setEnabled] = useState(false);
   const [arms, setArms] = useState<ArmDraft[]>([
-    { name: "control", weight: "50" },
-    { name: "candidate", weight: "50" },
+    { name: "control", weight: "90", promptVersionId: "" },
+    { name: "candidate", weight: "10", promptVersionId: "" },
   ]);
 
   const data = useAsync<{
@@ -63,8 +65,13 @@ export function Experiments() {
   const trimmedKey = key.trim();
   const keyValid = trimmedKey !== "" && /^[A-Za-z0-9._-]+$/.test(trimmedKey);
   const namedArms = arms.filter((a) => a.name.trim() !== "");
-  const weightsValid = namedArms.every((a) => Number(a.weight) > 0);
-  const canSave = keyValid && namedArms.length > 0 && weightsValid && !action.busy;
+  const weightsValid = namedArms.every(
+    (arm) => Number.isFinite(Number(arm.weight)) && Number(arm.weight) > 0,
+  );
+  const promptVersionsValid = namedArms.every(
+    (arm) => !arm.promptVersionId.trim() || UUID_PATTERN.test(arm.promptVersionId.trim()),
+  );
+  const canSave = keyValid && namedArms.length > 0 && weightsValid && promptVersionsValid && !action.busy;
 
   function save(): void {
     if (!canSave) return;
@@ -78,6 +85,7 @@ export function Experiments() {
               variants: namedArms.map((a) => ({
                 name: a.name.trim(),
                 weight: Number(a.weight),
+                prompt_version_id: a.promptVersionId.trim() || null,
               })),
               enabled,
             },
@@ -158,6 +166,24 @@ export function Experiments() {
                   setArms(arms.map((a, i) => (i === index ? { ...a, weight: e.target.value } : a)))
                 }
               />
+              <input
+                className="text-input arm-prompt-version"
+                value={arm.promptVersionId}
+                placeholder={t("experiments.armPromptVersion")}
+                aria-label={t("experiments.armPromptVersionLabel", {
+                  arm: arm.name.trim() || String(index + 1),
+                })}
+                aria-invalid={
+                  arm.promptVersionId.trim() !== "" && !UUID_PATTERN.test(arm.promptVersionId.trim())
+                }
+                onChange={(e) =>
+                  setArms(
+                    arms.map((a, i) =>
+                      i === index ? { ...a, promptVersionId: e.target.value } : a,
+                    ),
+                  )
+                }
+              />
               {arms.length > 1 ? (
                 <button
                   className="btn"
@@ -172,7 +198,7 @@ export function Experiments() {
           {arms.length < MAX_ARMS ? (
             <button
               className="btn"
-              onClick={() => setArms([...arms, { name: "", weight: "1" }])}
+              onClick={() => setArms([...arms, { name: "", weight: "1", promptVersionId: "" }])}
             >
               {t("experiments.addArm")}
             </button>
@@ -203,12 +229,18 @@ export function Experiments() {
             {t("experiments.weightsInvalid")}
           </p>
         ) : null}
+        {!promptVersionsValid ? (
+          <p className="prompt-error" role="alert">
+            {t("experiments.promptVersionInvalid")}
+          </p>
+        ) : null}
         <p className="muted">{t("experiments.weightNote")}</p>
+        <p className="muted">{t("experiments.candidateExposureNote")}</p>
       </Card>
 
       <ActionFeedback error={action.error} notice={action.notice} />
       <LoadError error={data.error} status={data.errorStatus} onRetry={data.reload} />
-      {data.loading ? <Spinner label={t("experiments.loading")} /> : null}
+      {data.loading ? <SkeletonRows rows={5} label={t("experiments.loading")} /> : null}
       {data.data && data.data.experiments.length === 0 ? (
         <EmptyState message={t("experiments.empty")} />
       ) : null}

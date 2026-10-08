@@ -47,6 +47,14 @@ REASON_NO_READ_CAPABILITY = "SEMANTIC_NO_READ_CAPABILITY"
 REASON_NEEDS_CLARIFICATION = "SEMANTIC_NEEDS_CLARIFICATION"
 REASON_WAITING_DEPENDENCY = "TASK_WAITING_DEPENDENCY"
 REASON_CONDITION_UNMET = "TASK_CONDITION_UNMET"
+REASON_TOOL_SELECTION_AMBIGUOUS = "TASK_TOOL_SELECTION_AMBIGUOUS"
+REASON_TOOL_SELECTION_UNRESOLVED = "TASK_TOOL_SELECTION_UNRESOLVED"
+
+# `tool` is a reserved task-slot name. The model may propose a tool globally,
+# but only this planner writes the task-local binding after matching the
+# allowlisted candidate against the server's input schema.
+TOOL_SLOT_NAME = "tool"
+TOOL_SLOT_ORIGIN = "server_capability"
 
 # Slots whose value is a real address, tax id or other identifier. Their
 # *names* may be stored; the values are not, and a task row is not the place
@@ -111,8 +119,33 @@ def plan_tasks(
 
     for index, intent in enumerate(intents):
         key = keys_by_index[index]
-        slots = [_slot_row(s) for s in intent.slots]
-        missing = list(intent.missing_slots)
+        # A model-supplied ordinary slot must never become the authoritative
+        # tool choice. The reserved row below is server generated.
+        slots = [_slot_row(s) for s in intent.slots if s.name != TOOL_SLOT_NAME]
+        missing = [name for name in intent.missing_slots if name != TOOL_SLOT_NAME]
+        selected_tool, selection_reason = _select_tool_for_intent(
+            intent,
+            capabilities=capabilities,
+            accepted_tool_names=accepted_tool_names,
+        )
+        if selected_tool is None and any(slot.name == TOOL_SLOT_NAME for slot in intent.slots):
+            # A model-written reserved slot is evidence of a selection attempt,
+            # not an authority to choose a business tool.
+            selection_reason = REASON_TOOL_SELECTION_UNRESOLVED
+        if selected_tool is not None:
+            provided_names = {slot.name for slot in intent.slots if slot.name != TOOL_SLOT_NAME}
+            for required_name in capabilities[selected_tool].required_parameters:
+                if required_name not in provided_names and required_name not in missing:
+                    missing.append(required_name)
+            slots.append(
+                {
+                    "name": TOOL_SLOT_NAME,
+                    "value": selected_tool,
+                    "origin": TOOL_SLOT_ORIGIN,
+                    "selection_source": "allowlisted_candidate_schema_match",
+                    "confirmed": False,
+                }
+            )
         condition = (
             intent.condition.model_dump(mode="json") if intent.condition is not None else None
         )
@@ -133,6 +166,8 @@ def plan_tasks(
         ]
 
         blocked = unsupported.get(index)
+        if selection_reason is not None and blocked in (None, REASON_MISSING_FIELDS):
+            blocked = selection_reason
         status, reason = _decide(
             intent=intent,
             blocked=blocked,
@@ -158,6 +193,68 @@ def plan_tasks(
         )
 
     return planned
+
+
+def _select_tool_for_intent(
+    intent: SemanticIntent,
+    *,
+    capabilities: dict[str, CapabilityView],
+    accepted_tool_names: list[str],
+) -> tuple[str | None, str | None]:
+    """Bind an allowlisted model candidate to one task only when schema says so.
+
+    `tool_candidates` is global to the model response, while tasks are per
+    intent. Matching by list order or picking the first candidate would attach
+    the wrong business action to a subtask. Parameter names are the only
+    server-owned bridge currently available. If more than one candidate fits,
+    the caller parks that task for a human instead of guessing.
+    """
+    if intent.task_kind is SemanticTaskKind.CLARIFY:
+        return None, None
+
+    task_kind = intent.task_kind.value
+    slot_names = {slot.name for slot in intent.slots if slot.name != TOOL_SLOT_NAME}
+    supplied_or_missing = slot_names | {
+        name for name in intent.missing_slots if name != TOOL_SLOT_NAME
+    }
+    candidates: list[CapabilityView] = []
+    seen: set[str] = set()
+    for name in accepted_tool_names:
+        if name in seen:
+            continue
+        seen.add(name)
+        capability = capabilities.get(name)
+        if capability is None or task_kind not in capability.allowed_task_kinds:
+            continue
+        candidates.append(capability)
+
+    if not candidates:
+        return None, REASON_TOOL_SELECTION_UNRESOLVED if accepted_tool_names else None
+
+    schema_matches: list[CapabilityView] = []
+    complete_matches: list[CapabilityView] = []
+    for capability in candidates:
+        parameter_names = set(capability.parameter_names)
+        required_parameters = set(capability.required_parameters)
+        # An empty schema is only informative for a no-argument task. When
+        # schema metadata is absent for a task with slots, do not infer a fit.
+        if not parameter_names and (slot_names or required_parameters):
+            continue
+        if not slot_names.issubset(parameter_names):
+            continue
+        schema_matches.append(capability)
+        if required_parameters.issubset(supplied_or_missing):
+            complete_matches.append(capability)
+
+    if len(complete_matches) == 1:
+        return complete_matches[0].tool_name, None
+    if len(complete_matches) > 1 or len(schema_matches) > 1:
+        return None, REASON_TOOL_SELECTION_AMBIGUOUS
+    if len(schema_matches) == 1:
+        # The capability is unique even though some required fields were not
+        # named by the model. Its schema supplies those names as missing input.
+        return schema_matches[0].tool_name, None
+    return None, REASON_TOOL_SELECTION_UNRESOLVED
 
 
 def _decide(
@@ -190,6 +287,9 @@ def _decide(
         intent.task_kind is SemanticTaskKind.READ and not accepted_tool_names
     ):
         return TaskStatus.NEEDS_HUMAN, REASON_NO_READ_CAPABILITY
+
+    if blocked in (REASON_TOOL_SELECTION_AMBIGUOUS, REASON_TOOL_SELECTION_UNRESOLVED):
+        return TaskStatus.NEEDS_HUMAN, blocked
 
     if blocked == REASON_MISSING_FIELDS or missing:
         return TaskStatus.AWAITING_INPUT, REASON_MISSING_FIELDS
@@ -263,6 +363,10 @@ __all__ = [
     "REASON_NO_READ_CAPABILITY",
     "REASON_NO_WRITE_CAPABILITY",
     "REASON_WAITING_DEPENDENCY",
+    "REASON_TOOL_SELECTION_AMBIGUOUS",
+    "REASON_TOOL_SELECTION_UNRESOLVED",
+    "TOOL_SLOT_NAME",
+    "TOOL_SLOT_ORIGIN",
     "SENSITIVE_SLOT_NAMES",
     "PlannedTask",
     "plan_tasks",

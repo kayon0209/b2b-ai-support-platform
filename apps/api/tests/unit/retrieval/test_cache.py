@@ -115,3 +115,26 @@ def test_the_embedding_key_is_stable_for_the_same_input() -> None:
 def test_the_embedding_key_does_not_collide_across_text_boundaries() -> None:
     """A separator is used so ("ab","c") and ("a","bc") differ."""
     assert embedding_key("ab", model="c") != embedding_key("a", model="bc")
+
+
+async def test_support_query_embeddings_can_bypass_process_cache() -> None:
+    from platform_core.retrieval.cache import embedding_cache
+    from platform_core.retrieval.hybrid import _cached_embed_query
+
+    class CountingEmbedder:
+        model = "phase4-test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def embed_query(self, query: str) -> list[float]:
+            self.calls += 1
+            return [float(self.calls)]
+
+    embedding_cache.clear()
+    embedder = CountingEmbedder()
+    await _cached_embed_query(embedder, "private support follow-up", cache=False)
+    await _cached_embed_query(embedder, "private support follow-up", cache=False)
+
+    assert embedder.calls == 2
+    assert len(embedding_cache) == 0

@@ -274,7 +274,9 @@ def test_the_api_has_all_three_probes() -> None:
     container = _app_containers(_named("Deployment", "platform-api")["spec"]["template"]["spec"])[0]
     for probe in ("startupProbe", "readinessProbe", "livenessProbe"):
         assert probe in container, probe
-        assert container[probe]["httpGet"]["path"] == "/healthz"
+    assert container["startupProbe"]["httpGet"]["path"] == "/healthz"
+    assert container["livenessProbe"]["httpGet"]["path"] == "/healthz"
+    assert container["readinessProbe"]["httpGet"]["path"] == "/readyz"
 
 
 def test_the_api_has_a_grace_period_longer_than_a_model_call() -> None:
@@ -343,6 +345,29 @@ def test_every_worker_runs_the_shared_worker_entrypoint() -> None:
         container = _app_containers(deployment["spec"]["template"]["spec"])[0]
         assert container["command"][:3] == ["python", "-m", "worker.runner"], role
         assert container["image"] == "registry.example.com/b2b-support/platform:REPLACE_ME_TAG"
+
+
+def test_worker_metrics_service_scrapes_every_role_only_inside_the_cluster() -> None:
+    service = _named("Service", "platform-worker-metrics")
+    assert service["spec"]["ports"][0]["targetPort"] == 8001
+    assert service["spec"]["selector"]["worker_metrics"] == "true"
+    for role, deployment in _worker_deployments().items():
+        labels = deployment["spec"]["template"]["metadata"]["labels"]
+        assert labels["worker_metrics"] == "true", role
+        assert labels["worker_queue"] == WORKER_QUEUES.get(role, role), role
+    policy = _named("NetworkPolicy", "worker-metrics-scrape")["spec"]
+    assert policy["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"] == {
+        "kubernetes.io/metadata.name": "monitoring"
+    }
+    assert policy["ingress"][0]["ports"][0]["port"] == 8001
+
+
+def test_worker_metrics_are_registered_with_the_operator_scrape() -> None:
+    monitor = _named("ServiceMonitor", "platform-worker-metrics")
+    endpoint = monitor["spec"]["endpoints"][0]
+    assert endpoint["path"] == "/metrics"
+    assert endpoint["port"] == "metrics"
+    assert endpoint["relabelings"][0]["targetLabel"] == "worker_queue"
 
 
 @pytest.mark.parametrize("role", ["interactive", "ingestion", "outbox", "retention", "sla"])
