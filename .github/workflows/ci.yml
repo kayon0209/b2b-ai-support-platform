@@ -358,6 +358,8 @@ jobs:
     # integration-only run would leave that count unmeasured.
     runs-on: ubuntu-latest
     needs: [integration-tests]
+    env:
+      CI_TEST_DATABASE_NAME: platform_ci_test
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -381,12 +383,20 @@ jobs:
              END \$\$;
              GRANT platform_app TO platform;
              GRANT ALL ON SCHEMA public TO platform_app;"
+      - name: Create isolated release-evidence database
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            createdb -U platform --owner=platform "$CI_TEST_DATABASE_NAME"
+          docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
+            psql -U platform -d "$CI_TEST_DATABASE_NAME" -c \
+            "GRANT ALL ON SCHEMA public TO platform_app;"
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+        run: pip install -r requirements-dev.txt -r requirements-evals.txt
       - name: Run migrations
-        run: alembic -c apps/api/migrations/alembic.ini upgrade head
+        run: |
+          export APP_DATABASE_URL="postgresql+psycopg://platform:platform@localhost:5435/$CI_TEST_DATABASE_NAME"
+          alembic -c apps/api/migrations/alembic.ini upgrade head
         env:
-          APP_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
           PYTHONPATH: apps/api/src
           # env.py resolves the URL through get_settings(), which refuses to
           # start without an auth decision - and this job has no .env to read
@@ -403,13 +413,26 @@ jobs:
         # "passes locally, fails fresh" shape that suite exists to catch.
         run: |
           docker compose -f infra/compose/docker-compose.yml exec -T ai-postgres \
-            psql -U platform -d platform -c \
+            psql -U platform -d "$CI_TEST_DATABASE_NAME" -c \
             "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
       - name: Run the full suite (produces the release-gate evidence)
-        run: pytest
+        run: |
+          export APP_DATABASE_URL="postgresql+psycopg://platform:platform@localhost:5435/$CI_TEST_DATABASE_NAME"
+          export APP_DATABASE_APP_URL="postgresql+psycopg://platform_app:platform_app@localhost:5435/$CI_TEST_DATABASE_NAME"
+          export APP_TEST_DATABASE_URL="postgresql+psycopg://platform_app:platform_app@localhost:5435/$CI_TEST_DATABASE_NAME"
+          export APP_ADMIN_DATABASE_URL="postgresql+psycopg://platform:platform@localhost:5435/$CI_TEST_DATABASE_NAME"
+          export APP_TEST_DATABASE_ISOLATED="1"
+          pytest
         env:
-          APP_TEST_DATABASE_URL: postgresql+psycopg://platform_app:platform_app@localhost:5435/platform
-          APP_ADMIN_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
+          DEEPEVAL_DISABLE_DOTENV: "1"
+          DEEPEVAL_DISABLE_LEGACY_KEYFILE: "1"
+          DEEPEVAL_TELEMETRY_OPT_OUT: "1"
+          DEEPEVAL_LOCAL_STORE: json
+          DEEPEVAL_RESULTS_FOLDER: /tmp/deepeval-results
+          DEEPEVAL_CACHE_FOLDER: /tmp/deepeval-cache
+          CONFIDENT_API_KEY: ""
+          CONFIDENT_TRACE_VERBOSE: "0"
+          CONFIDENT_TRACE_FLUSH: "0"
           PYTHONPATH: apps/api/src:apps/worker/src:packages/contracts/src:packages/policy/src:packages/observability/src
           # Same reasoning as the unit and integration jobs: this checkout has
           # no .env, and the auth guard refuses to resolve any settings without
