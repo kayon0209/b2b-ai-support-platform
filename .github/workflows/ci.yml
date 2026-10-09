@@ -211,6 +211,7 @@ jobs:
             "GRANT SELECT, INSERT, UPDATE, DELETE ON alembic_version TO platform_app;"
       - name: Run integration tests
         run: |
+          export APP_DATABASE_URL="postgresql+psycopg://platform:platform@localhost:5435/$CI_TEST_DATABASE_NAME"
           export APP_DATABASE_APP_URL="postgresql+psycopg://platform_app:platform_app@localhost:5435/$CI_TEST_DATABASE_NAME"
           export APP_TEST_DATABASE_URL="postgresql+psycopg://platform_app:platform_app@localhost:5435/$CI_TEST_DATABASE_NAME"
           export APP_ADMIN_DATABASE_URL="postgresql+psycopg://platform:platform@localhost:5435/$CI_TEST_DATABASE_NAME"

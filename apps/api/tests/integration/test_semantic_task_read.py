@@ -439,6 +439,7 @@ def _clean(_require_isolated_test_database: None):
 @pytest.fixture(scope="session")
 def _require_isolated_test_database() -> None:
     """Fail before any seed/cleanup SQL unless all URLs name a safe temp DB."""
+    owner_url_value = os.environ.get("APP_DATABASE_URL", "")
     app_url_value = os.environ.get("APP_DATABASE_APP_URL", "")
     test_url_value = os.environ.get("APP_TEST_DATABASE_URL", "")
     admin_url_value = os.environ.get("APP_ADMIN_DATABASE_URL", "")
@@ -446,20 +447,21 @@ def _require_isolated_test_database() -> None:
         raise RuntimeError(
             "task trajectory integration requires an explicitly isolated test database"
         )
-    if not app_url_value or not test_url_value or not admin_url_value:
+    if not owner_url_value or not app_url_value or not test_url_value or not admin_url_value:
         raise RuntimeError(
-            "task trajectory integration requires explicit app, test, and admin URLs"
+            "task trajectory integration requires explicit owner, app, test, and admin URLs"
         )
 
+    owner_url = make_url(owner_url_value)
     app_url = make_url(app_url_value)
     test_url = make_url(test_url_value)
     admin_url = make_url(admin_url_value)
-    urls = (app_url, test_url, admin_url)
-    if app_url.database in {None, "", "platform", "postgres"}:
+    urls = (owner_url, app_url, test_url, admin_url)
+    if owner_url.database in {None, "", "platform", "postgres"}:
         raise RuntimeError(
             "task trajectory integration refuses the development/maintenance database"
         )
-    if any(url.database != app_url.database for url in urls):
+    if any(url.database != owner_url.database for url in urls):
         raise RuntimeError(
             "task trajectory integration URLs must point to the same isolated database"
         )
