@@ -1571,9 +1571,9 @@ def test_api_process_crash_after_provider_acceptance_never_replays_the_write() -
                         "type": "object",
                         "properties": {
                             "project": {"type": "string"},
-                            "title": {"type": "string"},
+                            "summary": {"type": "string"},
                         },
-                        "required": ["project", "title"],
+                        "required": ["project", "summary"],
                         "additionalProperties": False,
                     }
                 ),
@@ -1618,7 +1618,7 @@ def test_api_process_crash_after_provider_acceptance_never_replays_the_write() -
             key="gateway-crash-proposal",
             body={
                 "tool_name": "jira.create_issue",
-                "arguments": {"project": "SUP", "title": "synthetic lost-ack case"},
+                "arguments": {"project": "SUP", "summary": "synthetic lost-ack case"},
             },
         )
         assert status == 200, proposed
