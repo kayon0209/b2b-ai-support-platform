@@ -12,19 +12,17 @@ would claim a downstream notification that never left the process.
 
 Delivery semantics chosen here, and why:
 
-- **At-least-once.** A crash after publish but before `mark_sent` re-sends.
-  That is deliberate: the alternative (mark sent, then publish) can silently
-  drop an event, which is worse for a support system than a duplicate.
-  Consumers dedupe using the stable `event_id`, which is why it is a
-  column and not the row primary key.
+- Queue claims are committed before handler work, and carry a processing
+  token. A process restart therefore consumes a durable attempt rather than
+  erasing its retry count.
+- Database handlers that are safe to replay use the stable `event_id`
+  as their deduplication key. A customer-visible reply is not automatically
+  replayed after an ambiguous result or a worker crash; it is parked for human
+  review because the channel may already have accepted it.
 - **`attempts` bounds retries.** A handler that keeps failing eventually
-  parks (status stays `queued`, `last_error` recorded) rather than spinning
-  forever. Parking is visible because `attempts` and `last_error` are on
-  the row.
-- **One transaction per batch, not per event.** The claim uses
-  `FOR UPDATE SKIP LOCKED`, so two relays never fight over the same row,
-  and a handler failure inside the batch does not roll back the events
-  already marked sent in that batch.
+  is parked after a small, durable attempt budget rather than spinning
+  forever. Each handler runs in its tenant-bound app-role transaction; the
+  owner connection reads queue metadata only.
 
 The relay is transport-agnostic in the same way `runner.py` is: handlers
 are registered in a dict, so tests drive real dispatch without a broker and
@@ -34,9 +32,11 @@ production can back them with Celery or an HTTP sink.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
@@ -45,13 +45,20 @@ from platform_core.agent_runtime.copilot import COPILOT_EVENT_TYPE
 from platform_core.agent_runtime.semantic.shadow import SHADOW_EVENT_TYPE
 from platform_core.agent_runtime.tasks.planning_seam import TASK_PLANNING_EVENT_TYPE
 from platform_core.billing.service import handle_usage_recorded
-from platform_core.identity.tenant_context import TenantContext, apply_rls_tenant
+from platform_core.execution_budget import ExecutionBudget, use_execution_budget
+from platform_core.identity.tenant_context import TenantContext, tenant_session
 from platform_core.knowledge.release_evaluator import (
     RELEASE_EVALUATION_REQUEST_EVENT,
     RELEASE_POST_TEST_REQUEST_EVENT,
 )
-from platform_core.outbox import OutboxEvent
-from platform_core.outbox_service import claim_pending, mark_failed, mark_sent
+from platform_core.outbox import OutboxEvent, OutboxStatus
+from platform_core.outbox_service import (
+    OutboxClaim,
+    claim_pending,
+    mark_failed,
+    mark_sent,
+    reclaim_stale_claims,
+)
 
 logger = JsonLogger("platform.outbox_relay")
 
@@ -59,12 +66,26 @@ logger = JsonLogger("platform.outbox_relay")
 # It stays `queued` so an operator can requeue it deliberately; silently
 # marking it `failed` would hide an event that was never delivered.
 MAX_ATTEMPTS = 5
+STALE_OUTBOX_CLAIM_SECONDS = 600
+RETRY_SAFE_EVENT_TYPES = frozenset({"case.created", "case.updated", "usage.recorded"})
 
 DEFAULT_BATCH = 50
 
 
+def _external_attempts_for_delivery(claim: OutboxClaim) -> int:
+    """Partition one persisted event ceiling across its bounded deliveries."""
+    if claim.max_attempts < 1 or claim.attempts < 1 or claim.attempts > claim.max_attempts:
+        return 0
+    base, remainder = divmod(claim.external_attempt_limit, claim.max_attempts)
+    return base + (1 if claim.attempts <= remainder else 0)
+
+
 class OutboxHandlerError(Exception):
     """Raised by a handler when delivery failed and retry is appropriate."""
+
+
+class OutboxOutcomeUnknown(OutboxHandlerError):
+    """A provider may have accepted a side effect; the event must not replay."""
 
 
 # A handler receives the full event row so it can use payload, trace_id and
@@ -107,115 +128,159 @@ class OutboxRelay:
         self.handlers[event_type] = handler
 
     async def run_once(self, session: AsyncSession, *, commit: bool = False) -> RelayStats:
-        """Claim and dispatch one batch. Returns what happened.
+        """Commit global queue claims, then run each handler in its tenant scope.
 
-        The session is supplied by the caller so a cycle shares one unit of
-        work, matching `inbox_consumer.drain_once`.
-
-        **The caller owns the transaction.** Everything this method writes -
-        the handler's rows and the `mark_sent` / `mark_failed` update - lands
-        in the session's transaction, which is only durable once somebody
-        commits. `OutboxWorker.run_once` supplies a `session_scope()`, which
-        commits; a caller that passes a raw session must either commit
-        itself or pass `commit=True`, which commits once at the end of the
-        batch.
-
-        Getting this wrong is silent and expensive. A caller that forgets
-        sees `RelayStats.sent == 1` - the handler ran, no exception was
-        raised - while the transaction is rolled back on close and nothing
-        was actually recorded. This is exactly how the billing ledger was
-        found reporting `sent=1` with an empty rollup.
-
-        `commit=True` is deliberately the *end* of the batch, not per row:
-        the batch shares one unit of work, so a crash mid-batch leaves the
-        whole batch to be retried rather than half-delivered.
-
-        **Each row is dispatched under its own tenant's RLS binding.** The
-        claim query runs before any tenant is known (the worker discovers
-        tenants from the rows it claims), but everything after it - the
-        handler's reads and writes, and the `mark_sent` / `mark_failed`
-        update - must run with `app.tenant_id` set to that row's tenant.
-        Without it the app role's RLS policy filters the work away, and the
-        failure is invisible: an insert whose `WITH CHECK` does not match is
-        rejected, but `ON CONFLICT DO NOTHING` turns that rejection into
-        zero rows inserted and no error, so the relay reports `sent` while
-        the ledger stays empty. This was found exactly that way - a billing
-        test saw `sent=1` and an empty rollup.
+        The supplied session is the queue-bookkeeping connection. It reads
+        only claim metadata and commits the processing token before dispatch.
+        Each handler reloads the full event under a tenant-bound app-role
+        session and commits its business work with the sent/failed receipt.
         """
         stats = RelayStats()
-        rows = await claim_pending(
+        now = int(time.time())
+        requeued, stale_failed = await reclaim_stale_claims(
+            session,
+            cutoff=now - STALE_OUTBOX_CLAIM_SECONDS,
+            max_attempts=self.max_attempts,
+            retry_safe_event_types=RETRY_SAFE_EVENT_TYPES,
+            exclude_event_types=self.excluded_event_types,
+        )
+        stats.failed += stale_failed
+        if requeued or stale_failed:
+            logger.warning(
+                "outbox_stale_claims_recovered",
+                requeued_count=requeued,
+                failed_count=stale_failed,
+            )
+        parked_query = (
+            select(func.count())
+            .select_from(OutboxEvent)
+            .where(
+                OutboxEvent.status == OutboxStatus.QUEUED.value,
+                OutboxEvent.attempts >= self.max_attempts,
+            )
+        )
+        if self.excluded_event_types:
+            parked_query = parked_query.where(
+                OutboxEvent.event_type.not_in(self.excluded_event_types)
+            )
+        stats.parked = int((await session.scalar(parked_query)) or 0)
+        claims = await claim_pending(
             session,
             batch=self.batch,
             exclude_event_types=self.excluded_event_types,
+            max_attempts=self.max_attempts,
         )
-        stats.claimed = len(rows)
-        if not rows:
-            return stats
-
-        await self._dispatch(session, rows, stats)
+        stats.claimed = len(claims)
+        # A claim is durable before any tenant handler or external side effect.
+        await session.commit()
+        if claims:
+            await self._dispatch_claims(claims, stats)
         if commit:
             await session.commit()
         return stats
 
-    async def _dispatch(
-        self, session: AsyncSession, rows: list[OutboxEvent], stats: RelayStats
-    ) -> None:
-        """Dispatch claimed rows in place. Commit stays with the caller."""
+    async def _dispatch_claims(self, claims: list[OutboxClaim], stats: RelayStats) -> None:
+        for claim in claims:
+            await self._dispatch_claim(claim, stats)
 
-        for row in rows:
-            if row.attempts > self.max_attempts:
-                # Already over budget from earlier cycles: leave it queued
-                # and do not count it as work this cycle.
-                stats.parked += 1
-                continue
+    async def _dispatch_claim(self, claim: OutboxClaim, stats: RelayStats) -> None:
+        handler = self.handlers.get(claim.event_type)
+        context = _ctx_for(claim)
+        try:
+            async with tenant_session(context) as tenant_work:
+                event = (
+                    await tenant_work.execute(
+                        select(OutboxEvent)
+                        .where(
+                            OutboxEvent.tenant_id == claim.tenant_id,
+                            OutboxEvent.id == claim.id,
+                            OutboxEvent.event_id == claim.event_id,
+                            OutboxEvent.status == OutboxStatus.PROCESSING.value,
+                            OutboxEvent.processing_token == claim.processing_token,
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if event is None:
+                    stats.parked += 1
+                    return
 
-            # Scope to the event's tenant before the handler touches anything.
-            # Set per row, so one batch can span tenants without mixing them.
-            await apply_rls_tenant(session, _ctx_for(row))
+                if handler is None:
+                    logger.warning(
+                        "outbox_event_unhandled",
+                        event_type=event.event_type,
+                        event_id=str(event.event_id),
+                    )
+                    get_metrics().outbox_unhandled_total.labels(event_type=event.event_type).inc()
+                    await mark_sent(tenant_work, event.id, processing_token=claim.processing_token)
+                    stats.unhandled += 1
+                    return
 
-            handler = self.handlers.get(row.event_type)
-            if handler is None:
-                # Warning, not info. This is an event the platform published
-                # and then dropped on the floor - a producer with no consumer.
-                # It is still retired so the queue drains, but "sent" is a
-                # claim about the queue and not about delivery, so the fact
-                # that it went nowhere has to be countable somewhere.
-                logger.warning(
-                    "outbox_event_unhandled",
-                    event_type=row.event_type,
-                    event_id=str(row.event_id),
+                from platform_core.config import get_settings
+
+                settings = get_settings()
+                remaining = claim.deadline_at - int(time.time())
+                if remaining <= 0:
+                    raise TimeoutError("OUTBOX_JOB_DEADLINE_EXHAUSTED")
+                attempt_limit = min(
+                    settings.outbox_handler_max_external_attempts,
+                    _external_attempts_for_delivery(claim),
                 )
-                get_metrics().outbox_unhandled_total.labels(event_type=row.event_type).inc()
-                await mark_sent(session, row.id)
-                stats.unhandled += 1
-                continue
-
-            try:
-                await handler(session, row)
-            except Exception as exc:  # noqa: BLE001 - classified below
-                # Record, do not re-raise: one bad event must not stop the
-                # rest of the batch or roll back the publishes already done.
-                #
-                # The savepoint is required. A handler that failed *inside*
-                # the database (an integrity error, a policy violation) has
-                # aborted the enclosing transaction, so the `mark_failed`
-                # UPDATE below would itself raise - and the reason the event
-                # failed would be lost, which is the one thing an operator
-                # needs from a parked row.
-                async with session.begin_nested():
-                    await mark_failed(session, row.id, f"{type(exc).__name__}: {exc}")
-                logger.warning(
-                    "outbox_delivery_failed",
-                    event_type=row.event_type,
-                    event_id=str(row.event_id),
-                    attempts=row.attempts,
-                    error_code=type(exc).__name__,
+                budget = ExecutionBudget.for_seconds(
+                    deadline_seconds=min(settings.outbox_handler_deadline_seconds, remaining),
+                    max_attempts=attempt_limit,
+                    operation_limits={
+                        "model": attempt_limit,
+                        "tool": attempt_limit,
+                        "outbound": attempt_limit,
+                    },
                 )
-                stats.failed += 1
-                continue
-
-            await mark_sent(session, row.id)
+                with use_execution_budget(budget):
+                    await handler(tenant_work, event)
+                if not await mark_sent(
+                    tenant_work, event.id, processing_token=claim.processing_token
+                ):
+                    raise RuntimeError("outbox claim was superseded before completion")
             stats.sent += 1
+        except OutboxOutcomeUnknown:
+            await self._settle_failed(claim, error="outbox_delivery_outcome_unknown", terminal=True)
+            logger.error(
+                "outbox_delivery_outcome_unknown",
+                event_type=claim.event_type,
+                event_id=str(claim.event_id),
+                attempts=claim.attempts,
+            )
+            stats.failed += 1
+        except Exception as exc:  # noqa: BLE001 - retry policy is explicit below
+            deadline_exhausted = claim.deadline_at <= int(time.time())
+            terminal = (
+                claim.attempts >= claim.max_attempts
+                or claim.event_type not in RETRY_SAFE_EVENT_TYPES
+                or deadline_exhausted
+            )
+            await self._settle_failed(
+                claim,
+                error="outbox_job_deadline_exhausted" if deadline_exhausted else type(exc).__name__,
+                terminal=terminal,
+            )
+            logger.warning(
+                "outbox_delivery_failed",
+                event_type=claim.event_type,
+                event_id=str(claim.event_id),
+                attempts=claim.attempts,
+                error_code=type(exc).__name__,
+            )
+            stats.failed += 1
+
+    async def _settle_failed(self, claim: OutboxClaim, *, error: str, terminal: bool) -> None:
+        async with tenant_session(_ctx_for(claim)) as session:
+            await mark_failed(
+                session,
+                claim.id,
+                error,
+                processing_token=claim.processing_token,
+                terminal=terminal,
+            )
 
 
 async def log_only_handler(session: AsyncSession, event: OutboxEvent) -> None:
@@ -249,12 +314,14 @@ async def handle_agent_reply(session: AsyncSession, event: OutboxEvent) -> None:
     customer never received and a queue that reported success, which is the
     `worker_cannot_send` shape this repository keeps finding.
 
-    `command_id` is derived from the turn id, so a retry after an ambiguous
-    failure re-uses the same idempotency key at the transport rather than
-    sending the reply twice.
+    `command_id` is derived from the turn id for traceability. The channel
+    providers do not all deduplicate that key, so an ambiguous result is parked
+    for human review and is never automatically sent again.
     """
+    import smtplib
     import uuid as _uuid
 
+    import httpx
     from sqlalchemy import select as _select
 
     from platform_core.agent_runtime.models import ConversationTurn
@@ -293,17 +360,18 @@ async def handle_agent_reply(session: AsyncSession, event: OutboxEvent) -> None:
         # and the customer has heard nothing.
         raise ChannelNotConfigured(f"no outbound transport for {channel!r}")
 
-    result = await sender.send_message(
-        system=channel,
-        address=address,
-        conversation_key=conversation_key,
-        content=str(text),
-        command_id=f"agent-reply:{turn_id}",
-    )
+    try:
+        result = await sender.send_message(
+            system=channel,
+            address=address,
+            conversation_key=conversation_key,
+            content=str(text),
+            command_id=f"agent-reply:{turn_id}",
+        )
+    except (httpx.TransportError, OSError, TimeoutError, smtplib.SMTPException) as exc:
+        raise OutboxOutcomeUnknown("channel transport did not return a receipt") from exc
     if getattr(result, "ambiguous", False):
-        # Unknown outcome: retry with the same command id rather than claim a
-        # success that may be a duplicate.
-        raise RuntimeError("agent reply delivery outcome unknown")
+        raise OutboxOutcomeUnknown("channel delivery outcome is ambiguous")
 
 
 def build_default_relay(batch: int = DEFAULT_BATCH) -> OutboxRelay:
@@ -364,29 +432,13 @@ class OutboxWorker:
         return self._stopping
 
     async def run_once(self) -> RelayStats:
-        """Claim and dispatch one batch on the queue's bookkeeping session.
+        """Commit global queue claims, then dispatch each event under tenant RLS.
 
-        **Known limitation, stated rather than hidden.** This class still runs
-        both the claim and the dispatch on the owner role, so the per-row
-        `apply_rls_tenant` in `_dispatch` is decoration: on a bypassing
-        connection RLS does not filter anything, and a handler's tenant scoping
-        rests entirely on the explicit `tenant_id` it passes. Contrast
-        `InboxWorker`, which was fixed to claim on this role and process each
-        event on a `tenant_session` after the same measurement showed the flag
-        lookup reading another tenant's row there.
-
-        The fix is the same split - claim here, dispatch each row on a
-        `tenant_session` - and it is *not* applied here yet because it changes
-        this class's documented unit of work: the batch is deliberately one
-        transaction ("a crash mid-batch leaves the whole batch to be retried"),
-        and per-row sessions mean per-row commits, which is a different
-        delivery-dedup story. That deserves its own change and its own
-        verification against a real downstream consumer, which this deployment
-        does not have (the default handler is `log_only_handler`).
-
-        Until then: handlers on this path MUST scope every read and write by an
-        explicit `tenant_id`. `tests/integration/test_outbox_relay.py` covers
-        delivery; nothing there can see the missing boundary.
+        The owner connection reads only queue metadata and commits a fenced
+        claim before work begins. Each handler reloads its payload on a
+        tenant_session using the non-owner application role. Safe database
+        events may be reclaimed after a crash; customer-visible replies are
+        terminally parked as unknown rather than blindly sent again.
         """
         from worker.wiring import queue_bookkeeping_session
 
@@ -412,15 +464,15 @@ class OutboxWorker:
         logger.info("outbox_relay_stopped")
 
 
-def _ctx_for(row: OutboxEvent) -> TenantContext:
-    """The RLS context for an outbox row.
+def _ctx_for(claim: OutboxClaim) -> TenantContext:
+    """The RLS context for an outbox claim.
 
     `actor_kind="system"`: the relay acts on behalf of no user. The actor is
     what audit trails attribute an action to, and claiming a user here would
     attribute a delivery to someone who did not make it.
     """
     return TenantContext(
-        tenant_id=row.tenant_id,
+        tenant_id=claim.tenant_id,
         actor_id=None,
         actor_kind="system",
     )

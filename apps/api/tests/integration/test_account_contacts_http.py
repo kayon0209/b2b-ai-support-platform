@@ -15,6 +15,7 @@ live that the service cannot tell you:
 from __future__ import annotations
 
 import os
+import time
 import uuid
 
 import pytest
@@ -98,6 +99,10 @@ def _seed() -> None:
 
 def _clear() -> None:
     statements = (
+        "DELETE FROM contact_facts WHERE tenant_id = :t",
+        "DELETE FROM conversation_turns WHERE tenant_id = :t",
+        "DELETE FROM conversation_contacts WHERE tenant_id = :t",
+        "DELETE FROM audit_events WHERE tenant_id = :t",
         "DELETE FROM enterprise_account_contacts WHERE tenant_id = :t",
         "DELETE FROM enterprise_accounts WHERE tenant_id = :t",
     )
@@ -205,3 +210,132 @@ def test_one_tenant_cannot_read_anothers_bindings() -> None:
 
     assert listed.status_code == 200
     assert listed.json()["contacts"] == []
+
+
+def test_memory_erasure_is_admin_only_audited_and_channel_scoped() -> None:
+    from platform_core.agent_runtime.conversation_store import contact_ref_from_external
+
+    now = int(time.time())
+    chat_conversation = uuid.uuid4()
+    wechat_conversation = uuid.uuid4()
+    chat_turn = uuid.uuid4()
+    wechat_turn = uuid.uuid4()
+    chat_fact = uuid.uuid4()
+    wechat_fact = uuid.uuid4()
+    contact = "erase-contact-71"
+    chat_ref = contact_ref_from_external(uuid.UUID(TENANT), contact, channel="chatwoot")
+    wechat_ref = contact_ref_from_external(uuid.UUID(TENANT), contact, channel="wechat")
+
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        for conversation, channel in (
+            (chat_conversation, "chatwoot"),
+            (wechat_conversation, "wechat"),
+        ):
+            conn.execute(
+                text(
+                    "INSERT INTO conversation_contacts (id, tenant_id, conversation_ref_id, "
+                    "external_contact_id, channel, created_at, updated_at) "
+                    "VALUES (:id, :tenant, :conversation, :contact, :channel, :now, :now)"
+                ),
+                {
+                    "id": uuid.uuid4(),
+                    "tenant": TENANT,
+                    "conversation": conversation,
+                    "contact": contact,
+                    "channel": channel,
+                    "now": now,
+                },
+            )
+        for conversation, turn_id, fact_id, contact_ref, value in (
+            (chat_conversation, chat_turn, chat_fact, chat_ref, "monthly"),
+            (wechat_conversation, wechat_turn, wechat_fact, wechat_ref, "annual"),
+        ):
+            conn.execute(
+                text(
+                    "INSERT INTO conversation_turns (id, tenant_id, conversation_ref_id, role, "
+                    "text_redacted, text_hash, ts, created_at) VALUES "
+                    "(:turn, :tenant, :conversation, 'customer', :body, 'hash', :now, :now)"
+                ),
+                {
+                    "turn": turn_id,
+                    "tenant": TENANT,
+                    "conversation": conversation,
+                    "body": f"my plan is {value}",
+                    "now": now,
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO contact_facts (id, tenant_id, contact_ref, key, value, "
+                    "source_turn_id, updated_at) VALUES "
+                    "(:fact, :tenant, :contact_ref, 'plan', :value, :turn, :now)"
+                ),
+                {
+                    "fact": fact_id,
+                    "tenant": TENANT,
+                    "contact_ref": contact_ref,
+                    "value": value,
+                    "turn": turn_id,
+                    "now": now,
+                },
+            )
+    admin.dispose()
+
+    endpoint = "/v1/identity/contact-memory/erase"
+    body = {"external_contact_id": contact, "channel": "chatwoot"}
+    agent = _client(TENANT, "support_agent")
+    assert agent.post(endpoint, json=body, headers=_headers()).status_code == 403
+
+    owner = _client(TENANT, "tenant_owner")
+    assert (
+        owner.post(
+            endpoint,
+            json=body,
+            headers={"Authorization": "Bearer pt_bootstrap_test"},
+        ).status_code
+        == 400
+    )
+    erased = owner.post(endpoint, json=body, headers=_headers())
+    assert erased.status_code == 200, erased.text[:300]
+    assert erased.json() == {
+        "erased": True,
+        "conversations_matched": 1,
+        "contact_facts_deleted": 1,
+        "conversation_turns_deleted": 1,
+        "trace_id": erased.json()["trace_id"],
+    }
+
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        remaining = (
+            conn.execute(
+                text(
+                    "SELECT id FROM contact_facts WHERE id IN (:chat_fact, :wechat_fact) "
+                    "UNION ALL SELECT id FROM conversation_turns WHERE id IN "
+                    "(:chat_turn, :wechat_turn)"
+                ),
+                {
+                    "chat_fact": chat_fact,
+                    "wechat_fact": wechat_fact,
+                    "chat_turn": chat_turn,
+                    "wechat_turn": wechat_turn,
+                },
+            )
+            .scalars()
+            .all()
+        )
+        audit = conn.execute(
+            text(
+                "SELECT action, metadata AS metadata_redacted FROM audit_events "
+                "WHERE tenant_id = :tenant "
+                "AND action = 'contact_memory.erase'"
+            ),
+            {"tenant": TENANT},
+        ).one()
+    admin.dispose()
+
+    assert set(remaining) == {wechat_fact, wechat_turn}
+    assert audit.action == "contact_memory.erase"
+    assert audit.metadata_redacted["contact_facts_deleted"] == 1
+    assert contact not in str(audit.metadata_redacted)

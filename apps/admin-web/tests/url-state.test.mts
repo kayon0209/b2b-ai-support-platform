@@ -31,6 +31,8 @@ import assert from "node:assert/strict";
 import {
   applyUrlValue,
   isOneOf,
+  pageOffsetValue,
+  parsePageOffset,
   readUrlValue,
 } from "../src/lib/urlState.ts";
 
@@ -76,6 +78,31 @@ check("other parameters survive a change", () => {
   const result = applyUrlValue(new URLSearchParams("tab=mine&q=old"), "q", "new");
   assert.equal(result.get("tab"), "mine", "tab must survive");
   assert.equal(result.get("q"), "new");
+});
+
+check("changing a filter clears its page offset atomically", () => {
+  const result = applyUrlValue(new URLSearchParams("tab=mine&q=old&offset=100"), "q", "new", ["offset"]);
+  assert.equal(result.get("tab"), "mine");
+  assert.equal(result.get("q"), "new");
+  assert.equal(result.has("offset"), false);
+});
+
+check("setting the same filter preserves its page offset", () => {
+  const result = applyUrlValue(new URLSearchParams("q=acme&offset=50"), "q", "acme", ["offset"]);
+  assert.equal(result.get("offset"), "50");
+});
+
+check("page offsets parse and align to the requested page size", () => {
+  assert.equal(parsePageOffset("75", 50), 50);
+  assert.equal(parsePageOffset("100", 50), 100);
+});
+
+check("invalid and oversized page offsets stay bounded", () => {
+  assert.equal(parsePageOffset("-50", 50), 0);
+  assert.equal(parsePageOffset("not-a-number", 50), 0);
+  assert.equal(parsePageOffset("999999", 50), 100_000);
+  assert.equal(pageOffsetValue(75, 50), "50");
+  assert.equal(pageOffsetValue(0, 50), null);
 });
 
 check("an absent parameter reads as the fallback", () => {

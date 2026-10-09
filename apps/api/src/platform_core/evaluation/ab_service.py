@@ -26,6 +26,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any
 
 from sqlalchemy import select
@@ -47,6 +48,7 @@ from platform_core.knowledge.flag_service import validate_flag_key
 
 # Bounded so a dashboard cannot run an unbounded scan.
 MAX_RUNS_SCANNED = 20000
+MAX_UNPUBLISHED_PROMPT_EXPOSURE = 0.10
 
 
 class ExperimentError(ValueError):
@@ -86,10 +88,13 @@ def _parse_arms(raw: object) -> list[ArmSpec]:
         # 0 is falsy - so a zero-weight arm would silently get equal traffic and
         # the "must sum above zero" guard below could never fire.
         raw_weight = item.get("weight")
+        weight = float(raw_weight) if raw_weight is not None else 1.0
+        if not isfinite(weight) or weight < 0:
+            raise ExperimentError("variant weights must be finite and non-negative")
         arms.append(
             ArmSpec(
                 name=str(item["name"]).strip(),
-                weight=float(raw_weight) if raw_weight is not None else 1.0,
+                weight=weight,
                 prompt_version_id=uuid.UUID(str(version_id)) if version_id else None,
             )
         )
@@ -98,6 +103,20 @@ def _parse_arms(raw: object) -> list[ArmSpec]:
     if sum(a.weight for a in arms) <= 0:
         raise ExperimentError("variant weights must sum to more than zero")
     return arms
+
+
+def _unpublished_prompt_exposure(
+    arms: list[ArmSpec], *, published_by_id: dict[uuid.UUID, bool]
+) -> float:
+    total = sum(arm.weight for arm in arms)
+    if total <= 0:
+        return 0.0
+    candidate_weight = sum(
+        arm.weight
+        for arm in arms
+        if arm.prompt_version_id is not None and not published_by_id[arm.prompt_version_id]
+    )
+    return candidate_weight / total
 
 
 async def list_experiments(session: AsyncSession, *, tenant_id: uuid.UUID) -> list[AbExperiment]:
@@ -131,6 +150,55 @@ async def upsert_experiment(
     if not validate_flag_key(clean_key):
         raise ExperimentError(f"invalid experiment key: {key!r}")
     arms = _parse_arms(variants)
+
+    existing_enabled = (
+        (
+            await session.execute(
+                select(AbExperiment).where(
+                    AbExperiment.tenant_id == tenant_id,
+                    AbExperiment.enabled.is_(True),
+                    AbExperiment.key != clean_key,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    enabled_arms = [
+        (experiment, _parse_arms(experiment.variants)) for experiment in existing_enabled
+    ]
+    prompt_ids = {arm.prompt_version_id for arm in arms if arm.prompt_version_id is not None}
+    prompt_ids.update(
+        arm.prompt_version_id
+        for _experiment, active_arms in enabled_arms
+        for arm in active_arms
+        if arm.prompt_version_id is not None
+    )
+    published_by_id: dict[uuid.UUID, bool] = {}
+    if prompt_ids:
+        prompt_rows = (
+            await session.execute(
+                select(PromptVersionRow.id, PromptVersionRow.published).where(
+                    PromptVersionRow.tenant_id == tenant_id,
+                    PromptVersionRow.id.in_(prompt_ids),
+                )
+            )
+        ).all()
+        published_by_id = {row.id: bool(row.published) for row in prompt_rows}
+        if set(published_by_id) != prompt_ids:
+            raise ExperimentError("prompt versions must exist in this tenant")
+
+    if enabled:
+        projected_exposure = _unpublished_prompt_exposure(
+            arms, published_by_id=published_by_id
+        ) + sum(
+            _unpublished_prompt_exposure(active_arms, published_by_id=published_by_id)
+            for _experiment, active_arms in enabled_arms
+        )
+        if projected_exposure > MAX_UNPUBLISHED_PROMPT_EXPOSURE + 1e-9:
+            raise ExperimentError(
+                "unpublished prompt exposure across enabled experiments cannot exceed 10%"
+            )
 
     row = (
         await session.execute(

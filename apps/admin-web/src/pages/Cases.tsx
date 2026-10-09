@@ -11,7 +11,7 @@ import {
   EmptyState,
   ErrorBanner,
   PageHeader,
-  Spinner,
+  SkeletonRows,
   ListTotal,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
@@ -263,7 +263,7 @@ export function Cases() {
         />
       ) : null}
 
-      {list.loading ? <Spinner label={t("cases.loadingCases")} /> : null}
+      {list.loading ? <SkeletonRows rows={6} label={t("cases.loadingCases")} /> : null}
       {list.data && list.data.items.length === 0 ? (
         <EmptyState message={t("cases.emptyList")} />
       ) : null}
@@ -307,7 +307,7 @@ export function Cases() {
           {!selected ? (
             <EmptyState message={t("cases.selectCase")} />
           ) : detail.loading ? (
-            <Spinner label={t("cases.loadingCase")} />
+            <SkeletonRows rows={5} label={t("cases.loadingCase")} />
           ) : detail.error ? (
             <ErrorBanner message={detail.error} onRetry={detail.reload} />
           ) : detail.data?.case ? (

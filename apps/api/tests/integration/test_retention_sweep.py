@@ -125,6 +125,8 @@ def seed_tenant():
 def clean_rows():
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
+        conn.execute(text("DELETE FROM contact_facts WHERE tenant_id = :t"), {"t": TENANT})
+        conn.execute(text("DELETE FROM conversation_turns WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(text("DELETE FROM dead_letter_items WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(text("DELETE FROM document_versions WHERE tenant_id = :t"), {"t": TENANT})
     yield
@@ -216,7 +218,70 @@ def test_sweep_executes_against_real_schema() -> None:
         "dead_letters_pruned",
         "inbox_events_pruned",
         "conversation_turns_pruned",
+        "contact_facts_pruned",
     }
+
+
+def _insert_contact_fact(*, source_ts: int) -> tuple[str, str]:
+    turn_id = str(uuid.uuid4())
+    fact_id = str(uuid.uuid4())
+    conversation_id = str(uuid.uuid4())
+    contact_ref = str(uuid.uuid4())
+    admin = create_engine(ADMIN_URL)
+    try:
+        with admin.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO conversation_turns (id, tenant_id, conversation_ref_id, role, "
+                    "text_redacted, text_hash, ts, created_at) VALUES "
+                    "(:turn, :tenant, :conversation, 'customer', 'plan stated', 'hash', :ts, :ts)"
+                ),
+                {
+                    "turn": turn_id,
+                    "tenant": TENANT,
+                    "conversation": conversation_id,
+                    "ts": source_ts,
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO contact_facts (id, tenant_id, contact_ref, key, value, "
+                    "source_turn_id, updated_at) VALUES "
+                    "(:id, :tenant, :contact, 'plan', 'monthly', :turn, :ts)"
+                ),
+                {
+                    "id": fact_id,
+                    "tenant": TENANT,
+                    "contact": contact_ref,
+                    "turn": turn_id,
+                    "ts": NOW,
+                },
+            )
+    finally:
+        admin.dispose()
+    return fact_id, turn_id
+
+
+def test_contact_memory_is_pruned_with_source_retention() -> None:
+    expired_id, _ = _insert_contact_fact(source_ts=NOW - 10 * DAY)
+    recent_id, _ = _insert_contact_fact(source_ts=NOW - DAY)
+
+    counts = _run(_sweep(now=NOW, policy=RetentionPolicy(contact_fact_days=5)))
+
+    assert counts["contact_facts_pruned"] == 1
+    admin = create_engine(ADMIN_URL)
+    try:
+        with admin.begin() as conn:
+            remaining = {
+                str(row)
+                for row in conn.execute(
+                    text("SELECT id FROM contact_facts WHERE id IN (:expired, :recent)"),
+                    {"expired": expired_id, "recent": recent_id},
+                ).scalars()
+            }
+        assert remaining == {recent_id}
+    finally:
+        admin.dispose()
 
 
 def test_timestamp_columns_referenced_by_sweep_exist() -> None:

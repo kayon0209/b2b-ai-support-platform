@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 
 from platform_core.config import get_settings
+from platform_core.execution_budget import AttemptBudgetExhausted, current_execution_budget
 from platform_core.integrations.resilience import (
     CircuitBreaker,
     CircuitOpen,
@@ -102,6 +103,7 @@ class GiteeAiClient:
         url = f"{self._base_url}{path}"
         delays = retry_delays(self._max_retries)
         last_error: ModelError | None = None
+        budget = current_execution_budget()
 
         for attempt, delay in enumerate(delays):
             try:
@@ -110,7 +112,14 @@ class GiteeAiClient:
                 raise ModelUnavailable("circuit breaker open") from None
 
             try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                request_timeout = self._timeout
+                if budget is not None:
+                    try:
+                        remaining = budget.reserve_attempt("model")
+                    except AttemptBudgetExhausted as exc:
+                        raise ModelUnavailable(exc.reason) from None
+                    request_timeout = min(request_timeout, remaining)
+                async with httpx.AsyncClient(timeout=request_timeout) as client:
                     resp = await client.post(url, json=payload, headers=headers)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = ModelUnavailable(type(exc).__name__)
@@ -129,7 +138,10 @@ class GiteeAiClient:
                     raise ModelRejected(resp.status_code, resp.text[:200])
 
             if attempt < len(delays) - 1:
-                await asyncio.sleep(delay)
+                if budget is None or budget.remaining_seconds() > delay:
+                    await asyncio.sleep(delay)
+                else:
+                    break
 
         assert last_error is not None
         raise last_error

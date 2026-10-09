@@ -21,7 +21,6 @@ import uuid
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import create_engine, text
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from platform_core.channels.outbound import ChannelSender, SendResult
 
@@ -31,11 +30,6 @@ ADMIN_URL = os.environ.get(
     "APP_ADMIN_DATABASE_URL",
     "postgresql+psycopg://platform:platform@localhost:5435/platform",
 )
-APP_URL = os.environ.get(
-    "APP_TEST_DATABASE_URL",
-    "postgresql+psycopg://platform_app:platform_app@localhost:5435/platform",
-)
-
 TENANT = "01900000-0000-7000-8000-0000000000d0"
 SLUG = "business-read-receipt"
 
@@ -100,14 +94,27 @@ class _ReceiptCitingGenerator:
         from platform_core.agent_runtime.prompts import KNOWLEDGE_QA_PROMPT
 
         self.template = KNOWLEDGE_QA_PROMPT
+        self.calls = 0
 
     async def generate(self, question, evidence, **kwargs):
         from platform_core.agent_runtime.qa_path import DraftAnswer
 
+        self.calls += 1
         return DraftAnswer(
             text="Your order SO-9001 is in production.",
             claims={0: [evidence[0].chunk_id]} if evidence else {},
         )
+
+
+class _CountingEmbedder:
+    model = "phase4-no-rag-check"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def embed_query(self, query: str) -> list[float]:
+        self.calls += 1
+        return [0.0] * 1536
 
 
 class _FailingExecutor:
@@ -224,26 +231,25 @@ def clean() -> None:
 
 
 async def _execute(
-    *, failing: bool = False, use_default_provider: bool = False
-) -> tuple[object, list[dict]]:
+    *,
+    failing: bool = False,
+    use_default_provider: bool = False,
+    question: str = QUESTION,
+) -> tuple[object, list[dict], int, int]:
     from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
-    from platform_core.db import create_engine
     from platform_core.identity import lease_service
+    from platform_core.identity.tenant_context import TenantContext, tenant_session
     from platform_core.retrieval.hybrid import PrincipalScope
 
     tid = uuid.UUID(TENANT)
     conv = uuid.uuid4()
     sender = _RecordingTransport()
-    engine = create_engine(APP_URL)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-
-    async with factory() as session:
-        await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT})
+    embedder = _CountingEmbedder()
+    generator = _ReceiptCitingGenerator()
+    tenant_context = TenantContext(tenant_id=tid, actor_id=None, actor_kind="system")
+    async with tenant_session(tenant_context) as session:
         lease = await lease_service.acquire_or_get(session, tenant_id=tid, conversation_ref_id=conv)
         await session.commit()
-
-    async with factory() as session:
-        await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT})
         orch = AgentOrchestrator(
             session,
             OrchestratorDeps(
@@ -257,13 +263,14 @@ async def _execute(
                         )
                     }
                 ),
-                generator=_ReceiptCitingGenerator(),
+                generator=generator,
+                embedder=embedder,
             ),
         )
         outcome = await orch.run(
             tenant_id=tid,
             conversation_ref_id=conv,
-            question=QUESTION,
+            question=question,
             principal=PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",)),
             expected_lease_version=int(lease.lease_version),
             channel_system="email",
@@ -271,18 +278,18 @@ async def _execute(
             channel_conversation_key="1",
         )
         await session.commit()
-    await engine.dispose()
-    return outcome, sender.calls
+    return outcome, sender.calls, embedder.calls, generator.calls
 
 
 def test_an_order_question_is_answered_from_the_tool_receipt() -> None:
-    outcome, _sent = _run(_execute())
+    outcome, _sent, embed_calls, _generation_calls = _run(_execute())
 
     # Not handed off, not abstained: the tool had the answer and it is live
     # data, so the corpus was never consulted (ADR 0006).
     assert outcome.status.value == "completed", outcome.abstain_reason
     assert outcome.route == "business_read"
     assert outcome.citation_count >= 1
+    assert embed_calls == 0
 
 
 def test_the_receipt_reaches_the_conversation_as_data() -> None:
@@ -292,7 +299,7 @@ def test_the_receipt_reaches_the_conversation_as_data() -> None:
     sentence describing them. Asserted here because the publisher alone cannot
     show that the read path actually calls it.
     """
-    _outcome, _sent = _run(_execute())
+    _outcome, _sent, _embed_calls, _generation_calls = _run(_execute())
 
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
@@ -320,12 +327,14 @@ def test_an_unreachable_erp_tells_the_customer_what_is_wrong() -> None:
     not the generic "couldn't verify", which is true but leaves them waiting
     on us for something that is not ours.
     """
-    outcome, sent = _run(_execute(failing=True))
+    outcome, sent, embed_calls, generation_calls = _run(_execute(failing=True))
 
     assert outcome.status.value == "abstained"
     # The gateway's name for "the external call failed". Arguments are
     # schema-validated before execution, so this is the other system.
     assert outcome.abstain_reason == "TOOL_EXECUTION_FAILED", outcome.abstain_reason
+    assert embed_calls == 0
+    assert generation_calls == 0
 
     customer_visible = [c["content"] for c in sent]
     assert customer_visible, "an outage that says nothing leaves them waiting"
@@ -345,10 +354,11 @@ def test_the_shipped_demo_provider_answers_a_real_question() -> None:
     carrying `source: demo` and `fetched_at`, so the card can say what it is
     and how old it is.
     """
-    outcome, _sent = _run(_execute(use_default_provider=True))
+    outcome, _sent, embed_calls, _generation_calls = _run(_execute(use_default_provider=True))
 
     assert outcome.status.value == "completed", outcome.abstain_reason
     assert outcome.route == "business_read"
+    assert embed_calls == 0
 
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
@@ -368,6 +378,32 @@ def test_the_shipped_demo_provider_answers_a_real_question() -> None:
     assert payload["source"] == "demo"
     assert payload["fetched_at"]
     assert len(payload["nodes"]) == 4
+
+
+def test_clarification_stops_before_retrieval_and_generation() -> None:
+    outcome, _sent, embed_calls, generation_calls = _run(_execute(question="it?"))
+
+    assert outcome.status.value == "abstained"
+    assert embed_calls == 0
+    assert generation_calls == 0
+
+
+def test_out_of_scope_request_stops_before_retrieval_and_generation() -> None:
+    outcome, _sent, embed_calls, generation_calls = _run(_execute(question="Tell me a joke"))
+
+    assert outcome.status.value == "abstained"
+    assert embed_calls == 0
+    assert generation_calls == 0
+
+
+def test_knowledge_question_enters_retrieval() -> None:
+    outcome, _sent, embed_calls, generation_calls = _run(
+        _execute(question="How long is the refund window?")
+    )
+
+    assert outcome.status.value == "abstained"  # this fixture has no knowledge corpus
+    assert embed_calls == 1
+    assert generation_calls == 0
 
 
 def test_the_real_adapter_receipt_survives_the_turn_store_redactor() -> None:

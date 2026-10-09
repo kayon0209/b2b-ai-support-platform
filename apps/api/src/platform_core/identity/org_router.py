@@ -115,6 +115,13 @@ class ContactIn(BaseModel):
     channel: str | None = Field(default=None, max_length=31)
 
 
+class ContactMemoryEraseIn(BaseModel):
+    """A precise provider identity; erasure never guesses across channels."""
+
+    external_contact_id: str = Field(min_length=1, max_length=255)
+    channel: str = Field(min_length=1, max_length=31, pattern=r"^[a-zA-Z0-9_-]+$")
+
+
 class AccountPatchIn(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     tier: str | None = Field(default=None, max_length=31)
@@ -319,6 +326,47 @@ async def unbind_account_contact(
     if not removed:
         return error_response(ORG_NOT_FOUND, "contact binding not found", status_code=404)
     return ok_response({"removed": True}, trace_id=trace_id)
+
+
+@router.post("/contact-memory/erase")
+async def erase_contact_memory(request: Request, body: ContactMemoryEraseIn) -> Any:
+    """Erase redacted turns and durable facts for one tenant/channel contact."""
+    ctx = get_context(request)
+    if ctx is None:
+        return _unresolved()
+    denied = require_policy(ctx, Action.TENANT_ADMIN)
+    if denied is not None:
+        return denied
+    missing_idem = require_write_idempotency(request, Action.TENANT_ADMIN)
+    if missing_idem is not None:
+        return missing_idem
+
+    from platform_core.agent_runtime.memory_erasure import erase_contact_memory as erase_memory
+    from platform_core.audit import service as audit_service
+
+    trace_id = new_trace_id()
+    async with tenant_session(ctx) as session:
+        counts = await erase_memory(
+            session,
+            tenant_id=ctx.tenant_id,
+            external_contact_id=body.external_contact_id,
+            channel=body.channel,
+        )
+        await audit_service.record(
+            session,
+            ctx=ctx,
+            action="contact_memory.erase",
+            resource_type="contact_memory",
+            decision="completed",
+            reason_code="CONTACT_MEMORY_ERASED",
+            metadata={
+                "channel": body.channel.casefold(),
+                **counts,
+            },
+            trace_id=trace_id,
+        )
+        await session.commit()
+    return ok_response({"erased": True, **counts}, trace_id=trace_id)
 
 
 @router.get("/accounts/{account_id}")

@@ -168,6 +168,12 @@ const COPY = {
   ratingThanks: "谢谢您的评价",
   ratingSkip: "不用了",
   ratingLow: "很抱歉没能帮上忙，您的反馈会交给同事跟进。",
+  resolutionQuestion: "本次问题已经解决了吗？",
+  resolutionYes: "已解决",
+  resolutionNo: "还没有解决",
+  resolutionSkip: "暂不回答",
+  resolutionThanksYes: "谢谢确认，我们会继续保持服务质量。",
+  resolutionThanksNo: "谢谢反馈，我们会继续跟进这个问题。",
   conversationClosed: "本次服务已结束。需要继续咨询时，请开启新会话。",
   newConversation: "开启新会话",
   send: "发送",
@@ -371,6 +377,11 @@ export function SupportChat() {
   const [ratingDismissed, setRatingDismissed] = useState(false);
   const [ratingBusy, setRatingBusy] = useState(false);
   const [ratingEligible, setRatingEligible] = useState(false);
+  const [resolutionFeedbackRequested, setResolutionFeedbackRequested] = useState(false);
+  const [resolutionConfirmation, setResolutionConfirmation] = useState<boolean | null>(null);
+  const [resolutionFeedbackDismissed, setResolutionFeedbackDismissed] = useState(false);
+  const [resolutionFeedbackBusy, setResolutionFeedbackBusy] = useState(false);
+  const resolutionPromptAttempted = useRef(false);
   /**
    * The text of a send that failed, so "重试" re-sends the same question. Held
    * in a ref rather than state: nothing renders from it, and putting it in
@@ -486,10 +497,43 @@ export function SupportChat() {
       // customer just gave in this tab.
       if (body.rating != null) setRating(Number(body.rating));
       setRatingEligible(Boolean(body.rating_eligible));
+      if (typeof body.resolution_feedback_requested === "boolean") {
+        setResolutionFeedbackRequested(body.resolution_feedback_requested);
+      }
+      if (body.resolution_confirmation === true || body.resolution_confirmation === false) {
+        setResolutionConfirmation(body.resolution_confirmation);
+      }
       return items;
     },
     [applyBranding, applyWindow],
   );
+
+  // Record the exposure after the eligible question is rendered. The server
+  // de-duplicates this event by conversation, so StrictMode/reloads do not
+  // inflate the response denominator.
+  useEffect(() => {
+    const token = session?.token;
+    if (!token || !ratingEligible || resolutionFeedbackRequested || resolutionPromptAttempted.current) {
+      return;
+    }
+    resolutionPromptAttempted.current = true;
+    let cancelled = false;
+    void fetchWithTimeout(`${API}/v1/support/resolution-feedback/requested`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Idempotency-Key": newIdempotencyKey(),
+      },
+    }).then(async (response) => {
+      if (!response.ok) return;
+      if (!cancelled) setResolutionFeedbackRequested(true);
+    }).catch(() => {
+      // Evaluation capture must not interrupt a finished support conversation.
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.token, ratingEligible, resolutionFeedbackRequested]);
 
   // Open (or resume) the session, then load the thread through the session that
   // came back. Kept as one effect because `loadTimeline` needs a token and the
@@ -825,6 +869,33 @@ export function SupportChat() {
     [session, ratingBusy],
   );
 
+  const submitResolutionFeedback = useCallback(
+    async (confirmed: boolean) => {
+      if (!session || !resolutionFeedbackRequested || resolutionFeedbackBusy) return;
+      setResolutionFeedbackBusy(true);
+      try {
+        const response = await fetchWithTimeout(`${API}/v1/support/resolution-feedback`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${session.token}`,
+            "Idempotency-Key": newIdempotencyKey(),
+          },
+          body: JSON.stringify({ confirmed }),
+        });
+        if (response.status === 401) throw new Error("EXPIRED");
+        if (!response.ok) throw new Error(await describeResponse(response));
+        setResolutionConfirmation(confirmed);
+      } catch (error) {
+        setProblemKind("send");
+        setProblem(describeFailure(error));
+      } finally {
+        setResolutionFeedbackBusy(false);
+      }
+    },
+    [session, resolutionFeedbackRequested, resolutionFeedbackBusy],
+  );
+
   const startNewConversation = useCallback(async () => {
     window.sessionStorage.removeItem(STORAGE_KEY);
     window.sessionStorage.removeItem(VISITOR_KEY);
@@ -833,6 +904,10 @@ export function SupportChat() {
     setRating(null);
     setRatingEligible(false);
     setRatingDismissed(false);
+    setResolutionFeedbackRequested(false);
+    setResolutionConfirmation(null);
+    setResolutionFeedbackDismissed(false);
+    resolutionPromptAttempted.current = false;
     setConversation({ owner: "ai", mode: "AI_ACTIVE" });
     setDraft("");
     setProblem(null);
@@ -1072,6 +1147,43 @@ export function SupportChat() {
             <span>{COPY.conversationClosed}</span>
             <button type="button" onClick={() => void startNewConversation()}>{COPY.newConversation}</button>
           </div>
+        ) : null}
+
+        {finished && ratingEligible && resolutionFeedbackRequested && resolutionConfirmation === null && !resolutionFeedbackDismissed ? (
+          <div className="support-rating" role="group" aria-label={COPY.resolutionQuestion}>
+            <span className="support-rating-ask">{COPY.resolutionQuestion}</span>
+            <div className="support-rating-buttons">
+              <button
+                type="button"
+                className="support-resolution-choice"
+                disabled={resolutionFeedbackBusy}
+                onClick={() => void submitResolutionFeedback(true)}
+              >
+                {COPY.resolutionYes}
+              </button>
+              <button
+                type="button"
+                className="support-resolution-choice"
+                disabled={resolutionFeedbackBusy}
+                onClick={() => void submitResolutionFeedback(false)}
+              >
+                {COPY.resolutionNo}
+              </button>
+              <button
+                type="button"
+                className="support-rating-skip"
+                disabled={resolutionFeedbackBusy}
+                onClick={() => setResolutionFeedbackDismissed(true)}
+              >
+                {COPY.resolutionSkip}
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {finished && resolutionConfirmation !== null ? (
+          <p className="support-rating-thanks" role="status">
+            {resolutionConfirmation ? COPY.resolutionThanksYes : COPY.resolutionThanksNo}
+          </p>
         ) : null}
 
         {/*

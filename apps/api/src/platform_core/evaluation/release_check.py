@@ -270,7 +270,7 @@ def _evaluate_p0_gate(path: str | None) -> GateResult | None:
         ],
     )
     try:
-        check_release_gate(evidence)
+        check_release_gate(evidence, require_human_review=False)
     except ReleaseError as exc:
         return GateResult(
             gate="p0_no_regression",

@@ -61,11 +61,18 @@ TENANT_TABLES = (
     "case_conversations",
     "conversation_turns",
     "csat_responses",
+    "customer_resolution_feedback_events",
     "case_attachments",
     "tool_definitions",
     "tool_proposals",
     "tool_executions",
+    "tool_execution_reconciliations",
+    "tool_execution_compensations",
     "action_confirmations",
+    "quality_review_batches",
+    "quality_review_items",
+    "quality_review_decisions",
+    "quality_review_evidence",
     # Phase five: the identity, SSO/SCIM and connection surface. 52 tables
     # carry `tenant_id` and this list now names all of them. Measured against
     # `information_schema`, not maintained by hand - the earlier note said "51
@@ -187,6 +194,7 @@ def seed_all_tables() -> None:
         task_id = str(uuid.uuid4())
         draft_id = str(uuid.uuid4())
         release_eval_id = str(uuid.uuid4())
+        review_batch_id = str(uuid.uuid4())
         candidate_version_id = str(uuid.uuid4())
         _seed_ids.update(
             space=space,
@@ -200,6 +208,7 @@ def seed_all_tables() -> None:
             task_id=task_id,
             draft_id=draft_id,
             release_eval_id=release_eval_id,
+            review_batch_id=review_batch_id,
         )
         stmts = [
             (
@@ -268,7 +277,36 @@ def seed_all_tables() -> None:
             (
                 "agent_runs",
                 "INSERT INTO agent_runs (id, tenant_id, conversation_ref_id, route) "
-                "VALUES (:rid, :t, gen_random_uuid(), 'knowledge_qa')",
+                "VALUES (:rid, :t, :conversation, 'knowledge_qa')",
+            ),
+            (
+                "quality_review_batches",
+                "INSERT INTO quality_review_batches (id, tenant_id, created_by, "
+                "idempotency_key_hash, request_hash, seed, window_seconds, requested_size, "
+                "population_by_stratum, sampler_version, created_at) "
+                "VALUES (:review_batch, :t, gen_random_uuid(), repeat('1', 64), repeat('2', 64), "
+                "'neg-seed', 86400, 1, '{\"routine\": 1}'::jsonb, 'risk-stratified-v1', 1000)",
+            ),
+            (
+                "quality_review_items",
+                "INSERT INTO quality_review_items (id, tenant_id, batch_id, agent_run_id, "
+                "conversation_ref_id, stratum, route, run_status, code_version, policy_version, "
+                "selected_at) VALUES (:i, :t, :review_batch, :rid, :conversation, 'routine', "
+                "'knowledge_qa', 'completed', 'test', 'v1', 1000)",
+            ),
+            (
+                "quality_review_decisions",
+                "INSERT INTO quality_review_decisions (id, tenant_id, batch_id, agent_run_id, "
+                "reviewer_actor_id, verdict, reason_code, idempotency_key_hash, request_hash, "
+                "reviewed_at) VALUES (:i, :t, :review_batch, :rid, gen_random_uuid(), 'agree', "
+                "NULL, repeat('3', 64), repeat('4', 64), 1000)",
+            ),
+            (
+                "quality_review_evidence",
+                "INSERT INTO quality_review_evidence (id, tenant_id, batch_id, evidence_hash, "
+                "idempotency_key_hash, request_hash, snapshot, created_by, created_at) "
+                "VALUES (:i, :t, :review_batch, repeat('5', 64), repeat('6', 64), "
+                "repeat('7', 64), '{}'::jsonb, gen_random_uuid(), 1000)",
             ),
             (
                 "citations",
@@ -337,6 +375,15 @@ def seed_all_tables() -> None:
                 "ORDER BY cc.id LIMIT 1",
             ),
             (
+                "customer_resolution_feedback_events",
+                "INSERT INTO customer_resolution_feedback_events (id, tenant_id, "
+                "conversation_ref_id, case_id, event_type, idempotency_key_hash, request_hash, "
+                "occurred_at, source) SELECT :i, :t, cc.conversation_ref_id, cc.case_id, "
+                "'requested', repeat('a', 64), repeat('b', 64), 1000, 'support_surface' "
+                "FROM case_conversations cc WHERE cc.tenant_id = CAST(:t AS uuid) "
+                "ORDER BY cc.id LIMIT 1",
+            ),
+            (
                 "case_attachments",
                 "INSERT INTO case_attachments (id, tenant_id, case_id, object_key, filename, "
                 "content_type, size_bytes, created_at) "
@@ -357,6 +404,28 @@ def seed_all_tables() -> None:
                 "tool_executions",
                 "INSERT INTO tool_executions (id, tenant_id, actor_id, tool_definition_id, "
                 "idempotency_key) VALUES (:i, :t, gen_random_uuid(), :tooldef, 'neg-idem-exec')",
+            ),
+            (
+                "tool_execution_reconciliations",
+                "INSERT INTO tool_execution_reconciliations (id, tenant_id, execution_id, "
+                "proposal_id, actor_id, idempotency_key_hash, request_hash, decision, "
+                "evidence_reference, created_at) SELECT :i, :t, te.id, tp.id, gen_random_uuid(), "
+                "repeat('c', 64), repeat('d', 64), 'applied', 'NEGATIVE_TEST', 1000 "
+                "FROM tool_executions te CROSS JOIN tool_proposals tp "
+                "WHERE te.tenant_id = CAST(:t AS uuid) AND tp.tenant_id = CAST(:t AS uuid) "
+                "ORDER BY te.id, tp.id LIMIT 1",
+            ),
+            (
+                "tool_execution_compensations",
+                "INSERT INTO tool_execution_compensations (id, tenant_id, execution_id, "
+                "proposal_id, actor_id, idempotency_key_hash, request_hash, action, outcome, "
+                "reason_code, case_id, result, created_at) SELECT :i, :t, te.id, tp.id, "
+                "gen_random_uuid(), repeat('e', 64), repeat('f', 64), "
+                "'case_create_close_unmodified', "
+                "'succeeded', 'NEGATIVE_TEST', :cid, '{}'::jsonb, 1000 "
+                "FROM tool_executions te CROSS JOIN tool_proposals tp "
+                "WHERE te.tenant_id = CAST(:t AS uuid) AND tp.tenant_id = CAST(:t AS uuid) "
+                "ORDER BY te.id, tp.id LIMIT 1",
             ),
             (
                 "action_confirmations",
@@ -481,8 +550,10 @@ def seed_all_tables() -> None:
             ),
             (
                 "contact_facts",
-                "INSERT INTO contact_facts (id, tenant_id, contact_ref, key, value) "
-                "VALUES (:i, :t, :i, 'neg_key', 'neg_value')",
+                "INSERT INTO contact_facts (id, tenant_id, contact_ref, key, value, "
+                "source_turn_id) SELECT :i, :t, :i, 'plan', 'neg_value', ct.id "
+                "FROM conversation_turns ct WHERE ct.tenant_id = CAST(:t AS uuid) "
+                "ORDER BY ct.id LIMIT 1",
             ),
             (
                 "visitor_session_revocations",
@@ -611,6 +682,7 @@ def seed_all_tables() -> None:
                     "taskid": task_id,
                     "draft": draft_id,
                     "release_eval": release_eval_id,
+                    "review_batch": review_batch_id,
                     "candidate_ver": candidate_version_id,
                     "slug": f"neg-{_tid[-4:]}-x",
                     "email": f"neg-{slug}@test.local",

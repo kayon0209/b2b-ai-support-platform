@@ -1181,17 +1181,17 @@ def classify_route(question: str) -> str:
 
 # Routes whose handling is settled before retrieval runs: there is nothing to
 # retrieve for them, and spending a model call would only produce an answer
-# that must then be suppressed. A human request and a sensitive request are
-# decided by *who asked*, not by what the corpus says.
+# that must then be suppressed. Human and sensitive requests are decided by
+# who asked; out-of-scope requests are not enterprise knowledge questions.
 PRE_RETRIEVAL_ROUTES: frozenset[str] = frozenset(
-    {Route.HUMAN_REQUIRED.value, Route.SENSITIVE.value}
+    {Route.HUMAN_REQUIRED.value, Route.SENSITIVE.value, Route.OUT_OF_SCOPE.value}
 )
 
 # Routes that must never produce a knowledge answer even if retrieval finds
 # something: a passage that happens to mention refunds does not authorise the
 # platform to answer a refund request, and an out-of-scope question has no
 # corpus to be answered from.
-NON_ANSWERABLE_ROUTES: frozenset[str] = PRE_RETRIEVAL_ROUTES | {Route.OUT_OF_SCOPE.value}
+NON_ANSWERABLE_ROUTES: frozenset[str] = PRE_RETRIEVAL_ROUTES
 
 
 __all__: list[str] = [

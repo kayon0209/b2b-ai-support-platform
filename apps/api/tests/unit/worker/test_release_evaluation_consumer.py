@@ -57,7 +57,7 @@ async def test_release_job_claim_reads_metadata_only_and_uses_fenced_claim() -> 
     assert await consumer.claim_release_jobs(session) == []  # type: ignore[arg-type]
 
     statement = str(
-        session.statements[0].compile(
+        session.statements[-1].compile(
             dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
         )
     )
@@ -69,6 +69,9 @@ async def test_release_job_claim_reads_metadata_only_and_uses_fenced_claim() -> 
     assert RELEASE_POST_TEST_REQUEST_EVENT in statement
     assert "FOR UPDATE SKIP LOCKED" in statement
     assert "processing_started_at" in statement
+    assert "first_attempt_at" in statement
+    assert "deadline_at" in statement
+    assert "external_attempt_limit" in statement
 
 
 @pytest.mark.asyncio
@@ -81,12 +84,13 @@ async def test_stale_release_claim_recovery_clears_token_and_bounds_attempts() -
     statements = [
         str(statement.compile(dialect=postgresql.dialect())) for statement in session.statements
     ]
-    assert len(statements) == 2
+    assert len(statements) == 3
     for statement in statements:
         assert "processing_started_at" in statement
         assert "processing_token" in statement
-    assert "attempts" in statements[0]
+    assert "deadline_at" in statements[0]
     assert "attempts" in statements[1]
+    assert "attempts" in statements[2]
 
 
 def test_release_job_payload_hash_is_canonical_and_strict() -> None:
@@ -118,6 +122,50 @@ def test_post_test_contract_has_no_tenant_or_customer_payload_fields() -> None:
         "dataset_approval_ref",
         "request_hash",
     }
+
+
+def test_release_external_attempts_and_deadline_survive_delivery_retries() -> None:
+    token = uuid.uuid4()
+    claim_one = consumer.ClaimedReleaseJob(
+        event_id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        processing_token=token,
+        attempt=1,
+        first_attempt_at=100,
+        deadline_at=250,
+        external_attempt_limit=10,
+    )
+    claim_two = consumer.ClaimedReleaseJob(
+        event_id=claim_one.event_id,
+        tenant_id=claim_one.tenant_id,
+        processing_token=uuid.uuid4(),
+        attempt=2,
+        first_attempt_at=claim_one.first_attempt_at,
+        deadline_at=claim_one.deadline_at,
+        external_attempt_limit=claim_one.external_attempt_limit,
+    )
+    claim_three = consumer.ClaimedReleaseJob(
+        event_id=claim_one.event_id,
+        tenant_id=claim_one.tenant_id,
+        processing_token=uuid.uuid4(),
+        attempt=3,
+        first_attempt_at=claim_one.first_attempt_at,
+        deadline_at=claim_one.deadline_at,
+        external_attempt_limit=claim_one.external_attempt_limit,
+    )
+    budget_one, remaining_one = consumer._budget_for_release_claim(claim_one, now=160)
+    budget_two, remaining_two = consumer._budget_for_release_claim(claim_two, now=180)
+    budget_three, _remaining_three = consumer._budget_for_release_claim(claim_three, now=200)
+
+    per_attempt = [
+        budget.operation_limits["model"] for budget in (budget_one, budget_two, budget_three)
+    ]
+    assert per_attempt == [4, 3, 3]
+    assert sum(per_attempt) == claim_one.external_attempt_limit
+    assert remaining_one == 90
+    assert remaining_two == 70
+    with pytest.raises(TimeoutError, match="RELEASE_EVALUATION_DEADLINE_EXCEEDED"):
+        consumer._budget_for_release_claim(claim_three, now=250)
 
 
 def test_release_evaluator_runtime_is_closed_when_auto_run_is_off(monkeypatch) -> None:

@@ -38,6 +38,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import and_, or_
 from sqlalchemy import select as sa_select
 from sqlalchemy.exc import IntegrityError
 
@@ -56,7 +57,14 @@ from platform_core.agent_runtime.copilot import (
 from platform_core.agent_runtime.models import ConversationTurn
 from platform_core.agent_runtime.semantic.modes import FLAG_COPILOT
 from platform_core.agent_runtime.tasks import store as task_store
-from platform_core.agent_runtime.tasks.models import CopilotDraft, StandardFlowStartRequest
+from platform_core.agent_runtime.tasks.dependencies import (
+    dependency_block_reason as _dependency_block_reason,
+)
+from platform_core.agent_runtime.tasks.models import (
+    ConversationTask,
+    CopilotDraft,
+    StandardFlowStartRequest,
+)
 from platform_core.agent_runtime.tasks.standard_flows import (
     FLAG_STANDARD_FLOW_INSTANCES,
     FLOW_EXECUTOR_UNAVAILABLE,
@@ -96,7 +104,12 @@ router = APIRouter(prefix="/v1/workbench", tags=["workbench-tasks"])
 # names these - see the module docstring for why there is no completion
 # command here.
 CommandName = Literal[
-    "collect_fields", "cancel", "handoff", "prepare_proposal", "query_order_status"
+    "collect_fields",
+    "cancel",
+    "handoff",
+    "prepare_proposal",
+    "query_order_status",
+    "execute_read",
 ]
 ALLOWED_COMMANDS: tuple[str, ...] = (
     "collect_fields",
@@ -104,6 +117,18 @@ ALLOWED_COMMANDS: tuple[str, ...] = (
     "handoff",
     "prepare_proposal",
     "query_order_status",
+    "execute_read",
+)
+DEPENDENCY_BLOCK_REASONS = frozenset(
+    {
+        "TASK_WAITING_DEPENDENCY",
+        "TASK_DEPENDENCY_MISSING",
+        "TASK_DEPENDENCY_PENDING",
+        "TASK_DEPENDENCY_CONDITION_INVALID",
+        "TASK_DEPENDENCY_CONDITION_UNRESOLVED",
+        "TASK_DEPENDENCY_EXECUTION_RECHECK_REQUIRED",
+        "TASK_CONDITION_UNMET",
+    }
 )
 INTERNAL_CASE_FLOWS = frozenset(
     {"invoice_application", "repair_quality_intake", "technical_escalation"}
@@ -211,6 +236,9 @@ def _task_out(
         "depends_on": row.depends_on,
         "condition": row.condition,
         "blocked_reason": row.blocked_reason,
+        "dependency_blocked": bool(
+            row.depends_on and row.blocked_reason in DEPENDENCY_BLOCK_REASONS
+        ),
         "proposal_id": str(row.proposal_id) if row.proposal_id else None,
         "execution_id": str(row.execution_id) if row.execution_id else None,
         "source_turn_id": row.source_turn_id,
@@ -297,22 +325,70 @@ async def list_conversation_tasks(
             session, tenant_id=ctx.tenant_id
         )
         orders_read_available = "orders_read" in connector_capabilities
+        dependent_rows = [row for row in rows if row.depends_on]
+        parents_by_turn: dict[str, dict[str, Any]] = {}
+        if dependent_rows:
+            parent_filter = or_(
+                *(
+                    and_(
+                        ConversationTask.source_turn_id == row.source_turn_id,
+                        ConversationTask.task_local_key.in_(row.depends_on),
+                    )
+                    for row in dependent_rows
+                )
+            )
+            parent_rows = (
+                await session.execute(
+                    sa_select(ConversationTask).where(
+                        ConversationTask.tenant_id == ctx.tenant_id,
+                        ConversationTask.conversation_ref_id == conversation_ref,
+                        parent_filter,
+                    )
+                )
+            ).scalars()
+            for parent in parent_rows:
+                parents_by_turn.setdefault(parent.source_turn_id, {})[parent.task_local_key] = (
+                    parent
+                )
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = _task_out(
+                row,
+                can_prepare_flow_proposal=_can_prepare_flow_proposal(row.flow_key, ctx),
+                can_query_order_flow=_can_query_order_flow(
+                    row.flow_key, ctx, orders_read_available=orders_read_available
+                ),
+            )
+            if row.depends_on:
+                if row.status in {
+                    TaskStatus.SUCCEEDED.value,
+                    TaskStatus.FAILED.value,
+                    TaskStatus.CANCELLED.value,
+                }:
+                    item["dependency_blocked"] = False
+                else:
+                    dependency_reason = await _dependency_block_reason(
+                        session,
+                        tenant_id=ctx.tenant_id,
+                        task=row,
+                        parents=parents_by_turn.get(row.source_turn_id, {}),
+                        allow_true_condition_for_proposal=True,
+                    )
+                    if (
+                        dependency_reason is None
+                        and row.blocked_reason not in DEPENDENCY_BLOCK_REASONS
+                    ):
+                        dependency_reason = row.blocked_reason
+                    item["blocked_reason"] = dependency_reason
+                    item["dependency_blocked"] = dependency_reason in DEPENDENCY_BLOCK_REASONS
+            items.append(item)
     return ok_response(
         {
             "conversation_ref": str(conversation_ref),
             "demo_presales_enabled": (
                 _demo_business_flows_enabled() and require_policy(ctx, Action.TOOL_READ) is None
             ),
-            "items": [
-                _task_out(
-                    row,
-                    can_prepare_flow_proposal=_can_prepare_flow_proposal(row.flow_key, ctx),
-                    can_query_order_flow=_can_query_order_flow(
-                        row.flow_key, ctx, orders_read_available=orders_read_available
-                    ),
-                )
-                for row in rows
-            ],
+            "items": items,
             "limit": limit,
             "offset": offset,
         }
@@ -810,6 +886,10 @@ async def command_conversation_task(
                 query_denied = require_policy(ctx, Action.TOOL_READ)
                 if query_denied is not None:
                     return query_denied
+            if body.command == "execute_read":
+                read_denied = require_policy(ctx, Action.TOOL_READ)
+                if read_denied is not None:
+                    return read_denied
 
             prior_request_hash = await task_store.command_request_hash(
                 session,
@@ -842,11 +922,56 @@ async def command_conversation_task(
                     trace_id=trace_id,
                 )
 
+            if body.command not in {"cancel", "handoff", "collect_fields"}:
+                dependency_block = await _dependency_block_reason(
+                    session,
+                    tenant_id=ctx.tenant_id,
+                    task=task,
+                    allow_true_condition_for_proposal=body.command == "prepare_proposal",
+                )
+                if dependency_block is not None:
+                    await audit_service.record(
+                        session,
+                        ctx=ctx,
+                        action="conversation_task.command_blocked",
+                        resource_type="conversation_task",
+                        resource_id=task.id,
+                        decision="denied",
+                        reason_code=dependency_block,
+                        metadata={
+                            "command": body.command,
+                            "dependency_count": len(task.depends_on or []),
+                        },
+                        trace_id=trace_id,
+                    )
+                    detail = (
+                        "the verified order state does not satisfy this task condition"
+                        if dependency_block == "TASK_CONDITION_UNMET"
+                        else "this task's prerequisites could not be proven from verified reads"
+                    )
+                    return error_response(
+                        "TASK_DEPENDENCY_BLOCKED",
+                        detail,
+                        status_code=409,
+                        trace_id=trace_id,
+                    )
+
             if body.command == "query_order_status":
                 updated = await _run_demo_order_query(
                     session,
                     ctx=ctx,
                     conversation_ref=conversation_ref,
+                    task=task,
+                    expected_version=body.expected_version,
+                    actor_ref=actor_ref,
+                    trace_id=trace_id,
+                    idempotency_key_hash=idempotency_key_hash,
+                    request_hash=request_hash,
+                )
+            elif body.command == "execute_read":
+                updated = await _run_selected_read_task(
+                    session,
+                    ctx=ctx,
                     task=task,
                     expected_version=body.expected_version,
                     actor_ref=actor_ref,
@@ -1118,6 +1243,234 @@ async def _verify_demo_flow_fields(
     return verified
 
 
+async def _run_selected_read_task(
+    session: Any,
+    *,
+    ctx: TenantContext,
+    task: Any,
+    expected_version: int,
+    actor_ref: str,
+    trace_id: str,
+    idempotency_key_hash: str,
+    request_hash: str,
+) -> Any:
+    """Execute a planned read through Tool Gateway and persist its receipt."""
+    if (
+        task.kind != TaskKind.READ.value
+        or TaskStatus(task.status) is not TaskStatus.READY
+        or task.flow_key is not None
+    ):
+        raise TaskCommandRefused("TASK_READ_NOT_EXECUTABLE", "only a ready semantic read may run")
+    if task.missing_slots:
+        raise TaskCommandRefused("TASK_FIELDS_REQUIRED", "collect the required fields first")
+    if ctx.actor_id is None:
+        raise TaskCommandRefused("ACTOR_UNRESOLVED", "read execution requires an identified agent")
+
+    selected_tool = next(
+        (
+            str(slot.get("value"))
+            for slot in task.slots or []
+            if slot.get("name") == "tool"
+            and slot.get("origin") == "server_capability"
+            and slot.get("selection_source") == "allowlisted_candidate_schema_match"
+            and slot.get("value")
+        ),
+        None,
+    )
+    if selected_tool is None:
+        raise TaskCommandRefused(
+            "TASK_TOOL_SELECTION_UNRESOLVED",
+            "no server-selected read tool is attached to this task",
+        )
+
+    from platform_core.tool_gateway.catalog import tool_risk
+    from platform_core.tool_gateway.gateway import (
+        ToolDenied,
+        ToolExecutionReceipt,
+        ToolGateway,
+        ToolGatewayError,
+        load_verified_read_execution,
+    )
+    from platform_core.tool_gateway.registry import resolve_executors
+
+    if await tool_risk(session, tenant_id=ctx.tenant_id, tool_name=selected_tool) != "read":
+        raise TaskCommandRefused(
+            "TASK_READ_TOOL_NOT_READ_ONLY", "the server-selected tool is not read-only"
+        )
+    arguments = _proposal_arguments(task)
+    if arguments is None:
+        raise TaskCommandRefused(
+            "TASK_FIELDS_REQUIRED", "a required read argument is missing or unsourced"
+        )
+    executors = await resolve_executors(
+        session,
+        tenant_id=ctx.tenant_id,
+        tool_names=[selected_tool],
+        ctx=ctx,
+        trace_id=trace_id,
+    )
+    if selected_tool not in executors:
+        raise TaskCommandRefused(
+            "TASK_READ_CONNECTOR_UNAVAILABLE", "the selected read tool has no active executor"
+        )
+
+    proposal_key = f"task-read:{task.id}:r{task.action_revision}:{idempotency_key_hash[:32]}"
+    gateway = ToolGateway(session, executors)
+    proposal_id = await gateway.proposal_id_for_idempotency_key(
+        tenant_id=ctx.tenant_id,
+        idempotency_key=proposal_key,
+    )
+    if proposal_id is None:
+        try:
+            proposal_id = await gateway.propose_id(
+                tenant_id=ctx.tenant_id,
+                actor_id=ctx.actor_id,
+                tool_name=selected_tool,
+                arguments=arguments,
+                role=ctx.role or "unknown",
+                idempotency_key=proposal_key,
+                permission_allowed=True,
+                required_action=Action.TOOL_READ.value,
+            )
+        except (ToolDenied, ToolGatewayError) as exc:
+            raise TaskCommandRefused(
+                "TASK_READ_PROPOSAL_REFUSED", "Tool Gateway refused the read proposal"
+            ) from exc
+
+    executing = await task_store.transition(
+        session,
+        tenant_id=ctx.tenant_id,
+        task=task,
+        command=task_store.TaskCommand(
+            target=TaskStatus.EXECUTING,
+            reason_code="TASK_READ_EXECUTION_STARTED",
+            actor_type="human",
+            actor_ref=actor_ref,
+            trace_id=trace_id,
+            expected_version=expected_version,
+            idempotency_key_hash=idempotency_key_hash,
+            request_hash=request_hash,
+            proposal_id=proposal_id,
+        ),
+    )
+    receipt: ToolExecutionReceipt | None = None
+    try:
+        receipt = await gateway.execute_receipt(
+            tenant_id=ctx.tenant_id,
+            actor_id=ctx.actor_id,
+            proposal_id=proposal_id,
+        )
+    except ToolGatewayError as exc:
+        receipt = await gateway.execution_receipt(
+            tenant_id=ctx.tenant_id,
+            proposal_id=proposal_id,
+        )
+        if receipt is None:
+            updated = await task_store.transition(
+                session,
+                tenant_id=ctx.tenant_id,
+                task=executing,
+                command=task_store.TaskCommand(
+                    target=TaskStatus.FAILED,
+                    reason_code="TASK_READ_EXECUTION_FAILED",
+                    actor_type="system",
+                    actor_ref="tool_gateway",
+                    trace_id=trace_id,
+                    expected_version=executing.version,
+                    blocked_reason="TOOL_EXECUTION_FAILED",
+                ),
+            )
+            await audit_service.record(
+                session,
+                ctx=ctx,
+                action="conversation.task_read_execution",
+                resource_type="conversation_task",
+                resource_id=updated.id,
+                decision="failed",
+                reason_code=exc.code[:63],
+                metadata={"tool_name": selected_tool, "proposal_id": str(proposal_id)},
+                trace_id=trace_id,
+            )
+            return updated
+    if receipt is None:
+        raise TaskCommandRefused(
+            "TASK_READ_RECEIPT_MISSING", "Tool Gateway returned no execution receipt"
+        )
+
+    from platform_core.agent_runtime.tasks.gateway_lifecycle import record_execution_result
+
+    verified_read = await load_verified_read_execution(
+        session,
+        tenant_id=ctx.tenant_id,
+        execution_id=receipt.id,
+    )
+    result_slots = (
+        _semantic_read_result_slots(task, selected_tool, receipt, verified_read)
+        if receipt.status == "executed" and receipt.verification_status == "verified"
+        else None
+    )
+    linked_task = await record_execution_result(
+        session,
+        tenant_id=ctx.tenant_id,
+        proposal_id=proposal_id,
+        execution_id=receipt.id,
+        execution_status=receipt.status,
+        verification_status=receipt.verification_status,
+        trace_id=trace_id,
+        result_slots=result_slots,
+    )
+    if linked_task is None:
+        raise TaskCommandRefused(
+            "TASK_READ_RESULT_NOT_LINKED", "Gateway receipt could not be linked to this task"
+        )
+    await audit_service.record(
+        session,
+        ctx=ctx,
+        action="conversation.task_read_execution",
+        resource_type="conversation_task",
+        resource_id=linked_task.id,
+        decision="completed" if linked_task.status == TaskStatus.SUCCEEDED.value else "failed",
+        reason_code=linked_task.status,
+        metadata={
+            "tool_name": selected_tool,
+            "proposal_id": str(proposal_id),
+            "execution_id": str(receipt.id),
+            "verification_status": receipt.verification_status or "",
+        },
+        trace_id=trace_id,
+    )
+    return linked_task
+
+
+def _semantic_read_result_slots(
+    task: Any,
+    tool_name: str,
+    receipt: Any,
+    read: Any,
+) -> list[dict[str, Any]]:
+    """Persist a small safe summary; the complete sanitized receipt stays in Gateway."""
+    value: dict[str, Any] = {
+        "tool_name": tool_name,
+        "execution_id": str(receipt.id),
+        "verification_status": "verified",
+    }
+    if tool_name == "order.get_status" and read is not None:
+        from platform_core.agent_runtime.tasks.conditions import facts_from_verified_read
+
+        facts = facts_from_verified_read(tool_name, read.sanitized_output)
+        order = facts.get("order")
+        if isinstance(order, dict):
+            value["order_id"] = read.sanitized_input.get("order_id")
+            value["status"] = order.get("status")
+    result_slot = {
+        "name": "tool_result",
+        "value": value,
+        "origin": "verified_receipt",
+        "confirmed": True,
+    }
+    return _merge_slots(list(task.slots or []), [result_slot])
+
+
 async def _run_demo_order_query(
     session: Any,
     *,
@@ -1353,6 +1706,17 @@ async def _run_demo_order_query(
             request_hash=request_hash,
         ),
     )
+    if target is TaskStatus.SUCCEEDED:
+        from platform_core.agent_runtime.tasks.dependencies import (
+            advance_dependents_after_parent,
+        )
+
+        await advance_dependents_after_parent(
+            session,
+            tenant_id=ctx.tenant_id,
+            parent=updated,
+            trace_id=trace_id,
+        )
     await audit_service.record(
         session,
         ctx=ctx,
@@ -1505,6 +1869,7 @@ async def _build_command(
             reason_code=("TASK_FIELDS_COLLECTED" if not remaining else "TASK_FIELDS_PARTIAL"),
             missing_slots=remaining,
             slots=new_slots,
+            blocked_reason="TASK_MISSING_FIELDS" if remaining else "",
             **base,
         )
 
@@ -1634,6 +1999,7 @@ async def _build_command(
             blocked_reason="",
             bump_action_revision=True,
             proposal_id=proposal,
+            proposal_lease_version=body.expected_lease_version,
             **base,
         )
 
@@ -1663,6 +2029,7 @@ async def _build_command(
         reason_code="TASK_PROPOSAL_PREPARED",
         bump_action_revision=True,
         proposal_id=proposal,
+        proposal_lease_version=body.expected_lease_version,
         **base,
     )
 

@@ -442,6 +442,176 @@ def test_two_workers_racing_on_one_task_produce_one_winner() -> None:
     assert sorted(outcomes) == ["TASK_VERSION_CONFLICT", "won"]
 
 
+def test_verified_parent_completion_persists_ready_child_and_event() -> None:
+    """A successful read clears the child's durable waiting reason once.
+
+    The task status remains `ready`; the compare-and-set increments its
+    version and appends a same-state dependency event, so task-list refreshes
+    do not repeatedly perform the transition.
+    """
+    engine = _engine()
+    tenant_id, conv, _ = _run(_seed_tenant(engine))
+    _run(_dispose(engine))
+
+    async def _advance() -> tuple[str, str | None, int, str]:
+        from platform_core.agent_runtime.tasks.dependencies import (
+            advance_dependents_after_parent,
+        )
+        from platform_core.db import session_scope_with_url
+
+        async with session_scope_with_url(str(ADMIN_URL)) as session:  # type: ignore[attr-defined]
+            parent, _ = await create_or_get(
+                session,
+                tenant_id=tenant_id,
+                conversation_ref_id=conv,
+                source_turn_id="dependency-turn",
+                task_local_key="read-0",
+                kind=TaskKind.READ,
+                status=TaskStatus.READY,
+            )
+            child, _ = await create_or_get(
+                session,
+                tenant_id=tenant_id,
+                conversation_ref_id=conv,
+                source_turn_id="dependency-turn",
+                task_local_key="write-1",
+                kind=TaskKind.WRITE,
+                status=TaskStatus.READY,
+                depends_on=["read-0"],
+                blocked_reason="TASK_WAITING_DEPENDENCY",
+                sequence=1,
+            )
+            parent = await transition(
+                session,
+                tenant_id=tenant_id,
+                task=parent,
+                command=TaskCommand(target=TaskStatus.EXECUTING, reason_code="READ_STARTED"),
+            )
+            parent = await transition(
+                session,
+                tenant_id=tenant_id,
+                task=parent,
+                command=TaskCommand(
+                    target=TaskStatus.SUCCEEDED,
+                    reason_code="READ_VERIFIED",
+                    completion_evidence=f"{EVIDENCE_HUMAN_ACTION}external-read",
+                ),
+            )
+            advanced = await advance_dependents_after_parent(
+                session,
+                tenant_id=tenant_id,
+                parent=parent,
+                trace_id="dependency-test",
+            )
+            refreshed = await get_task(session, tenant_id=tenant_id, task_id=child.id)
+            assert refreshed is not None
+            reason = (
+                await session.execute(
+                    select(ConversationTaskEvent.reason_code)
+                    .where(
+                        ConversationTaskEvent.tenant_id == tenant_id,
+                        ConversationTaskEvent.task_id == child.id,
+                    )
+                    .order_by(ConversationTaskEvent.sequence.desc())
+                    .limit(1)
+                )
+            ).scalar_one()
+            return refreshed.status, refreshed.blocked_reason, len(advanced), str(reason)
+
+    status, blocked_reason, count, reason_code = _run(_advance())
+    assert status == TaskStatus.READY.value
+    assert blocked_reason == ""
+    assert count == 1
+    assert reason_code == "TASK_DEPENDENCY_SATISFIED"
+
+
+def test_false_verified_condition_persists_child_as_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A false, already-verified branch is terminal and cannot later execute."""
+    engine = _engine()
+    tenant_id, conv, _ = _run(_seed_tenant(engine))
+    _run(_dispose(engine))
+
+    from platform_core.agent_runtime.tasks import dependencies
+
+    async def condition_false(*_args: object, **_kwargs: object) -> str:
+        return "TASK_CONDITION_UNMET"
+
+    monkeypatch.setattr(dependencies, "dependency_block_reason", condition_false)
+
+    async def _advance() -> tuple[str, str | None, str]:
+        from platform_core.agent_runtime.tasks.dependencies import (
+            advance_dependents_after_parent,
+        )
+        from platform_core.db import session_scope_with_url
+
+        async with session_scope_with_url(str(ADMIN_URL)) as session:  # type: ignore[attr-defined]
+            parent, _ = await create_or_get(
+                session,
+                tenant_id=tenant_id,
+                conversation_ref_id=conv,
+                source_turn_id="conditional-turn",
+                task_local_key="read-0",
+                kind=TaskKind.READ,
+                status=TaskStatus.READY,
+            )
+            child, _ = await create_or_get(
+                session,
+                tenant_id=tenant_id,
+                conversation_ref_id=conv,
+                source_turn_id="conditional-turn",
+                task_local_key="write-1",
+                kind=TaskKind.WRITE,
+                status=TaskStatus.READY,
+                depends_on=["read-0"],
+                condition={"field": "order.status", "operator": "ne", "value": "shipped"},
+                blocked_reason="TASK_WAITING_DEPENDENCY",
+                sequence=1,
+            )
+            parent = await transition(
+                session,
+                tenant_id=tenant_id,
+                task=parent,
+                command=TaskCommand(target=TaskStatus.EXECUTING, reason_code="READ_STARTED"),
+            )
+            parent = await transition(
+                session,
+                tenant_id=tenant_id,
+                task=parent,
+                command=TaskCommand(
+                    target=TaskStatus.SUCCEEDED,
+                    reason_code="READ_VERIFIED",
+                    completion_evidence=f"{EVIDENCE_HUMAN_ACTION}external-read",
+                ),
+            )
+            await advance_dependents_after_parent(
+                session,
+                tenant_id=tenant_id,
+                parent=parent,
+                trace_id="dependency-condition-test",
+            )
+            refreshed = await get_task(session, tenant_id=tenant_id, task_id=child.id)
+            assert refreshed is not None
+            reason = (
+                await session.execute(
+                    select(ConversationTaskEvent.reason_code)
+                    .where(
+                        ConversationTaskEvent.tenant_id == tenant_id,
+                        ConversationTaskEvent.task_id == child.id,
+                    )
+                    .order_by(ConversationTaskEvent.sequence.desc())
+                    .limit(1)
+                )
+            ).scalar_one()
+            return refreshed.status, refreshed.blocked_reason, str(reason)
+
+    status, blocked_reason, reason_code = _run(_advance())
+    assert status == TaskStatus.CANCELLED.value
+    assert blocked_reason == "TASK_CONDITION_UNMET"
+    assert reason_code == "TASK_DEPENDENCY_CONDITION_UNMET"
+
+
 async def _race_transitions(
     task_id: uuid.UUID, tenant_id: uuid.UUID, stale_version: int
 ) -> list[str]:

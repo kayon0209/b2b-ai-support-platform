@@ -40,3 +40,31 @@ spec:
       # that the ingress does not route, so it is reachable only from inside
       # the namespace.
       honorLabels: false
+---
+# Worker registries are process-local: scrape every role pod so counters and
+# queue-age histograms describe that worker rather than the API process.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: platform-worker-metrics
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - b2b-support
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform
+      app.kubernetes.io/component: worker-metrics
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      honorLabels: false
+      relabelings:
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_worker_queue
+          targetLabel: worker_queue

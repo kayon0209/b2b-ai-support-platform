@@ -29,6 +29,7 @@ from platform_core.db import session_scope
 from platform_core.outbox import OutboxEvent, OutboxStatus
 from worker.outbox_relay import (
     MAX_ATTEMPTS,
+    OutboxOutcomeUnknown,
     OutboxRelay,
     pending_count,
 )
@@ -255,8 +256,8 @@ async def test_failing_handler_records_error_and_stays_queued() -> None:
     async def boom(session: AsyncSession, event: OutboxEvent) -> None:
         raise RuntimeError("downstream refused")
 
-    event_id = _seed_event()
-    relay = OutboxRelay(handlers={EVENT_TYPE: boom})
+    event_id = _seed_event(event_type="case.created")
+    relay = OutboxRelay(handlers={"case.created": boom})
 
     async with session_scope() as session:
         stats = await relay.run_once(session)
@@ -267,8 +268,114 @@ async def test_failing_handler_records_error_and_stays_queued() -> None:
     status, attempts, last_error = await _row_status(event_id)
     assert status == OutboxStatus.QUEUED.value  # still deliverable
     assert attempts == 1
-    assert last_error is not None
-    assert "downstream refused" in last_error
+    assert last_error == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_retryable_outbox_handler_reuses_total_budget_and_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Five safe deliveries share one persisted event cap and deadline."""
+    from platform_core import config as config_module
+    from platform_core.config import Settings
+    from platform_core.execution_budget import current_execution_budget
+
+    monkeypatch.setattr(
+        config_module,
+        "get_settings",
+        lambda: Settings(
+            environment="test",
+            allow_bootstrap_tokens=True,
+            outbox_job_deadline_seconds=300,
+            outbox_event_max_external_attempts=20,
+            outbox_handler_deadline_seconds=30,
+            outbox_handler_max_external_attempts=4,
+        ),
+    )
+    event_id = _seed_event(event_type="case.created")
+    delivery_attempts: list[tuple[int, int]] = []
+    external_attempts = 0
+
+    async def retry_four_times(session: AsyncSession, event: OutboxEvent) -> None:
+        nonlocal external_attempts
+        budget = current_execution_budget()
+        assert budget is not None
+        delivery_attempts.append((budget.max_attempts, budget.operation_limits["model"]))
+        for _ in range(budget.operation_limits["model"]):
+            budget.reserve_attempt("model")
+            external_attempts += 1
+        if len(delivery_attempts) < MAX_ATTEMPTS:
+            raise RuntimeError("synthetic retryable failure")
+
+    relay = OutboxRelay(handlers={"case.created": retry_four_times})
+    persisted_budget: tuple[int | None, int | None, int | None] | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        async with session_scope() as session:
+            result = await relay.run_once(session)
+        assert result.claimed == 1
+        status, claimed_attempts, _error = await _row_status(event_id)
+        assert claimed_attempts == attempt
+        if attempt < MAX_ATTEMPTS:
+            assert status == OutboxStatus.QUEUED.value
+        else:
+            assert status == OutboxStatus.SENT.value
+        admin = create_engine(ADMIN_URL)
+        with admin.connect() as conn:
+            values = conn.execute(
+                text(
+                    "SELECT first_attempt_at, deadline_at, external_attempt_limit "
+                    "FROM outbox_events WHERE event_id = :event"
+                ),
+                {"event": str(event_id)},
+            ).one()
+        admin.dispose()
+        current_budget = (values[0], values[1], values[2])
+        if persisted_budget is None:
+            persisted_budget = current_budget
+        assert current_budget == persisted_budget
+
+    assert delivery_attempts == [(4, 4)] * MAX_ATTEMPTS
+    assert external_attempts == 20
+    assert persisted_budget is not None
+    first_attempt_at, deadline_at, external_limit = persisted_budget
+    assert deadline_at == first_attempt_at + 300
+    assert external_limit == 20
+
+
+@pytest.mark.asyncio
+async def test_expired_queued_outbox_job_is_failed_without_a_handler_call() -> None:
+    event_id = _seed_event(event_type="case.created")
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE outbox_events SET first_attempt_at = :first, deadline_at = :deadline, "
+                "external_attempt_limit = 20 WHERE event_id = :event"
+            ),
+            {
+                "first": int(time.time()) - 301,
+                "deadline": int(time.time()) - 1,
+                "event": str(event_id),
+            },
+        )
+    admin.dispose()
+    calls = 0
+
+    async def must_not_run(session: AsyncSession, event: OutboxEvent) -> None:
+        nonlocal calls
+        calls += 1
+
+    relay = OutboxRelay(handlers={"case.created": must_not_run})
+    async with session_scope() as session:
+        result = await relay.run_once(session)
+
+    status, attempts, last_error = await _row_status(event_id)
+    assert result.claimed == 0
+    assert result.failed == 1
+    assert calls == 0
+    assert status == OutboxStatus.FAILED.value
+    assert attempts == 0
+    assert last_error == "outbox_job_deadline_exhausted"
 
 
 @pytest.mark.asyncio
@@ -288,10 +395,132 @@ async def test_row_over_attempt_budget_is_parked() -> None:
     assert stats.parked == 1
     assert calls == []  # the handler was never invoked
     # Still queued, so an operator can requeue it deliberately.
-    assert (await _row_status(event_id))[0] == OutboxStatus.QUEUED.value
+    status, attempts, _ = await _row_status(event_id)
+    assert status == OutboxStatus.QUEUED.value
+    assert attempts == MAX_ATTEMPTS + 1
+
+    # Parked rows are counted for operators but no longer claimed or bumped
+    # on every poll cycle.
+    async with session_scope() as session:
+        repeated = await relay.run_once(session)
+    assert repeated.parked == 1
+    assert repeated.claimed == 0
+    assert (await _row_status(event_id))[1] == attempts
 
 
-def _seed_event_with_payload(payload: str) -> uuid.UUID:
+@pytest.mark.asyncio
+async def test_external_unknown_is_terminal_and_never_replayed() -> None:
+    event_id = _seed_event()
+    calls = 0
+
+    async def ambiguous(session: AsyncSession, event: OutboxEvent) -> None:
+        nonlocal calls
+        calls += 1
+        raise OutboxOutcomeUnknown("provider may have accepted the side effect")
+
+    relay = OutboxRelay(handlers={EVENT_TYPE: ambiguous})
+    async with session_scope() as session:
+        result = await relay.run_once(session)
+    assert result.failed == 1
+    status, attempts, last_error = await _row_status(event_id)
+    assert status == OutboxStatus.FAILED.value
+    assert attempts == 1
+    assert last_error == "outbox_delivery_outcome_unknown"
+
+    async with session_scope() as session:
+        replay = await relay.run_once(session)
+    assert replay.claimed == 0
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_crashed_external_reply_claim_is_not_automatically_requeued() -> None:
+    event_id = _seed_event(
+        status=OutboxStatus.PROCESSING.value,
+        attempts=1,
+        event_type="conversation.agent_reply",
+    )
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE outbox_events SET processing_started_at = :stale, "
+                "processing_token = :token WHERE event_id = :event"
+            ),
+            {
+                "stale": int(time.time()) - 3600,
+                "token": uuid.uuid4(),
+                "event": str(event_id),
+            },
+        )
+    admin.dispose()
+    calls = 0
+
+    async def should_not_replay(session: AsyncSession, event: OutboxEvent) -> None:
+        nonlocal calls
+        calls += 1
+
+    relay = OutboxRelay(handlers={"conversation.agent_reply": should_not_replay})
+    async with session_scope() as session:
+        result = await relay.run_once(session)
+
+    status, attempts, last_error = await _row_status(event_id)
+    assert result.claimed == 0
+    assert result.failed == 1
+    assert calls == 0
+    assert status == OutboxStatus.FAILED.value
+    assert attempts == 1
+    assert last_error == "outbox_delivery_outcome_unknown"
+
+
+@pytest.mark.asyncio
+async def test_stale_claim_replays_database_work_but_parks_external_reply() -> None:
+    safe_id = _seed_event(
+        status=OutboxStatus.PROCESSING.value,
+        attempts=1,
+        event_type="case.created",
+    )
+    unsafe_id = _seed_event(
+        status=OutboxStatus.PROCESSING.value,
+        attempts=1,
+        event_type="conversation.agent_reply",
+    )
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE outbox_events SET processing_started_at = :stale, "
+                "processing_token = :token WHERE event_id IN (:safe, :unsafe)"
+            ),
+            {
+                "stale": int(time.time()) - 3600,
+                "token": uuid.uuid4(),
+                "safe": str(safe_id),
+                "unsafe": str(unsafe_id),
+            },
+        )
+    admin.dispose()
+    delivered: list[uuid.UUID] = []
+
+    async def safe_handler(session: AsyncSession, event: OutboxEvent) -> None:
+        delivered.append(event.event_id)
+
+    relay = OutboxRelay(handlers={"case.created": safe_handler})
+    async with session_scope() as session:
+        stats = await relay.run_once(session)
+
+    assert stats.claimed == 1
+    assert stats.sent == 1
+    assert stats.failed == 1
+    assert delivered == [safe_id]
+    assert (await _row_status(safe_id))[0] == OutboxStatus.SENT.value
+    unsafe_status, unsafe_attempts, unsafe_error = await _row_status(unsafe_id)
+    assert unsafe_status == OutboxStatus.FAILED.value
+    assert unsafe_attempts == 1
+    assert unsafe_error == "outbox_delivery_outcome_unknown"
+
+
+def _seed_event_with_payload(payload: str, *, event_type: str = EVENT_TYPE) -> uuid.UUID:
     """Seed one queued row with an explicit payload."""
     event_id = uuid.uuid4()
     admin = create_engine(ADMIN_URL)
@@ -311,7 +540,7 @@ def _seed_event_with_payload(payload: str) -> uuid.UUID:
                 "id": str(uuid7()),
                 "tid": TENANT,
                 "eid": str(event_id),
-                "etype": EVENT_TYPE,
+                "etype": event_type,
                 "agg": str(uuid.uuid4()),
                 "payload": payload,
                 "created": int(time.time()),
@@ -335,11 +564,11 @@ async def test_one_failing_event_does_not_block_the_batch() -> None:
             raise RuntimeError("nope")
         delivered.append(str(event.event_id))
 
-    bad = _seed_event_with_payload('{"fail": true}')
-    good_a = _seed_event_with_payload('{"fail": false}')
-    good_b = _seed_event_with_payload('{"fail": false}')
+    bad = _seed_event_with_payload('{"fail": true}', event_type="case.created")
+    good_a = _seed_event_with_payload('{"fail": false}', event_type="case.created")
+    good_b = _seed_event_with_payload('{"fail": false}', event_type="case.created")
 
-    relay = OutboxRelay(handlers={EVENT_TYPE: selective})
+    relay = OutboxRelay(handlers={"case.created": selective})
     async with session_scope() as session:
         stats = await relay.run_once(session)
 

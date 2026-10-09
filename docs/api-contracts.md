@@ -50,6 +50,20 @@ outage for clients that honour the flag. They are distinct codes so that a load
 balancer, a backoff policy and an operator can tell a capacity problem from a
 bug - a page of identical 500s cannot.
 
+The Tool Gateway returns HTTP 409 `TASK_DEPENDENCY_BLOCKED` when a write
+proposal is linked to a task whose prerequisite cannot be proven at execution
+time. A confirmed proposal is rechecked against a fresh, verified read before
+the executor runs; a false condition withdraws the proposal and records the
+dependent task as skipped. An unavailable or unverified read leaves the write
+unexecuted and the task blocked.
+
+Task-linked proposals also capture the conversation lease version when the
+proposal is prepared. `confirm` and a new `execute` re-check that the lease is
+still active, human-owned, and at that version; otherwise the Gateway returns
+HTTP 409 `TASK_LEASE_STALE` before recording a new execution. A pending task
+proposal created before lease-version capture was deployed fails closed and
+must be prepared again.
+
 ## Signed channel/connector webhooks
 
 ```text
@@ -112,6 +126,32 @@ Response:
 {
   "run_id": "019...",
   "status": "queued",
+  "trace_id": "019..."
+}
+```
+
+Operator-requested retries create a new run and preserve the failed record:
+
+```text
+POST /v1/conversations/agent-runs/{run_id}/rerun
+```
+
+This command has no request body and requires `CASE_UPDATE`, a human operator
+context, and `Idempotency-Key`. The key is stored only as a tenant-scoped hash.
+Repeating the same request returns the same replacement run, including after it
+has started or finished, and reports that run's current status. A different
+request while a replacement is queued/running is refused; a new key is also
+refused after a rerun has completed or handed the conversation to a human. The
+command and its result are audited in the same transaction.
+
+Response:
+
+```json
+{
+  "run_id": "019...",
+  "rerun_of": "019...",
+  "status": "queued",
+  "idempotent_replay": false,
   "trace_id": "019..."
 }
 ```
@@ -253,6 +293,27 @@ underlying rows. `related_cases.basis` is spelled out rather than left
 implied - the query filters on category and recency, and an agent who believes
 it is a relevance ranking will trust it more than it deserves.
 
+## Contact memory erasure
+
+```text
+POST /v1/identity/contact-memory/erase
+Headers: Idempotency-Key
+Permission: TENANT_ADMIN
+```
+
+```json
+{"external_contact_id": "provider-local-id", "channel": "chatwoot"}
+```
+
+The channel is required so equal provider-local IDs in different channels are
+not treated as one person. The command deletes that tenant/channel contact's
+durable `ContactFact` rows and redacted turns from linked conversations, and
+records row counts in the append-only audit log. Conversation summaries are
+computed per run and are not stored; support-path query embeddings bypass the
+process cache, and retrieval result sets are never cached. Verified task state,
+audit history, provider address mappings, and the external channel's raw
+transcript remain outside this memory-erasure command.
+
 ## Answer corrections
 
 ```text
@@ -288,6 +349,11 @@ stays its own reviewed act.
 ```text
 GET  /v1/quality/metrics?window_seconds=86400
 GET  /v1/quality/routes?window_seconds=86400
+GET  /v1/quality/outcomes?window_seconds=2592000&confirmation_window_seconds=604800
+POST /v1/quality/reviews/batches
+GET  /v1/quality/reviews/batches/{batch_id}
+POST /v1/quality/reviews/batches/{batch_id}/decisions
+POST /v1/quality/reviews/batches/{batch_id}/finalize
 POST /v1/quality/categories/state
 ```
 
@@ -300,6 +366,10 @@ Returns the dashboard numbers, plus the leak analysis:
   rather than automation. Each carries `sample_questions` taken from the gap
   queue, so the list is a work queue and not a histogram with opinions.
 - `pending_corrections` - agent corrections awaiting review (see above).
+- `GET /v1/quality/outcomes` - confirmation answers and mature no-response
+  events after the customer-facing resolution question was actually displayed.
+  Silence is never a positive confirmation. `same_issue_recontact_rate` stays
+  null until a tenant-scoped same-contact/same-case follow-up can be verified.
 
 `POST /categories/state` is the only write here, and it is the one that records
 that something was *decided* about a category - which is why it demands an
@@ -309,6 +379,69 @@ state machine it advances is deliberate: a first decision may not skip the work
 (`observed` before `automated`), and two illegal transitions are refused with
 `CATEGORY_STATE_INVALID` rather than normalised. A client that timed out and
 retried would move that machine twice, so the retry needs the key.
+
+The customer surface records exposure and explicit answers separately:
+
+```text
+POST /v1/support/resolution-feedback/requested
+POST /v1/support/resolution-feedback   { "confirmed": true | false }
+```
+
+Both commands require the conversation's visitor token and an
+`Idempotency-Key`; the server derives tenant, conversation, and an unambiguous
+linked Case. Events contain only an enum, timestamps, and hashed request keys,
+are append-only under tenant RLS, and are audited. A question is eligible only
+after the conversation is closed and a human has replied.
+
+Human review batches require `case.review` and idempotency keys on create,
+decision, and finalize. Create accepts `window_seconds`, `size`, and an
+optional tenant-owned `target_prompt_version_id`; when supplied, the sample
+population contains only AgentRuns for that immutable prompt version. The
+batch records code/policy/prompt version scope, per-stratum population, and the
+sampler version. Decisions are one-per-selected-run, store only agree/override
+plus a bounded reason code, and are append-only. Finalization is available
+only after all selected items are reviewed; it writes an immutable hashed
+snapshot with the weighted result and exact version scope. Prompt promotion
+resolves this evidence server-side for the exact candidate version. Snapshot
+schema v2 also binds bounded override-reason counts so release checks can
+distinguish safety overrides from general quality disagreements.
+
+## Prompt promotion release gate
+
+```text
+POST /v1/prompts/{version_id}/promote
+```
+
+Promotion requires `prompt.release`, an `Idempotency-Key`, a caller-supplied
+CI evaluation summary (`eval_run_id`, category `scores`, and `regressions`),
+and recent server-stored human-review evidence for the exact candidate
+version. The human-review artifact is never accepted from the request body.
+The release service reloads it under tenant RLS and rechecks its canonical
+hash, target version, completeness, freshness, sample coverage, override
+reasons, and thresholds before archiving the incumbent or activating the
+candidate.
+
+The initial code defaults require evidence finalized within 30 days; at least
+30 reviewed cases, or a census when the measured population is smaller; at
+least five reviewed cases per populated stratum, or a census of that stratum
+when it contains fewer than five cases; zero `unsafe_action`,
+`unsupported_claim`, or `citation_gap` overrides; and a population-weighted
+override rate no greater than 10%. A failed condition returns HTTP 422 with a
+stable `HUMAN_REVIEW_*` code and writes a `prompt.promotion_blocked` audit
+event. Successful promotion audit data records the evidence ID/hash, target
+version, sample counts, weighted rate, and threshold values. Emergency
+rollback retains its existing path and does not require fresh evidence.
+
+Unpublished prompt versions can enter enabled A/B experiments to collect
+candidate-version runs before promotion. The server verifies each prompt
+reference belongs to the tenant and caps the combined allocation of
+unpublished versions at 10% across enabled experiments. Promotion remains the
+only path to mark a version as serving.
+
+The evaluation summary remains an operator/CI-supplied declaration; this
+endpoint does not authenticate an external CI artifact. Signed CI provenance,
+independent human holdout, and calibration on approved production traffic
+remain production admission work.
 
 ## Case evidence attachments
 
@@ -419,6 +552,8 @@ proposal the agent raised without being able to raise one.
 POST /v1/tool-proposals
 POST /v1/tool-proposals/{id}/confirm
 POST /v1/tool-proposals/{id}/execute
+POST /v1/tool-proposals/{id}/reconcile
+POST /v1/tool-proposals/{id}/compensate
 GET  /v1/tool-proposals
 GET  /v1/tool-proposals/{id}
 ```
@@ -447,6 +582,46 @@ A proposal freezes:
 - expiry time.
 
 Execution requires the same action hash. Any material argument change invalidates confirmation.
+
+`confirm`, `execute`, and provider-outcome reconciliation recheck the actor's
+current active tenant membership from PostgreSQL. The confirmation and execute
+paths lock that membership row; a concurrent role change/removal either commits
+first and is denied, or waits until the durable execution intent commits. If
+the repeatable-read snapshot conflicts with a concurrent membership change, the
+API returns HTTP 409 `AUTHORIZATION_STATE_CHANGED` and requires a fresh request.
+Proposal and confirmation expiry are checked again after live preconditions,
+immediately before the execution intent is committed; an approval expired at
+that boundary cannot dispatch a provider call. Once the intent is committed,
+the external request is an authorized in-flight operation and cannot be
+recalled by a later role change.
+
+An execution intent is committed before the provider call. If a process exits
+after the provider may have accepted a write but before its receipt is stored,
+the execution remains unresolved. A duplicate execute returns HTTP 409
+TOOL_EXECUTION_IN_PROGRESS while the bounded provider window is active, then
+TOOL_EXECUTION_OUTCOME_UNKNOWN; neither response dispatches another write.
+
+An authorized current human owner can use reconcile after checking the provider
+record. The request requires an Idempotency-Key and a compact evidence_reference
+(provider record or lookup reference; no pasted document or free-form note).
+The decision is applied, not_applied, or unresolved. Applied records a human
+provider lookup as verified; not_applied closes the attempt as failed and
+requires a new proposal and confirmation for any later write; unresolved keeps
+the execution unknown and allows a later lookup under a new idempotency key.
+Every decision is append-only and audited. Reconciliation never invokes the
+executor. Provider-specific automatic lookup and provider-side idempotency
+remain connector capabilities that must be qualified separately.
+
+Compensation is business-specific and opt-in. Today the only qualified
+compensator is for a verified `case.create`: an authorized human can request
+`case.create.close_unmodified`, which closes (never deletes) the case only if
+it remains `NEW` at version 1. The request requires `case.close`, a controlled
+reason code, and an Idempotency-Key. A changed or missing case produces an
+append-only failed-compensation record, audit event, and bounded Prometheus
+counter/alert; the human must inspect the case before choosing another action.
+Provider issue creation, CRM writes, notifications, and release confirmations
+have no generic undo path. They remain at their explicit provider/no-return
+point and use reconciliation or the owning system's human workflow.
 
 ## Tenant branding
 

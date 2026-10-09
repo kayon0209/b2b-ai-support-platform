@@ -47,6 +47,7 @@ from typing import Protocol
 import httpx
 
 from platform_core.config import Settings
+from platform_core.execution_budget import current_execution_budget
 
 
 class ChannelNotConfigured(RuntimeError):
@@ -64,6 +65,13 @@ class SendResult:
     success - retrying with the same `command_id` is the safe next step."""
 
     ambiguous: bool = False
+
+
+def _request_timeout(configured_seconds: float) -> float:
+    budget = current_execution_budget()
+    if budget is None:
+        return configured_seconds
+    return min(configured_seconds, budget.reserve_attempt("outbound"))
 
 
 class ChannelTransport(Protocol):
@@ -152,11 +160,15 @@ class EmailSmtpTransport:
 
         # `smtplib` is blocking; a run must not hold the event loop for a network
         # round trip.
-        await asyncio.to_thread(self._send_blocking, message)
+        await asyncio.to_thread(
+            self._send_blocking,
+            message,
+            _request_timeout(20.0),
+        )
         return SendResult()
 
-    def _send_blocking(self, message: EmailMessage) -> None:
-        with smtplib.SMTP(self._host, self._port, timeout=20) as smtp:
+    def _send_blocking(self, message: EmailMessage, timeout_seconds: float) -> None:
+        with smtplib.SMTP(self._host, self._port, timeout=timeout_seconds) as smtp:
             smtp.starttls()
             if self._username and self._password:
                 smtp.login(self._username, self._password)
@@ -192,7 +204,7 @@ class WeChatTransport:
     ) -> SendResult:
         del conversation_key  # the openid is the address; there is no thread key
         token = await self._access_token()
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=_request_timeout(self._timeout)) as client:
             resp = await client.post(
                 self._SEND_URL,
                 params={"access_token": token},
@@ -222,7 +234,7 @@ class WeChatTransport:
         now = time.monotonic()
         if self._token and now < self._token_expires_at:
             return self._token
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=_request_timeout(self._timeout)) as client:
             resp = await client.get(
                 self._TOKEN_URL,
                 params={

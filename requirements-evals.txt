@@ -1,0 +1,2 @@
+# Optional, eval-only instrumentation. Never install into production API/Worker images.
+deepeval==4.2.0

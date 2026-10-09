@@ -9,7 +9,7 @@ import {
   Card,
   EmptyState,
   PageHeader,
-  Spinner,
+  SkeletonRows,
   ListTotal,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
@@ -155,7 +155,7 @@ export function Members() {
       </Card>
 
       <LoadError error={members.error} status={members.errorStatus} onRetry={members.reload} />
-      {members.loading ? <Spinner label={t("members.loading")} /> : null}
+      {members.loading ? <SkeletonRows rows={6} label={t("members.loading")} /> : null}
       {members.data && members.data.items.length === 0 ? (
         <EmptyState message={t("members.empty")} />
       ) : null}

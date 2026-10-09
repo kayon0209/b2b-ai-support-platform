@@ -74,7 +74,7 @@ MODEL_OUTPUT = json.dumps(
                 "evidence": [{"turn_id": "t-1", "start": 0, "end": 3}],
                 "slots": [
                     {
-                        "name": "order_no",
+                        "name": "order_id",
                         "value": "SO-240918",
                         "origin": "customer_stated",
                         "confirmed": True,
@@ -260,6 +260,7 @@ def _clear() -> None:
         from platform_core.tool_gateway.registry import TOOL_CATALOG
 
         for tenant in (TENANT, OTHER):
+            conn.execute(text("DELETE FROM connectors WHERE tenant_id = :t"), {"t": tenant})
             conn.execute(
                 text("DELETE FROM conversation_task_events WHERE tenant_id = :t"), {"t": tenant}
             )
@@ -374,6 +375,59 @@ def test_the_spec_sentence_produces_three_tasks() -> None:
     assert [t["key"] for t in tasks] == ["read-0", "write-1", "write-2"]
 
 
+def test_workbench_task_endpoint_reads_the_worker_persisted_tool_provenance() -> None:
+    """The Workbench API consumes the same rows produced by the task worker."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from platform_core.identity.middleware import TenantContextMiddleware
+    from platform_core.identity.tenant_context import TenantContext
+
+    _run(
+        _plan(
+            provider=_StubProvider(MODEL_OUTPUT),
+            flags={"agent.conversation_tasks": True, "agent.semantic_assist": True},
+            conversation=CONV,
+            tenant=TENANT,
+        )
+    )
+
+    class _Resolver:
+        async def __call__(self, request: object) -> TenantContext:
+            return TenantContext(
+                tenant_id=uuid.UUID(TENANT),
+                actor_id=uuid.uuid5(uuid.NAMESPACE_URL, "phase1-workbench-reader"),
+                actor_kind="user",
+                role="support_admin",
+            )
+
+    main_mod = __import__("platform_core.main", fromlist=["app"])
+    app = FastAPI()
+    for route in main_mod.app.router.routes:
+        app.router.routes.append(route)
+    app.add_middleware(TenantContextMiddleware, resolver=_Resolver())
+    response = TestClient(app, raise_server_exceptions=False).get(
+        f"/v1/workbench/conversations/{CONV}/tasks",
+        headers={"Authorization": "Bearer pt_bootstrap_test"},
+    )
+
+    assert response.status_code == 200, response.text
+    items = response.json()["items"]
+    assert [item["local_key"] for item in items] == ["read-0", "write-1", "write-2"]
+    read_task = items[0]
+    assert read_task["status"] == "ready"
+    assert any(
+        slot["name"] == "tool"
+        and slot["value"] == "order.get_status"
+        and slot["origin"] == "server_capability"
+        for slot in read_task["slots"]
+    )
+    assert any(
+        slot["name"] == "order_id" and slot["origin"] == "customer_stated"
+        for slot in read_task["slots"]
+    )
+
+
 def test_the_read_is_ready_and_the_writes_need_a_human() -> None:
     """Spec section 1, step 4: an address change R1 cannot perform is a human
     task, and so is the invoice request."""
@@ -429,7 +483,7 @@ def test_the_order_number_is_stored_because_it_is_not_sensitive() -> None:
         )
     )
     read_task = _tasks()[0]
-    slot = next(s for s in read_task["slots"] if s["name"] == "order_no")
+    slot = next(s for s in read_task["slots"] if s["name"] == "order_id")
     assert slot["value"] == "SO-240918"
     assert slot["origin"] == "customer_stated"
 
@@ -472,7 +526,7 @@ def test_a_different_order_in_the_same_turn_is_refused_not_merged() -> None:
     # And the original task still describes the original order.
     tasks = _tasks()
     assert len(tasks) == 3
-    slot = next(s for s in tasks[0]["slots"] if s["name"] == "order_no")
+    slot = next(s for s in tasks[0]["slots"] if s["name"] == "order_id")
     assert slot["value"] == "SO-240918"
 
 
@@ -493,7 +547,7 @@ def test_another_tenant_sees_no_tasks() -> None:
 
 
 def test_semantic_worker_consumes_the_deferred_task_event() -> None:
-    """The production worker claims the id-only event and plans from RLS turns."""
+    """The production worker claims the event and binds only a live read tool."""
     from platform_core.agent_runtime.chat_service import append_customer_turn
     from platform_core.agent_runtime.orchestrator import OrchestratorDeps
     from platform_core.identity.tenant_context import TenantContext, tenant_session
@@ -501,6 +555,17 @@ def test_semantic_worker_consumes_the_deferred_task_event() -> None:
     from worker.runner import SemanticWorker
 
     _set_flags(TENANT, ["agent.conversation_tasks", "agent.semantic_assist"])
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO connectors (id, tenant_id, provider, name, status, capabilities, "
+                "configuration) VALUES (:id, :tenant, 'business_api', 'Orders', 'active', "
+                "'[\"orders_read\"]'::jsonb, '{}'::jsonb)"
+            ),
+            {"id": uuid.uuid4(), "tenant": TENANT},
+        )
+    admin.dispose()
     ctx = TenantContext(
         tenant_id=uuid.UUID(TENANT), actor_id=None, actor_kind="system", role="integration_service"
     )
@@ -527,7 +592,20 @@ def test_semantic_worker_consumes_the_deferred_task_event() -> None:
     worker = SemanticWorker(OrchestratorDeps(extra={"chat": provider}))
     assert _run(worker.run_once()) >= 1
     assert provider.calls == 1
-    assert len(_tasks()) == 3
+    tasks = _tasks()
+    assert len(tasks) == 3
+    selected_read_tool = next(slot for slot in tasks[0]["slots"] if slot.get("name") == "tool")
+    assert tasks[0]["status"] == "ready"
+    assert selected_read_tool["value"] == "order.get_status"
+    assert selected_read_tool["origin"] == "server_capability"
+    assert selected_read_tool["selection_source"] == "allowlisted_candidate_schema_match"
+    assert all(
+        not any(
+            slot.get("name") == "tool" and slot.get("value") == "order.get_status"
+            for slot in task["slots"]
+        )
+        for task in tasks[1:]
+    ), "a read-only tool must never bind to either write task"
 
     admin = create_engine(ADMIN_URL)
     with admin.connect() as conn:
@@ -595,9 +673,10 @@ def test_new_process_reclaims_a_task_event_after_claiming_worker_crashes(
 
     admin = create_engine(ADMIN_URL)
     with admin.connect() as conn:
-        status, claimed_at = conn.execute(
+        status, claimed_at, first_attempt_at, deadline_at, attempt_limit = conn.execute(
             text(
-                "SELECT status, processing_started_at FROM outbox_events "
+                "SELECT status, processing_started_at, first_attempt_at, deadline_at, "
+                "external_attempt_limit FROM outbox_events "
                 "WHERE tenant_id = :t AND event_id = :event"
             ),
             {"t": TENANT, "event": str(event_id)},
@@ -605,6 +684,9 @@ def test_new_process_reclaims_a_task_event_after_claiming_worker_crashes(
     admin.dispose()
     assert status == "processing"
     assert claimed_at is not None
+    assert first_attempt_at is not None
+    assert deadline_at > first_attempt_at
+    assert attempt_limit == 3
 
     from worker import task_planning_consumer
 
@@ -615,20 +697,28 @@ def test_new_process_reclaims_a_task_event_after_claiming_worker_crashes(
     restarted_worker = SemanticWorker(OrchestratorDeps(extra={"chat": provider}))
     assert _run(restarted_worker.run_once()) >= 1
     assert provider.calls == 1
-    assert len(_tasks()) == 3
+    tasks = _tasks()
+    assert len(tasks) == 3
+    assert not any(slot.get("name") == "tool" for task in tasks for slot in task["slots"]), (
+        "global catalog entries must not become task tools without an active tenant connector"
+    )
 
     admin = create_engine(ADMIN_URL)
     with admin.connect() as conn:
-        status, claimed_at = conn.execute(
+        status, claimed_at, first_attempt_retry, deadline_retry, limit_retry = conn.execute(
             text(
-                "SELECT status, processing_started_at FROM outbox_events "
-                "WHERE tenant_id = :t AND event_type = 'conversation.task_planning_requested'"
+                "SELECT status, processing_started_at, first_attempt_at, deadline_at, "
+                "external_attempt_limit FROM outbox_events "
+                "WHERE tenant_id = :t AND event_id = :event"
             ),
-            {"t": TENANT},
+            {"t": TENANT, "event": str(event_id)},
         ).one()
     admin.dispose()
     assert status == "sent"
     assert claimed_at is None
+    assert first_attempt_retry == first_attempt_at
+    assert deadline_retry == deadline_at
+    assert limit_retry == attempt_limit
 
     # A second fresh process sees a terminal event and cannot create duplicates.
     another_worker = SemanticWorker(OrchestratorDeps(extra={"chat": _StubProvider(MODEL_OUTPUT)}))
@@ -671,7 +761,15 @@ async def _plan(
         actor_kind="system",
         role="integration_service",
     )
-    capabilities = {"order.get_status": CapabilityView("order.get_status", "read")}
+    capabilities = {
+        "order.get_status": CapabilityView(
+            "order.get_status",
+            "read",
+            allowed_task_kinds=frozenset({"read"}),
+            parameter_names=("order_id",),
+            required_parameters=("order_id",),
+        )
+    }
 
     # The production path checks the flags *before* building a context or
     # calling the model, and this test asserts that the model is not consulted

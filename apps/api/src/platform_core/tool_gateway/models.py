@@ -124,3 +124,61 @@ class ToolExecution(Base, PkMixin, TenantMixin):
     started_at: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     completed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(63), nullable=True)
+
+
+class ToolExecutionReconciliation(Base, PkMixin, TenantMixin):
+    """Append-only, idempotent operator evidence for an unresolved execution."""
+
+    __tablename__ = "tool_execution_reconciliations"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key_hash",
+            name="uq_tool_execution_reconciliation_idempotency",
+        ),
+        Index(
+            "ix_tool_execution_reconciliations_execution",
+            "tenant_id",
+            "execution_id",
+            "created_at",
+        ),
+    )
+
+    execution_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tool_executions.id"), nullable=False
+    )
+    proposal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tool_proposals.id"), nullable=False)
+    actor_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    idempotency_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    decision: Mapped[str] = mapped_column(String(31), nullable=False)
+    evidence_reference: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class ToolExecutionCompensation(Base, PkMixin, TenantMixin):
+    """Append-only outcome of a human-requested business compensator."""
+
+    __tablename__ = "tool_execution_compensations"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key_hash",
+            name="uq_tool_execution_compensation_idempotency",
+        ),
+        Index("ix_tool_execution_compensations_execution", "tenant_id", "execution_id"),
+    )
+
+    execution_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tool_executions.id"), nullable=False
+    )
+    proposal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tool_proposals.id"), nullable=False)
+    actor_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    idempotency_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(63), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(31), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(63), nullable=False)
+    case_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

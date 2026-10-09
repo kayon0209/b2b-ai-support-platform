@@ -62,6 +62,23 @@ spec:
               pod readiness and the ingress before anything else.
             runbook: docs/launch-checklist-and-runbook.md#incident-runbook
 
+        - alert: PlatformWorkerMetricsDown
+          # Each worker pod has a process-local registry. If no target exists,
+          # or a role repeatedly fails scraping, queue and event metrics cannot
+          # guide an operator through a backlog or recovery incident.
+          expr: absent(up{job="platform-worker-metrics"}) or max by (worker_queue) (up{job="platform-worker-metrics"} == 0) > 0
+          for: 2m
+          labels:
+            severity: warning
+            component: worker
+          annotations:
+            summary: Worker metrics are unavailable
+            description: >-
+              Prometheus cannot scrape one or more worker processes, or the
+              worker metrics Service has no targets. Check worker pod status,
+              the metrics listener and the monitoring NetworkPolicy.
+            runbook: docs/launch-checklist-and-runbook.md#incident-runbook
+
         - alert: PlatformErrorRateHigh
           # The failure share of all traffic, expressed as "everything that is
           # not `ok`" rather than as a list of the bad values.
@@ -157,6 +174,21 @@ spec:
               label says which. This is a wiring gap, not a transient failure:
               the same event type will keep going nowhere.
             runbook: docs/launch-checklist-and-runbook.md#incident-runbook
+
+        - alert: PlatformToolCompensationFailed
+          expr: increase(platform_tool_compensations_total{outcome="failed"}[15m]) > 0
+          for: 1m
+          labels:
+            severity: warning
+            component: tool-gateway
+          annotations:
+            summary: A business compensator could not reverse an unchanged case creation
+            description: >-
+              A requested case.create compensation failed its business precondition.
+              The original case was preserved. Review the linked execution and audit
+              event; do not repeat the compensator until an operator verifies the
+              current case state and chooses the correct business action.
+            runbook: docs/launch-checklist-and-runbook.md#business-compensation-failed
 
     # ---------------------------------------------------------------------
     # Answer quality. These are the runbook's wrong-answer signals, and they

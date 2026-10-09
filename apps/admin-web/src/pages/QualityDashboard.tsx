@@ -1,11 +1,78 @@
 import { useState } from "react";
-import { apiGet } from "../lib/api";
+import { apiGet, apiPost } from "../lib/api";
+import { newIdempotencyKey } from "../lib/idempotency";
 import { useAsync } from "../lib/useAsync";
 import type { CsatSummary, QualityMetrics, RouteDistribution } from "../lib/types";
-import { Card, EmptyState, PageHeader, Spinner, Stat, Badge } from "../components/ui";
+import { Card, EmptyState, PageHeader, SkeletonRows, Stat, Badge } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { useLang } from "../lib/i18n";
 import { int, ms, pct } from "../lib/format";
+
+interface CustomerOutcomeSummary {
+  confirmation_requested: number;
+  customer_confirmed: number;
+  customer_rejected: number;
+  customer_no_response: number;
+  awaiting_confirmation: number;
+  explicit_confirmation_rate_of_requests: number | null;
+  same_issue_recontact_rate: number | null;
+  recontact_linkage_status: string;
+}
+
+type ReviewReasonCode =
+  | "unsupported_claim"
+  | "wrong_route"
+  | "citation_gap"
+  | "unsafe_action"
+  | "task_outcome_mismatch"
+  | "other";
+
+interface ReviewItem {
+  agent_run_id: string;
+  conversation_ref_id: string;
+  stratum: string;
+  route: string;
+  run_status: string;
+  prompt_version_id: string | null;
+  code_version: string;
+  policy_version: string;
+  reviewed: boolean;
+  verdict: "agree" | "override" | null;
+  reason_code: ReviewReasonCode | null;
+}
+
+interface ReviewBatch {
+  batch_id: string;
+  window_seconds: number;
+  requested_size: number;
+  target_prompt_version_id: string | null;
+  population_by_stratum: Record<string, number>;
+  sampler_version: string;
+  summary: {
+    status: "measured" | "incomplete" | "unavailable";
+    selected_count: number;
+    reviewed_count: number;
+    completion_rate: number | null;
+    weighted_override_rate: number | null;
+  };
+  items: ReviewItem[];
+}
+
+interface ReviewEvidence {
+  evidence_id: string;
+  evidence_hash: string;
+  snapshot: Record<string, unknown>;
+  replayed: boolean;
+}
+
+const REVIEW_REASONS: ReviewReasonCode[] = [
+  "unsupported_claim",
+  "wrong_route",
+  "citation_gap",
+  "unsafe_action",
+  "task_outcome_mismatch",
+  "other",
+];
 
 const WINDOWS: { labelKey: "quality.window1h" | "quality.window24h" | "quality.window30d"; seconds: number }[] = [
   { labelKey: "quality.window1h", seconds: 3600 },
@@ -22,6 +89,12 @@ function toneFor(rate: number, warnAbove: number, badAbove: number) {
 export function QualityDashboard() {
   const { t } = useLang();
   const [window, setWindow] = useState(86_400);
+  const [reviewBatch, setReviewBatch] = useState<ReviewBatch | null>(null);
+  const [reviewEvidence, setReviewEvidence] = useState<ReviewEvidence | null>(null);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewReasons, setReviewReasons] = useState<Record<string, ReviewReasonCode>>({});
+  const [targetPromptVersionId, setTargetPromptVersionId] = useState("");
 
   const metrics = useAsync<QualityMetrics>(
     () => apiGet<QualityMetrics>(`/v1/quality/metrics?window_seconds=${window}`),
@@ -39,6 +112,103 @@ export function QualityDashboard() {
     () => apiGet<{ csat: CsatSummary }>(`/v1/quality/csat?window_seconds=${window}`),
     [window],
   );
+  const outcomes = useAsync<{ outcomes: CustomerOutcomeSummary }>(
+    () => apiGet<{ outcomes: CustomerOutcomeSummary }>(`/v1/quality/outcomes?window_seconds=${window}`),
+    [window],
+  );
+
+  async function createReviewBatch() {
+    setReviewBusy(true);
+    setReviewError(null);
+    setReviewEvidence(null);
+    try {
+      const batch = await apiPost<{
+        batch_id: string;
+        window_seconds: number;
+        requested_size: number;
+        target_prompt_version_id: string | null;
+        population_by_stratum: Record<string, number>;
+        sampler_version: string;
+        selected_count: number;
+        items: Array<Omit<ReviewItem, "reviewed" | "verdict" | "reason_code">>;
+      }>(
+        "/v1/quality/reviews/batches",
+        {
+          window_seconds: window,
+          size: 20,
+          ...(targetPromptVersionId.trim()
+            ? { target_prompt_version_id: targetPromptVersionId.trim() }
+            : {}),
+        },
+        newIdempotencyKey(),
+      );
+      setReviewBatch({
+        ...batch,
+        summary: {
+          status: "incomplete",
+          selected_count: batch.selected_count,
+          reviewed_count: 0,
+          completion_rate: batch.selected_count ? 0 : null,
+          weighted_override_rate: null,
+        },
+        items: batch.items.map((item) => ({
+          ...item,
+          reviewed: false,
+          verdict: null,
+          reason_code: null,
+        })),
+      });
+    } catch (error) {
+      setReviewError(error instanceof Error ? error.message : t("quality.reviewError"));
+    } finally {
+      setReviewBusy(false);
+    }
+  }
+
+  async function refreshReviewBatch(batchId: string) {
+    const current = await apiGet<ReviewBatch>(`/v1/quality/reviews/batches/${batchId}`);
+    setReviewBatch(current);
+  }
+
+  async function recordReview(item: ReviewItem, verdict: "agree" | "override") {
+    if (!reviewBatch || item.reviewed) return;
+    setReviewBusy(true);
+    setReviewError(null);
+    try {
+      await apiPost(
+        `/v1/quality/reviews/batches/${reviewBatch.batch_id}/decisions`,
+        {
+          agent_run_id: item.agent_run_id,
+          verdict,
+          reason_code: verdict === "override" ? (reviewReasons[item.agent_run_id] ?? "other") : null,
+        },
+        newIdempotencyKey(),
+      );
+      await refreshReviewBatch(reviewBatch.batch_id);
+    } catch (error) {
+      setReviewError(error instanceof Error ? error.message : t("quality.reviewError"));
+    } finally {
+      setReviewBusy(false);
+    }
+  }
+
+  async function finalizeReviewBatch() {
+    if (!reviewBatch || reviewBatch.summary.status !== "measured") return;
+    setReviewBusy(true);
+    setReviewError(null);
+    try {
+      const evidence = await apiPost<ReviewEvidence>(
+        `/v1/quality/reviews/batches/${reviewBatch.batch_id}/finalize`,
+        undefined,
+        newIdempotencyKey(),
+      );
+      setReviewEvidence(evidence);
+    } catch (error) {
+      setReviewError(error instanceof Error ? error.message : t("quality.reviewError"));
+    } finally {
+      setReviewBusy(false);
+    }
+  }
 
   return (
     <div className="page">
@@ -62,8 +232,9 @@ export function QualityDashboard() {
 
       <LoadError error={metrics.error} status={metrics.errorStatus} onRetry={metrics.reload} />
       <LoadError error={routes.error} status={routes.errorStatus} onRetry={routes.reload} />
+      <LoadError error={outcomes.error} status={outcomes.errorStatus} onRetry={outcomes.reload} />
 
-      {metrics.loading ? <Spinner label={t("quality.loading")} /> : null}
+      {metrics.loading ? <SkeletonRows rows={4} label={t("quality.loading")} /> : null}
 
       {/* Zero runs and a broken pipeline render identically as a wall of
           0.0%. Saying which one it is is the difference between "nothing
@@ -169,6 +340,24 @@ export function QualityDashboard() {
                 }
               />
             </Card>
+            <Card>
+              <Stat
+                label={t("quality.explicitResolutionConfirmation")}
+                value={pct(outcomes.data?.outcomes.explicit_confirmation_rate_of_requests)}
+              />
+            </Card>
+            <Card>
+              <Stat
+                label={t("quality.resolutionQuestionNoResponse")}
+                value={int(outcomes.data?.outcomes.customer_no_response)}
+              />
+            </Card>
+            <Card>
+              <Stat
+                label={t("quality.sameCaseRecontact")}
+                value={pct(outcomes.data?.outcomes.same_issue_recontact_rate)}
+              />
+            </Card>
           </div>
 
           <div className="grid-2">
@@ -251,7 +440,7 @@ export function QualityDashboard() {
                   <p className="muted">{t("quality.noRouted")}</p>
                 )
               ) : routes.loading ? (
-                <Spinner />
+                <SkeletonRows rows={3} />
               ) : (
                 <p className="muted">{t("quality.routeUnavailable")}</p>
               )}
@@ -297,6 +486,90 @@ export function QualityDashboard() {
               )}
             </Card>
           </div>
+
+          <Card title={t("quality.humanReviewTitle")}>
+            <p className="muted">{t("quality.humanReviewDescription")}</p>
+            {reviewError ? <p role="alert" className="text-bad">{reviewError}</p> : null}
+            {!reviewBatch ? (
+              <>
+                <label className="field">
+                  <span>{t("quality.promptVersionFilter")}</span>
+                  <input
+                    className="text-input"
+                    value={targetPromptVersionId}
+                    onChange={(event) => setTargetPromptVersionId(event.target.value)}
+                    aria-label={t("quality.promptVersionFilter")}
+                    placeholder={t("quality.promptVersionFilterHint")}
+                  />
+                </label>
+                <button className="btn btn-primary" type="button" disabled={reviewBusy} onClick={() => void createReviewBatch()}>
+                  {reviewBusy ? t("quality.reviewWorking") : t("quality.createReviewBatch")}
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="muted">
+                  {t("quality.reviewBatchCount", {
+                    reviewed: int(reviewBatch.summary.reviewed_count),
+                    selected: int(reviewBatch.summary.selected_count),
+                  })}
+                  {" · "}{t("quality.reviewOverrideRate")}: {pct(reviewBatch.summary.weighted_override_rate)}
+                </p>
+                {reviewBatch.target_prompt_version_id ? (
+                  <p className="muted">
+                    {t("quality.promptVersionFilter")}: <code>{reviewBatch.target_prompt_version_id}</code>
+                  </p>
+                ) : null}
+                {reviewBatch.items.map((item) => (
+                  <div className="quality-review-row" key={item.agent_run_id}>
+                    <a href={`/admin/workbench/conversation/${item.conversation_ref_id}`}>
+                      {t("quality.reviewOpenConversation")}
+                    </a>
+                    <span>{item.route} · {item.run_status} · {item.stratum}</span>
+                    {item.reviewed ? (
+                      <Badge tone={item.verdict === "override" ? "warn" : "good"}>
+                        {item.verdict === "override" ? t("quality.reviewOverride") : t("quality.reviewAgree")}
+                      </Badge>
+                    ) : (
+                      <div className="quality-review-actions">
+                        <select
+                          aria-label={t("quality.reviewOverrideReason")}
+                          value={reviewReasons[item.agent_run_id] ?? "other"}
+                          onChange={(event) => setReviewReasons((previous) => ({
+                            ...previous,
+                            [item.agent_run_id]: event.target.value as ReviewReasonCode,
+                          }))}
+                        >
+                          {REVIEW_REASONS.map((reason) => (
+                            <option value={reason} key={reason}>{t(`quality.reviewReason.${reason}`)}</option>
+                          ))}
+                        </select>
+                        <button type="button" className="btn btn-ghost" disabled={reviewBusy} onClick={() => void recordReview(item, "agree")}>
+                          {t("quality.reviewAgree")}
+                        </button>
+                        <button type="button" className="btn btn-primary" disabled={reviewBusy} onClick={() => void recordReview(item, "override")}>
+                          {t("quality.reviewOverride")}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+                <div className="quality-review-actions">
+                  <button className="btn btn-ghost" type="button" disabled={reviewBusy} onClick={() => void refreshReviewBatch(reviewBatch.batch_id)}>
+                    {t("quality.reviewRefresh")}
+                  </button>
+                  <button className="btn btn-primary" type="button" disabled={reviewBusy || reviewBatch.summary.status !== "measured"} onClick={() => void finalizeReviewBatch()}>
+                    {t("quality.reviewFinalize")}
+                  </button>
+                </div>
+                {reviewEvidence ? (
+                  <p role="status" className="text-good">
+                    {t("quality.reviewEvidenceCreated")}: {reviewEvidence.evidence_hash}
+                  </p>
+                ) : null}
+              </>
+            )}
+          </Card>
         </>
       ) : null}
     </div>

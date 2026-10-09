@@ -1,14 +1,23 @@
-import { useState } from "react";
-import { useUrlState } from "../lib/urlState";
+import { useCallback, useState } from "react";
+import { parsePageOffset, pageOffsetValue, useUrlState } from "../lib/urlState";
 
-import { apiGet } from "../lib/api";
+import { apiGet, apiPost } from "../lib/api";
 import { useAsync } from "../lib/useAsync";
 import type { ConversationList, ConversationReplay, ReplayRun, ReplayTurn } from "../lib/types";
-import { Badge, Card, EmptyState, ListTotal, PageHeader, SkeletonRows, Spinner } from "../components/ui";
+import {
+  Badge,
+  Card,
+  Dialog,
+  EmptyState,
+  ListTotal,
+  PageHeader,
+  SkeletonRows,
+} from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { useLang } from "../lib/i18n";
 import type { DictKey } from "../lib/i18n";
 import { dateFromEpochSeconds, int, ms } from "../lib/format";
+import { newIdempotencyKey } from "../lib/idempotency";
 
 /**
  * Conversation replay (feature list 8.3).
@@ -110,7 +119,13 @@ const INTENT_ORDER = [
   "spelling_corrections",
 ] as const;
 
-function DecisionPanel({ run }: { run: ReplayRun }) {
+function DecisionPanel({
+  run,
+  onRerun,
+}: {
+  run: ReplayRun;
+  onRerun?: (runId: string) => void;
+}) {
   const { t } = useLang();
   const intent = run.intent ?? {};
   const chips = INTENT_ORDER.filter((key) => intent[key] !== undefined).map((key) => {
@@ -168,11 +183,22 @@ function DecisionPanel({ run }: { run: ReplayRun }) {
           every conclusion drawn from this panel depends on how the decision
           was tied to the question above it. */}
       <div className="muted replay-small">{t("conversations.matchedBy", { how: run.matched_by })}</div>
+      {run.status === "failed" && onRerun ? (
+        <button className="btn btn-ghost" type="button" onClick={() => onRerun(run.run_id)}>
+          {t("conversations.rerun")}
+        </button>
+      ) : null}
     </div>
   );
 }
 
-function Timeline({ replay }: { replay: ConversationReplay }) {
+function Timeline({
+  replay,
+  onRerun,
+}: {
+  replay: ConversationReplay;
+  onRerun: (runId: string) => void;
+}) {
   const { t } = useLang();
   if (replay.turns.length === 0) {
     return <EmptyState message={t("conversations.noTurns")} />;
@@ -193,9 +219,10 @@ function Timeline({ replay }: { replay: ConversationReplay }) {
               run={{
                 ...turn.decision,
                 started_at: turn.at,
-                sources:
+              sources:
                   replay.runs.find((r) => r.run_id === turn.decision?.run_id)?.sources ?? [],
               }}
+              onRerun={onRerun}
             />
           ) : null}
         </li>
@@ -211,7 +238,23 @@ export function Conversations() {
   // away whatever the operator had narrowed the list down to.
   const [selected, setSelectedRaw] = useUrlState("conversation", "");
   const setSelected = (next: string | null) => setSelectedRaw(next);
-  const [offset, setOffset] = useState(0);
+  const [offsetParam, setOffsetParam] = useUrlState("offset", "0");
+  const offset = parsePageOffset(offsetParam, PAGE_SIZE);
+  const setOffset = (next: number) => setOffsetParam(pageOffsetValue(next, PAGE_SIZE));
+  const [rerunTarget, setRerunTarget] = useState<{ runId: string; key: string } | null>(null);
+  const [rerunPending, setRerunPending] = useState(false);
+  const [rerunError, setRerunError] = useState<string | null>(null);
+  const [rerunNotice, setRerunNotice] = useState<string | null>(null);
+  const openRerun = useCallback((runId: string) => {
+    setRerunError(null);
+    setRerunNotice(null);
+    setRerunTarget({ runId, key: newIdempotencyKey() });
+  }, []);
+  const closeRerun = useCallback(() => {
+    if (rerunPending) return;
+    setRerunTarget(null);
+    setRerunError(null);
+  }, [rerunPending]);
 
   const list = useAsync(
     () => apiGet<ConversationList>(`/v1/conversations?limit=${PAGE_SIZE}&offset=${offset}`),
@@ -225,6 +268,26 @@ export function Conversations() {
     [selected],
   );
 
+  async function confirmRerun() {
+    if (!rerunTarget || rerunPending) return;
+    setRerunPending(true);
+    setRerunError(null);
+    try {
+      const result = await apiPost<{ run_id: string }>(
+        `/v1/conversations/agent-runs/${rerunTarget.runId}/rerun`,
+        undefined,
+        rerunTarget.key,
+      );
+      setRerunTarget(null);
+      setRerunNotice(t("conversations.rerunQueued", { run: result.run_id.slice(0, 8) }));
+      replay.reload();
+    } catch (error) {
+      setRerunError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRerunPending(false);
+    }
+  }
+
   // Runs whose input hash matched no turn. Shown separately instead of
   // omitted: each one is a decision the platform took about this customer, and
   // a replay that hides them shows a tidier story than what happened.
@@ -236,6 +299,7 @@ export function Conversations() {
   return (
     <div className="page">
       <PageHeader title={t("conversations.title")} subtitle={t("conversations.subtitle")} />
+      {rerunNotice ? <p className="muted" role="status">{rerunNotice}</p> : null}
 
       {list.error ? <LoadError error={list.error} status={list.errorStatus} onRetry={list.reload} /> : null}
       {/* A skeleton rather than a spinner: the spinner unmounted the whole
@@ -279,14 +343,14 @@ export function Conversations() {
             <button
               className="btn btn-ghost"
               disabled={offset === 0 || list.loading}
-              onClick={() => setOffset((current) => Math.max(0, current - PAGE_SIZE))}
+              onClick={() => setOffset(offset - PAGE_SIZE)}
             >
               {t("conversations.newer")}
             </button>
             <button
               className="btn btn-ghost"
               disabled={list.loading || (list.data?.items.length ?? 0) < PAGE_SIZE}
-              onClick={() => setOffset((current) => current + PAGE_SIZE)}
+              onClick={() => setOffset(offset + PAGE_SIZE)}
             >
               {t("conversations.older")}
             </button>
@@ -312,7 +376,7 @@ export function Conversations() {
           {replay.error ? (
             <LoadError error={replay.error} status={replay.errorStatus} onRetry={replay.reload} />
           ) : null}
-          {replay.loading ? <Spinner label={t("conversations.loadingReplay")} /> : null}
+          {replay.loading ? <SkeletonRows rows={6} label={t("conversations.loadingReplay")} /> : null}
 
           {replay.data ? (
             <>
@@ -346,7 +410,7 @@ export function Conversations() {
               </Card>
 
               <Card title={t("conversations.exchange")}>
-                <Timeline replay={replay.data} />
+                <Timeline replay={replay.data} onRerun={openRerun} />
               </Card>
 
               {unattributed.length > 0 ? (
@@ -364,7 +428,7 @@ export function Conversations() {
                             </span>
                           ) : null}
                         </div>
-                        <DecisionPanel run={run} />
+                        <DecisionPanel run={run} onRerun={openRerun} />
                       </li>
                     ))}
                   </ul>
@@ -390,6 +454,34 @@ export function Conversations() {
           ) : null}
         </div>
       </div>
+      <Dialog
+        open={rerunTarget !== null}
+        onClose={closeRerun}
+        label={t("conversations.confirmRerunTitle")}
+        className="prompt"
+      >
+        <h2>{t("conversations.confirmRerunTitle")}</h2>
+        <p>{t("conversations.confirmRerunBody")}</p>
+        {rerunTarget ? (
+          <p className="cell-code">
+            {t("conversations.failedRun", { run: rerunTarget.runId.slice(0, 8) })}
+          </p>
+        ) : null}
+        {rerunError ? <p className="prompt-error" role="alert">{rerunError}</p> : null}
+        <div className="prompt-actions">
+          <button className="btn btn-ghost" type="button" disabled={rerunPending} onClick={closeRerun}>
+            {t("common.cancel")}
+          </button>
+          <button
+            className="btn btn-primary"
+            type="button"
+            disabled={rerunPending}
+            onClick={() => void confirmRerun()}
+          >
+            {rerunPending ? t("conversations.rerunSubmitting") : t("common.confirm")}
+          </button>
+        </div>
+      </Dialog>
     </div>
   );
 }

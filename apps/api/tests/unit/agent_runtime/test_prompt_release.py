@@ -7,6 +7,9 @@ equally important, the things the gate must NOT block, because a gate that
 refuses too much gets disabled.
 """
 
+import time
+import uuid
+
 import pytest
 
 from platform_core.agent_runtime.prompt_release import (
@@ -29,6 +32,41 @@ def _evidence(
         scores=scores if scores is not None else [CategoryScore("citation", 18, 20)],
         regressions=regressions or [],
     )
+
+
+def _human_review_evidence(
+    *,
+    population: int = 30,
+    selected: int = 30,
+    override_rate: float = 0.0,
+    reason_counts: dict[str, int] | None = None,
+    prompt_version_id: uuid.UUID | None = None,
+) -> dict[str, object]:
+    version_id = prompt_version_id or uuid.uuid4()
+    overrides = int(population * override_rate)
+    return {
+        "evidence_id": str(uuid.uuid4()),
+        "evidence_hash": "a" * 64,
+        "target_prompt_version_id": str(version_id),
+        "created_at": int(time.time()),
+        "override_reason_counts": reason_counts
+        or ({"wrong_route": overrides} if overrides else {}),
+        "summary": {
+            "status": "measured",
+            "population_count": population,
+            "selected_count": selected,
+            "reviewed_count": selected,
+            "weighted_override_rate": override_rate,
+            "by_stratum": {
+                "routine": {
+                    "population": population,
+                    "selected": selected,
+                    "reviewed": selected,
+                    "override_count": overrides,
+                }
+            },
+        },
+    }
 
 
 # --- Refusals ---------------------------------------------------------------
@@ -103,7 +141,8 @@ def test_multiple_p0_regressions_are_all_named() -> None:
 
 
 def test_evidence_without_regressions_is_allowed() -> None:
-    check_release_gate(_evidence())  # must not raise
+    assessment = check_release_gate(_evidence(), human_review_evidence=_human_review_evidence())
+    assert assessment["passed"] is True
 
 
 def test_non_p0_regression_does_not_block() -> None:
@@ -118,7 +157,11 @@ def test_non_p0_regression_does_not_block() -> None:
         ]
     )
 
-    check_release_gate(evidence)  # must not raise
+    assessment = check_release_gate(
+        evidence,
+        human_review_evidence=_human_review_evidence(),
+    )
+    assert assessment["passed"] is True
 
 
 def test_p0_improvement_is_allowed() -> None:
@@ -128,7 +171,56 @@ def test_p0_improvement_is_allowed() -> None:
         regressions=[],
     )
 
-    check_release_gate(evidence)
+    assessment = check_release_gate(
+        evidence,
+        human_review_evidence=_human_review_evidence(),
+    )
+    assert assessment["passed"] is True
+
+
+def test_missing_human_review_evidence_fails_closed() -> None:
+    with pytest.raises(ReleaseError) as err:
+        check_release_gate(_evidence())
+
+    assert err.value.code == "HUMAN_REVIEW_REQUIRED"
+
+
+def test_evaluation_summary_can_report_before_a_candidate_canary() -> None:
+    assessment = check_release_gate(_evidence(), require_human_review=False)
+
+    assert assessment["passed"] is False
+    assert assessment["code"] == "HUMAN_REVIEW_REQUIRED"
+
+
+def test_human_review_requires_sample_per_stratum_and_minimum_coverage() -> None:
+    evidence = _human_review_evidence(population=30, selected=10)
+
+    with pytest.raises(ReleaseError) as err:
+        check_release_gate(_evidence(), human_review_evidence=evidence)
+
+    assert err.value.code == "HUMAN_REVIEW_SAMPLE_TOO_SMALL"
+
+
+def test_high_risk_override_blocks_even_below_weighted_threshold() -> None:
+    evidence = _human_review_evidence(
+        override_rate=0.0333,
+        reason_counts={"unsafe_action": 1},
+    )
+    evidence["summary"]["by_stratum"]["routine"]["override_count"] = 1
+
+    with pytest.raises(ReleaseError) as err:
+        check_release_gate(_evidence(), human_review_evidence=evidence)
+
+    assert err.value.code == "HUMAN_REVIEW_SAFETY_OVERRIDE"
+
+
+def test_weighted_review_override_above_ten_percent_blocks() -> None:
+    evidence = _human_review_evidence(population=30, selected=30, override_rate=0.2)
+
+    with pytest.raises(ReleaseError) as err:
+        check_release_gate(_evidence(), human_review_evidence=evidence)
+
+    assert err.value.code == "HUMAN_REVIEW_OVERRIDE_THRESHOLD"
 
 
 # --- Evidence summary -------------------------------------------------------

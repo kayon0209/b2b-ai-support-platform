@@ -14,7 +14,7 @@ import {
   Card,
   ErrorBanner,
   PageHeader,
-  Spinner,
+  SkeletonRows,
   Stat,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
@@ -206,7 +206,7 @@ export function Usage() {
         </div>
       ) : null}
 
-      {usage.loading && !snapshot ? <Spinner label={t("usage.loadUsage")} /> : null}
+      {usage.loading && !snapshot ? <SkeletonRows rows={5} label={t("usage.loadUsage")} /> : null}
 
       {snapshot ? (
         <>
@@ -286,7 +286,7 @@ export function Usage() {
         ) : billing.error ? (
           <ErrorBanner message={billing.error} onRetry={billing.reload} />
         ) : billing.loading && !ledger ? (
-          <Spinner label={t("usage.loadLedger")} />
+          <SkeletonRows rows={5} label={t("usage.loadLedger")} />
         ) : ledger ? (
           <>
             <ul className="kv">

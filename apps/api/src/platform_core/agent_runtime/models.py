@@ -10,7 +10,16 @@ import enum
 import uuid
 from typing import Any
 
-from sqlalchemy import BigInteger, ForeignKey, Index, String, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -68,7 +77,22 @@ class PromptTemplate(Base, PkMixin, TenantMixin):
 
 class AgentRun(Base, PkMixin, TenantMixin):
     __tablename__ = "agent_runs"
-    __table_args__ = (Index("ix_agent_runs_status", "status"),)
+    __table_args__ = (
+        Index("ix_agent_runs_status", "status"),
+        Index(
+            "uq_agent_runs_replay_request_key",
+            "tenant_id",
+            "replay_of_run_id",
+            "replay_request_key_hash",
+            unique=True,
+            postgresql_where=text(
+                "replay_of_run_id IS NOT NULL AND replay_request_key_hash IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "replay_of_run_id IS NOT NULL AND replay_request_key_hash IS NOT NULL"
+            ),
+        ),
+    )
 
     conversation_ref_id: Mapped[uuid.UUID] = mapped_column(nullable=False, index=True)
     case_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
@@ -102,6 +126,10 @@ class AgentRun(Base, PkMixin, TenantMixin):
     # second customer message, and the first attempt's failure - the reason
     # somebody is looking at it - stops being visible.
     replay_of_run_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    # SHA-256 only: the caller's raw idempotency token is never persisted.
+    # Scoped to the failed parent run so an HTTP retry resolves to the same
+    # replacement even after that replacement has moved past queued state.
+    replay_request_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     output_hash: Mapped[str | None] = mapped_column(String(127), nullable=True)
     token_usage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     latency_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -237,22 +265,30 @@ class ConversationTurn(Base, PkMixin, TenantMixin):
 class ContactFact(Base, PkMixin, TenantMixin):
     """One durable fact about a contact, across conversations (plan 2.5).
 
-    Current statements override history (ON CONFLICT ... DO UPDATE): the
-    customer correcting themselves is the normal case, and "latest wins" is
-    the only conflict rule that needs no arbitration. Only facts extracted
-    from CUSTOMER turns are ever written here - an assistant's own claim
-    must not become its memory (model self-feedback).
+    The accepted value is ordered by its source customer turn, not by worker
+    arrival time. `source_turn_id` is provenance, `source_ts` is the turn's
+    recorded event time, and `revision` only advances when a newer source wins.
+    Only facts extracted from CUSTOMER turns are written here - an assistant's
+    own claim must not become its memory (model self-feedback).
     """
 
     __tablename__ = "contact_facts"
     __table_args__ = (
         UniqueConstraint("tenant_id", "contact_ref", "key", name="uq_contact_fact_key"),
+        CheckConstraint(
+            "key IN ('plan', 'product', 'region', 'case_ref', 'order_ref', 'response_language')",
+            name="ck_contact_facts_key_allowlist",
+        ),
     )
 
     contact_ref: Mapped[uuid.UUID] = mapped_column(nullable=False, index=True)
     key: Mapped[str] = mapped_column(String(63), nullable=False)
     value: Mapped[str] = mapped_column(String(255), nullable=False)
     source_turn_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    source_ts: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    revision: Mapped[int] = mapped_column(nullable=False, default=1, server_default="1")
     confidence: Mapped[int] = mapped_column(nullable=False, default=100)  # percent
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

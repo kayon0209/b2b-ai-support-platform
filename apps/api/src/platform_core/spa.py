@@ -71,7 +71,7 @@ SPA_EXACT_PATHS = frozenset({"/"})
 # shape and content negotiation; the shell would flatten all three.
 API_PATH_PREFIXES = ("/v1/", "/scim/", "/assets/")
 API_EXACT_PATHS = frozenset(
-    {"/healthz", "/metrics", "/openapi.json", "/docs", "/redoc", "/favicon.ico"}
+    {"/healthz", "/readyz", "/metrics", "/openapi.json", "/docs", "/redoc", "/favicon.ico"}
 )
 
 

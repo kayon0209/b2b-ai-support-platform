@@ -42,6 +42,7 @@ export interface TaskSlot {
     | "customer_stated"
     | "verified_receipt"
     | "verified_business_record"
+    | "server_capability"
     | "inferred"
     | "agent_collected";
   confirmed: boolean;
@@ -49,6 +50,7 @@ export interface TaskSlot {
   value_withheld?: boolean;
   inferred?: boolean;
   verification_source?: string;
+  selection_source?: string;
   authority_version?: string;
   collected_by?: string;
   collected_at?: number;
@@ -78,6 +80,7 @@ export interface ConversationTask {
   depends_on: string[];
   condition: { field: string; operator: string; value: unknown } | null;
   blocked_reason: string | null;
+  dependency_blocked?: boolean;
   proposal_id: string | null;
   execution_id: string | null;
   source_turn_id: string;
@@ -121,6 +124,7 @@ interface DemoPreSalesEvidence {
 
 export type TaskCommand =
   | "collect_fields"
+  | "execute_read"
   | "cancel"
   | "handoff"
   | "prepare_proposal"
@@ -191,8 +195,15 @@ const BLOCKED_LABEL: Record<string, string> = {
   SEMANTIC_NEEDS_CLARIFICATION: "信息不明确，需要先向客户确认。",
   TASK_MISSING_FIELDS: "缺少必填信息。",
   TASK_WAITING_DEPENDENCY: "等待前置任务完成。",
+  TASK_DEPENDENCY_MISSING: "未找到前置任务，已阻止执行。",
+  TASK_DEPENDENCY_PENDING: "前置任务尚未核验完成。",
+  TASK_DEPENDENCY_CONDITION_INVALID: "前置条件无效，已阻止执行。",
+  TASK_DEPENDENCY_CONDITION_UNRESOLVED: "无法从已核验的业务读取结果确认前置条件。",
+  TASK_DEPENDENCY_EXECUTION_RECHECK_REQUIRED: "条件当前满足；写入前仍需通过 Tool Gateway 重新查询。",
   TASK_HANDED_TO_HUMAN: "已转人工处理。",
-  TASK_CONDITION_UNMET: "前置条件不满足，已跳过。",
+  TASK_CONDITION_UNMET: "前置条件不满足，下游动作未执行。",
+  TASK_TOOL_SELECTION_AMBIGUOUS: "多个已授权工具都匹配该任务；已停止自动选择，请由坐席确认工具。",
+  TASK_TOOL_SELECTION_UNRESOLVED: "无法将已授权工具可靠匹配到该子任务；已停止执行，请人工核对。",
   FLOW_EXECUTOR_UNAVAILABLE: "该流程已绑定到当前会话并进入人工接续；流程专用执行器尚未接入，不会自动查询或写入业务系统。",
   FLOW_INTERNAL_CASE_ONLY: "当前流程只会准备平台内部 Case 提案，不会直接开票、维修、质量判定或调用外部工程系统。",
   FLOW_INTERNAL_CASE_PROPOSAL_UNAVAILABLE: "平台未能准备内部工单提案；请人工核对账户关联和当前工具权限。",
@@ -207,8 +218,15 @@ const BLOCKED_LABEL_EN: Record<string, string> = {
   SEMANTIC_NEEDS_CLARIFICATION: "The request is unclear; confirm it with the customer first.",
   TASK_MISSING_FIELDS: "Required information is missing.",
   TASK_WAITING_DEPENDENCY: "Waiting for a prerequisite task.",
+  TASK_DEPENDENCY_MISSING: "A prerequisite task was not found; execution is blocked.",
+  TASK_DEPENDENCY_PENDING: "A prerequisite task has not been verified complete.",
+  TASK_DEPENDENCY_CONDITION_INVALID: "The prerequisite condition is invalid; execution is blocked.",
+  TASK_DEPENDENCY_CONDITION_UNRESOLVED: "The prerequisite cannot be confirmed from a verified business read.",
+  TASK_DEPENDENCY_EXECUTION_RECHECK_REQUIRED: "The condition currently holds; the Gateway must recheck it before a write.",
   TASK_HANDED_TO_HUMAN: "This task has been handed to a person.",
-  TASK_CONDITION_UNMET: "The prerequisite was not met, so this task was skipped.",
+  TASK_CONDITION_UNMET: "The prerequisite was not met; the dependent action was not run.",
+  TASK_TOOL_SELECTION_AMBIGUOUS: "More than one authorized tool matches this task; an agent must choose.",
+  TASK_TOOL_SELECTION_UNRESOLVED: "No authorized tool could be matched to this task safely; review it manually.",
   FLOW_EXECUTOR_UNAVAILABLE: "This flow requires manual follow-up and will not run automatically.",
   FLOW_INTERNAL_CASE_ONLY: "This flow can prepare an internal Case proposal only; it does not issue invoices or make external business changes.",
   FLOW_INTERNAL_CASE_PROPOSAL_UNAVAILABLE: "The internal Case proposal was not prepared; verify the account and tool permissions.",
@@ -245,6 +263,7 @@ const ORIGIN_LABEL: Record<string, string> = {
   agent_collected: "坐席录入",
   verified_receipt: "已核验回执",
   verified_business_record: "业务记录已核验",
+  server_capability: "按已授权工具 schema 绑定",
   inferred: "推断（不可直接采信）",
 };
 const ORIGIN_LABEL_EN: Record<string, string> = {
@@ -252,6 +271,7 @@ const ORIGIN_LABEL_EN: Record<string, string> = {
   agent_collected: "Entered by agent",
   verified_receipt: "Verified receipt",
   verified_business_record: "Verified business record",
+  server_capability: "Bound by the authorized tool schema",
   inferred: "Inferred (not verified)",
 };
 
@@ -270,6 +290,7 @@ const TASK_FIELD_LABELS: Record<string, string> = {
   lot_or_work_order_ref: "批次或工单号",
   customer_account_ref: "客户账户",
   tax_id: "税号",
+  tool_result: "只读结果",
 };
 const TASK_FIELD_LABELS_EN: Record<string, string> = {
   order_id: "Order number",
@@ -280,11 +301,24 @@ const TASK_FIELD_LABELS_EN: Record<string, string> = {
   lot_or_work_order_ref: "Lot or work-order reference",
   customer_account_ref: "Customer account",
   tax_id: "Tax ID",
+  tool_result: "Read result",
 };
 
 function taskFieldLabel(name: string, lang: Lang): string {
   const labels = lang === "zh" ? TASK_FIELD_LABELS : TASK_FIELD_LABELS_EN;
   return labels[name] ?? name.replace(/_/g, " ");
+}
+
+function taskToolResultLabel(value: unknown, lang: Lang): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return String(value ?? "—");
+  }
+  const result = value as Record<string, unknown>;
+  if (typeof result.order_id === "string" && typeof result.status === "string") {
+    return `${result.order_id} · ${result.status}`;
+  }
+  const toolName = typeof result.tool_name === "string" ? result.tool_name : "Tool Gateway";
+  return copy(lang, `${toolName} · 已核验回执`, `${toolName} · verified receipt`);
 }
 
 function flowTitle(task: ConversationTask, lang: Lang): string {
@@ -442,6 +476,10 @@ export function TaskPanel({
               ? copy(lang, "任务已转人工。", "Task handed to a person.")
               : command === "prepare_proposal"
                 ? copy(lang, "任务已进入待确认，等待坐席确认后执行。", "The proposal is ready and waiting for agent confirmation.")
+                : command === "execute_read"
+                  ? response.task.status === "succeeded"
+                    ? copy(lang, "只读工具结果已通过 Tool Gateway 核验并记录。", "The read result was verified through Tool Gateway and recorded.")
+                    : copy(lang, "只读查询未核验，已记录实际执行状态。", "The read could not be verified; its actual execution status was recorded.")
                 : command === "query_order_status"
                   ? response.task.status === "succeeded"
                     ? copy(lang, "Demo ERP 订单状态已核验；回执已记录在任务中。", "The Demo order status was verified and its receipt was added to the task.")
@@ -759,12 +797,15 @@ function TaskRow({
   const { lang } = useLang();
   const [expanded, setExpanded] = useState(false);
   const missing = task.missing_slots;
+  const dependencyBlocked = task.dependency_blocked === true;
   const collectable =
-    task.status === "awaiting_input" ||
-    task.status === "ready" ||
-    task.status === "manual_flow" ||
-    (task.flow_key === "invoice_application" && task.status === "needs_human");
+    !dependencyBlocked &&
+    (task.status === "awaiting_input" ||
+      task.status === "ready" ||
+      task.status === "manual_flow" ||
+      (task.flow_key === "invoice_application" && task.status === "needs_human"));
   const mayPrepareFlowProposal =
+    !dependencyBlocked &&
     (task.flow_key === "invoice_application" ||
       task.flow_key === "repair_quality_intake" ||
       task.flow_key === "technical_escalation") &&
@@ -772,24 +813,40 @@ function TaskRow({
     missing.length === 0 &&
     task.flow_can_prepare_proposal;
   const mayQueryOrderStatus =
+    !dependencyBlocked &&
     task.flow_key === "order_status" &&
     task.kind === "read" &&
     task.status === "manual_flow" &&
     missing.length === 0 &&
     task.flow_can_query_order;
+  const mayExecuteSemanticRead =
+    !dependencyBlocked &&
+    task.flow_key === null &&
+    task.kind === "read" &&
+    task.status === "ready" &&
+    task.slots.some(
+      (slot) =>
+        slot.name === "tool" &&
+        slot.origin === "server_capability" &&
+        slot.selection_source === "allowlisted_candidate_schema_match",
+    );
   // Both decisions come from `lib/taskPanelState`, which `task-panel-state`
   // executes: per-task field keys, and only the fields this task is waiting
   // for. Inlined here they were correct but untested, and the acceptance
   // review had to read the component to find that.
   const allCollected = everyFieldFilled(collecting, task.task_id, missing);
   const collected = collectedFor(collecting, task.task_id, missing);
+  const taskStatusLabel =
+    task.status === "cancelled" && task.blocked_reason === "TASK_CONDITION_UNMET"
+      ? copy(lang, "已跳过（前置条件不满足）", "Skipped; prerequisite condition was not met")
+      : (lang === "zh" ? STATUS_LABEL : STATUS_LABEL_EN)[task.status] ?? task.status;
 
   return (
     <li className={`wb-task wb-task-${task.status}`}>
       {task.flow_title ? <p className="wb-task-flow-title">{copy(lang, "标准流程：", "Standard flow: ")}{flowTitle(task, lang)} (v{task.flow_version})</p> : null}
       <div className="wb-task-head">
         <span className={`wb-task-status wb-task-status-${task.status}`}>
-          {(lang === "zh" ? STATUS_LABEL : STATUS_LABEL_EN)[task.status] ?? task.status}
+          {taskStatusLabel}
         </span>
         <span className="wb-task-kind">{(lang === "zh" ? KIND_LABEL : KIND_LABEL_EN)[task.kind] ?? task.kind}</span>
         {task.status === "succeeded" ? (
@@ -819,6 +876,8 @@ function TaskRow({
                   <span>
                     {slot.name === "order_status_receipt"
                       ? copy(lang, "已核验；展开下方 Demo ERP 回执", "Verified; see the Demo ERP receipt below")
+                      : slot.name === "tool_result"
+                        ? taskToolResultLabel(slot.value, lang)
                       : String(slot.value ?? "—")}
                   </span>
                 )}
@@ -933,6 +992,21 @@ function TaskRow({
             {busy ? copy(lang, "提交中…", "Saving…") : copy(lang, "记录补充", "Save details")}
           </button>
         ) : null}
+        {canCommand && mayExecuteSemanticRead ? (
+          <button
+            type="button"
+            className="wb-btn wb-btn-primary"
+            disabled={busy}
+            onClick={() => void onCommand(task, "execute_read")}
+            title={copy(
+              lang,
+              "仅执行服务端按只读 schema 绑定的 Tool Gateway 工具。",
+              "Runs only the server-bound read-only Tool Gateway tool.",
+            )}
+          >
+            {busy ? copy(lang, "查询中…", "Checking…") : copy(lang, "执行只读查询", "Run read-only query")}
+          </button>
+        ) : null}
         {canCommand && mayQueryOrderStatus ? (
           <button
             type="button"
@@ -967,6 +1041,7 @@ function TaskRow({
         {canCommand && !isTerminal(task.status) ? (
           <>
             {task.kind === "write" &&
+            !dependencyBlocked &&
             ((task.status === "ready" && !task.flow_key) || mayPrepareFlowProposal) ? (
               <button
                 type="button"

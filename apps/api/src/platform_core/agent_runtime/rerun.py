@@ -91,6 +91,8 @@ class RerunRef:
 
     new_run_id: uuid.UUID
     rerun_of: uuid.UUID
+    reused: bool = False
+    status: str = RunStatus.QUEUED.value
 
 
 async def record_run_failure(
@@ -147,6 +149,7 @@ async def rerun_failed_run(
     run_id: uuid.UUID,
     tenant_id: uuid.UUID,
     actor_ref: str,
+    request_key_hash: str | None = None,
     now: int | None = None,
 ) -> RerunRef:
     """Queue a new run that repeats `run_id`. Raises `ReplayRefused` if it must not.
@@ -158,30 +161,72 @@ async def rerun_failed_run(
     if not actor_ref.strip():
         raise ReplayRefused("ACTOR_REQUIRED", "a re-run must name the operator who asked")
 
+    if request_key_hash is not None and (
+        len(request_key_hash) != 64
+        or any(char not in "0123456789abcdef" for char in request_key_hash)
+    ):
+        raise ReplayRefused("INVALID_IDEMPOTENCY_KEY", "the request key hash is invalid")
+
     from sqlalchemy import select
 
     original = await session.scalar(
-        select(AgentRun).where(AgentRun.id == run_id, AgentRun.tenant_id == tenant_id)
+        select(AgentRun)
+        .where(AgentRun.id == run_id, AgentRun.tenant_id == tenant_id)
+        .with_for_update()
     )
     if original is None:
         raise ReplayRefused("NOT_FOUND", f"no agent run {run_id} for this tenant")
+    if request_key_hash is not None:
+        existing = await session.scalar(
+            select(AgentRun)
+            .where(
+                AgentRun.tenant_id == tenant_id,
+                AgentRun.replay_of_run_id == run_id,
+                AgentRun.replay_request_key_hash == request_key_hash,
+            )
+            .with_for_update()
+        )
+        if existing is not None:
+            return RerunRef(
+                new_run_id=existing.id,
+                rerun_of=run_id,
+                reused=True,
+                status=existing.status,
+            )
+    previous_reruns = list(
+        (
+            await session.scalars(
+                select(AgentRun)
+                .where(
+                    AgentRun.tenant_id == tenant_id,
+                    AgentRun.replay_of_run_id == run_id,
+                )
+                .with_for_update()
+            )
+        ).all()
+    )
+    if any(
+        row.status in (RunStatus.COMPLETED.value, RunStatus.HANDED_OFF.value)
+        for row in previous_reruns
+    ):
+        raise ReplayRefused(
+            "RERUN_ALREADY_ANSWERED",
+            "a previous rerun completed or handed the conversation to a human",
+        )
+    live = next(
+        (row for row in previous_reruns if row.status in _LIVE),
+        None,
+    )
+    if live is not None:
+        raise ReplayRefused(
+            "ALREADY_IN_FLIGHT",
+            f"run {run_id} already has a live re-run ({live.id}); wait for it or resolve it",
+        )
     if original.status not in REPLAYABLE:
         raise ReplayRefused(
             "NOT_REPLAYABLE",
             f"a run in status {original.status!r} has either already answered the "
             f"customer or never failed; repeating it is refused",
-        )
-
-    live = await session.scalar(
-        select(AgentRun.id).where(
-            AgentRun.replay_of_run_id == run_id,
-            AgentRun.status.in_(_LIVE),
-        )
-    )
-    if live is not None:
-        raise ReplayRefused(
-            "ALREADY_IN_FLIGHT",
-            f"run {run_id} already has a live re-run ({live}); wait for it or resolve it",
         )
 
     replacement = AgentRun(
@@ -191,6 +236,7 @@ async def rerun_failed_run(
         route=original.route,
         status=RunStatus.QUEUED.value,
         replay_of_run_id=original.id,
+        replay_request_key_hash=request_key_hash,
         model_config=dict(original.model_config or {}),
         retrieval_config=dict(original.retrieval_config or {}),
         policy_version=original.policy_version,
@@ -203,4 +249,8 @@ async def rerun_failed_run(
     )
     session.add(replacement)
     await session.flush()
-    return RerunRef(new_run_id=replacement.id, rerun_of=original.id)
+    return RerunRef(
+        new_run_id=replacement.id,
+        rerun_of=original.id,
+        status=replacement.status,
+    )

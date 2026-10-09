@@ -12,7 +12,7 @@ import {
   ErrorBanner,
   ListTotal,
   PageHeader,
-  Spinner,
+  SkeletonRows,
   Stat,
   type BadgeTone,
 } from "../components/ui";
@@ -83,6 +83,30 @@ function confirmationIsNotable(p: ToolProposal): boolean {
 interface ProposalDetail {
   proposal: ToolProposal;
   executions: ToolProposalExecution[];
+  reconciliations: ToolProposalReconciliation[];
+  compensations: ToolProposalCompensation[];
+}
+
+interface ToolProposalReconciliation {
+  reconciliation_id: string;
+  execution_id: string;
+  decision: "applied" | "not_applied" | "unresolved";
+  evidence_reference: string;
+  actor_id: string;
+  created_at: number;
+}
+
+type ToolCompensationReason = "created_in_error" | "duplicate_case" | "incorrect_customer";
+
+interface ToolProposalCompensation {
+  compensation_id: string;
+  execution_id: string;
+  action: string;
+  outcome: "succeeded" | "failed";
+  reason_code: ToolCompensationReason;
+  case_id: string | null;
+  result: Record<string, unknown>;
+  created_at: number;
 }
 
 /**
@@ -177,7 +201,7 @@ function ProposePanel({
         onRetry={catalog.reload}
       />
       {catalog.loading ? (
-        <Spinner />
+        <SkeletonRows rows={5} />
       ) : items.length === 0 ? (
         // The catalog is filtered by what this caller may propose, and the
         // write grants are narrow - a support agent holds none. Saying so beats
@@ -309,6 +333,60 @@ export function Approvals() {
     refresh();
   }
 
+  async function reconcile(
+    p: ToolProposal,
+    decision: ToolProposalReconciliation["decision"],
+    evidenceReference: string,
+  ) {
+    const promptKey = {
+      applied: "approvals.reconcileAppliedDetail",
+      not_applied: "approvals.reconcileNotAppliedDetail",
+      unresolved: "approvals.reconcileUnresolvedDetail",
+    }[decision] as DictKey;
+    const ok = await prompt.confirm(
+      t("approvals.reconcileTitle"),
+      t("approvals.reconcileConfirm"),
+      t(promptKey),
+    );
+    if (!ok) return;
+    const ran = await action.run(
+      async () => {
+        await apiPost(
+          `/v1/tool-proposals/${p.proposal_id}/reconcile`,
+          { decision, evidence_reference: evidenceReference.trim() },
+          newIdempotencyKey(),
+        );
+      },
+      t("approvals.reconcileRecorded"),
+    );
+    if (ran) refresh();
+  }
+
+  async function compensate(p: ToolProposal, reasonCode: ToolCompensationReason) {
+    const ok = await prompt.confirm(
+      t("approvals.compensateTitle"),
+      t("approvals.compensate"),
+      t("approvals.compensateDetail"),
+    );
+    if (!ok) return;
+    let outcome: ToolProposalCompensation["outcome"] | null = null;
+    let errorCode: string | null = null;
+    const ran = await action.run(async () => {
+      const response = await apiPost<{ compensation: ToolProposalCompensation }>(
+        `/v1/tool-proposals/${p.proposal_id}/compensate`,
+        { reason_code: reasonCode },
+        newIdempotencyKey(),
+      );
+      outcome = response.compensation.outcome;
+      const code = response.compensation.result.error_code;
+      errorCode = typeof code === "string" ? code : null;
+    });
+    if (!ran) return;
+    if (outcome === "succeeded") action.succeed(t("approvals.compensationSucceeded"));
+    else action.fail(t("approvals.compensationFailed", { code: errorCode ?? "unknown" }));
+    refresh();
+  }
+
   const waitingCount = waiting.data?.total ?? 0;
 
   return (
@@ -370,7 +448,9 @@ export function Approvals() {
           </select>
         </label>
 
-        {list.loading && !list.data ? <Spinner label={t("approvals.loading")} /> : null}
+        {list.loading && !list.data ? (
+          <SkeletonRows rows={5} label={t("approvals.loading")} />
+        ) : null}
         {list.data && list.data.items.length === 0 ? (
           <EmptyState
             message={status === "authorized" ? t("approvals.empty") : t("approvals.emptyFiltered")}
@@ -422,7 +502,7 @@ export function Approvals() {
       {!selected ? (
         <EmptyState message={t("approvals.select")} />
       ) : detail.loading && !detail.data ? (
-        <Spinner label={t("approvals.loading")} />
+        <SkeletonRows rows={4} label={t("approvals.loading")} />
       ) : detail.error ? (
         <ErrorBanner message={detail.error} onRetry={detail.reload} />
       ) : detail.data ? (
@@ -431,6 +511,8 @@ export function Approvals() {
           busy={action.busy}
           onApprove={approve}
           onExecute={execute}
+          onReconcile={reconcile}
+          onCompensate={compensate}
           onClose={() => setSelected(null)}
         />
       ) : null}
@@ -443,15 +525,26 @@ function ProposalPanel({
   busy,
   onApprove,
   onExecute,
+  onReconcile,
+  onCompensate,
   onClose,
 }: {
   detail: ProposalDetail;
   busy: boolean;
   onApprove: (p: ToolProposal) => void;
   onExecute: (p: ToolProposal) => void;
+  onReconcile: (
+    p: ToolProposal,
+    decision: ToolProposalReconciliation["decision"],
+    evidenceReference: string,
+  ) => void;
+  onCompensate: (p: ToolProposal, reasonCode: ToolCompensationReason) => void;
   onClose: () => void;
 }) {
   const { t } = useLang();
+  const [evidenceReference, setEvidenceReference] = useState("");
+  const [compensationReason, setCompensationReason] =
+    useState<ToolCompensationReason>("created_in_error");
   const p = detail.proposal;
   const left = minutesLeft(p.expires_at);
   const approvable = p.effective_status === "authorized" && p.required_confirmation;
@@ -554,6 +647,114 @@ function ProposalPanel({
           <pre className="code-block">{JSON.stringify(latest.output ?? {}, null, 2)}</pre>
         </>
       ) : null}
+
+      {latest && ["executing", "unknown"].includes(latest.status) ? (
+        <section>
+          <h3 className="section-title">{t("approvals.reconcileTitle")}</h3>
+          <p className="muted">{t("approvals.reconcileHelp")}</p>
+          <label className="field">
+            {t("approvals.evidenceReference")}
+            <input
+              value={evidenceReference}
+              onChange={(event) => setEvidenceReference(event.target.value)}
+              maxLength={255}
+              autoComplete="off"
+            />
+          </label>
+          <div className="toolbar wrap">
+            <button
+              className="btn"
+              disabled={busy || !evidenceReference.trim()}
+              onClick={() => onReconcile(p, "applied", evidenceReference)}
+            >
+              {t("approvals.reconcileApplied")}
+            </button>
+            <button
+              className="btn"
+              disabled={busy || !evidenceReference.trim()}
+              onClick={() => onReconcile(p, "not_applied", evidenceReference)}
+            >
+              {t("approvals.reconcileNotApplied")}
+            </button>
+            <button
+              className="btn"
+              disabled={busy || !evidenceReference.trim()}
+              onClick={() => onReconcile(p, "unresolved", evidenceReference)}
+            >
+              {t("approvals.reconcileUnresolved")}
+            </button>
+          </div>
+        </section>
+      ) : null}
+
+      {detail.reconciliations.length > 0 ? (
+        <>
+          <h3 className="section-title">{t("approvals.reconciliationHistory")}</h3>
+          <ul className="kv">
+            {detail.reconciliations.map((row) => (
+              <li key={row.reconciliation_id}>
+                <span>
+                  {t(`approvals.reconcileDecision.${row.decision}` as DictKey)}
+                </span>
+                <span className="cell-code">{row.evidence_reference}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+
+      {p.tool_name === "case.create" &&
+      latest?.status === "executed" &&
+      latest.verification_status === "verified" &&
+      detail.compensations.length === 0 ? (
+        <section>
+          <h3 className="section-title">{t("approvals.compensationTitle")}</h3>
+          <p className="muted">{t("approvals.compensationHelp")}</p>
+          <label className="field">
+            {t("approvals.compensationReason")}
+            <select
+              value={compensationReason}
+              onChange={(event) =>
+                setCompensationReason(event.target.value as ToolCompensationReason)
+              }
+            >
+              <option value="created_in_error">{t("approvals.compensationReason.createdInError")}</option>
+              <option value="duplicate_case">{t("approvals.compensationReason.duplicateCase")}</option>
+              <option value="incorrect_customer">{t("approvals.compensationReason.incorrectCustomer")}</option>
+            </select>
+          </label>
+          <button
+            className="btn"
+            disabled={busy}
+            onClick={() => onCompensate(p, compensationReason)}
+          >
+            {t("approvals.compensate")}
+          </button>
+        </section>
+      ) : null}
+
+      {detail.compensations.length > 0 ? (
+        <>
+          <h3 className="section-title">{t("approvals.compensationHistory")}</h3>
+          <ul className="kv">
+            {detail.compensations.map((row) => (
+              <li key={row.compensation_id}>
+                <span>{t(`approvals.compensationOutcome.${row.outcome}` as DictKey)}</span>
+                <span>
+                  {t(`approvals.compensationReason.${camelReason(row.reason_code)}` as DictKey)}
+                  {typeof row.result.error_code === "string" ? ` · ${row.result.error_code}` : ""}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
     </Card>
   );
+}
+
+function camelReason(reason: ToolCompensationReason): string {
+  if (reason === "duplicate_case") return "duplicateCase";
+  if (reason === "incorrect_customer") return "incorrectCustomer";
+  return "createdInError";
 }
