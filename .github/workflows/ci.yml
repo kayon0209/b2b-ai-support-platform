@@ -202,8 +202,10 @@ jobs:
       - name: Run integration tests
         run: pytest apps/api/tests/integration -m integration
         env:
+          APP_DATABASE_APP_URL: postgresql+psycopg://platform_app:platform_app@localhost:5435/platform
           APP_TEST_DATABASE_URL: postgresql+psycopg://platform_app:platform_app@localhost:5435/platform
           APP_ADMIN_DATABASE_URL: postgresql+psycopg://platform:platform@localhost:5435/platform
+          APP_TEST_DATABASE_ISOLATED: "1"
           PYTHONPATH: apps/api/src
           # Same reason as the unit job: no .env exists in the checkout.
           APP_ENVIRONMENT: local

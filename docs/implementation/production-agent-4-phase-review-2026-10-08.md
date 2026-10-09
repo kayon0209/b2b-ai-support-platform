@@ -27,7 +27,7 @@
 
 `rerun_failed_run` 原先只拒绝 queued/running 子重跑。旧失败 run 保持 failed 时，第一次重跑完成后，使用另一个幂等键仍可能创建第二条客户回复；分开的状态查询也存在旧重跑由 running 转 completed 的竞态窗口。
 
-已在 [rerun.py](../../apps/api/src/platform_core/agent_runtime/rerun.py) 中锁定旧 run 与其已有重跑，在同一读取里拒绝 live 和已完成/已转人工的重跑；相同幂等键仍返回原重跑并报告其当前状态。隔离 PostgreSQL 集成覆盖同键终态重放和新键拒绝，Worker 演练 97 项通过。
+已在 [rerun.py](../../apps/api/src/platform_core/agent_runtime/rerun.py) 中锁定旧 run 与其已有重跑，在同一读取里拒绝 live 和已完成/已转人工的重跑；相同幂等键仍返回原重跑并报告其当前状态。隔离 PostgreSQL 集成覆盖同键终态重放和新键拒绝，Worker 演练 147 项通过。
 
 ### HIGH：Admin Web 锁定的 source-map-js 存在 high 级公告
 

@@ -62,6 +62,32 @@ class _Resolver:
         )
 
 
+def _seed_actor(tenant: str, agent: str, role: str) -> uuid.UUID:
+    """Persist the user and live membership used by a synthetic API actor."""
+    actor_id = uuid.uuid5(uuid.NAMESPACE_URL, agent)
+    email = f"r2flow-{actor_id.hex}@example.test"
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO users (id, primary_email, display_name, is_service_account) "
+                "VALUES (:id, :email, :agent, false) ON CONFLICT (id) DO NOTHING"
+            ),
+            {"id": actor_id, "email": email, "agent": agent},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO memberships (id, tenant_id, user_id, role, status) "
+                "VALUES (gen_random_uuid(), :tenant, :actor, :role, 'active') "
+                "ON CONFLICT (tenant_id, user_id) DO UPDATE "
+                "SET role = EXCLUDED.role, status = 'active'"
+            ),
+            {"tenant": tenant, "actor": actor_id, "role": role},
+        )
+    admin.dispose()
+    return actor_id
+
+
 def _client(
     tenant: str = TENANT,
     *,
@@ -70,6 +96,7 @@ def _client(
 ) -> TestClient:
     import importlib
 
+    _seed_actor(tenant, agent, role)
     main_mod = importlib.import_module("platform_core.main")
     fresh = FastAPI()
     for route in main_mod.app.router.routes:
@@ -172,6 +199,7 @@ def _start_restart_api(
     environment_overrides: dict[str, str] | None = None,
 ) -> tuple[subprocess.Popen[bytes], str]:
     """Run the real API routes in a disposable OS process for restart acceptance."""
+    actor_id = _seed_actor(TENANT, actor, role)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = int(listener.getsockname()[1])
@@ -200,7 +228,7 @@ def _start_restart_api(
             "-c",
             _RESTART_API_BOOTSTRAP,
             TENANT,
-            str(uuid.uuid5(uuid.NAMESPACE_URL, actor)),
+            str(actor_id),
             role,
             str(port),
         ],
@@ -1541,8 +1569,11 @@ def test_api_process_crash_after_provider_acceptance_never_replays_the_write() -
                 "schema": json.dumps(
                     {
                         "type": "object",
-                        "properties": {"title": {"type": "string"}},
-                        "required": ["title"],
+                        "properties": {
+                            "project": {"type": "string"},
+                            "title": {"type": "string"},
+                        },
+                        "required": ["project", "title"],
                         "additionalProperties": False,
                     }
                 ),
@@ -1587,7 +1618,7 @@ def test_api_process_crash_after_provider_acceptance_never_replays_the_write() -
             key="gateway-crash-proposal",
             body={
                 "tool_name": "jira.create_issue",
-                "arguments": {"title": "synthetic lost-ack case"},
+                "arguments": {"project": "SUP", "title": "synthetic lost-ack case"},
             },
         )
         assert status == 200, proposed

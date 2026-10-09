@@ -43,6 +43,10 @@ TESTS = (
     "apps/api/tests/integration/test_customer_journey_to_tasks.py",
     "apps/api/tests/integration/test_collect_fields_persistence.py",
     "apps/api/tests/integration/test_inbox_worker_isolation.py",
+    "apps/api/tests/integration/test_agent_write_path.py",
+    "apps/api/tests/integration/test_schema_privileges.py",
+    "apps/api/tests/integration/test_standard_flow_instances.py",
+    "apps/api/tests/integration/test_semantic_task_read.py",
     "apps/api/tests/integration/test_migration_and_performance.py",
     "apps/api/tests/integration/test_agent_run_replay.py",
     "apps/api/tests/unit/agent_runtime/test_task_planner.py",
@@ -368,6 +372,7 @@ def main() -> int:
             "APP_DATABASE_APP_URL": app_url,
             "APP_ADMIN_DATABASE_URL": admin_url,
             "APP_TEST_DATABASE_URL": app_url,
+            "APP_TEST_DATABASE_ISOLATED": "1",
             "APP_TEST_ARTIFACT_DIR": str(artifact_dir),
             "PYTHONDONTWRITEBYTECODE": "1",
         }
@@ -449,6 +454,16 @@ def main() -> int:
                 {"batchSize": batch_size, "enqueueToDrainMs": elapsed_ms, "billingRows": batch_size}
             )
             print(f"queue_batch_size={batch_size} enqueue_to_drain_ms={elapsed_ms}")
+
+        # The injected gate is a temporary drill-only table and must not leak
+        # into schema/privilege tests that compare the migrated schema to the
+        # application's mapped tables.
+        with psycopg.connect(admin_dsn) as connection:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS r2r3_pause_billing_insert ON billing_entries"
+            )
+            connection.execute("DROP FUNCTION IF EXISTS r2r3_pause_billing_insert()")
+            connection.execute("DROP TABLE IF EXISTS r2r3_drill_gate")
 
         _compose(project, compose_env, "stop", "drill-outbox-worker", check=False)
         test_result = _run_pytest(test_env)
