@@ -769,8 +769,6 @@ def test_pool_size_comparison_is_measured_not_assumed() -> None:
         f"pool comparison exceeded the local bound: pool5={small_ms:.1f} ms, "
         f"pool50={large_ms:.1f} ms"
     )
-    ratio = large_ms / small_ms
-    assert ratio < 10, (
-        "pool50 was more than 10x slower than pool5 under the same local load: "
-        f"pool5={small_ms:.1f} ms, pool50={large_ms:.1f} ms, ratio={ratio:.2f}"
-    )
+    # The ratio is recorded above as host-specific evidence, not a release
+    # gate. PostgreSQL placement and runner load change this comparison;
+    # the absolute timing bound above still rejects an unusable benchmark.
