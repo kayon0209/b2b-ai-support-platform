@@ -11,6 +11,7 @@ provider-specific contracts the rest of the platform depends on:
 import httpx
 import pytest
 
+from platform_core.execution_budget import ExecutionBudget, use_execution_budget
 from platform_core.integrations.resilience import CircuitBreaker
 from platform_core.llm.gitee_ai import GiteeAiClient
 from platform_core.llm.provider import (
@@ -88,6 +89,27 @@ async def test_complete_retries_then_succeeds(monkeypatch) -> None:
     assert result.text == "ok"
     assert calls["n"] == 2
     assert client.breaker.state.value == "closed"
+
+
+async def test_provider_retries_share_the_current_run_budget(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    client = _client(handler, monkeypatch, max_retries=5)
+    budget = ExecutionBudget.for_seconds(
+        deadline_seconds=5,
+        max_attempts=1,
+        operation_limits={"model": 1, "tool": 0, "outbound": 0},
+    )
+    with use_execution_budget(budget):
+        with pytest.raises(ModelUnavailable):
+            await client.complete([ChatMessage(ProviderRole.USER, "hi")])
+
+    assert calls["n"] == 1
+    assert budget.total_attempts == 1
 
 
 async def test_complete_non_retryable_status_raises_rejected(monkeypatch) -> None:

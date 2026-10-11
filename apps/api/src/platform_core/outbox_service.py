@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,21 @@ class OutboxReceipt:
     event_id: uuid.UUID
     status: str
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OutboxClaim:
+    """Queue metadata only; the tenant-bound handler loads the payload later."""
+
+    id: uuid.UUID
+    event_id: uuid.UUID
+    tenant_id: uuid.UUID
+    event_type: str
+    processing_token: uuid.UUID
+    attempts: int
+    max_attempts: int
+    deadline_at: int
+    external_attempt_limit: int
 
 
 async def get_receipt(
@@ -144,42 +159,216 @@ async def claim_pending(
     *,
     batch: int = 50,
     exclude_event_types: tuple[str, ...] = (),
-) -> list[OutboxEvent]:
+    max_attempts: int | None = None,
+) -> list[OutboxClaim]:
     """Claim queued rows with SKIP LOCKED (safe for concurrent relays).
 
     Claims mark rows 'sent-in-flight' by bumping attempts; actual SENT is
     set by mark_sent after successful publish.
     """
-    stmt = select(OutboxEvent).where(OutboxEvent.status == OutboxStatus.QUEUED.value)
+    from platform_core.config import get_settings
+
+    settings = get_settings()
+    delivery_limit = max_attempts if max_attempts is not None else 5
+    now = int(time.time())
+    stmt = select(
+        OutboxEvent.id,
+        OutboxEvent.event_id,
+        OutboxEvent.tenant_id,
+        OutboxEvent.event_type,
+        OutboxEvent.attempts,
+        OutboxEvent.first_attempt_at,
+        OutboxEvent.deadline_at,
+        OutboxEvent.external_attempt_limit,
+    ).where(OutboxEvent.status == OutboxStatus.QUEUED.value)
     if exclude_event_types:
         stmt = stmt.where(OutboxEvent.event_type.not_in(exclude_event_types))
+    stmt = stmt.where(
+        OutboxEvent.attempts < delivery_limit,
+        or_(OutboxEvent.deadline_at.is_(None), OutboxEvent.deadline_at > now),
+    )
     stmt = stmt.order_by(OutboxEvent.id).limit(batch).with_for_update(skip_locked=True)
-    rows = (await session.execute(stmt)).scalars().all()
-    if rows:
-        ids = [r.id for r in rows]
+    rows = (await session.execute(stmt)).all()
+    claims: list[OutboxClaim] = []
+    for row in rows:
+        token = uuid.uuid4()
+        first_attempt_at = int(row.first_attempt_at or now)
+        deadline_at = int(
+            row.deadline_at or first_attempt_at + settings.outbox_job_deadline_seconds
+        )
+        external_attempt_limit = int(
+            row.external_attempt_limit or settings.outbox_event_max_external_attempts
+        )
         await session.execute(
             update(OutboxEvent)
-            .where(OutboxEvent.id.in_(ids))
-            .values(attempts=OutboxEvent.attempts + 1)
+            .where(
+                OutboxEvent.id == row.id,
+                OutboxEvent.status == OutboxStatus.QUEUED.value,
+            )
+            .values(
+                status=OutboxStatus.PROCESSING.value,
+                processing_started_at=now,
+                processing_token=token,
+                first_attempt_at=func.coalesce(OutboxEvent.first_attempt_at, now),
+                deadline_at=func.coalesce(OutboxEvent.deadline_at, deadline_at),
+                external_attempt_limit=func.coalesce(
+                    OutboxEvent.external_attempt_limit,
+                    settings.outbox_event_max_external_attempts,
+                ),
+                attempts=OutboxEvent.attempts + 1,
+            )
         )
-    return list(rows)
+        claims.append(
+            OutboxClaim(
+                id=row.id,
+                event_id=row.event_id,
+                tenant_id=row.tenant_id,
+                event_type=str(row.event_type),
+                processing_token=token,
+                attempts=int(row.attempts) + 1,
+                max_attempts=delivery_limit,
+                deadline_at=deadline_at,
+                external_attempt_limit=external_attempt_limit,
+            )
+        )
+    return claims
 
 
-async def mark_sent(session: AsyncSession, row_id: uuid.UUID) -> None:
-    await session.execute(
+async def mark_sent(
+    session: AsyncSession,
+    row_id: uuid.UUID,
+    *,
+    processing_token: uuid.UUID | None = None,
+) -> bool:
+    stmt = (
         update(OutboxEvent)
         .where(OutboxEvent.id == row_id)
         .values(
             status=OutboxStatus.SENT.value,
             published_at=int(time.time()),
             processing_started_at=None,
+            processing_token=None,
         )
     )
+    if processing_token is not None:
+        stmt = stmt.where(
+            OutboxEvent.status == OutboxStatus.PROCESSING.value,
+            OutboxEvent.processing_token == processing_token,
+        )
+    result = await session.execute(stmt)
+    return bool(getattr(result, "rowcount", 0))
 
 
-async def mark_failed(session: AsyncSession, row_id: uuid.UUID, error: str) -> None:
-    await session.execute(
+async def mark_failed(
+    session: AsyncSession,
+    row_id: uuid.UUID,
+    error: str,
+    *,
+    processing_token: uuid.UUID | None = None,
+    terminal: bool = False,
+) -> bool:
+    stmt = (
         update(OutboxEvent)
         .where(OutboxEvent.id == row_id)
-        .values(last_error=error[:2000], processing_started_at=None)
+        .values(
+            status=OutboxStatus.FAILED.value if terminal else OutboxStatus.QUEUED.value,
+            last_error=error[:2000],
+            processing_started_at=None,
+            processing_token=None,
+        )
     )
+    if processing_token is not None:
+        stmt = stmt.where(
+            OutboxEvent.status == OutboxStatus.PROCESSING.value,
+            OutboxEvent.processing_token == processing_token,
+        )
+    result = await session.execute(stmt)
+    return bool(getattr(result, "rowcount", 0))
+
+
+async def reclaim_stale_claims(
+    session: AsyncSession,
+    *,
+    cutoff: int,
+    max_attempts: int,
+    retry_safe_event_types: frozenset[str],
+    exclude_event_types: tuple[str, ...] = (),
+) -> tuple[int, int]:
+    """Reclaim safe rows and terminally park ambiguous side-effect rows.
+
+    The queue role reads only metadata. A customer-visible reply is not
+    automatically replayed after a crashed send because its provider may have
+    accepted the message before the process died.
+    """
+    now = int(time.time())
+    expired_queued = update(OutboxEvent).where(
+        OutboxEvent.status == OutboxStatus.QUEUED.value,
+        OutboxEvent.deadline_at <= now,
+    )
+    if exclude_event_types:
+        expired_queued = expired_queued.where(OutboxEvent.event_type.not_in(exclude_event_types))
+    expired_queued_result = await session.execute(
+        expired_queued.values(
+            status=OutboxStatus.FAILED.value,
+            last_error="outbox_job_deadline_exhausted",
+        )
+    )
+    failed = int(getattr(expired_queued_result, "rowcount", 0) or 0)
+    claim_query = (
+        select(
+            OutboxEvent.id,
+            OutboxEvent.event_type,
+            OutboxEvent.attempts,
+            OutboxEvent.processing_token,
+            OutboxEvent.deadline_at,
+        )
+        .where(
+            OutboxEvent.status == OutboxStatus.PROCESSING.value,
+            OutboxEvent.processing_started_at <= cutoff,
+        )
+        .order_by(OutboxEvent.processing_started_at, OutboxEvent.id)
+        .with_for_update(skip_locked=True)
+    )
+    if exclude_event_types:
+        claim_query = claim_query.where(OutboxEvent.event_type.not_in(exclude_event_types))
+    rows = (await session.execute(claim_query)).all()
+    requeued = 0
+    for row in rows:
+        deadline_exhausted = row.deadline_at is not None and int(row.deadline_at) <= now
+        safe_to_replay = (
+            not deadline_exhausted
+            and str(row.event_type) in retry_safe_event_types
+            and int(row.attempts) < max_attempts
+        )
+        result = await session.execute(
+            update(OutboxEvent)
+            .where(
+                OutboxEvent.id == row.id,
+                OutboxEvent.status == OutboxStatus.PROCESSING.value,
+                OutboxEvent.processing_token == row.processing_token,
+            )
+            .values(
+                status=(OutboxStatus.QUEUED.value if safe_to_replay else OutboxStatus.FAILED.value),
+                last_error=(
+                    "outbox_stale_claim_requeued"
+                    if safe_to_replay
+                    else (
+                        "outbox_job_deadline_exhausted"
+                        if deadline_exhausted
+                        else (
+                            "outbox_attempt_budget_exhausted"
+                            if int(row.attempts) >= max_attempts
+                            else "outbox_delivery_outcome_unknown"
+                        )
+                    )
+                ),
+                processing_started_at=None,
+                processing_token=None,
+            )
+        )
+        if getattr(result, "rowcount", 0):
+            if safe_to_replay:
+                requeued += 1
+            else:
+                failed += 1
+    return requeued, failed

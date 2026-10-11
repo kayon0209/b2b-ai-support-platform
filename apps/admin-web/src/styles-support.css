@@ -942,6 +942,27 @@
   color: var(--support-accent);
 }
 
+.support-resolution-choice {
+  min-height: 40px;
+  padding: 8px 14px;
+  border: 1px solid var(--support-line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--support-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.support-resolution-choice:hover:not(:disabled) {
+  border-color: var(--support-accent);
+  color: var(--support-accent);
+}
+
+.support-resolution-choice:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .support-rating-star:disabled {
   opacity: 0.5;
   cursor: default;

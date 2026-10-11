@@ -11,7 +11,7 @@ import {
   Card,
   EmptyState,
   PageHeader,
-  Spinner,
+  SkeletonRows,
   ListTotal,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
@@ -103,7 +103,7 @@ export function FeatureFlags() {
       <ActionFeedback error={action.error} notice={action.notice} />
       {prompt.element}
       <LoadError error={flags.error} status={flags.errorStatus} onRetry={flags.reload} />
-      {flags.loading ? <Spinner label={t("flags.loading")} /> : null}
+      {flags.loading ? <SkeletonRows rows={5} label={t("flags.loading")} /> : null}
       {flags.data && flags.data.items.length === 0 ? (
         <EmptyState message={t("flags.empty")} />
       ) : null}

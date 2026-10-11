@@ -111,6 +111,7 @@ def _seed():
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
         for table in (
+            "inbox_events",
             "conversation_turns",
             "conversation_control_leases",
             "citations",
@@ -171,18 +172,47 @@ async def _execute(mode: str) -> tuple[object, list[dict]]:
 
     # The enqueue path the API uses, so the mode lands on the run row exactly
     # the way a real request puts it there.
+    idem = f"idem-{uuid.uuid4()}"
     async with factory() as session:
         await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT})
-        await chat_service.queue_agent_run(
-            session,
-            ctx=TenantContext(tenant_id=tid, actor_id=None, actor_kind="user"),
-            conversation_ref_id=conv,
-            external_ref=str(conv),
-            trigger_message_ref="msg-1",
-            idem=f"idem-{uuid.uuid4()}",
-            mode=mode,
-            trace_id="trace-draft",
+        queue_args = {
+            "session": session,
+            "ctx": TenantContext(tenant_id=tid, actor_id=None, actor_kind="user"),
+            "conversation_ref_id": conv,
+            "external_ref": str(conv),
+            "trigger_message_ref": "msg-1",
+            "idem": idem,
+            "mode": mode,
+            "trace_id": "trace-draft",
+        }
+        queued = await chat_service.queue_agent_run(
+            **queue_args,
         )
+        replay = await chat_service.queue_agent_run(
+            **queue_args,
+        )
+        assert replay["duplicate"] is True
+        assert replay["run_id"] == queued["run_id"]
+        stored_run_id = (
+            await session.execute(
+                text(
+                    "SELECT minimized_payload->>'agent_run_id' FROM inbox_events "
+                    "WHERE tenant_id = :tenant AND delivery_id = :delivery"
+                ),
+                {"tenant": TENANT, "delivery": f"agent-run:{idem}"},
+            )
+        ).scalar_one()
+        assert stored_run_id == queued["run_id"]
+        run_count = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM agent_runs "
+                    "WHERE tenant_id = :tenant AND conversation_ref_id = :conversation"
+                ),
+                {"tenant": TENANT, "conversation": conv},
+            )
+        ).scalar_one()
+        assert run_count == 1
         await session.commit()
 
     async with factory() as session:
@@ -197,6 +227,7 @@ async def _execute(mode: str) -> tuple[object, list[dict]]:
             tenant_id=tid,
             conversation_ref_id=conv,
             question=QUESTION,
+            queued_run_id=uuid.UUID(queued["run_id"]),
             principal=PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",)),
             # A channel is **required for this test to mean anything**. Without
             # one, `_dispatch` takes the platform-surface branch and sends
@@ -209,6 +240,7 @@ async def _execute(mode: str) -> tuple[object, list[dict]]:
         await session.commit()
 
     await engine.dispose()
+    assert str(outcome.run_id) == queued["run_id"]
     return outcome, sender.calls
 
 
@@ -234,3 +266,118 @@ def test_a_customer_reply_run_still_sends() -> None:
     assert len(sent) == 1
     assert sent[0]["content"] == DRAFT
     assert sent[0]["command_id"] == f"run:{outcome.run_id}"
+
+
+def test_same_conversation_events_adopt_their_own_queued_run() -> None:
+    """Out-of-order worker scheduling must not cross-wire message placeholders."""
+    from platform_core.agent_runtime import chat_service
+    from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
+    from platform_core.db import create_engine as async_engine
+    from platform_core.identity import lease_service
+    from platform_core.identity.tenant_context import TenantContext
+    from platform_core.retrieval.hybrid import PrincipalScope
+
+    tid = uuid.UUID(TENANT)
+    conversation = uuid.uuid4()
+
+    async def scenario() -> tuple[object, list[dict], list[tuple[uuid.UUID, str]], list[uuid.UUID]]:
+        engine = async_engine(APP_URL)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        sender = _RecordingTransport()
+        ctx = TenantContext(tenant_id=tid, actor_id=None, actor_kind="user")
+        try:
+            async with factory() as session:
+                await session.execute(
+                    text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT}
+                )
+                await lease_service.acquire_or_get(
+                    session, tenant_id=tid, conversation_ref_id=conversation
+                )
+                await session.commit()
+
+            async with factory() as session:
+                await session.execute(
+                    text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT}
+                )
+                queued: list[dict] = []
+                for index in (1, 2):
+                    queued.append(
+                        await chat_service.queue_agent_run(
+                            session,
+                            ctx=ctx,
+                            conversation_ref_id=conversation,
+                            external_ref=str(conversation),
+                            trigger_message_ref=f"msg-{index}",
+                            idem=f"ordered-{uuid.uuid4()}-{index}",
+                            mode="customer_reply",
+                            trace_id=f"trace-{index}",
+                        )
+                    )
+                await session.commit()
+
+            second_run_id = uuid.UUID(queued[1]["run_id"])
+            async with factory() as session:
+                await session.execute(
+                    text("SELECT set_config('app.tenant_id', :t, true)"), {"t": TENANT}
+                )
+                event_run_ids = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT minimized_payload->>'agent_run_id' FROM inbox_events "
+                                "WHERE tenant_id = :tenant "
+                                "AND minimized_payload->>'conversation_ref' = :conversation "
+                                "ORDER BY received_at, id"
+                            ),
+                            {"tenant": TENANT, "conversation": str(conversation)},
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert event_run_ids == [item["run_id"] for item in queued]
+                orchestrator = AgentOrchestrator(
+                    session,
+                    OrchestratorDeps(
+                        channel_sender=ChannelSender({"email": sender}),
+                        generator=_FixedGenerator(),
+                    ),
+                )
+                outcome = await orchestrator.run(
+                    tenant_id=tid,
+                    conversation_ref_id=conversation,
+                    question=QUESTION,
+                    queued_run_id=second_run_id,
+                    principal=PrincipalScope(
+                        principal_types=("role",), principal_ids=("ai_agent",)
+                    ),
+                    channel_system="email",
+                    channel_address="buyer@example.test",
+                )
+                await session.commit()
+
+            admin = create_engine(ADMIN_URL)
+            with admin.connect() as conn:
+                statuses = conn.execute(
+                    text(
+                        "SELECT id, status FROM agent_runs WHERE tenant_id = :tenant "
+                        "AND conversation_ref_id = :conversation ORDER BY id"
+                    ),
+                    {"tenant": TENANT, "conversation": str(conversation)},
+                ).all()
+            admin.dispose()
+            return (
+                outcome,
+                sender.calls,
+                [(row.id, row.status) for row in statuses],
+                [uuid.UUID(item["run_id"]) for item in queued],
+            )
+        finally:
+            await engine.dispose()
+
+    outcome, sent, statuses, queued_ids = _run(scenario())
+    assert len(set(queued_ids)) == 2
+    assert outcome.run_id == queued_ids[1]
+    assert sent == [{"content": DRAFT, "command_id": f"run:{outcome.run_id}"}]
+    assert (queued_ids[0], "queued") in statuses
+    assert (queued_ids[1], "completed") in statuses

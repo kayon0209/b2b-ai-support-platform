@@ -19,12 +19,13 @@ turns it into a body. Three properties are the acceptance criteria:
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
@@ -39,6 +40,11 @@ from platform_core.agent_runtime.copilot import (
     should_expire,
 )
 from platform_core.agent_runtime.semantic.modes import FLAG_COPILOT
+from platform_core.execution_budget import (
+    ExecutionBudget,
+    run_with_execution_budget,
+    use_execution_budget,
+)
 from platform_core.identity import lease_service
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.outbox import OutboxEvent, OutboxStatus
@@ -49,6 +55,7 @@ logger = JsonLogger("platform.worker")
 # is worth more than a shadow comparison, and neither is worth a stalled queue.
 COPILOT_DEADLINE_SECONDS = 8.0
 COPILOT_MAX_RETRIES = 0
+COPILOT_MAX_ATTEMPTS = 3
 
 STALE_COPILOT_SECONDS = 600
 COPILOT_BATCH = 5
@@ -103,12 +110,26 @@ async def claim_copilot_jobs(
     session: AsyncSession, *, batch: int = COPILOT_BATCH
 ) -> list[ClaimedCopilot]:
     """Claim queued generation requests with SKIP LOCKED."""
+    await session.execute(
+        update(OutboxEvent)
+        .where(
+            OutboxEvent.event_type == COPILOT_EVENT_TYPE,
+            OutboxEvent.status == OutboxStatus.QUEUED.value,
+            OutboxEvent.attempts >= COPILOT_MAX_ATTEMPTS,
+        )
+        .values(
+            status=OutboxStatus.FAILED.value,
+            processing_started_at=None,
+            last_error="copilot_attempt_budget_exhausted",
+        )
+    )
     rows = (
         await session.execute(
             select(OutboxEvent.id, OutboxEvent.event_id, OutboxEvent.tenant_id)
             .where(
                 OutboxEvent.event_type == COPILOT_EVENT_TYPE,
                 OutboxEvent.status == OutboxStatus.QUEUED.value,
+                OutboxEvent.attempts < COPILOT_MAX_ATTEMPTS,
             )
             .order_by(OutboxEvent.created_at, OutboxEvent.id)
             .limit(batch)
@@ -120,7 +141,11 @@ async def claim_copilot_jobs(
         await session.execute(
             update(OutboxEvent)
             .where(OutboxEvent.id == row.id)
-            .values(status=COPILOT_IN_FLIGHT, processing_started_at=int(time.time()))
+            .values(
+                status=COPILOT_IN_FLIGHT,
+                processing_started_at=int(time.time()),
+                attempts=OutboxEvent.attempts + 1,
+            )
         )
         claimed.append(ClaimedCopilot(event_id=row.event_id, tenant_id=row.tenant_id))
     return claimed
@@ -129,15 +154,31 @@ async def claim_copilot_jobs(
 async def reclaim_stale_copilot(session: AsyncSession) -> int:
     """Return long-claimed rows to the queue after a consumer died."""
     cutoff = int(time.time()) - STALE_COPILOT_SECONDS
+    stale = and_(
+        OutboxEvent.event_type == COPILOT_EVENT_TYPE,
+        OutboxEvent.status == COPILOT_IN_FLIGHT,
+        OutboxEvent.processing_started_at < cutoff,
+    )
     result = await session.execute(
         update(OutboxEvent)
-        .where(
-            OutboxEvent.event_type == COPILOT_EVENT_TYPE,
-            OutboxEvent.status == COPILOT_IN_FLIGHT,
-            OutboxEvent.processing_started_at < cutoff,
-        )
+        .where(stale, OutboxEvent.attempts < COPILOT_MAX_ATTEMPTS)
         .values(status=OutboxStatus.QUEUED.value, processing_started_at=None)
     )
+    exhausted = await session.execute(
+        update(OutboxEvent)
+        .where(stale, OutboxEvent.attempts >= COPILOT_MAX_ATTEMPTS)
+        .values(
+            status=OutboxStatus.FAILED.value,
+            processing_started_at=None,
+            last_error="copilot_attempt_budget_exhausted",
+        )
+    )
+    exhausted_count = int(getattr(exhausted, "rowcount", 0) or 0)
+    if exhausted_count:
+        logger.error("copilot_attempt_budget_exhausted", count=exhausted_count)
+        get_metrics().inbox_events_total.labels(result="copilot_retry_budget_exhausted").inc(
+            exhausted_count
+        )
     return int(getattr(result, "rowcount", 0) or 0)
 
 
@@ -254,14 +295,33 @@ async def process_copilot_job(
     system = SUMMARY_SYSTEM_PROMPT if work.kind is CopilotKind.SUMMARY else REPLY_SYSTEM_PROMPT
     transcript = "\n".join(f"[{t.get('role')}] {t.get('text')}" for t in turns if t.get("text"))
     try:
-        completion = await provider.complete(
-            [
-                ChatMessage(role=ProviderRole.SYSTEM, content=system),
-                ChatMessage(role=ProviderRole.USER, content=transcript[:6000]),
-            ],
-            max_tokens=max_tokens,
-            temperature=0.0,
+        remaining = max(
+            0.0,
+            min(
+                COPILOT_DEADLINE_SECONDS,
+                JOB_TTL_SECONDS - max(0, int(time.time()) - int(draft.created_at)),
+            ),
         )
+        budget = ExecutionBudget.for_seconds(
+            deadline_seconds=remaining,
+            max_attempts=1,
+            operation_limits={"model": 1, "tool": 0, "outbound": 0},
+        )
+        with use_execution_budget(budget):
+            completion = await run_with_execution_budget(
+                budget,
+                asyncio.wait_for(
+                    provider.complete(
+                        [
+                            ChatMessage(role=ProviderRole.SYSTEM, content=system),
+                            ChatMessage(role=ProviderRole.USER, content=transcript[:6000]),
+                        ],
+                        max_tokens=max_tokens,
+                        temperature=0.0,
+                    ),
+                    timeout=max(0.001, remaining),
+                ),
+            )
     except Exception as exc:  # noqa: BLE001 - recorded on the row, not raised
         code = type(exc).__name__
         await _mark_draft(session, work, status=CopilotJobStatus.FAILED.value, error=code)
@@ -452,6 +512,7 @@ def context_for(claimed: ClaimedCopilot) -> TenantContext:
 __all__ = [
     "COPILOT_BATCH",
     "COPILOT_DEADLINE_SECONDS",
+    "COPILOT_MAX_ATTEMPTS",
     "COPILOT_MAX_RETRIES",
     "JOB_TTL_SECONDS",
     "REPLY_SYSTEM_PROMPT",

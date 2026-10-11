@@ -112,6 +112,35 @@ async def resolve_identity(
     )
 
 
+async def lock_active_membership_role(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> str | None:
+    """Lock and return a user's current active role in the resolved tenant.
+
+    High-risk commands use this immediately before persisting their execution
+    intent. The row lock serializes permission revocation with that no-return
+    point: either revocation wins and the command is refused, or the durable
+    execution intent wins before revocation commits.
+    """
+    row = (
+        await session.execute(
+            select(Membership.role, Membership.status)
+            .where(
+                Membership.tenant_id == tenant_id,
+                Membership.user_id == user_id,
+            )
+            .with_for_update()
+        )
+    ).one_or_none()
+    if row is None or row.status != "active":
+        return None
+    role = row.role
+    return str(role.value if isinstance(role, MembershipRole) else role)
+
+
 async def load_context(
     session: AsyncSession, tenant_slug: str, user_id: uuid.UUID
 ) -> TenantContext:

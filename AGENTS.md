@@ -124,6 +124,20 @@ A feature is not complete until it has:
 - user-facing acceptance test
 - updated documentation
 
+## Multi-stage implementation tracking
+
+For multi-stage work, keep a roadmap in `docs/implementation/` using
+`docs/templates/implementation-roadmap-template.md`. Mark each milestone
+`[x]` complete, `[~]` partial, `[!]` externally blocked, or `[ ]` pending;
+update it after each milestone and report the same status in the active chat.
+Use `scripts/roadmap_progress.py <roadmap> --watch` for a live checklist bar.
+The percentage is checklist-weighted, not an effort, elapsed-time, or ETA
+estimate. The watcher's stale marker tracks the last roadmap edit, not hidden
+model activity; update the roadmap after each milestone and state if work is
+waiting on an external dependency. On macOS, `--notify-stale` can send one
+desktop notification per stale period. Advance stages only after the current
+stage's acceptance criteria are met.
+
 ## Prohibited shortcuts
 
 - Direct database joins across the platform's database and any external system

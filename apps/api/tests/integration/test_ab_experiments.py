@@ -186,7 +186,9 @@ def _define(tenant: str, key: str, variants: list[dict], *, enabled: bool = True
     )
 
 
-def _publish_prompt(tenant: str, *, name: str, version: int, body: str) -> uuid.UUID:
+def _publish_prompt(
+    tenant: str, *, name: str, version: int, body: str, published: bool = True
+) -> uuid.UUID:
     """A prompt version the experiment can point at."""
     row_id = uuid.uuid4()
     admin = create_engine(ADMIN_URL)
@@ -194,7 +196,7 @@ def _publish_prompt(tenant: str, *, name: str, version: int, body: str) -> uuid.
         conn.execute(
             text(
                 "INSERT INTO prompt_versions (id, tenant_id, template_name, version, body, "
-                "published) VALUES (:i, :t, :n, :v, :b, true)"
+                "published) VALUES (:i, :t, :n, :v, :b, :published)"
             ),
             {
                 "i": str(row_id),
@@ -202,6 +204,7 @@ def _publish_prompt(tenant: str, *, name: str, version: int, body: str) -> uuid.
                 "n": name,
                 "v": version,
                 "b": body,
+                "published": published,
             },
         )
     admin.dispose()
@@ -473,6 +476,46 @@ def test_zero_total_weight_is_refused() -> None:
             )
 
     _run(_with_session(TENANT, go))
+
+
+def test_unpublished_prompt_canary_exposure_is_capped_across_experiments() -> None:
+    from platform_core.evaluation.ab_service import ExperimentError
+
+    candidate = _publish_prompt(
+        TENANT, name="canary_candidate", version=1, body="candidate", published=False
+    )
+    _define(
+        TENANT,
+        "canary-ten-percent",
+        [
+            {"name": "candidate", "weight": 1, "prompt_version_id": str(candidate)},
+            {"name": "control", "weight": 9},
+        ],
+    )
+
+    with pytest.raises(ExperimentError, match="cannot exceed 10%"):
+        _define(
+            TENANT,
+            "canary-additional-share",
+            [
+                {"name": "candidate", "weight": 1, "prompt_version_id": str(candidate)},
+                {"name": "control", "weight": 9},
+            ],
+        )
+
+
+def test_experiment_prompt_references_must_belong_to_the_tenant() -> None:
+    from platform_core.evaluation.ab_service import ExperimentError
+
+    foreign_prompt = _publish_prompt(
+        TENANT_OTHER, name="foreign", version=1, body="foreign", published=False
+    )
+    with pytest.raises(ExperimentError, match="this tenant"):
+        _define(
+            TENANT,
+            "foreign-prompt",
+            [{"name": "candidate", "weight": 1, "prompt_version_id": str(foreign_prompt)}],
+        )
 
 
 def test_another_tenant_neither_sees_nor_is_bucketed_by_our_experiment() -> None:

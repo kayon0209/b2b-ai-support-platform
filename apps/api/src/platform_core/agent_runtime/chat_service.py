@@ -32,6 +32,7 @@ from platform_core.config import get_settings
 from platform_core.evaluation.pii import redact_text
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.identity.usage import usage_snapshot
+from platform_core.orm_base import default_uuid
 from platform_core.support_bridge import inbox
 from platform_core.support_bridge.minimize import payload_hash
 from platform_core.support_bridge.models import InboxEvent, InboxEventStatus
@@ -542,6 +543,8 @@ async def queue_agent_run(
         # than through a channel id it does not have.
         "conversation_ref": str(conversation_ref_id),
     }
+    run_id = default_uuid()
+    minimized["agent_run_id"] = str(run_id)
     if external_ref is not None:
         # Only for callers that hold one. The worker derives from this when
         # `conversation_ref` is absent, and the channel delivery path reads it
@@ -559,23 +562,37 @@ async def queue_agent_run(
     if verified_account is not None:
         minimized["verified_account"] = verified_account
 
+    delivery_id = f"agent-run:{idem}"
     result = await inbox.persist_inbox_event(
         session,
         tenant_id=ctx.tenant_id,
-        delivery_id=f"agent-run:{idem}",
+        delivery_id=delivery_id,
         event_type="message_created",
         raw_body=b"",
         minimized_payload=minimized,
     )
     if result.duplicate:
-        return {
+        existing_payload = await session.scalar(
+            select(InboxEvent.minimized_payload).where(
+                InboxEvent.tenant_id == ctx.tenant_id,
+                InboxEvent.delivery_id == delivery_id,
+            )
+        )
+        existing_run_id = (
+            existing_payload.get("agent_run_id") if isinstance(existing_payload, dict) else None
+        )
+        response = {
             "status": RunStatus.QUEUED.value,
             "conversation_ref": str(conversation_ref_id),
             "duplicate": True,
             "idempotency_key": idem,
         }
+        if isinstance(existing_run_id, str):
+            response["run_id"] = existing_run_id
+        return response
 
     run = AgentRun(
+        id=run_id,
         tenant_id=ctx.tenant_id,
         conversation_ref_id=conversation_ref_id,
         route="knowledge_qa",

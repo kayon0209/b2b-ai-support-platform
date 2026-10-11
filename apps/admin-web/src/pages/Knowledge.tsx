@@ -13,7 +13,7 @@ import {
   EmptyState,
   ListTotal,
   PageHeader,
-  Spinner,
+  SkeletonRows,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { usePrompt } from "../components/Prompt";
@@ -143,7 +143,7 @@ export function Knowledge() {
             status={documents.errorStatus}
             onRetry={documents.reload}
           />
-          {documents.loading ? <Spinner label={t("knowledge.loadingDocuments")} /> : null}
+          {documents.loading ? <SkeletonRows rows={5} label={t("knowledge.loadingDocuments")} /> : null}
           {documents.data && documents.data.items.length === 0 ? (
             <EmptyState message={t("knowledge.emptyDocuments")} />
           ) : null}
@@ -397,7 +397,7 @@ function AliasTable({
       </div>
 
       <LoadError error={error} status={errorStatus ?? null} onRetry={onReload} />
-      {loading ? <Spinner label={t("knowledge.loadingAliases")} /> : null}
+      {loading ? <SkeletonRows rows={4} label={t("knowledge.loadingAliases")} /> : null}
       {!loading && aliases.length === 0 ? (
         <EmptyState message={t("knowledge.emptyAliases")} />
       ) : null}

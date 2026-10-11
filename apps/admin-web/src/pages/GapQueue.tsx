@@ -13,7 +13,7 @@ import {
   EmptyState,
   PageHeader,
   ListTotal,
-  Spinner,
+  SkeletonRows,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { usePrompt } from "../components/Prompt";
@@ -205,7 +205,7 @@ export function GapQueue() {
           </div>
 
           <LoadError error={gaps.error} status={gaps.errorStatus} onRetry={gaps.reload} />
-          {gaps.loading ? <Spinner label={t("gaps.loadingGaps")} /> : null}
+          {gaps.loading ? <SkeletonRows rows={5} label={t("gaps.loadingGaps")} /> : null}
           {gaps.data && gaps.data.items.length === 0 ? (
             <EmptyState message={t("gaps.emptyGaps")} />
           ) : null}
@@ -316,7 +316,7 @@ export function GapQueue() {
       ) : (
         <>
           <LoadError error={drafts.error} status={drafts.errorStatus} onRetry={drafts.reload} />
-          {drafts.loading ? <Spinner label={t("gaps.loadingDrafts")} /> : null}
+          {drafts.loading ? <SkeletonRows rows={5} label={t("gaps.loadingDrafts")} /> : null}
           {drafts.data && drafts.data.items.length === 0 ? (
             <EmptyState message={t("gaps.emptyDrafts")} />
           ) : null}
@@ -505,7 +505,9 @@ export function GapQueue() {
               status={releaseEvaluations.errorStatus}
               onRetry={releaseEvaluations.reload}
             />
-            {releaseEvaluations.loading ? <Spinner label={t("gaps.loadingReleaseEvidence")} /> : null}
+            {releaseEvaluations.loading ? (
+              <SkeletonRows rows={3} label={t("gaps.loadingReleaseEvidence")} />
+            ) : null}
             {releaseEvaluations.data?.items.length === 0 ? <p className="muted">{t("gaps.noReleaseEvidence")}</p> : null}
             {releaseEvaluations.data?.items.map((item) => (
               <div className="release-evidence-row" key={item.evaluation_id}>

@@ -6,8 +6,8 @@ import {
   UsersRound, X,
 } from "lucide-react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { isOneOf, useUrlState } from "../lib/urlState";
-import { Dialog } from "../components/ui";
+import { isOneOf, pageOffsetValue, parsePageOffset, useUrlState } from "../lib/urlState";
+import { Dialog, SkeletonRows } from "../components/ui";
 import { StandardFlowCatalog } from "../components/StandardFlowCatalog";
 import { TaskPanel } from "../components/TaskPanel";
 import { ToolCard, type ToolCardData } from "../components/ToolCard";
@@ -46,6 +46,7 @@ import "../styles-workbench.css";
 type Tab = WorkbenchQueueTab;
 /** Use the shared queue-tab contract for URL validation and rendering. */
 const ALL_TABS = WORKBENCH_QUEUE_TABS;
+const RESET_QUEUE_OFFSET = ["offset"] as const;
 type Action = "claim" | "release" | "transfer" | "close";
 type Origin = WorkbenchDraftOrigin;
 type DraftUpdateOptions = { dirty?: boolean; broadcast?: boolean; updatedAtMs?: number };
@@ -369,14 +370,16 @@ export function Workbench() {
   //
   // `isOneOf` is not decoration. A hand-edited or stale `?tab=whatever` would
   // otherwise put the page into a state no render path handles.
-  const [tabParam, setTabParam] = useUrlState("tab", "queue");
+  const [tabParam, setTabParam] = useUrlState("tab", "queue", { resetKeys: RESET_QUEUE_OFFSET });
   const tab: Tab = isOneOf(tabParam, ALL_TABS) ? tabParam : "queue";
   const setTab = (next: Tab) => setTabParam(next);
-  const [sortParam, setSortParam] = useUrlState("sort", "activity");
+  const [sortParam, setSortParam] = useUrlState("sort", "activity", { resetKeys: RESET_QUEUE_OFFSET });
   const sortMode: "activity" | "emotion" = sortParam === "emotion" ? "emotion" : "activity";
-  const [query, setQuery] = useUrlState("q", "");
+  const [query, setQuery] = useUrlState("q", "", { resetKeys: RESET_QUEUE_OFFSET });
   const [debouncedQuery, setDebouncedQuery] = useState("");
-  const [offset, setOffset] = useState(0);
+  const [offsetParam, setOffsetParam] = useUrlState("offset", "0");
+  const offset = parsePageOffset(offsetParam, 50);
+  const setOffset = (next: number) => setOffsetParam(pageOffsetValue(next, 50));
   const [queue, setQueue] = useState<QueueResponse | null>(null);
   const [detail, setDetail] = useState<Detail | null>(null);
   const [olderTurns, setOlderTurns] = useState<Turn[]>([]);
@@ -1079,7 +1082,6 @@ export function Workbench() {
   }
   function selectTab(next: Tab) {
     setTab(next);
-    setOffset(0);
     setMobileQueue(true);
   }
   async function submitEmotionCorrection() {
@@ -1288,7 +1290,6 @@ export function Workbench() {
             } else {
               setTab("queue");
             }
-            setOffset(0);
             setMobileQueue(true);
           }} aria-label="返回会话队列">
             <ChevronLeft size={20} />
@@ -1303,7 +1304,7 @@ export function Workbench() {
           <label className="wb-global-search">
             <Search size={17} aria-hidden="true" />
             <span className="sr-only">搜索会话、订单或关键词</span>
-            <input value={query} onChange={(event) => { setQuery(event.target.value); setOffset(0); }} placeholder="搜索会话、订单或关键词…" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索会话、订单或关键词…" />
           </label>
           <div className="wb-popover-anchor">
             <button type="button" className="wb-icon-btn wb-bell" onClick={() => setNotificationsOpen((open) => !open)} aria-label="查看待处理提醒" aria-expanded={notificationsOpen}>
@@ -1355,14 +1356,14 @@ export function Workbench() {
           </div>
           {queue?.emotion_advice_enabled ? <div className="wb-emotion-sort" aria-label="会话排序">
             <span>队列排序</span>
-            <button type="button" aria-pressed={sortMode === "activity"} className={sortMode === "activity" ? "active" : ""} onClick={() => { setSortParam("activity"); setOffset(0); }}>最近活动</button>
-            <button type="button" aria-pressed={sortMode === "emotion"} className={sortMode === "emotion" ? "active" : ""} onClick={() => { setSortParam("emotion"); setOffset(0); }}>优先关注</button>
+          <button type="button" aria-pressed={sortMode === "activity"} className={sortMode === "activity" ? "active" : ""} onClick={() => setSortParam("activity")}>最近活动</button>
+          <button type="button" aria-pressed={sortMode === "emotion"} className={sortMode === "emotion" ? "active" : ""} onClick={() => setSortParam("emotion")}>优先关注</button>
             <small>{sortMode === "emotion" ? "仅重排当前页 · 不改工单优先级" : "情绪建议仅供人工参考"}</small>
           </div> : null}
           <label className="wb-queue-search">
             <Search size={16} aria-hidden="true" />
             <span className="sr-only">搜索当前队列</span>
-            <input value={query} onChange={(event) => { setQuery(event.target.value); setOffset(0); }} placeholder="搜索会话、客户或订单号…" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索会话、客户或订单号…" />
           </label>
           <div
             id="wb-queue-panel"
@@ -1371,7 +1372,7 @@ export function Workbench() {
             aria-labelledby={`wb-queue-tab-${tab}`}
             tabIndex={0}
           >
-            {loadingQueue && !queue ? <p className="wb-muted wb-padding">正在加载会话…</p> : null}
+            {loadingQueue && !queue ? <SkeletonRows rows={6} label="正在加载会话…" /> : null}
             {!loadingQueue && queue?.items.length === 0 ? <div className="wb-queue-empty"><MessageCircle size={25} /><p>{query ? "没有匹配的会话" : "当前队列暂无会话"}</p></div> : null}
             {queue?.items.map((item) => {
               const sla = countdown(item.case?.first_responded_at
@@ -1402,7 +1403,9 @@ export function Workbench() {
 
         <section className="wb-conversation" aria-label="当前会话">
           {!selectedRef ? <div className="wb-center-empty"><Headset size={36} /><h2>选择一条会话开始接待</h2><p>待认领的对话会出现在左侧队列。</p></div> : null}
-          {selectedRef && (loadingDetail || !detailIsCurrent) ? <div className="wb-center-empty" role="status" aria-live="polite">正在打开会话…</div> : null}
+          {selectedRef && (loadingDetail || !detailIsCurrent) ? (
+            <SkeletonRows rows={4} label="正在打开会话…" />
+          ) : null}
           {detail && selectedRef === detail.conversation_ref ? <>
             <header className="wb-conversation-head">
               <div className="wb-contact-icon"><UsersRound size={19} /></div>

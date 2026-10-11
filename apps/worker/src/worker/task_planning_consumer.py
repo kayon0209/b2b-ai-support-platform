@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
@@ -20,6 +20,7 @@ from platform_core.outbox import OutboxEvent, OutboxStatus
 logger = JsonLogger("platform.worker")
 
 TASK_PLAN_BATCH = 5
+TASK_PLAN_MAX_ATTEMPTS = 3
 TASK_PLAN_IN_FLIGHT = "processing"
 STALE_TASK_PLAN_SECONDS = 600
 
@@ -30,6 +31,9 @@ class ClaimedTaskPlanning:
 
     event_id: uuid.UUID
     tenant_id: uuid.UUID
+    deadline_at: int | None = None
+    attempt: int = 1
+    external_attempt_limit: int = TASK_PLAN_MAX_ATTEMPTS
 
 
 async def claim_task_planning_events(
@@ -45,9 +49,51 @@ async def claim_task_planning_events(
     test claim one known event without touching neighboring tenants' queue
     entries. The normal poller omits them and claims the bounded global batch.
     """
-    stmt = select(OutboxEvent.id, OutboxEvent.event_id, OutboxEvent.tenant_id).where(
+    from platform_core.config import get_settings
+
+    settings = get_settings()
+    now = int(time.time())
+    await session.execute(
+        update(OutboxEvent)
+        .where(
+            OutboxEvent.event_type == TASK_PLANNING_EVENT_TYPE,
+            OutboxEvent.status == OutboxStatus.QUEUED.value,
+            OutboxEvent.attempts >= TASK_PLAN_MAX_ATTEMPTS,
+        )
+        .values(
+            status=OutboxStatus.FAILED.value,
+            processing_started_at=None,
+            last_error="task_planning_attempt_budget_exhausted",
+        )
+    )
+    expired = await session.execute(
+        update(OutboxEvent)
+        .where(
+            OutboxEvent.event_type == TASK_PLANNING_EVENT_TYPE,
+            OutboxEvent.status == OutboxStatus.QUEUED.value,
+            OutboxEvent.deadline_at <= now,
+        )
+        .values(status=OutboxStatus.FAILED.value, last_error="task_planning_deadline_exhausted")
+    )
+    expired_count = int(getattr(expired, "rowcount", 0) or 0)
+    if expired_count:
+        logger.error("task_planning_deadline_exhausted", count=expired_count)
+        get_metrics().inbox_events_total.labels(result="task_plan_deadline_exhausted").inc(
+            expired_count
+        )
+    stmt = select(
+        OutboxEvent.id,
+        OutboxEvent.event_id,
+        OutboxEvent.tenant_id,
+        OutboxEvent.attempts,
+        OutboxEvent.first_attempt_at,
+        OutboxEvent.deadline_at,
+        OutboxEvent.external_attempt_limit,
+    ).where(
         OutboxEvent.event_type == TASK_PLANNING_EVENT_TYPE,
         OutboxEvent.status == OutboxStatus.QUEUED.value,
+        OutboxEvent.attempts < TASK_PLAN_MAX_ATTEMPTS,
+        or_(OutboxEvent.deadline_at.is_(None), OutboxEvent.deadline_at > now),
     )
     if tenant_id is not None:
         stmt = stmt.where(OutboxEvent.tenant_id == tenant_id)
@@ -62,27 +108,95 @@ async def claim_task_planning_events(
     ).all()
     claims: list[ClaimedTaskPlanning] = []
     for row in rows:
+        first_attempt_at = int(row.first_attempt_at or now)
+        deadline_at = int(
+            row.deadline_at or first_attempt_at + settings.outbox_job_deadline_seconds
+        )
+        external_attempt_limit = int(
+            row.external_attempt_limit
+            or min(settings.outbox_event_max_external_attempts, TASK_PLAN_MAX_ATTEMPTS)
+        )
         await session.execute(
             update(OutboxEvent)
             .where(OutboxEvent.id == row.id)
-            .values(status=TASK_PLAN_IN_FLIGHT, processing_started_at=int(time.time()))
+            .values(
+                status=TASK_PLAN_IN_FLIGHT,
+                processing_started_at=now,
+                first_attempt_at=func.coalesce(OutboxEvent.first_attempt_at, now),
+                deadline_at=func.coalesce(OutboxEvent.deadline_at, deadline_at),
+                external_attempt_limit=func.coalesce(
+                    OutboxEvent.external_attempt_limit, external_attempt_limit
+                ),
+                attempts=OutboxEvent.attempts + 1,
+            )
         )
-        claims.append(ClaimedTaskPlanning(event_id=row.event_id, tenant_id=row.tenant_id))
+        claims.append(
+            ClaimedTaskPlanning(
+                event_id=row.event_id,
+                tenant_id=row.tenant_id,
+                deadline_at=deadline_at,
+                attempt=int(row.attempts) + 1,
+                external_attempt_limit=external_attempt_limit,
+            )
+        )
     return claims
 
 
 async def reclaim_stale_task_planning(session: AsyncSession) -> int:
     """Return claims from a stopped worker to the durable queue."""
-    cutoff = int(time.time()) - STALE_TASK_PLAN_SECONDS
-    result = await session.execute(
+    now = int(time.time())
+    cutoff = now - STALE_TASK_PLAN_SECONDS
+    stale = and_(
+        OutboxEvent.event_type == TASK_PLANNING_EVENT_TYPE,
+        OutboxEvent.status == TASK_PLAN_IN_FLIGHT,
+        OutboxEvent.processing_started_at < cutoff,
+    )
+    expired_queued = await session.execute(
         update(OutboxEvent)
         .where(
             OutboxEvent.event_type == TASK_PLANNING_EVENT_TYPE,
-            OutboxEvent.status == TASK_PLAN_IN_FLIGHT,
-            OutboxEvent.processing_started_at < cutoff,
+            OutboxEvent.status == OutboxStatus.QUEUED.value,
+            OutboxEvent.deadline_at <= now,
         )
+        .values(status=OutboxStatus.FAILED.value, last_error="task_planning_deadline_exhausted")
+    )
+    deadline_failed = await session.execute(
+        update(OutboxEvent)
+        .where(stale, OutboxEvent.deadline_at <= now)
+        .values(
+            status=OutboxStatus.FAILED.value,
+            processing_started_at=None,
+            last_error="task_planning_deadline_exhausted",
+        )
+    )
+    retryable_stale = and_(
+        stale,
+        or_(OutboxEvent.deadline_at.is_(None), OutboxEvent.deadline_at > now),
+    )
+    result = await session.execute(
+        update(OutboxEvent)
+        .where(retryable_stale, OutboxEvent.attempts < TASK_PLAN_MAX_ATTEMPTS)
         .values(status=OutboxStatus.QUEUED.value, processing_started_at=None)
     )
+    exhausted = await session.execute(
+        update(OutboxEvent)
+        .where(retryable_stale, OutboxEvent.attempts >= TASK_PLAN_MAX_ATTEMPTS)
+        .values(
+            status=OutboxStatus.FAILED.value,
+            processing_started_at=None,
+            last_error="task_planning_attempt_budget_exhausted",
+        )
+    )
+    exhausted_count = (
+        int(getattr(exhausted, "rowcount", 0) or 0)
+        + int(getattr(deadline_failed, "rowcount", 0) or 0)
+        + int(getattr(expired_queued, "rowcount", 0) or 0)
+    )
+    if exhausted_count:
+        logger.error("task_planning_attempt_budget_exhausted", count=exhausted_count)
+        get_metrics().inbox_events_total.labels(result="task_plan_retry_budget_exhausted").inc(
+            exhausted_count
+        )
     return int(getattr(result, "rowcount", 0) or 0)
 
 
@@ -155,20 +269,53 @@ async def process_task_planning_event(
     history = [(str(row.id), row.text_redacted) for row in reversed(history_rows)]
 
     try:
+        from platform_core.config import get_settings
+        from platform_core.execution_budget import ExecutionBudget, use_execution_budget
         from worker.inbox_consumer import _plan_conversation_tasks
 
-        await _plan_conversation_tasks(
-            session,
-            tenant_id=claim.tenant_id,
-            conversation_ref_id=conversation_ref_id,
-            question=turn.text_redacted,
-            history=history,
-            lease_owner_type="ai",
-            deps=deps,
-            turn_created_at=int(turn.ts or time.time()),
-            turn_id=str(turn.id),
-            raise_errors=True,
+        remaining = (
+            get_settings().outbox_job_deadline_seconds
+            if claim.deadline_at is None
+            else claim.deadline_at - int(time.time())
         )
+        if remaining <= 0:
+            await _finish(
+                session,
+                claim,
+                status=OutboxStatus.FAILED.value,
+                error="task_planning_deadline_exhausted",
+            )
+            get_metrics().inbox_events_total.labels(result="task_plan_deadline_exhausted").inc()
+            return "failed"
+        base, remainder = divmod(claim.external_attempt_limit, TASK_PLAN_MAX_ATTEMPTS)
+        model_attempts = base + (1 if claim.attempt <= remainder else 0)
+        if model_attempts < 1:
+            await _finish(
+                session,
+                claim,
+                status=OutboxStatus.FAILED.value,
+                error="task_planning_attempt_budget_exhausted",
+            )
+            get_metrics().inbox_events_total.labels(result="task_plan_retry_budget_exhausted").inc()
+            return "failed"
+        budget = ExecutionBudget.for_seconds(
+            deadline_seconds=min(3.0, float(remaining)),
+            max_attempts=model_attempts,
+            operation_limits={"model": model_attempts, "tool": 0, "outbound": 0},
+        )
+        with use_execution_budget(budget):
+            await _plan_conversation_tasks(
+                session,
+                tenant_id=claim.tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                question=turn.text_redacted,
+                history=history,
+                lease_owner_type="ai",
+                deps=deps,
+                turn_created_at=int(turn.ts or time.time()),
+                turn_id=str(turn.id),
+                raise_errors=True,
+            )
     except Exception as exc:  # noqa: BLE001 - record failure without poisoning the worker
         await _finish(
             session,

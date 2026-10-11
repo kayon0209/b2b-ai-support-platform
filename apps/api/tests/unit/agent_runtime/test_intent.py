@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from platform_core.agent_runtime.intent import (
+    PRE_RETRIEVAL_ROUTES,
     IntentAction,
     IntentKind,
     Route,
@@ -37,6 +38,15 @@ def test_a_refund_question_and_a_refund_request_are_not_the_same() -> None:
     assert question.route is Route.KNOWLEDGE_QA
     assert request.primary_kind is IntentKind.BUSINESS_ACTION
     assert request.route is Route.BUSINESS_WRITE
+
+
+def test_non_knowledge_routes_are_settled_before_retrieval() -> None:
+    assert Route.HUMAN_REQUIRED.value in PRE_RETRIEVAL_ROUTES
+    assert Route.SENSITIVE.value in PRE_RETRIEVAL_ROUTES
+    assert Route.OUT_OF_SCOPE.value in PRE_RETRIEVAL_ROUTES
+    # Live business reads are attempted before RAG; verified tool evidence
+    # replaces corpus retrieval when the connector answers.
+    assert Route.BUSINESS_READ.value not in PRE_RETRIEVAL_ROUTES
 
 
 def test_a_procedure_question_is_not_a_write() -> None:

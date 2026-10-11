@@ -4,7 +4,14 @@ import { useSearchParams } from "react-router-dom";
 import { apiGet, apiPatch } from "../lib/api";
 import { newIdempotencyKey } from "../lib/idempotency";
 import { useAsync } from "../lib/useAsync";
-import { ActionFeedback, Badge, Card, EmptyState, PageHeader, Spinner } from "../components/ui";
+import {
+  ActionFeedback,
+  Badge,
+  Card,
+  EmptyState,
+  PageHeader,
+  SkeletonRows,
+} from "../components/ui";
 
 type Account = {
   account_id: string;
@@ -75,13 +82,13 @@ export function Customers() {
     <div className="grid-case">
       <Card title="企业客户">
         <label className="customer-search"><Search size={16} /><span className="visually-hidden">搜索客户</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索企业名称或 CRM 编号" /></label>
-        {list.loading ? <Spinner /> : null}
+        {list.loading ? <SkeletonRows rows={5} label="正在加载客户…" /> : null}
         {!list.loading && filtered.length === 0 ? <EmptyState message="没有匹配的企业客户。" /> : null}
         <ul className="case-list">{filtered.map((account) => <li key={account.account_id}><button type="button" className={`case-row${selected === account.account_id ? " active" : ""}`} onClick={() => choose(account.account_id)}><span className="case-subject"><Building2 size={16} /> {account.name}</span><span className="case-meta"><Badge tone={account.contract_status === "active" ? "good" : "warn"}>{account.tier}</Badge></span></button></li>)}</ul>
       </Card>
       <div>
         {!selected ? <Card title="客户资料"><EmptyState message="选择左侧企业查看资料。" /></Card> : null}
-        {detail.loading ? <Spinner /> : null}
+        {detail.loading ? <SkeletonRows rows={4} label="正在加载客户资料…" /> : null}
         {detail.data?.account ? <>
           <Card title="企业资料">
             <div className="customer-detail-head"><div><h2>{detail.data.account.name}</h2><p className="muted">CRM：{detail.data.account.external_crm_ref || "未记录"}</p></div><button className="btn" type="button" onClick={() => setEditing((current) => !current)}>{editing ? "取消编辑" : "编辑企业名称"}</button></div>

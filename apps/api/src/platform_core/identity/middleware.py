@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # from connector configuration - `integrations/inbound.py`).
 EXEMPT_PATHS = {
     "/healthz",
+    "/readyz",
     # Prometheus scrapes on a timer and cannot present a bearer token. The
     # endpoint is safe to exempt only because no metric it serves carries a
     # tenant-identifying label; see observability_router for the full

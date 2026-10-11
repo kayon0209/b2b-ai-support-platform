@@ -21,7 +21,9 @@ injected so policy gates can be tested without a live Keycloak.
 
 import json
 import os
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -56,6 +58,8 @@ JIRA_TOOL = "jira.create_issue"
 # The CRM write tool: also connector-backed, but the connector must claim
 # `update_account` before the resolver will build an executor.
 CRM_TOOL = "crm.update_account"
+CASE_CREATE_TOOL = "case.create"
+ACCOUNT_A = "01900000-0000-7000-8000-0000000000d1"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -78,6 +82,34 @@ def seed_tenants_and_tools() -> None:
                 ),
                 {"id": tid, "slug": slug},
             )
+            for role in ("support_admin", "support_agent"):
+                actor_id = _actor_id(tid, role)
+                conn.execute(
+                    text(
+                        "INSERT INTO users (id, primary_email, display_name, is_service_account) "
+                        "VALUES (:id, :email, 'M2 integration actor', false) "
+                        "ON CONFLICT (id) DO NOTHING"
+                    ),
+                    {"id": actor_id, "email": f"{actor_id}@m2-api.test"},
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO memberships (id, tenant_id, user_id, role, status) "
+                        "VALUES (gen_random_uuid(), :tenant, :user, :role, 'active') "
+                        "ON CONFLICT (tenant_id, user_id) DO UPDATE "
+                        "SET role = EXCLUDED.role, status = 'active'"
+                    ),
+                    {"tenant": tid, "user": actor_id, "role": role},
+                )
+        conn.execute(
+            text(
+                "INSERT INTO enterprise_accounts "
+                "(id, tenant_id, name, tier, contract_status, attributes, created_at, updated_at) "
+                "VALUES (:id, :tenant, 'M2 compensation account', 'standard', 'active', "
+                "'{}'::jsonb, 0, 0) ON CONFLICT (id) DO NOTHING"
+            ),
+            {"id": ACCOUNT_A, "tenant": TENANT_A},
+        )
         conn.execute(
             text(
                 "INSERT INTO tool_definitions (id, tenant_id, name, version, risk, "
@@ -121,6 +153,19 @@ def seed_tenants_and_tools() -> None:
                     '"required":["account_ref"]}',
                     "reqconf": True,
                 },
+                {
+                    "name": CASE_CREATE_TOOL,
+                    "risk": "confirmed_write",
+                    "inschema": (
+                        '{"type":"object","properties":{'
+                        '"enterprise_account_id":{"type":"string"},'
+                        '"subject":{"type":"string"},"description":{"type":"string"},'
+                        '"priority":{"type":"string"},"category":{"type":"string"}},'
+                        '"required":["enterprise_account_id","subject"],'
+                        '"additionalProperties":false}'
+                    ),
+                    "reqconf": True,
+                },
             ],
         )
     yield
@@ -136,7 +181,30 @@ def _cleanup(admin: Any) -> None:
     proposal still points at it.
     """
     with admin.begin() as conn:
-        names = (CONFIRMED_TOOL, LOW_RISK_TOOL, JIRA_TOOL, CRM_TOOL)
+        names = (CONFIRMED_TOOL, LOW_RISK_TOOL, JIRA_TOOL, CRM_TOOL, CASE_CREATE_TOOL)
+        actor_ids = [
+            _actor_id(tid, role)
+            for tid in (TENANT_A, TENANT_B)
+            for role in ("support_admin", "support_agent")
+        ]
+        conn.execute(
+            text(
+                "DELETE FROM tool_execution_compensations WHERE proposal_id IN ("
+                "  SELECT p.id FROM tool_proposals p"
+                "  JOIN tool_definitions d ON d.id = p.tool_definition_id"
+                "  WHERE d.name = ANY(:names))"
+            ),
+            {"names": list(names)},
+        )
+        conn.execute(
+            text(
+                "DELETE FROM tool_execution_reconciliations WHERE proposal_id IN ("
+                "  SELECT p.id FROM tool_proposals p"
+                "  JOIN tool_definitions d ON d.id = p.tool_definition_id"
+                "  WHERE d.name = ANY(:names))"
+            ),
+            {"names": list(names)},
+        )
         conn.execute(
             text(
                 "DELETE FROM tool_executions WHERE proposal_id IN ("
@@ -182,6 +250,10 @@ def _cleanup(admin: Any) -> None:
             {"t1": TENANT_A, "t2": TENANT_B},
         )
         conn.execute(
+            text("DELETE FROM enterprise_accounts WHERE tenant_id IN (:t1, :t2)"),
+            {"t1": TENANT_A, "t2": TENANT_B},
+        )
+        conn.execute(
             text("DELETE FROM audit_events WHERE tenant_id IN (:t1, :t2)"),
             {"t1": TENANT_A, "t2": TENANT_B},
         )
@@ -193,6 +265,8 @@ def _cleanup(admin: Any) -> None:
             text("DELETE FROM inbox_events WHERE tenant_id IN (:t1, :t2)"),
             {"t1": TENANT_A, "t2": TENANT_B},
         )
+        conn.execute(text("DELETE FROM memberships WHERE user_id = ANY(:ids)"), {"ids": actor_ids})
+        conn.execute(text("DELETE FROM users WHERE id = ANY(:ids)"), {"ids": actor_ids})
         # Runs, and their citations. Every `POST /agent-runs` in this file
         # leaves a `queued` placeholder behind, and once the tenant row is
         # deleted those runs belong to nobody: no tenant-scoped sweep can ever
@@ -214,6 +288,10 @@ def _cleanup(admin: Any) -> None:
             conn.execute(text("DELETE FROM tenants WHERE slug = :slug"), {"slug": slug})
 
 
+def _actor_id(tenant_id: str, role: str) -> uuid.UUID:
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"actor:{tenant_id}-{role}")
+
+
 class _RoleResolver:
     """Fabricate a TenantContext with a fixed tenant and role.
 
@@ -225,7 +303,7 @@ class _RoleResolver:
     def __init__(self, tenant_id: str, role: str | None) -> None:
         self._tenant_id = tenant_id
         self._role = role
-        self._actor = uuid.uuid5(uuid.NAMESPACE_URL, f"actor:{tenant_id}-{role}")
+        self._actor = _actor_id(tenant_id, str(role))
 
     async def __call__(self, request: object) -> TenantContext:
         return TenantContext(
@@ -236,7 +314,9 @@ class _RoleResolver:
         )
 
 
-def _client(tenant_id: str, role: str | None) -> TestClient:
+def _client(
+    tenant_id: str, role: str | None, *, raise_server_exceptions: bool = False
+) -> TestClient:
     """Build a fresh app sharing the real routers under a fabricated role.
 
     A fresh FastAPI instance is required because middleware cannot be added
@@ -249,7 +329,7 @@ def _client(tenant_id: str, role: str | None) -> TestClient:
     for route in main_mod.app.router.routes:
         fresh.router.routes.append(route)
     fresh.add_middleware(TenantContextMiddleware, resolver=_RoleResolver(tenant_id, role))
-    return TestClient(fresh, raise_server_exceptions=False)
+    return TestClient(fresh, raise_server_exceptions=raise_server_exceptions)
 
 
 def _auth() -> dict[str, str]:
@@ -484,6 +564,130 @@ def test_confirmed_write_tool_requires_confirmation_before_execute() -> None:
     )
     assert blocked.status_code == 409
     assert blocked.json()["error"]["code"] == "CONFIRMATION_REQUIRED"
+
+
+def test_confirmation_rechecks_membership_after_request_identity_was_resolved() -> None:
+    """A stale request role cannot create confirmation after a live demotion."""
+    actor_id = _actor_id(TENANT_A, "support_admin")
+    admin = create_engine(ADMIN_URL)
+    client = _client(TENANT_A, "support_admin")
+    proposed = client.post(
+        "/v1/tool-proposals",
+        headers={**_auth(), "Idempotency-Key": "membership-confirm-proposal"},
+        json={"tool_name": CONFIRMED_TOOL, "arguments": {"amount": 500}},
+    )
+    assert proposed.status_code == 200, proposed.text
+    proposal_id = proposed.json()["proposal"]["proposal_id"]
+    try:
+        with admin.begin() as conn:
+            conn.execute(
+                text("UPDATE memberships SET role = 'support_viewer' WHERE user_id = :actor"),
+                {"actor": actor_id},
+            )
+
+        confirmation = client.post(
+            f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={}
+        )
+        assert confirmation.status_code == 403, confirmation.text
+        assert confirmation.json()["error"]["code"] == "ACTOR_PERMISSION_REVOKED"
+        with admin.connect() as conn:
+            count = conn.execute(
+                text("SELECT count(*) FROM action_confirmations WHERE proposal_id = :proposal"),
+                {"proposal": proposal_id},
+            ).scalar_one()
+        assert count == 0
+    finally:
+        with admin.begin() as conn:
+            conn.execute(
+                text("UPDATE memberships SET role = 'support_admin' WHERE user_id = :actor"),
+                {"actor": actor_id},
+            )
+        admin.dispose()
+
+
+def test_permission_revocation_racing_execution_fences_gateway_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A revocation holding the membership row wins before ToolExecution intent."""
+    from platform_core.tool_gateway import router as router_mod
+
+    actor_id = _actor_id(TENANT_A, "support_admin")
+    client = _client(TENANT_A, "support_admin")
+    calls: list[str] = []
+
+    class _Executor:
+        async def execute(
+            self, tool_name: str, parameters: dict[str, Any], idempotency_key: str
+        ) -> dict[str, Any]:
+            calls.append(idempotency_key)
+            return {"accepted": True}
+
+        async def verify_postcondition(
+            self, tool_name: str, parameters: dict[str, Any], output: dict[str, Any]
+        ) -> bool:
+            return True
+
+    async def _resolve(*_args: Any, **_kwargs: Any) -> dict[str, _Executor]:
+        return {CONFIRMED_TOOL: _Executor()}
+
+    monkeypatch.setattr(router_mod, "resolve_executors", _resolve)
+    proposed = client.post(
+        "/v1/tool-proposals",
+        headers={**_auth(), "Idempotency-Key": "membership-race-proposal"},
+        json={"tool_name": CONFIRMED_TOOL, "arguments": {"amount": 500}},
+    )
+    assert proposed.status_code == 200, proposed.text
+    proposal_id = proposed.json()["proposal"]["proposal_id"]
+    confirmed = client.post(f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={})
+    assert confirmed.status_code == 200, confirmed.text
+
+    admin = create_engine(ADMIN_URL)
+    connection = admin.connect()
+    transaction = connection.begin()
+    try:
+        connection.execute(
+            text("UPDATE memberships SET role = 'support_viewer' WHERE user_id = :actor"),
+            {"actor": actor_id},
+        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(
+                client.post,
+                f"/v1/tool-proposals/{proposal_id}/execute",
+                headers={**_auth(), "Idempotency-Key": "membership-race-execute"},
+                json={},
+            )
+            # The request blocks on the membership row until revocation commits.
+            time.sleep(0.15)
+            was_waiting_on_revocation = not pending.done()
+            transaction.commit()
+            response = pending.result(timeout=15)
+
+        assert was_waiting_on_revocation
+        assert response.status_code in (403, 409), response.text
+        assert response.json()["error"]["code"] in {
+            "ACTOR_PERMISSION_REVOKED",
+            "AUTHORIZATION_STATE_CHANGED",
+        }
+        assert calls == []
+        with admin.connect() as conn:
+            count = conn.execute(
+                text(
+                    "SELECT count(*) FROM tool_executions "
+                    "WHERE tenant_id = :tenant AND proposal_id = :proposal"
+                ),
+                {"tenant": TENANT_A, "proposal": proposal_id},
+            ).scalar_one()
+        assert count == 0
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
+        with admin.begin() as conn:
+            conn.execute(
+                text("UPDATE memberships SET role = 'support_admin' WHERE user_id = :actor"),
+                {"actor": actor_id},
+            )
+        admin.dispose()
 
 
 def test_low_risk_tool_cannot_be_confirmed_unnecessarily() -> None:
@@ -986,6 +1190,274 @@ def test_execute_is_idempotent_under_retry() -> None:
     finally:
         registry_mod.default_factories = original
         _clear_connectors(TENANT_A)
+
+
+def test_unknown_execution_reconciles_without_replay_and_is_idempotent() -> None:
+    """A human resolves the stored attempt; reconciliation never calls the adapter."""
+    import importlib
+
+    from platform_core.integrations.sdk import ConnectorContext
+    from platform_core.tool_gateway import registry as registry_mod
+
+    calls: list[str] = []
+
+    class _AmbiguousJira:
+        def __init__(self, context: ConnectorContext) -> None:
+            self.context = context
+
+        async def execute(
+            self, tool_name: str, parameters: dict[str, Any], idempotency_key: str
+        ) -> dict[str, Any] | None:
+            calls.append(idempotency_key)
+            return {"ok": True, "issue_key": "SUP-43"}
+
+        async def verify_postcondition(
+            self,
+            tool_name: str,
+            parameters: dict[str, Any],
+            output: dict[str, Any] | None,
+        ) -> bool | None:
+            return None
+
+    _clear_connectors(TENANT_A)
+    _seed_connector(TENANT_A, "jira", ["create_issue"])
+    original = registry_mod.default_factories
+
+    def _patched() -> dict[str, registry_mod.AdapterFactory]:
+        factories = dict(original())
+        factories["jira"] = registry_mod.AdapterFactory(provider="jira", build=_AmbiguousJira)
+        return factories
+
+    registry_mod.default_factories = _patched
+    try:
+        importlib.import_module("platform_core.main")
+        client = _client(TENANT_A, "support_admin", raise_server_exceptions=True)
+        proposed = client.post(
+            "/v1/tool-proposals",
+            headers={**_auth(), "Idempotency-Key": "unknown-reconcile-proposal"},
+            json={
+                "tool_name": JIRA_TOOL,
+                "arguments": {"title": "Ambiguous provider receipt"},
+            },
+        )
+        assert proposed.status_code == 200, proposed.text
+        proposal_id = proposed.json()["proposal"]["proposal_id"]
+        confirmed = client.post(
+            f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={}
+        )
+        assert confirmed.status_code == 200, confirmed.text
+
+        executed = client.post(
+            f"/v1/tool-proposals/{proposal_id}/execute",
+            headers={**_auth(), "Idempotency-Key": "unknown-reconcile-execute"},
+            json={},
+        )
+        assert executed.status_code == 200, executed.text
+        assert executed.json()["execution"]["status"] == "unknown"
+        assert executed.json()["execution"]["verification_status"] == "unknown"
+
+        replay = client.post(
+            f"/v1/tool-proposals/{proposal_id}/execute",
+            headers={**_auth(), "Idempotency-Key": "unknown-reconcile-execute"},
+            json={},
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["execution"]["status"] == "unknown"
+        assert len(calls) == 1
+
+        reconciled = client.post(
+            f"/v1/tool-proposals/{proposal_id}/reconcile",
+            headers={**_auth(), "Idempotency-Key": "unknown-reconcile-record"},
+            json={"decision": "applied", "evidence_reference": "SUP-43"},
+        )
+        assert reconciled.status_code == 200, reconciled.text
+        payload = reconciled.json()
+        assert payload["execution"]["status"] == "executed"
+        assert payload["execution"]["verification_status"] == "verified"
+        assert payload["reconciliation"]["decision"] == "applied"
+        assert len(calls) == 1, "reconciliation must not dispatch another provider write"
+
+        repeated_reconciliation = client.post(
+            f"/v1/tool-proposals/{proposal_id}/reconcile",
+            headers={**_auth(), "Idempotency-Key": "unknown-reconcile-record"},
+            json={"decision": "applied", "evidence_reference": "SUP-43"},
+        )
+        assert repeated_reconciliation.status_code == 200
+        assert repeated_reconciliation.json()["replayed"] is True
+        assert (
+            repeated_reconciliation.json()["reconciliation"]["reconciliation_id"]
+            == payload["reconciliation"]["reconciliation_id"]
+        )
+
+        conflict = client.post(
+            f"/v1/tool-proposals/{proposal_id}/reconcile",
+            headers={**_auth(), "Idempotency-Key": "unknown-reconcile-record"},
+            json={"decision": "not_applied", "evidence_reference": "SUP-44"},
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+        detail = client.get(f"/v1/tool-proposals/{proposal_id}", headers=_auth())
+        assert detail.status_code == 200, detail.text
+        assert len(detail.json()["reconciliations"]) == 1
+        assert detail.json()["reconciliations"][0]["decision"] == "applied"
+
+        admin = create_engine(ADMIN_URL)
+        with admin.connect() as conn:
+            stored_key = conn.execute(
+                text("SELECT idempotency_key FROM tool_executions WHERE proposal_id = :proposal"),
+                {"proposal": proposal_id},
+            ).scalar_one()
+            reconciliation_count = conn.execute(
+                text(
+                    "SELECT count(*) FROM tool_execution_reconciliations "
+                    "WHERE tenant_id = :tenant AND proposal_id = :proposal"
+                ),
+                {"tenant": TENANT_A, "proposal": proposal_id},
+            ).scalar_one()
+        admin.dispose()
+        assert stored_key == "unknown-reconcile-proposal"
+        assert reconciliation_count == 1
+    finally:
+        registry_mod.default_factories = original
+        _clear_connectors(TENANT_A)
+
+
+def test_case_create_compensation_closes_and_preserves_an_untouched_case() -> None:
+    client = _client(TENANT_A, "support_admin")
+    proposed = client.post(
+        "/v1/tool-proposals",
+        headers={**_auth(), "Idempotency-Key": "case-compensation-proposal"},
+        json={
+            "tool_name": CASE_CREATE_TOOL,
+            "arguments": {
+                "enterprise_account_id": ACCOUNT_A,
+                "subject": "Synthetic case opened in error",
+                "description": "Fixture for the business-specific compensator.",
+            },
+        },
+    )
+    assert proposed.status_code == 200, proposed.text
+    proposal_id = proposed.json()["proposal"]["proposal_id"]
+    confirmed = client.post(f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={})
+    assert confirmed.status_code == 200, confirmed.text
+    executed = client.post(
+        f"/v1/tool-proposals/{proposal_id}/execute",
+        headers={**_auth(), "Idempotency-Key": "case-compensation-execute"},
+        json={},
+    )
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["execution"]["status"] == "executed"
+    assert executed.json()["execution"]["verification_status"] == "verified"
+    case_id = executed.json()["execution"]["output"]["case_id"]
+
+    compensated = client.post(
+        f"/v1/tool-proposals/{proposal_id}/compensate",
+        headers={**_auth(), "Idempotency-Key": "case-compensation-close"},
+        json={"reason_code": "created_in_error"},
+    )
+    assert compensated.status_code == 200, compensated.text
+    result = compensated.json()["compensation"]
+    assert result["outcome"] == "succeeded"
+    assert result["action"] == "case_create_close_unmodified"
+    assert result["case_id"] == case_id
+    assert result["result"]["status"] == "closed"
+    assert result["result"]["version"] == 2
+
+    replay = client.post(
+        f"/v1/tool-proposals/{proposal_id}/compensate",
+        headers={**_auth(), "Idempotency-Key": "case-compensation-close"},
+        json={"reason_code": "created_in_error"},
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True
+    assert replay.json()["compensation"]["compensation_id"] == result["compensation_id"]
+    conflict = client.post(
+        f"/v1/tool-proposals/{proposal_id}/compensate",
+        headers={**_auth(), "Idempotency-Key": "case-compensation-close"},
+        json={"reason_code": "duplicate_case"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    detail = client.get(f"/v1/tool-proposals/{proposal_id}", headers=_auth())
+    assert detail.status_code == 200
+    assert len(detail.json()["compensations"]) == 1
+    admin = create_engine(ADMIN_URL)
+    with admin.connect() as conn:
+        status, version = conn.execute(
+            text("SELECT status, version FROM cases WHERE tenant_id = :tenant AND id = :case"),
+            {"tenant": TENANT_A, "case": case_id},
+        ).one()
+    admin.dispose()
+    assert (status, version) == ("closed", 2)
+
+
+def test_case_create_compensation_refuses_to_undo_later_case_work() -> None:
+    client = _client(TENANT_A, "support_admin")
+    proposed = client.post(
+        "/v1/tool-proposals",
+        headers={**_auth(), "Idempotency-Key": "case-compensation-stale-proposal"},
+        json={
+            "tool_name": CASE_CREATE_TOOL,
+            "arguments": {
+                "enterprise_account_id": ACCOUNT_A,
+                "subject": "Synthetic case with later work",
+            },
+        },
+    )
+    assert proposed.status_code == 200, proposed.text
+    proposal_id = proposed.json()["proposal"]["proposal_id"]
+    confirmed = client.post(f"/v1/tool-proposals/{proposal_id}/confirm", headers=_auth(), json={})
+    assert confirmed.status_code == 200, confirmed.text
+    executed = client.post(
+        f"/v1/tool-proposals/{proposal_id}/execute",
+        headers={**_auth(), "Idempotency-Key": "case-compensation-stale-execute"},
+        json={},
+    )
+    assert executed.status_code == 200, executed.text
+    case_id = executed.json()["execution"]["output"]["case_id"]
+    changed = client.post(
+        f"/v1/cases/{case_id}/commands",
+        headers={**_auth(), "Idempotency-Key": "case-compensation-priority-change"},
+        json={
+            "command": "change_priority",
+            "expected_version": 1,
+            "parameters": {"priority": "p1"},
+            "reason": "Synthetic operator follow-up",
+        },
+    )
+    assert changed.status_code == 200, changed.text
+
+    compensated = client.post(
+        f"/v1/tool-proposals/{proposal_id}/compensate",
+        headers={**_auth(), "Idempotency-Key": "case-compensation-stale-close"},
+        json={"reason_code": "created_in_error"},
+    )
+    assert compensated.status_code == 200, compensated.text
+    result = compensated.json()["compensation"]
+    assert result["outcome"] == "failed"
+    assert result["result"]["error_code"] == "COMPENSATION_TARGET_CHANGED"
+
+    admin = create_engine(ADMIN_URL)
+    with admin.connect() as conn:
+        status, priority, version = conn.execute(
+            text(
+                "SELECT status, priority, version FROM cases "
+                "WHERE tenant_id = :tenant AND id = :case"
+            ),
+            {"tenant": TENANT_A, "case": case_id},
+        ).one()
+        stored_outcome = conn.execute(
+            text(
+                "SELECT outcome FROM tool_execution_compensations "
+                "WHERE tenant_id = :tenant AND execution_id = :execution"
+            ),
+            {"tenant": TENANT_A, "execution": executed.json()["execution"]["execution_id"]},
+        ).scalar_one()
+    admin.dispose()
+    assert (status, priority, version) == ("new", "p1", 2)
+    assert stored_outcome == "failed"
 
 
 def test_crm_connector_without_update_capability_cannot_execute() -> None:

@@ -82,9 +82,11 @@ PROBES: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "the source is importable",
+        "APP_ENVIRONMENT=test APP_ALLOW_BOOTSTRAP_TOKENS=true "
         'python -c "import platform_core.main"',
         "PYTHONPATH has to actually resolve, or every probe above is measuring "
-        "a container that cannot serve",
+        "a container that cannot serve. Test-only auth settings let the module "
+        "load without weakening the production image's authentication defaults.",
     ),
 )
 

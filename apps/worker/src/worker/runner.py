@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from observability import JsonLogger
+from observability_metrics import get_metrics, platform_range_labels
 from platform_core.agent_runtime.orchestrator import OrchestratorDeps
 from worker.inbox_consumer import drain_once
 from worker.ingestion_consumer import drain_ingestion_once
@@ -140,11 +141,19 @@ async def _run_poll_loop(
       transient blips hours apart never accumulate into a shutdown.
     """
     logger.info("worker_started", queue=name)
+    if name not in platform_range_labels("worker_queue"):
+        raise ValueError("worker loop name is not in the bounded metrics vocabulary")
     consecutive_failures = 0
     while not stopping():
+        cycle_started = time.monotonic()
         try:
             processed = await cycle()
         except Exception as exc:  # noqa: BLE001 - classified below
+            metrics = get_metrics()
+            metrics.worker_cycles_total.labels(queue=name, result="error").inc()
+            metrics.worker_cycle_seconds.labels(queue=name).observe(
+                max(0.0, time.monotonic() - cycle_started)
+            )
             consecutive_failures += 1
             logger.error(
                 "worker_cycle_failed",
@@ -159,6 +168,12 @@ async def _run_poll_loop(
                 raise
             await asyncio.sleep(_backoff_seconds(config, consecutive_failures))
             continue
+        metrics = get_metrics()
+        metrics.worker_cycles_total.labels(queue=name, result="success").inc()
+        metrics.worker_cycle_seconds.labels(queue=name).observe(
+            max(0.0, time.monotonic() - cycle_started)
+        )
+        metrics.worker_last_success_timestamp_seconds.labels(queue=name).set(time.time())
         consecutive_failures = 0
         if processed == 0:
             await asyncio.sleep(config.poll_interval_seconds)
@@ -556,8 +571,26 @@ def main() -> None:
         logger.error("worker_misconfigured", error_code=type(exc).__name__)
         raise
 
+    def run_worker(coro_factory: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        """Start an optional, bounded-cardinality scrape endpoint for this process."""
+        if os.environ.get("APP_WORKER_METRICS_ENABLED", "false").strip().lower() != "true":
+            run(coro_factory())
+            return
+        from worker.metrics_server import WorkerMetricsServer
+
+        host = os.environ.get("APP_WORKER_METRICS_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        raw_port = os.environ.get("APP_WORKER_METRICS_PORT", "8001")
+        try:
+            port = int(raw_port)
+        except ValueError as exc:
+            raise WorkerConfigurationError("APP_WORKER_METRICS_PORT must be an integer") from exc
+        if port < 1 or port > 65535:
+            raise WorkerConfigurationError("APP_WORKER_METRICS_PORT must be between 1 and 65535")
+        with WorkerMetricsServer(queue=queue, host=host, port=port):
+            run(coro_factory())
+
     if queue == ROLE_OUTBOX:
-        run(_run_outbox_only())
+        run_worker(_run_outbox_only)
         return
 
     if queue == ROLE_RELEASE_EVALUATOR:
@@ -570,26 +603,26 @@ def main() -> None:
             has_embedding=True,
             max_cases_per_run=runtime.max_cases_per_run,
         )
-        run(_run_release_evaluator(runtime))
+        run_worker(lambda: _run_release_evaluator(runtime))
         return
 
     if queue == ROLE_INGESTION:
         ingestion_deps = build_ingestion_deps()
         logger.info("worker_wiring", queue=queue, has_embedding=ingestion_deps.can_embed)
-        run(_run_ingestion_only(ingestion_deps))
+        run_worker(lambda: _run_ingestion_only(ingestion_deps))
         return
 
     if queue == ROLE_RETENTION:
         # No wiring: the sweep needs no external collaborator.
         logger.info("worker_wiring", queue=queue)
-        run(_run_retention_only())
+        run_worker(_run_retention_only)
         return
 
     if queue == ROLE_SLA:
         # No wiring either: the breach scan reads Cases and writes its own
         # ledger. It notifies through the outbox, which is the relay's job.
         logger.info("worker_wiring", queue=queue)
-        run(_run_sla_only())
+        run_worker(_run_sla_only)
         return
 
     # Real collaborators, assembled in one place. `build_interactive_deps`
@@ -604,7 +637,7 @@ def main() -> None:
         # answered".
         logger.warning("worker_cannot_send", reason_code="NO_OUTBOUND_TRANSPORT")
 
-    run(_run_both(interactive_deps))
+    run_worker(lambda: _run_both(interactive_deps))
 
 
 async def _run_both(deps: OrchestratorDeps) -> None:

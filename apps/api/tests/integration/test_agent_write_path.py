@@ -63,7 +63,15 @@ def _factory(engine):
 
 
 async def _with_ctx(session, tenant_id: str) -> None:
-    await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+    from platform_core.identity.tenant_context import (
+        TenantContext,
+        apply_rls_tenant,
+        bind_tenant_on_every_transaction,
+    )
+
+    ctx = TenantContext(tenant_id=uuid.UUID(tenant_id), actor_id=None, actor_kind="system")
+    bind_tenant_on_every_transaction(session, ctx)
+    await apply_rls_tenant(session, ctx)
 
 
 def _seed_tenant() -> None:

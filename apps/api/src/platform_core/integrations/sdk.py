@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+from platform_core.execution_budget import AttemptBudgetExhausted, current_execution_budget
 from platform_core.integrations.resilience import (
     CircuitBreaker,
     retry_delays,
@@ -60,6 +61,7 @@ def _jitter_ratio() -> float:
 
 
 AUTH_FAILURE_STATUS = {401, 403}
+RETRY_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 # The error *codes* an adapter reports for a rejected credential. Declared
 # next to the status set they are derived from so a reader changing one sees
@@ -145,6 +147,7 @@ class ConnectorAdapter(ABC):
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         max_retries: int = 2,
+        retry_safe: bool | None = None,
         connect_timeout: float = 3.0,
         total_timeout: float = 10.0,
     ) -> ExecutionResult:
@@ -160,6 +163,9 @@ class ConnectorAdapter(ABC):
         after exhausting retries report ambiguous=True for writes.
         """
         started = time.monotonic()
+        safe_to_retry = method.upper() in RETRY_SAFE_METHODS if retry_safe is None else retry_safe
+        effective_retries = max_retries if safe_to_retry else 0
+        budget = current_execution_budget()
         self.breaker.before_call()
         attempts = 0
         last_error: ConnectorError | None = None
@@ -176,11 +182,34 @@ class ConnectorAdapter(ABC):
             )
         ) as client:
             jitter = _jitter_ratio()
-            for attempt, delay in enumerate(retry_delays(max_retries, jitter_ratio=jitter)):
-                attempts = attempt + 1
+            for attempt, delay in enumerate(retry_delays(effective_retries, jitter_ratio=jitter)):
                 try:
+                    request_timeout = total_timeout
+                    if budget is not None:
+                        try:
+                            remaining = budget.reserve_attempt("tool")
+                        except AttemptBudgetExhausted:
+                            return ExecutionResult(
+                                ok=False,
+                                error_code="EXECUTION_BUDGET_EXHAUSTED",
+                                ambiguous=not safe_to_retry and attempts > 0,
+                                latency_ms=int((time.monotonic() - started) * 1000),
+                                attempts=attempts,
+                            )
+                        request_timeout = min(request_timeout, remaining)
+                    attempts += 1
                     resp = await client.request(
-                        method, url, headers=headers, json=json_body, params=params
+                        method,
+                        url,
+                        headers=headers,
+                        json=json_body,
+                        params=params,
+                        timeout=httpx.Timeout(
+                            connect=min(connect_timeout, request_timeout),
+                            read=request_timeout,
+                            write=request_timeout,
+                            pool=request_timeout,
+                        ),
                     )
                     if resp.status_code < 300:
                         self.breaker.on_success()
@@ -205,13 +234,32 @@ class ConnectorAdapter(ABC):
                         wait = (
                             float(retry_after) if retry_after and retry_after.isdigit() else delay
                         )
-                        await _sleep(wait)
-                        continue
+                        if attempt < effective_retries and (
+                            budget is None or budget.remaining_seconds() > wait
+                        ):
+                            await _sleep(wait)
+                            continue
+                        return ExecutionResult(
+                            ok=False,
+                            error_code="CONNECTOR_RATE_LIMITED",
+                            latency_ms=int((time.monotonic() - started) * 1000),
+                            attempts=attempts,
+                        )
                     if resp.status_code in RETRYABLE_STATUS:
                         last_error = ConnectorUnavailable(f"status {resp.status_code}")
                         self.breaker.on_failure()
-                        await _sleep(delay)
-                        continue
+                        if attempt < effective_retries and (
+                            budget is None or budget.remaining_seconds() > delay
+                        ):
+                            await _sleep(delay)
+                            continue
+                        return ExecutionResult(
+                            ok=False,
+                            error_code=last_error.code,
+                            ambiguous=not safe_to_retry,
+                            latency_ms=int((time.monotonic() - started) * 1000),
+                            attempts=attempts,
+                        )
                     self.breaker.on_failure()
                     return ExecutionResult(
                         ok=False,
@@ -222,7 +270,9 @@ class ConnectorAdapter(ABC):
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
                     last_error = ConnectorUnavailable(type(exc).__name__)
                     self.breaker.on_failure()
-                    if attempt < max_retries:
+                    if attempt < effective_retries and (
+                        budget is None or budget.remaining_seconds() > delay
+                    ):
                         await _sleep(delay)
 
         latency = int((time.monotonic() - started) * 1000)
@@ -230,7 +280,7 @@ class ConnectorAdapter(ABC):
         return ExecutionResult(
             ok=False,
             error_code=code,
-            ambiguous=True,  # writes may or may not have landed
+            ambiguous=not safe_to_retry,  # writes may or may not have landed
             latency_ms=latency,
             attempts=attempts,
         )

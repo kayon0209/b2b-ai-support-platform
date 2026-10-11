@@ -86,6 +86,11 @@ from platform_core.agent_runtime.queue_status import queue_notice, queue_status
 from platform_core.agent_runtime.routing import routing_note, team_for
 from platform_core.agent_runtime.tool_card import glossary_for
 from platform_core.audit import service as audit_service
+from platform_core.execution_budget import (
+    ExecutionBudget,
+    current_execution_budget,
+    run_with_execution_budget,
+)
 from platform_core.identity import lease_service
 from platform_core.identity.control_lease import LeaseConflict
 from platform_core.identity.org import ContactAccountFacts
@@ -181,6 +186,7 @@ async def retrieve_evidence(
     metadata_filter: Any | None = None,
     enabled_paths: tuple[str, ...] | None = None,
     rerank_cap: int | None = None,
+    cache_query_embedding: bool = False,
 ) -> list[RetrievedChunk]:
     """Authorized retrieval. Evidence never crosses tenants: the tenant
     filter and ACL narrowing are applied inside hybrid_search before any
@@ -220,6 +226,7 @@ async def retrieve_evidence(
             metadata_filter=metadata_filter,
             enabled_paths=enabled_paths,
             rrf_k=settings.retrieval_rrf_k,
+            cache_query_embedding=cache_query_embedding,
         )
         if reranker is not None and len(chunks) > 1:
             cap = min(rerank_cap or len(chunks), len(chunks))
@@ -564,6 +571,9 @@ class AgentOrchestrator:
         tenant_id: uuid.UUID,
         conversation_ref_id: uuid.UUID,
         question: str,
+        queued_run_id: uuid.UUID | None = None,
+        allow_legacy_queued_run: bool = False,
+        source_event_id: uuid.UUID | None = None,
         principal: PrincipalScope,
         trace: TraceContext | None = None,
         channel_conversation_key: str | None = None,
@@ -610,6 +620,18 @@ class AgentOrchestrator:
         """
         started = time.monotonic()
         ctx = trace or new_trace_context()
+        budget = current_execution_budget()
+        if budget is None:
+            settings = self._settings()
+            budget = ExecutionBudget.for_seconds(
+                deadline_seconds=settings.agent_run_deadline_seconds,
+                max_attempts=settings.agent_run_max_external_attempts,
+                operation_limits={
+                    "model": settings.agent_run_max_model_attempts,
+                    "tool": settings.agent_run_max_tool_attempts,
+                    "outbound": 2,
+                },
+            )
         self._channel_system = channel_system
         self._channel_address = channel_address
         # One root span per run. Everything the pipeline does hangs off it, so
@@ -617,25 +639,31 @@ class AgentOrchestrator:
         # have to be stitched together by timestamp.
         run_span = ctx.span("agent_run", **{"span.kind": "server"})
         try:
-            outcome = await self._run_pipeline(
-                tenant_id=tenant_id,
-                conversation_ref_id=conversation_ref_id,
-                question=question,
-                principal=principal,
-                ctx=ctx,
-                started=started,
-                run_span=run_span,
-                channel_conversation_key=channel_conversation_key,
-                expected_lease_version=expected_lease_version,
-                restricted_query=restricted_query,
-                history=history,
-                context_budget_chars=context_budget_chars,
-                known_facts=known_facts,
-                contact_id=contact_id,
-                attachment_types=attachment_types,
-                verified_account=verified_account,
-                channel_system=channel_system,
-                channel_address=channel_address,
+            outcome = await run_with_execution_budget(
+                budget,
+                self._run_pipeline(
+                    tenant_id=tenant_id,
+                    conversation_ref_id=conversation_ref_id,
+                    question=question,
+                    queued_run_id=queued_run_id,
+                    allow_legacy_queued_run=allow_legacy_queued_run,
+                    source_event_id=source_event_id,
+                    principal=principal,
+                    ctx=ctx,
+                    started=started,
+                    run_span=run_span,
+                    channel_conversation_key=channel_conversation_key,
+                    expected_lease_version=expected_lease_version,
+                    restricted_query=restricted_query,
+                    history=history,
+                    context_budget_chars=context_budget_chars,
+                    known_facts=known_facts,
+                    contact_id=contact_id,
+                    attachment_types=attachment_types,
+                    verified_account=verified_account,
+                    channel_system=channel_system,
+                    channel_address=channel_address,
+                ),
             )
         except Exception as exc:
             # An unexpected failure still has to be visible in metrics and in
@@ -652,6 +680,20 @@ class AgentOrchestrator:
             if outcome.status is RunStatus.ABSTAINED:
                 run_span.set_status("ok", outcome.abstain_reason)
             run_span.end()
+            if budget.total_attempts:
+                run_row = (
+                    await self._session.execute(
+                        select(AgentRun).where(
+                            AgentRun.tenant_id == tenant_id,
+                            AgentRun.id == outcome.run_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if run_row is not None:
+                    run_row.model_config = {
+                        **(run_row.model_config or {}),
+                        "execution_budget": budget.snapshot(),
+                    }
             return outcome
 
     async def _account_facts(
@@ -684,6 +726,9 @@ class AgentOrchestrator:
         tenant_id: uuid.UUID,
         conversation_ref_id: uuid.UUID,
         question: str,
+        queued_run_id: uuid.UUID | None = None,
+        allow_legacy_queued_run: bool = False,
+        source_event_id: uuid.UUID | None = None,
         principal: PrincipalScope,
         ctx: TraceContext,
         started: float,
@@ -869,6 +914,8 @@ class AgentOrchestrator:
         run = await self._adopt_or_create_run(
             tenant_id=tenant_id,
             conversation_ref_id=conversation_ref_id,
+            queued_run_id=queued_run_id,
+            allow_legacy_placeholder=allow_legacy_queued_run,
             route=route,
             ctx=ctx,
             context=context,
@@ -877,6 +924,27 @@ class AgentOrchestrator:
             retrieval_query=retrieval_query,
             question=question,
         )
+
+        if run.status != RunStatus.RUNNING.value:
+            # A reclaimed/duplicate inbox delivery may outlive the run it
+            # names. Its run id is the idempotency boundary: never adopt a
+            # sibling placeholder or execute the same customer turn again.
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            status = RunStatus(run.status)
+            return RunOutcome(
+                run_id=run.id,
+                status=status,
+                route=run.route,
+                send_blocked_reason="RUN_ALREADY_SETTLED",
+                latency_ms=elapsed_ms,
+                trace_id=ctx.trace_id,
+            )
+
+        budget = current_execution_budget()
+        if budget is not None and run.started_at is not None:
+            deadline_seconds = self._settings().agent_run_deadline_seconds
+            remaining = int(run.started_at) + deadline_seconds - time.time()
+            budget.tighten_deadline(time.monotonic() + max(0.0, remaining))
 
         # The mode lives on the run, so it is read from the run rather than
         # threaded through every call site - and an execution path that forgets
@@ -1534,6 +1602,49 @@ class AgentOrchestrator:
                 latency_ms=run.latency_ms,
                 trace_id=ctx.trace_id,
             )
+
+        if source_event_id is not None:
+            from platform_core.support_bridge.inbox import has_newer_incoming_message
+
+            if await has_newer_incoming_message(
+                self._session,
+                tenant_id=tenant_id,
+                conversation_ref_id=conversation_ref_id,
+                source_event_id=source_event_id,
+            ):
+                # A later customer message arrived while this answer was being
+                # generated. It remains queued behind this event; suppress the
+                # stale draft so the next run answers from the newer turn.
+                run.status = RunStatus.SUPERSEDED.value
+                run.output_hash = None
+                run.latency_ms = int((time.monotonic() - started) * 1000)
+                await self._session.flush()
+                await audit_service.record(
+                    self._session,
+                    ctx=TenantContext(tenant_id=tenant_id, actor_id=None, actor_kind="service"),
+                    action="agent_run.superseded",
+                    resource_type="agent_run",
+                    resource_id=run.id,
+                    decision="superseded",
+                    reason_code="NEWER_CUSTOMER_MESSAGE",
+                    metadata={"source_event_id": str(source_event_id)},
+                    trace_id=ctx.trace_id,
+                )
+                get_metrics().observe_run(
+                    outcome="superseded",
+                    route=route,
+                    latency_seconds=run.latency_ms / 1000.0,
+                    citation_count=citation_count,
+                )
+                return RunOutcome(
+                    run_id=run.id,
+                    status=RunStatus.SUPERSEDED,
+                    route=route,
+                    send_blocked_reason="NEWER_CUSTOMER_MESSAGE",
+                    citation_count=0,
+                    latency_ms=run.latency_ms,
+                    trace_id=ctx.trace_id,
+                )
 
         # --- 8b. Take exclusive right to finish this run. ---
         #
@@ -3048,6 +3159,8 @@ class AgentOrchestrator:
         *,
         tenant_id: uuid.UUID,
         conversation_ref_id: uuid.UUID,
+        queued_run_id: uuid.UUID | None = None,
+        allow_legacy_placeholder: bool = True,
         route: str,
         ctx: TraceContext,
         context: CompactedContext | None,
@@ -3088,24 +3201,48 @@ class AgentOrchestrator:
         twenty-message burst produced 39 run rows for 20 turns. Returning the
         row as-is is what keeps one logical run to one row.
         """
-        placeholder = (
-            await self._session.execute(
-                select(AgentRun)
-                .where(
-                    AgentRun.tenant_id == tenant_id,
-                    AgentRun.conversation_ref_id == conversation_ref_id,
-                    AgentRun.status.in_((RunStatus.QUEUED.value, RunStatus.SUPERSEDED.value)),
-                    AgentRun.input_hash == "",
+        if queued_run_id is not None:
+            placeholder = (
+                await self._session.execute(
+                    select(AgentRun)
+                    .where(
+                        AgentRun.id == queued_run_id,
+                        AgentRun.tenant_id == tenant_id,
+                        AgentRun.conversation_ref_id == conversation_ref_id,
+                    )
+                    .with_for_update()
                 )
-                .order_by(AgentRun.started_at.asc())
-                .limit(1)
-                .with_for_update(skip_locked=True)
-            )
-        ).scalar_one_or_none()
+            ).scalar_one_or_none()
+            if placeholder is None:
+                raise ValueError("inbox event references no run for this tenant conversation")
+        elif allow_legacy_placeholder:
+            # Legacy events and external-channel webhooks do not have an API
+            # run id. Only old API queue deliveries opt into this fallback;
+            # external webhook events create their own run so they cannot
+            # steal a sibling API request's placeholder.
+            placeholder = (
+                await self._session.execute(
+                    select(AgentRun)
+                    .where(
+                        AgentRun.tenant_id == tenant_id,
+                        AgentRun.conversation_ref_id == conversation_ref_id,
+                        AgentRun.status.in_((RunStatus.QUEUED.value, RunStatus.SUPERSEDED.value)),
+                        AgentRun.input_hash == "",
+                    )
+                    .order_by(AgentRun.started_at.asc(), AgentRun.id.asc())
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalar_one_or_none()
+        else:
+            placeholder = None
 
-        if placeholder is not None and placeholder.status == RunStatus.SUPERSEDED.value:
-            # Already has its outcome. Overwriting `status` would resurrect it,
-            # and writing `started_at` would report a run that never began.
+        if placeholder is not None and (
+            placeholder.status != RunStatus.QUEUED.value or placeholder.input_hash != ""
+        ):
+            # This delivery may be stale or duplicated. Preserve the named
+            # run's state; overwriting `status` could resurrect a terminal run
+            # and duplicate its customer-visible side effect.
             return placeholder
 
         # What the *enqueue* path recorded about this run's purpose, read before

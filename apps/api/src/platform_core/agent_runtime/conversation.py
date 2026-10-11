@@ -145,6 +145,11 @@ _UNRESOLVED = re.compile(
     r"has not been|hasn't been|outstanding|follow(?:ing)? up)\b",
     re.IGNORECASE,
 )
+_NEGATIVE_CONSTRAINT = re.compile(
+    r"\b(?:do not|don't|never|must not|mustn't|without|avoid|no longer)\b"
+    r"|(?:不要|请勿|不得|不允许|别|不能|禁止|切勿|不要再)",
+    re.IGNORECASE,
+)
 # Tool outcomes are recognised by role as well as by text, so a bare "ok" from
 # a TOOL turn is still pinned.
 _TOOL_OUTCOME = re.compile(
@@ -157,6 +162,7 @@ _PIN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("approval", _APPROVAL),
     ("ownership", _OWNERSHIP),
     ("unresolved", _UNRESOLVED),
+    ("negative_constraint", _NEGATIVE_CONSTRAINT),
     ("tool_outcome", _TOOL_OUTCOME),
 )
 
@@ -209,7 +215,20 @@ _DURABLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "order_ref",
         re.compile(r"\border\s*#?\s*([A-Z0-9-]{4,20})\b", re.IGNORECASE),
     ),
+    (
+        "response_language",
+        re.compile(
+            r"(?:以后|之后|始终|一直)(?:请)?(?:用|使用)(中文|英文|英语|简体中文|繁體中文|繁体中文)"
+            r"(?:回复|回答|沟通)"
+            r"|(?:我)?(?:偏好|更喜欢)(?:用|使用)?(中文|英文|英语|简体中文|繁體中文|繁体中文)"
+            r"(?:回复|回答|沟通)?"
+            r"|\b(?:i prefer|please always|always)\s+(?:replies?\s+)?in\s+"
+            r"(chinese|english)\b",
+            re.IGNORECASE,
+        ),
+    ),
 )
+DURABLE_FACT_KEYS = frozenset(key for key, _pattern in _DURABLE_PATTERNS)
 
 # Never persisted, whatever the customer typed. Storing a credential because it
 # appeared in a sentence is the failure this list exists to prevent; the
@@ -217,7 +236,8 @@ _DURABLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # is its read-path counterpart.
 _NEVER_DURABLE = re.compile(
     r"\b(?:password|passphrase|secret|token|api[ _-]?key|credential|"
-    r"social security|ssn|credit card|card number|bank account|iban)\b",
+    r"social security|ssn|credit card|card number|bank account|iban)\b"
+    r"|(?:密码|口令|密钥|令牌|银行卡|身份证|社保号)",
     re.IGNORECASE,
 )
 
@@ -823,6 +843,7 @@ __all__: list[str] = [
     "CompactedContext",
     "ConversationMemory",
     "DurableFact",
+    "DURABLE_FACT_KEYS",
     "Turn",
     "TurnRole",
     "extract_durable_facts",

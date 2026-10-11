@@ -5,9 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
+import subprocess
+import sys
+import threading
+import time
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -54,6 +62,32 @@ class _Resolver:
         )
 
 
+def _seed_actor(tenant: str, agent: str, role: str) -> uuid.UUID:
+    """Persist the user and live membership used by a synthetic API actor."""
+    actor_id = uuid.uuid5(uuid.NAMESPACE_URL, agent)
+    email = f"r2flow-{actor_id.hex}@example.test"
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO users (id, primary_email, display_name, is_service_account) "
+                "VALUES (:id, :email, :agent, false) ON CONFLICT (id) DO NOTHING"
+            ),
+            {"id": actor_id, "email": email, "agent": agent},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO memberships (id, tenant_id, user_id, role, status) "
+                "VALUES (gen_random_uuid(), :tenant, :actor, :role, 'active') "
+                "ON CONFLICT (tenant_id, user_id) DO UPDATE "
+                "SET role = EXCLUDED.role, status = 'active'"
+            ),
+            {"tenant": tenant, "actor": actor_id, "role": role},
+        )
+    admin.dispose()
+    return actor_id
+
+
 def _client(
     tenant: str = TENANT,
     *,
@@ -62,6 +96,7 @@ def _client(
 ) -> TestClient:
     import importlib
 
+    _seed_actor(tenant, agent, role)
     main_mod = importlib.import_module("platform_core.main")
     fresh = FastAPI()
     for route in main_mod.app.router.routes:
@@ -71,6 +106,177 @@ def _client(
         resolver=_Resolver(tenant=tenant, agent=agent, role=role),
     )
     return TestClient(fresh, raise_server_exceptions=False)
+
+
+_RESTART_API_BOOTSTRAP = """
+import sys
+import uuid
+import uvicorn
+from fastapi import FastAPI
+from platform_core.identity.middleware import TenantContextMiddleware
+from platform_core.identity.tenant_context import TenantContext
+from platform_core.main import app as source_app
+import os
+
+tenant_id, actor_id, role, port = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+
+class Resolver:
+    async def __call__(self, request):
+        return TenantContext(
+            tenant_id=uuid.UUID(tenant_id),
+            actor_id=uuid.UUID(actor_id),
+            actor_kind="user",
+            role=role,
+        )
+
+app = FastAPI()
+for route in source_app.router.routes:
+    app.router.routes.append(route)
+app.add_middleware(TenantContextMiddleware, resolver=Resolver())
+
+provider_url = os.environ.get("PHASE2_TEST_FAKE_PROVIDER_URL")
+if provider_url:
+    import httpx
+    from platform_core.tool_gateway import registry as registry_mod
+
+    class ProcessCrashJira:
+        def __init__(self, context):
+            self.context = context
+
+        async def execute(self, tool_name, parameters, idempotency_key):
+            async with httpx.AsyncClient(timeout=3) as client:
+                response = await client.post(
+                    provider_url,
+                    json={"tool": tool_name, "idempotency_key": idempotency_key},
+                )
+                response.raise_for_status()
+            if os.environ.get("PHASE2_TEST_KILL_AFTER_PROVIDER") == "1":
+                os._exit(91)
+            return {"ok": True, "issue_key": "SUP-CRASH-1"}
+
+        async def verify_postcondition(self, tool_name, parameters, output):
+            return True
+
+    original_factories = registry_mod.default_factories
+
+    def patched_factories():
+        factories = dict(original_factories())
+        factories["jira"] = registry_mod.AdapterFactory(
+            provider="jira", build=ProcessCrashJira
+        )
+        return factories
+
+    registry_mod.default_factories = patched_factories
+
+uvicorn.run(app, host="127.0.0.1", port=port, log_level="critical")
+"""
+
+
+class _FakeProviderHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        self.server.call_count += 1  # type: ignore[attr-defined]
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"accepted":true}')
+
+    def log_message(self, format: str, *args: object) -> None:
+        del format, args
+
+
+class _FakeProviderServer(ThreadingHTTPServer):
+    def __init__(self) -> None:
+        self.call_count = 0
+        super().__init__(("127.0.0.1", 0), _FakeProviderHandler)
+
+
+def _start_restart_api(
+    *,
+    role: str,
+    actor: str,
+    environment_overrides: dict[str, str] | None = None,
+) -> tuple[subprocess.Popen[bytes], str]:
+    """Run the real API routes in a disposable OS process for restart acceptance."""
+    actor_id = _seed_actor(TENANT, actor, role)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = int(listener.getsockname()[1])
+    repo_root = Path(__file__).resolve().parents[4]
+    source_roots = (
+        repo_root / "apps/api/src",
+        repo_root / "apps/worker/src",
+        repo_root / "packages/policy/src",
+        repo_root / "packages/contracts/src",
+        repo_root / "packages/observability/src",
+        repo_root,
+    )
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    pythonpath_entries = [str(path) for path in source_roots]
+    if existing_pythonpath:
+        pythonpath_entries.append(existing_pythonpath)
+    environment["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    if environment_overrides:
+        environment.update(environment_overrides)
+    # Static test bootstrap plus fixed fixture identifiers; no shell or user input.
+    # noqa is attached to the call because Bandit cannot inspect this local harness.
+    process = subprocess.Popen(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            _RESTART_API_BOOTSTRAP,
+            TENANT,
+            str(actor_id),
+            role,
+            str(port),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        env=environment,
+    )
+    base_url = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("disposable API process exited before becoming ready")
+        try:
+            response = httpx.get(f"{base_url}/healthz", timeout=0.5)
+            if response.status_code == 200:
+                return process, base_url
+        except httpx.RequestError:
+            time.sleep(0.05)
+    _stop_restart_api(process)
+    raise RuntimeError("disposable API process did not become ready within 10 seconds")
+
+
+def _stop_restart_api(process: subprocess.Popen[bytes]) -> None:
+    """Hard-exit the disposable API between requests to model process loss."""
+    if process.poll() is not None:
+        return
+    process.kill()
+    process.wait(timeout=5)
+
+
+def _restart_api_request(
+    base_url: str,
+    method: str,
+    path: str,
+    *,
+    key: str,
+    body: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    response = httpx.request(
+        method,
+        f"{base_url}{path}",
+        headers={"Authorization": "Bearer pt_restart_test", "Idempotency-Key": key},
+        json=body,
+        timeout=5,
+    )
+    return int(response.status_code), response.json()
 
 
 def _headers(key: str) -> dict[str, str]:
@@ -87,6 +293,10 @@ def _clear() -> None:
             )
             conn.execute(
                 text("DELETE FROM action_confirmations WHERE tenant_id = :t"), {"t": tenant}
+            )
+            conn.execute(
+                text("DELETE FROM tool_execution_reconciliations WHERE tenant_id = :t"),
+                {"t": tenant},
             )
             conn.execute(text("DELETE FROM tool_executions WHERE tenant_id = :t"), {"t": tenant})
             conn.execute(text("DELETE FROM tool_proposals WHERE tenant_id = :t"), {"t": tenant})
@@ -1116,6 +1326,378 @@ def test_verified_tool_receipt_completes_the_linked_invoice_task() -> None:
     completed = next(item for item in tasks.json()["items"] if item["task_id"] == task["task_id"])
     assert completed["status"] == "succeeded"
     assert completed["execution_id"] == executed.json()["execution"]["execution_id"]
+
+
+def test_linked_proposal_cannot_execute_after_its_task_lease_version_moves() -> None:
+    _seed_invoice_context()
+    started = _start(key="invoice-lease-start", flow_key="invoice_application")
+    task = _collect_invoice_fields(started.json()["task"], key="invoice-lease-fields")
+    prepared = _prepare_invoice_proposal(task, key="invoice-lease-proposal")
+    assert prepared.status_code == 200, prepared.text
+    task = prepared.json()["task"]
+
+    admin = create_engine(ADMIN_URL)
+    with admin.connect() as conn:
+        proposal_lease_version = conn.execute(
+            text(
+                "SELECT proposal_lease_version FROM conversation_tasks "
+                "WHERE tenant_id = :tenant AND id = :task"
+            ),
+            {"tenant": TENANT, "task": task["task_id"]},
+        ).scalar_one()
+    admin.dispose()
+    assert proposal_lease_version == LEASE_VERSION
+
+    approver = _client(role="support_admin", agent="invoice-lease-approver")
+    proposal_path = f"/v1/tool-proposals/{task['proposal_id']}"
+    confirmed = approver.post(
+        f"{proposal_path}/confirm",
+        headers=_headers("invoice-lease-confirm"),
+        json={},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+
+    admin = create_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE conversation_control_leases SET lease_version = :version, "
+                "owner_ref = :owner, changed_reason = 'reassigned while awaiting approval' "
+                "WHERE tenant_id = :tenant AND conversation_ref_id = :conversation"
+            ),
+            {
+                "version": LEASE_VERSION + 1,
+                "owner": "another-human",
+                "tenant": TENANT,
+                "conversation": CONVERSATION,
+            },
+        )
+    admin.dispose()
+
+    executed = approver.post(
+        f"{proposal_path}/execute",
+        headers=_headers("invoice-lease-execute"),
+        json={"reason": "the lease moved after confirmation"},
+    )
+    assert executed.status_code == 409, executed.text
+    assert executed.json()["error"]["code"] == "TASK_LEASE_STALE"
+
+    admin = create_engine(ADMIN_URL)
+    with admin.connect() as conn:
+        execution_count = conn.execute(
+            text(
+                "SELECT count(*) FROM tool_executions "
+                "WHERE tenant_id = :tenant AND proposal_id = :proposal"
+            ),
+            {"tenant": TENANT, "proposal": task["proposal_id"]},
+        ).scalar_one()
+    admin.dispose()
+    assert execution_count == 0
+
+
+def test_pending_fields_and_approval_resume_after_api_process_restart() -> None:
+    """Pending input and approval live in PostgreSQL, and stale leases stay fenced."""
+    _seed_invoice_context()
+    processes: list[subprocess.Popen[bytes]] = []
+
+    def start_api(*, role: str, actor: str) -> tuple[subprocess.Popen[bytes], str]:
+        process, base_url = _start_restart_api(role=role, actor=actor)
+        processes.append(process)
+        return process, base_url
+
+    def stop_api(process: subprocess.Popen[bytes]) -> None:
+        _stop_restart_api(process)
+        if process in processes:
+            processes.remove(process)
+
+    try:
+        first_process, first_url = start_api(role="support_agent", actor=AGENT_REF)
+        status, started = _restart_api_request(
+            first_url,
+            "POST",
+            f"/v1/workbench/conversations/{CONVERSATION}/standard-flows/tasks",
+            key="process-restart-flow-start",
+            body={"flow_key": "invoice_application", "expected_lease_version": LEASE_VERSION},
+        )
+        assert status == 200, started
+        task = started["task"]
+        assert task["status"] == "manual_flow"
+        assert set(task["missing_slots"]) == {"order_id", "invoice_type"}
+        stop_api(first_process)
+
+        second_process, second_url = start_api(role="support_admin", actor=AGENT_REF)
+        status, listed = _restart_api_request(
+            second_url,
+            "GET",
+            f"/v1/workbench/conversations/{CONVERSATION}/tasks",
+            key="process-restart-list-fields",
+        )
+        assert status == 200, listed
+        resumed = next(item for item in listed["items"] if item["task_id"] == task["task_id"])
+        assert resumed["status"] == "manual_flow"
+        assert set(resumed["missing_slots"]) == {"order_id", "invoice_type"}
+
+        status, collected = _restart_api_request(
+            second_url,
+            "POST",
+            f"/v1/workbench/conversations/{CONVERSATION}/tasks/{task['task_id']}/commands",
+            key="process-restart-collect-fields",
+            body={
+                "command": "collect_fields",
+                "expected_version": resumed["version"],
+                "expected_lease_version": LEASE_VERSION,
+                "fields": {"order_id": "SO-1234", "invoice_type": "增值税专用发票"},
+            },
+        )
+        assert status == 200, collected
+        task = collected["task"]
+        assert task["status"] == "manual_flow"
+        assert task["missing_slots"] == []
+
+        status, prepared = _restart_api_request(
+            second_url,
+            "POST",
+            f"/v1/workbench/conversations/{CONVERSATION}/tasks/{task['task_id']}/commands",
+            key="process-restart-prepare-proposal",
+            body={
+                "command": "prepare_proposal",
+                "expected_version": task["version"],
+                "expected_lease_version": LEASE_VERSION,
+            },
+        )
+        assert status == 200, prepared
+        task = prepared["task"]
+        assert task["status"] == "awaiting_confirmation"
+        proposal_id = task["proposal_id"]
+        stop_api(second_process)
+
+        third_process, third_url = start_api(role="support_admin", actor="restart-approver")
+        status, listed = _restart_api_request(
+            third_url,
+            "GET",
+            f"/v1/workbench/conversations/{CONVERSATION}/tasks",
+            key="process-restart-list-approval",
+        )
+        assert status == 200, listed
+        resumed = next(item for item in listed["items"] if item["task_id"] == task["task_id"])
+        assert resumed["status"] == "awaiting_confirmation"
+        assert resumed["proposal_id"] == proposal_id
+
+        status, confirmed = _restart_api_request(
+            third_url,
+            "POST",
+            f"/v1/tool-proposals/{proposal_id}/confirm",
+            key="process-restart-confirm",
+            body={},
+        )
+        assert status == 200, confirmed
+        stop_api(third_process)
+
+        fourth_process, fourth_url = start_api(role="support_admin", actor="restart-approver")
+        status, proposal_detail = _restart_api_request(
+            fourth_url,
+            "GET",
+            f"/v1/tool-proposals/{proposal_id}",
+            key="process-restart-read-approved-proposal",
+        )
+        assert status == 200, proposal_detail
+        assert proposal_detail["proposal"]["effective_status"] == "confirmed"
+
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE conversation_control_leases SET lease_version = :version, "
+                    "owner_ref = :owner, changed_reason = 'reassigned during API restart drill' "
+                    "WHERE tenant_id = :tenant AND conversation_ref_id = :conversation"
+                ),
+                {
+                    "version": LEASE_VERSION + 1,
+                    "owner": "another-human",
+                    "tenant": TENANT,
+                    "conversation": CONVERSATION,
+                },
+            )
+        admin.dispose()
+
+        status, rejected = _restart_api_request(
+            fourth_url,
+            "POST",
+            f"/v1/tool-proposals/{proposal_id}/execute",
+            key="process-restart-stale-lease-execute",
+            body={"reason": "lease changed while approval was pending"},
+        )
+        assert status == 409, rejected
+        assert rejected["error"]["code"] == "TASK_LEASE_STALE"
+
+        admin = create_engine(ADMIN_URL)
+        with admin.connect() as conn:
+            execution_count = conn.execute(
+                text(
+                    "SELECT count(*) FROM tool_executions "
+                    "WHERE tenant_id = :tenant AND proposal_id = :proposal"
+                ),
+                {"tenant": TENANT, "proposal": proposal_id},
+            ).scalar_one()
+        admin.dispose()
+        assert execution_count == 0
+        stop_api(fourth_process)
+    finally:
+        for process in list(processes):
+            _stop_restart_api(process)
+
+
+def test_api_process_crash_after_provider_acceptance_never_replays_the_write() -> None:
+    """A committed execution intent fences the same proposal after a hard exit."""
+    provider = _FakeProviderServer()
+    provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    provider_thread.start()
+    admin = create_engine(ADMIN_URL)
+    tool_id = uuid.uuid4()
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO tool_definitions "
+                "(id, tenant_id, name, version, risk, input_schema, output_schema, "
+                "required_permissions, timeout_ms, idempotent, requires_confirmation) "
+                "VALUES (:id, :tenant, 'jira.create_issue', 1, 'confirmed_write', "
+                "CAST(:schema AS jsonb), '{}'::jsonb, '[]'::jsonb, 10000, true, true)"
+            ),
+            {
+                "id": tool_id,
+                "tenant": TENANT,
+                "schema": json.dumps(
+                    {
+                        "type": "object",
+                        "properties": {
+                            "project": {"type": "string"},
+                            "summary": {"type": "string"},
+                        },
+                        "required": ["project", "summary"],
+                        "additionalProperties": False,
+                    }
+                ),
+            },
+        )
+        conn.execute(
+            text(
+                "INSERT INTO connectors "
+                "(id, tenant_id, provider, name, status, capabilities, configuration, "
+                "credential_ref) VALUES (:id, :tenant, 'jira', 'Crash drill Jira', 'active', "
+                "'[\"create_issue\"]'::jsonb, '{}'::jsonb, 'vault://phase2/fake')"
+            ),
+            {"id": uuid.uuid4(), "tenant": TENANT},
+        )
+
+    provider_url = f"http://127.0.0.1:{provider.server_port}/accepted"
+    processes: list[subprocess.Popen[bytes]] = []
+
+    def start_api(*, kill_after_provider: bool) -> tuple[subprocess.Popen[bytes], str]:
+        process, base_url = _start_restart_api(
+            role="support_admin",
+            actor=AGENT_REF,
+            environment_overrides={
+                "PHASE2_TEST_FAKE_PROVIDER_URL": provider_url,
+                "PHASE2_TEST_KILL_AFTER_PROVIDER": "1" if kill_after_provider else "0",
+            },
+        )
+        processes.append(process)
+        return process, base_url
+
+    def stop_api(process: subprocess.Popen[bytes]) -> None:
+        _stop_restart_api(process)
+        if process in processes:
+            processes.remove(process)
+
+    try:
+        first_process, first_url = start_api(kill_after_provider=True)
+        status, proposed = _restart_api_request(
+            first_url,
+            "POST",
+            "/v1/tool-proposals",
+            key="gateway-crash-proposal",
+            body={
+                "tool_name": "jira.create_issue",
+                "arguments": {"project": "SUP", "summary": "synthetic lost-ack case"},
+            },
+        )
+        assert status == 200, proposed
+        proposal_id = proposed["proposal"]["proposal_id"]
+
+        status, confirmed = _restart_api_request(
+            first_url,
+            "POST",
+            f"/v1/tool-proposals/{proposal_id}/confirm",
+            key="gateway-crash-confirm",
+            body={},
+        )
+        assert status == 200, confirmed
+
+        try:
+            _restart_api_request(
+                first_url,
+                "POST",
+                f"/v1/tool-proposals/{proposal_id}/execute",
+                key="gateway-crash-execute",
+                body={},
+            )
+        except httpx.RequestError:
+            pass
+        else:
+            pytest.fail("the synthetic API process should hard-exit after provider acceptance")
+        first_process.wait(timeout=5)
+        assert provider.call_count == 1
+        stop_api(first_process)
+
+        with admin.begin() as conn:
+            persisted = conn.execute(
+                text(
+                    "SELECT e.status, e.idempotency_key, p.status "
+                    "FROM tool_executions e JOIN tool_proposals p ON p.id = e.proposal_id "
+                    "WHERE e.tenant_id = :tenant AND p.id = :proposal"
+                ),
+                {"tenant": TENANT, "proposal": proposal_id},
+            ).one()
+            conn.execute(
+                text(
+                    "UPDATE tool_executions SET started_at = 0 "
+                    "WHERE tenant_id = :tenant AND proposal_id = :proposal"
+                ),
+                {"tenant": TENANT, "proposal": proposal_id},
+            )
+        assert persisted == ("executing", "gateway-crash-proposal", "executing")
+
+        second_process, second_url = start_api(kill_after_provider=False)
+        status, unresolved = _restart_api_request(
+            second_url,
+            "POST",
+            f"/v1/tool-proposals/{proposal_id}/execute",
+            key="gateway-crash-execute",
+            body={},
+        )
+        assert status == 409, unresolved
+        assert unresolved["error"]["code"] == "TOOL_EXECUTION_OUTCOME_UNKNOWN"
+        assert provider.call_count == 1, "the provider mutation must not be re-sent"
+
+        status, reconciled = _restart_api_request(
+            second_url,
+            "POST",
+            f"/v1/tool-proposals/{proposal_id}/reconcile",
+            key="gateway-crash-reconcile",
+            body={"decision": "applied", "evidence_reference": "SUP-CRASH-1"},
+        )
+        assert status == 200, reconciled
+        assert reconciled["execution"]["status"] == "executed"
+        assert reconciled["execution"]["verification_status"] == "verified"
+        assert provider.call_count == 1
+        stop_api(second_process)
+    finally:
+        for process in list(processes):
+            _stop_restart_api(process)
+        provider.shutdown()
+        provider.server_close()
+        provider_thread.join(timeout=5)
+        admin.dispose()
 
 
 def test_invoice_executor_rechecks_account_link_before_creating_the_case() -> None:

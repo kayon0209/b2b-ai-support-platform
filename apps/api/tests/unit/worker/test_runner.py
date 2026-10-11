@@ -21,6 +21,7 @@ import asyncio
 
 import pytest
 
+from observability_metrics import get_metrics, metric_sample_value, reset_default_metrics
 from worker.runner import InboxWorker, WorkerConfig
 
 
@@ -42,6 +43,7 @@ def _worker(**config) -> InboxWorker:
 
 def test_a_failing_cycle_does_not_kill_the_worker(monkeypatch) -> None:
     """A dependency outage must be survivable, not fatal."""
+    reset_default_metrics()
     worker = _worker()
     attempts: list[int] = []
 
@@ -57,6 +59,18 @@ def test_a_failing_cycle_does_not_kill_the_worker(monkeypatch) -> None:
     _run(asyncio.wait_for(worker.run_forever(), timeout=5))
 
     assert len(attempts) == 3, "the loop stopped instead of surviving the outage"
+    assert (
+        metric_sample_value(
+            get_metrics(), "platform_worker_cycles_total", queue="interactive", result="error"
+        )
+        == 2.0
+    )
+    assert (
+        metric_sample_value(
+            get_metrics(), "platform_worker_cycles_total", queue="interactive", result="success"
+        )
+        == 1.0
+    )
 
 
 def test_a_persistent_fault_is_not_swallowed_forever(monkeypatch) -> None:
@@ -66,6 +80,7 @@ def test_a_persistent_fault_is_not_swallowed_forever(monkeypatch) -> None:
     poll interval indefinitely. An operator sees a green process and a
     growing backlog - the worst combination, because nothing pages.
     """
+    reset_default_metrics()
     worker = _worker(max_consecutive_failures=3)
     attempts: list[int] = []
 
@@ -79,6 +94,12 @@ def test_a_persistent_fault_is_not_swallowed_forever(monkeypatch) -> None:
         _run(asyncio.wait_for(worker.run_forever(), timeout=5))
 
     assert len(attempts) == 3, "the worker kept retrying past its failure budget"
+    assert (
+        metric_sample_value(
+            get_metrics(), "platform_worker_cycles_total", queue="interactive", result="error"
+        )
+        == 3.0
+    )
 
 
 def test_a_recovered_dependency_resets_the_failure_budget(monkeypatch) -> None:

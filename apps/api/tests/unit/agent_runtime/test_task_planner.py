@@ -28,16 +28,27 @@ from platform_core.agent_runtime.tasks.planner import (
     REASON_MISSING_FIELDS,
     REASON_NO_READ_CAPABILITY,
     REASON_NO_WRITE_CAPABILITY,
+    REASON_TOOL_SELECTION_AMBIGUOUS,
+    REASON_TOOL_SELECTION_UNRESOLVED,
+    TOOL_SLOT_NAME,
     plan_tasks,
 )
 from platform_core.agent_runtime.tasks.state_machine import TaskStatus
 
 READ_CAPS = {
     "order.get_status": CapabilityView(
-        tool_name="order.get_status", risk_class="read", allowed_task_kinds=frozenset({"read"})
+        tool_name="order.get_status",
+        risk_class="read",
+        allowed_task_kinds=frozenset({"read"}),
+        parameter_names=("order_id",),
+        required_parameters=("order_id",),
     ),
     "billing.get_invoice": CapabilityView(
-        tool_name="billing.get_invoice", risk_class="read", allowed_task_kinds=frozenset({"read"})
+        tool_name="billing.get_invoice",
+        risk_class="read",
+        allowed_task_kinds=frozenset({"read"}),
+        parameter_names=("invoice_id",),
+        required_parameters=("invoice_id",),
     ),
 }
 
@@ -48,7 +59,7 @@ SPEC_INTENTS: list[SemanticIntent] = [
         source_turn_id="t-1",
         slots=[
             SemanticSlot(
-                name="order_no",
+                name="order_id",
                 value="SO-240918",
                 origin=SlotOrigin.CUSTOMER_STATED,
                 confirmed=True,
@@ -282,6 +293,153 @@ def test_a_non_sensitive_stated_value_is_kept() -> None:
     assert order_slot["value"] == "SO-240918"
     assert order_slot["origin"] == "customer_stated"
     assert order_slot["confirmed"] is True
+
+
+def test_each_task_gets_a_server_selected_tool_and_keeps_parameter_source() -> None:
+    intent = SemanticIntent(
+        task_kind=SemanticTaskKind.READ,
+        source_turn_id="t-tool-binding",
+        slots=[
+            SemanticSlot(
+                name="order_id",
+                value="SO-240918",
+                origin=SlotOrigin.CUSTOMER_STATED,
+                confirmed=True,
+            )
+        ],
+    )
+
+    task = plan_tasks(
+        [intent],
+        capabilities=READ_CAPS,
+        accepted_tool_names=["billing.get_invoice", "order.get_status"],
+        unsupported={},
+    )[0]
+
+    selected = next(slot for slot in task.slots if slot["name"] == TOOL_SLOT_NAME)
+    order_id = next(slot for slot in task.slots if slot["name"] == "order_id")
+    assert selected == {
+        "name": "tool",
+        "value": "order.get_status",
+        "origin": "server_capability",
+        "selection_source": "allowlisted_candidate_schema_match",
+        "confirmed": False,
+    }
+    assert order_id["origin"] == "customer_stated"
+    assert order_id["confirmed"] is True
+    assert task.missing_slots == []
+
+
+def test_unique_tool_selection_adds_required_schema_fields_as_missing() -> None:
+    intent = SemanticIntent(task_kind=SemanticTaskKind.READ, source_turn_id="t-missing-order")
+
+    task = plan_tasks(
+        [intent],
+        capabilities=READ_CAPS,
+        accepted_tool_names=["order.get_status"],
+        unsupported={},
+    )[0]
+
+    assert task.status is TaskStatus.AWAITING_INPUT
+    assert task.missing_slots == ["order_id"]
+    assert any(
+        slot["name"] == TOOL_SLOT_NAME and slot["value"] == "order.get_status"
+        for slot in task.slots
+    )
+
+
+def test_ambiguous_tool_candidates_are_parked_for_human_review() -> None:
+    capabilities = {
+        "orders.read": CapabilityView(
+            tool_name="orders.read",
+            risk_class="read",
+            allowed_task_kinds=frozenset({"read"}),
+            parameter_names=("record_id",),
+            required_parameters=("record_id",),
+        ),
+        "invoices.read": CapabilityView(
+            tool_name="invoices.read",
+            risk_class="read",
+            allowed_task_kinds=frozenset({"read"}),
+            parameter_names=("record_id",),
+            required_parameters=("record_id",),
+        ),
+    }
+    task = plan_tasks(
+        [
+            SemanticIntent(
+                task_kind=SemanticTaskKind.READ,
+                source_turn_id="t-ambiguous-tools",
+                slots=[
+                    SemanticSlot(
+                        name="record_id",
+                        value="R-1",
+                        origin=SlotOrigin.CUSTOMER_STATED,
+                        confirmed=True,
+                    )
+                ],
+            )
+        ],
+        capabilities=capabilities,
+        accepted_tool_names=["orders.read", "invoices.read"],
+        unsupported={},
+    )[0]
+
+    assert task.status is TaskStatus.NEEDS_HUMAN
+    assert task.blocked_reason == REASON_TOOL_SELECTION_AMBIGUOUS
+    assert not any(slot["name"] == TOOL_SLOT_NAME for slot in task.slots)
+
+
+def test_model_cannot_write_the_reserved_tool_slot() -> None:
+    intent = SemanticIntent(
+        task_kind=SemanticTaskKind.READ,
+        source_turn_id="t-forged-tool-slot",
+        slots=[
+            SemanticSlot(
+                name="tool",
+                value="unregistered.write",
+                origin=SlotOrigin.CUSTOMER_STATED,
+                confirmed=True,
+            )
+        ],
+    )
+
+    task = plan_tasks(
+        [intent],
+        capabilities=READ_CAPS,
+        accepted_tool_names=["order.get_status", "billing.get_invoice"],
+        unsupported={},
+    )[0]
+
+    assert task.status is TaskStatus.NEEDS_HUMAN
+    assert task.blocked_reason == REASON_TOOL_SELECTION_UNRESOLVED
+    assert not any(slot.get("value") == "unregistered.write" for slot in task.slots)
+
+
+def test_tool_candidate_with_incompatible_parameters_is_not_selected() -> None:
+    intent = SemanticIntent(
+        task_kind=SemanticTaskKind.READ,
+        source_turn_id="t-incompatible-tool",
+        slots=[
+            SemanticSlot(
+                name="case_ref",
+                value="CASE-1",
+                origin=SlotOrigin.CUSTOMER_STATED,
+                confirmed=True,
+            )
+        ],
+    )
+
+    task = plan_tasks(
+        [intent],
+        capabilities=READ_CAPS,
+        accepted_tool_names=["order.get_status"],
+        unsupported={},
+    )[0]
+
+    assert task.status is TaskStatus.NEEDS_HUMAN
+    assert task.blocked_reason == REASON_TOOL_SELECTION_UNRESOLVED
+    assert not any(slot["name"] == TOOL_SLOT_NAME for slot in task.slots)
 
 
 def test_an_inferred_value_is_withheld_even_when_not_sensitive() -> None:

@@ -6,7 +6,7 @@ import { useSearchParams } from "react-router-dom";
  *
  * The gap this closes
  * -------------------
- * Three pieces of operator state lived in `useState` and were therefore lost on
+ * Operator state lived in `useState` and was therefore lost on
  * refresh and absent from a pasted link: which conversation a replay was
  * showing, which queue tab the workbench was on, and what had been typed into
  * the queue search. The workbench already put `caseId` and `conversationRef` in
@@ -55,16 +55,23 @@ import { useSearchParams } from "react-router-dom";
  * - Anything else is set, replacing whatever was there.
  * - Other parameters are preserved: a link with `?tab=queue&q=x` must keep
  *   `tab` when the search changes, and dropping it would silently reset the
- *   operator's view.
+ *   operator's view. A dependent offset can be reset in the same URL update,
+ *   so changing a filter cannot race a second query-string write.
  */
 export function applyUrlValue(
   current: URLSearchParams,
   key: string,
   next: string | null,
+  resetKeys: readonly string[] = [],
 ): URLSearchParams {
   const updated = new URLSearchParams(current);
+  const previous = current.get(key) ?? "";
+  const normalizedNext = next ?? "";
   if (next === null || next === "") updated.delete(key);
   else updated.set(key, next);
+  if (previous !== normalizedNext) {
+    for (const resetKey of resetKeys) updated.delete(resetKey);
+  }
   return updated;
 }
 
@@ -84,23 +91,53 @@ export function readUrlValue(
   return stored;
 }
 
+/** Parse a bounded, page-aligned offset from a shared link. */
+export function parsePageOffset(
+  value: string | null,
+  pageSize: number,
+  maxOffset = 100_000,
+): number {
+  if (!value || !/^\d+$/.test(value) || !Number.isSafeInteger(pageSize) || pageSize < 1) {
+    return 0;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return 0;
+  const bounded = Math.min(parsed, Math.max(0, maxOffset));
+  return Math.floor(bounded / pageSize) * pageSize;
+}
+
+/** Return the canonical URL value for a bounded, page-aligned offset. */
+export function pageOffsetValue(
+  value: number,
+  pageSize: number,
+  maxOffset = 100_000,
+): string | null {
+  if (!Number.isSafeInteger(value) || !Number.isSafeInteger(pageSize) || pageSize < 1) {
+    return null;
+  }
+  const bounded = Math.min(Math.max(0, value), Math.max(0, maxOffset));
+  const aligned = Math.floor(bounded / pageSize) * pageSize;
+  return aligned > 0 ? String(aligned) : null;
+}
+
 export function useUrlState(
   key: string,
   fallback: string,
-  options: { push?: boolean } = {},
+  options: { push?: boolean; resetKeys?: readonly string[] } = {},
 ): readonly [string, (next: string | null) => void] {
   const { push = false } = options;
+  const { resetKeys = [] } = options;
   const [params, setParams] = useSearchParams();
   const value = useMemo(() => readUrlValue(params, key, fallback), [params, key, fallback]);
 
   const set = useCallback(
     (next: string | null) => {
       setParams(
-        (current) => applyUrlValue(current, key, next),
+        (current) => applyUrlValue(current, key, next, resetKeys),
         { replace: !push },
       );
     },
-    [key, push, setParams],
+    [key, push, resetKeys, setParams],
   );
 
   return [value, set] as const;

@@ -10,7 +10,7 @@ import {
   EmptyState,
   ListTotal,
   PageHeader,
-  Spinner,
+  SkeletonRows,
 } from "../components/ui";
 import { LoadError } from "../components/LoadError";
 import { useLang } from "../lib/i18n";
@@ -60,7 +60,7 @@ export function Channels() {
 
       <ActionFeedback error={action.error} notice={action.notice} />
       <LoadError error={connectors.error} status={connectors.errorStatus} onRetry={connectors.reload} />
-      {connectors.loading ? <Spinner label={t("channels.loading")} /> : null}
+      {connectors.loading ? <SkeletonRows rows={5} label={t("channels.loading")} /> : null}
       {connectors.data && items.length === 0 ? (
         <EmptyState message={t("channels.empty")} />
       ) : null}

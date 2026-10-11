@@ -22,6 +22,7 @@ happy path: a replay endpoint that accepts a `completed` run is a
 send-everything-twice button.
 """
 
+import hashlib
 import os
 import uuid
 
@@ -79,6 +80,8 @@ def _cleanup(*run_ids: str) -> None:
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
         for run_id in run_ids:
+            conn.execute(text("DELETE FROM agent_runs WHERE replay_of_run_id = :i"), {"i": run_id})
+        for run_id in run_ids:
             conn.execute(
                 text("DELETE FROM dead_letter_items WHERE resource_id = :i"), {"i": run_id}
             )
@@ -119,7 +122,7 @@ async def _record_failure(run_id: str, error_code: str, detail: str) -> object:
         await engine.dispose()
 
 
-async def _replay(run_id: str) -> object:
+async def _replay(run_id: str, request_key_hash: str | None = None) -> object:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from platform_core.agent_runtime.rerun import ReplayRefused, rerun_failed_run
@@ -138,6 +141,7 @@ async def _replay(run_id: str) -> object:
                     run_id=uuid.UUID(run_id),
                     tenant_id=uuid.UUID(TENANT),
                     actor_ref="operator@example.test",
+                    request_key_hash=request_key_hash,
                     now=1_700_000_000,
                 )
                 await session.commit()
@@ -277,5 +281,44 @@ def test_replay_refuses_when_one_is_already_in_flight() -> None:
         second = _run(_replay(run_id))
         assert getattr(first, "new_run_id", None) is not None, first
         assert type(second).__name__ == "ReplayRefused", second
+    finally:
+        _cleanup(run_id)
+
+
+def test_same_idempotency_key_returns_the_same_rerun_after_it_finishes() -> None:
+    """A late HTTP retry must not turn one operator action into two replies."""
+    run_id = _seed_run(FAILED)
+    key_hash = hashlib.sha256(b"operator-rerun-key").hexdigest()
+    try:
+        first = _run(_replay(run_id, key_hash))
+        first_id = getattr(first, "new_run_id", None)
+        assert first_id is not None, first
+        assert getattr(first, "reused", True) is False
+
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            conn.execute(
+                text("UPDATE agent_runs SET status = 'completed' WHERE id = :i"),
+                {"i": str(first_id)},
+            )
+        admin.dispose()
+
+        retried = _run(_replay(run_id, key_hash))
+        assert getattr(retried, "new_run_id", None) == first_id, retried
+        assert getattr(retried, "reused", False) is True
+        assert getattr(retried, "status", None) == COMPLETED
+
+        different_key = _run(_replay(run_id, hashlib.sha256(b"new-rerun-key").hexdigest()))
+        assert type(different_key).__name__ == "ReplayRefused", different_key
+        assert getattr(different_key, "code", None) == "RERUN_ALREADY_ANSWERED"
+
+        admin = create_engine(ADMIN_URL)
+        with admin.begin() as conn:
+            stored_hash = conn.execute(
+                text("SELECT replay_request_key_hash FROM agent_runs WHERE id = :i"),
+                {"i": str(first_id)},
+            ).scalar_one()
+        admin.dispose()
+        assert stored_hash == key_hash
     finally:
         _cleanup(run_id)

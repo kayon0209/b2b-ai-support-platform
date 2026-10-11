@@ -30,7 +30,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import JsonLogger
@@ -41,6 +41,7 @@ from platform_core.agent_runtime.semantic.shadow import (
     capabilities_for_shadow,
     record_shadow,
 )
+from platform_core.execution_budget import ExecutionBudget, use_execution_budget
 from platform_core.identity.tenant_context import TenantContext
 from platform_core.outbox import OutboxEvent, OutboxStatus
 
@@ -50,10 +51,11 @@ logger = JsonLogger("platform.worker")
 # gets a shorter deadline than the interactive path and no retry at all.
 SHADOW_DEADLINE_SECONDS = 2.0
 SHADOW_MAX_RETRIES = 0
-
+SHADOW_MAX_ATTEMPTS = 3
 # A claimed row nobody finishes within this window returns to the queue. Well
 # beyond the deadline, so a slow provider is never mistaken for a dead worker.
 STALE_SHADOW_SECONDS = 300
+SHADOW_JOB_DEADLINE_SECONDS = STALE_SHADOW_SECONDS * SHADOW_MAX_ATTEMPTS
 
 # The claimed state. `OutboxStatus` has no in-flight member, and adding one
 # would change a shared vocabulary the outbox relay also reads; a literal
@@ -72,6 +74,9 @@ class ClaimedShadow:
 
     event_id: uuid.UUID
     tenant_id: uuid.UUID
+    deadline_at: int | None = None
+    attempt: int = 1
+    external_attempt_limit: int = SHADOW_MAX_ATTEMPTS
 
 
 @dataclass(frozen=True)
@@ -106,12 +111,54 @@ async def claim_shadow_events(
     the same turn, and a duplicate analysis would write two assessments for one
     input.
     """
+    from platform_core.config import get_settings
+
+    settings = get_settings()
+    now = int(time.time())
+    await session.execute(
+        update(OutboxEvent)
+        .where(
+            OutboxEvent.event_type == SHADOW_EVENT_TYPE,
+            OutboxEvent.status == OutboxStatus.QUEUED.value,
+            OutboxEvent.attempts >= SHADOW_MAX_ATTEMPTS,
+        )
+        .values(
+            status=OutboxStatus.FAILED.value,
+            processing_started_at=None,
+            last_error="shadow_attempt_budget_exhausted",
+        )
+    )
+    expired = await session.execute(
+        update(OutboxEvent)
+        .where(
+            OutboxEvent.event_type == SHADOW_EVENT_TYPE,
+            OutboxEvent.status == OutboxStatus.QUEUED.value,
+            OutboxEvent.deadline_at <= now,
+        )
+        .values(status=OutboxStatus.FAILED.value, last_error="shadow_deadline_exhausted")
+    )
+    expired_count = int(getattr(expired, "rowcount", 0) or 0)
+    if expired_count:
+        logger.error("shadow_deadline_exhausted", count=expired_count)
+        get_metrics().inbox_events_total.labels(result="shadow_deadline_exhausted").inc(
+            expired_count
+        )
     rows = (
         await session.execute(
-            select(OutboxEvent.id, OutboxEvent.event_id, OutboxEvent.tenant_id)
+            select(
+                OutboxEvent.id,
+                OutboxEvent.event_id,
+                OutboxEvent.tenant_id,
+                OutboxEvent.attempts,
+                OutboxEvent.first_attempt_at,
+                OutboxEvent.deadline_at,
+                OutboxEvent.external_attempt_limit,
+            )
             .where(
                 OutboxEvent.event_type == SHADOW_EVENT_TYPE,
                 OutboxEvent.status == OutboxStatus.QUEUED.value,
+                OutboxEvent.attempts < SHADOW_MAX_ATTEMPTS,
+                or_(OutboxEvent.deadline_at.is_(None), OutboxEvent.deadline_at > now),
             )
             .order_by(OutboxEvent.created_at, OutboxEvent.id)
             .limit(batch)
@@ -120,12 +167,36 @@ async def claim_shadow_events(
     ).all()
     claimed: list[ClaimedShadow] = []
     for row in rows:
+        first_attempt_at = int(row.first_attempt_at or now)
+        deadline_at = int(row.deadline_at or first_attempt_at + SHADOW_JOB_DEADLINE_SECONDS)
+        external_attempt_limit = int(
+            row.external_attempt_limit
+            or min(settings.outbox_event_max_external_attempts, SHADOW_MAX_ATTEMPTS)
+        )
         await session.execute(
             update(OutboxEvent)
             .where(OutboxEvent.id == row.id)
-            .values(status=SHADOW_IN_FLIGHT, processing_started_at=int(time.time()))
+            .values(
+                status=SHADOW_IN_FLIGHT,
+                processing_started_at=now,
+                first_attempt_at=func.coalesce(OutboxEvent.first_attempt_at, now),
+                deadline_at=func.coalesce(OutboxEvent.deadline_at, deadline_at),
+                external_attempt_limit=func.coalesce(
+                    OutboxEvent.external_attempt_limit,
+                    external_attempt_limit,
+                ),
+                attempts=OutboxEvent.attempts + 1,
+            )
         )
-        claimed.append(ClaimedShadow(event_id=row.event_id, tenant_id=row.tenant_id))
+        claimed.append(
+            ClaimedShadow(
+                event_id=row.event_id,
+                tenant_id=row.tenant_id,
+                deadline_at=deadline_at,
+                attempt=int(row.attempts) + 1,
+                external_attempt_limit=external_attempt_limit,
+            )
+        )
     return claimed
 
 
@@ -136,16 +207,59 @@ async def reclaim_stale_shadow(session: AsyncSession) -> int:
     forever and the comparison silently stops. The assessment write is
     idempotent per turn, so re-running an interrupted claim is safe.
     """
-    cutoff = int(time.time()) - STALE_SHADOW_SECONDS
-    result = await session.execute(
+    now = int(time.time())
+    cutoff = now - STALE_SHADOW_SECONDS
+    expired_queued = await session.execute(
         update(OutboxEvent)
         .where(
             OutboxEvent.event_type == SHADOW_EVENT_TYPE,
-            OutboxEvent.status == SHADOW_IN_FLIGHT,
-            OutboxEvent.processing_started_at < cutoff,
+            OutboxEvent.status == OutboxStatus.QUEUED.value,
+            OutboxEvent.deadline_at <= now,
         )
+        .values(status=OutboxStatus.FAILED.value, last_error="shadow_deadline_exhausted")
+    )
+    stale = and_(
+        OutboxEvent.event_type == SHADOW_EVENT_TYPE,
+        OutboxEvent.status == SHADOW_IN_FLIGHT,
+        OutboxEvent.processing_started_at < cutoff,
+    )
+    deadline_failed = await session.execute(
+        update(OutboxEvent)
+        .where(stale, OutboxEvent.deadline_at <= now)
+        .values(
+            status=OutboxStatus.FAILED.value,
+            processing_started_at=None,
+            last_error="shadow_deadline_exhausted",
+        )
+    )
+    retryable_stale = and_(
+        stale,
+        or_(OutboxEvent.deadline_at.is_(None), OutboxEvent.deadline_at > now),
+    )
+    result = await session.execute(
+        update(OutboxEvent)
+        .where(retryable_stale, OutboxEvent.attempts < SHADOW_MAX_ATTEMPTS)
         .values(status=OutboxStatus.QUEUED.value, processing_started_at=None)
     )
+    exhausted = await session.execute(
+        update(OutboxEvent)
+        .where(retryable_stale, OutboxEvent.attempts >= SHADOW_MAX_ATTEMPTS)
+        .values(
+            status=OutboxStatus.FAILED.value,
+            processing_started_at=None,
+            last_error="shadow_attempt_budget_exhausted",
+        )
+    )
+    exhausted_count = (
+        int(getattr(exhausted, "rowcount", 0) or 0)
+        + int(getattr(deadline_failed, "rowcount", 0) or 0)
+        + int(getattr(expired_queued, "rowcount", 0) or 0)
+    )
+    if exhausted_count:
+        logger.error("shadow_attempt_budget_exhausted", count=exhausted_count)
+        get_metrics().inbox_events_total.labels(result="shadow_retry_budget_exhausted").inc(
+            exhausted_count
+        )
     return int(getattr(result, "rowcount", 0) or 0)
 
 
@@ -243,24 +357,56 @@ async def process_shadow_event(
         await registry.ensure_tool_definitions(session, tenant_id=work.tenant_id)
         available = capabilities_for_shadow(await _tenant_tool_names(session, work.tenant_id))
 
-        outcome = await record_shadow(
-            session,
-            ShadowRequest(
-                tenant_id=work.tenant_id,
-                conversation_ref_id=work.conversation_ref_id,
-                turn_id=work.turn_id,
-                turn_text=turn.text_redacted,
-                history=history,
-                lease_owner_type="ai",
-                capabilities=available,
-                turn_created_at=int(turn.ts or time.time()),
-            ),
-            provider=provider,
-            budget=SemanticBudget(
-                deadline_seconds=SHADOW_DEADLINE_SECONDS,
-                max_retries=SHADOW_MAX_RETRIES,
-            ),
+        remaining = (
+            SHADOW_JOB_DEADLINE_SECONDS
+            if claimed.deadline_at is None
+            else claimed.deadline_at - int(time.time())
         )
+        if remaining <= 0:
+            await _finish(
+                session,
+                claimed,
+                status=OutboxStatus.FAILED.value,
+                error="shadow_deadline_exhausted",
+            )
+            metrics.inbox_events_total.labels(result="shadow_deadline_exhausted").inc()
+            return "failed"
+        base, remainder = divmod(claimed.external_attempt_limit, SHADOW_MAX_ATTEMPTS)
+        model_attempts = base + (1 if claimed.attempt <= remainder else 0)
+        if model_attempts < 1:
+            await _finish(
+                session,
+                claimed,
+                status=OutboxStatus.FAILED.value,
+                error="shadow_attempt_budget_exhausted",
+            )
+            metrics.inbox_events_total.labels(result="shadow_retry_budget_exhausted").inc()
+            return "failed"
+        request_deadline = min(SHADOW_DEADLINE_SECONDS, float(remaining))
+        attempt_budget = ExecutionBudget.for_seconds(
+            deadline_seconds=request_deadline,
+            max_attempts=model_attempts,
+            operation_limits={"model": model_attempts, "tool": 0, "outbound": 0},
+        )
+        with use_execution_budget(attempt_budget):
+            outcome = await record_shadow(
+                session,
+                ShadowRequest(
+                    tenant_id=work.tenant_id,
+                    conversation_ref_id=work.conversation_ref_id,
+                    turn_id=work.turn_id,
+                    turn_text=turn.text_redacted,
+                    history=history,
+                    lease_owner_type="ai",
+                    capabilities=available,
+                    turn_created_at=int(turn.ts or time.time()),
+                ),
+                provider=provider,
+                budget=SemanticBudget(
+                    deadline_seconds=request_deadline,
+                    max_retries=SHADOW_MAX_RETRIES,
+                ),
+            )
     except Exception as exc:  # noqa: BLE001 - recorded, never propagated
         await _finish(session, claimed, status=OutboxStatus.FAILED.value, error=type(exc).__name__)
         metrics.inbox_events_total.labels(result="shadow_error").inc()

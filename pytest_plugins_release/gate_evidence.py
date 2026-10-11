@@ -41,9 +41,16 @@ from pathlib import Path
 
 import pytest
 
-EVIDENCE_PATH = (
-    Path(__file__).resolve().parents[1] / "tests" / "artifacts" / "release_gate_evidence.json"
-)
+DEFAULT_EVIDENCE_DIRECTORY = Path(__file__).resolve().parents[1] / "tests" / "artifacts"
+
+
+def evidence_path_for(artifact_directory: str | Path | None = None) -> Path:
+    """Resolve the session artifact path, honoring isolated test-run outputs."""
+    directory = Path(artifact_directory) if artifact_directory else DEFAULT_EVIDENCE_DIRECTORY
+    return directory / "release_gate_evidence.json"
+
+
+EVIDENCE_PATH = evidence_path_for(os.environ.get("APP_TEST_ARTIFACT_DIR"))
 MARKER = "zero_tolerance"
 
 # One id per session. Generated per *write* instead, two artifacts from the

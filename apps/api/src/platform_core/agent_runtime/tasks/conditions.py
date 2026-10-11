@@ -56,6 +56,49 @@ REGISTERED_FIELDS: dict[str, ConditionReader] = {
 ALLOWED_FIELDS = frozenset(REGISTERED_FIELDS)
 
 
+def facts_from_verified_read(tool_name: str, output: dict[str, Any]) -> dict[str, Any]:
+    """Project a verified tool result into the small condition vocabulary.
+
+    Provider-specific fields are never exposed directly to a condition. A
+    tool without an explicit projection, a missing record, or an unknown
+    status yields no facts and therefore remains undecidable.
+    """
+    if output.get("found") is not True:
+        return {}
+
+    if tool_name != "order.get_status" or output.get("resource") != "orders":
+        # case.read is tenant-scoped but does not yet carry the conversation's
+        # account proof; invoice reads also lack a stored ownership receipt.
+        # Do not treat either as customer-authorized evidence here.
+        return {}
+
+    record = output.get("record")
+    source = record if isinstance(record, dict) else output
+    status = source.get("status")
+    order_statuses = {
+        "draft",
+        "submitted",
+        "accepted",
+        "in_production",
+        "partially_shipped",
+        "shipped",
+        "delivered",
+        "on_hold",
+        "cancelled",
+    }
+    if not isinstance(status, str) or status not in order_statuses:
+        return {}
+
+    order: dict[str, Any] = {"status": status}
+    known_unshipped = {"draft", "submitted", "accepted", "in_production"}
+    known_shipped = {"partially_shipped", "shipped", "delivered"}
+    if status in known_unshipped:
+        order["shipped"] = False
+    elif status in known_shipped:
+        order["shipped"] = True
+    return {"order": order}
+
+
 @dataclass(frozen=True)
 class ConditionOutcome:
     """The result, and whether it is trustworthy enough to act on."""
@@ -123,5 +166,6 @@ __all__ = [
     "REGISTERED_FIELDS",
     "ConditionOutcome",
     "evaluate_condition",
+    "facts_from_verified_read",
     "validate_condition",
 ]

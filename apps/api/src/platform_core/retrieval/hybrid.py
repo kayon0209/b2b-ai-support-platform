@@ -255,7 +255,12 @@ def _embedder_identity(embedder: Embedder) -> str:
     return f"{type(embedder).__name__}:{model or ''}"
 
 
-async def _cached_embed_query(embedder: Embedder, query: str) -> list[float]:
+async def _cached_embed_query(
+    embedder: Embedder,
+    query: str,
+    *,
+    cache: bool = True,
+) -> list[float]:
     """Embed a query, reusing the vector when the same text came before.
 
     Only the embedding is cached, never the result set: an embedding depends on
@@ -263,6 +268,9 @@ async def _cached_embed_query(embedder: Embedder, query: str) -> list[float]:
     the one thing here that is safe to key on a string. See
     `retrieval.cache` for the full reasoning.
     """
+    if not cache:
+        return await embedder.embed_query(query)
+
     from platform_core.retrieval.cache import embedding_cache, embedding_key
 
     key = embedding_key(query, model=_embedder_identity(embedder))
@@ -296,6 +304,7 @@ async def hybrid_search(
     authority_boost: Mapping[str, float] | None = None,
     embedder: Embedder | None = None,
     release_candidate: ReleaseCandidateScope | None = None,
+    cache_query_embedding: bool = True,
 ) -> list[RetrievedChunk]:
     """Run the enabled retrieval paths under tenant/ACL/metadata filter,
     fuse with RRF, optionally boost by document authority.
@@ -497,7 +506,11 @@ async def hybrid_search(
 
     if "vector" in paths:
         active_embedder: Embedder = embedder or DeterministicEmbedder()
-        vec = await _cached_embed_query(active_embedder, query)
+        vec = await _cached_embed_query(
+            active_embedder,
+            query,
+            cache=cache_query_embedding,
+        )
         params["vec"] = _vector_literal(vec)
         results["vector"] = list((await session.execute(vec_sql, params)).mappings().all())
 

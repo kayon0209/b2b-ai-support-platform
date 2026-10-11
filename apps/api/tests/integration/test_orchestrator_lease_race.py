@@ -18,6 +18,7 @@ These run against a real PostgreSQL with RLS enabled because the lease CAS
 mechanisms under test — a fake session would prove nothing.
 """
 
+import json
 import os
 import uuid
 
@@ -122,6 +123,7 @@ def seed_corpus() -> None:
 
     cleanup = create_engine(ADMIN_URL)
     with cleanup.begin() as conn:
+        conn.execute(text("DELETE FROM inbox_events WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(text("DELETE FROM citations WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(text("DELETE FROM agent_runs WHERE tenant_id = :t"), {"t": TENANT})
         conn.execute(text("DELETE FROM prompt_versions WHERE tenant_id = :t"), {"t": TENANT})
@@ -717,6 +719,164 @@ def test_outbound_failure_marks_run_failed_not_completed() -> None:
     assert outcome.status.value == "failed"
     assert status == "failed"
     assert output_hash is None
+
+
+def test_newer_customer_message_supersedes_a_slow_old_answer() -> None:
+    """A newer accepted turn makes an older in-flight draft expire before send."""
+    import asyncio
+
+    from sqlalchemy import create_engine as create_admin_engine
+
+    from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
+    from platform_core.db import create_engine
+    from platform_core.identity import lease_service
+    from platform_core.retrieval.hybrid import PrincipalScope
+    from platform_core.support_bridge.inbox import persist_inbox_event
+    from worker.inbox_consumer import mark_completed
+
+    tid = uuid.UUID(TENANT)
+    conversation = uuid.uuid4()
+    source_event = uuid.uuid4()
+    received_at = 1
+    admin = create_admin_engine(ADMIN_URL)
+    with admin.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO inbox_events (id, tenant_id, delivery_id, event_type, payload_hash, "
+                "minimized_payload, status, received_at) VALUES (:id, :tenant, :delivery, "
+                "'message_created', 'old-hash', CAST(:payload AS jsonb), 'processing', :received)"
+            ),
+            {
+                "id": source_event,
+                "tenant": TENANT,
+                "delivery": f"old-turn-{source_event}",
+                "payload": json.dumps(
+                    {
+                        "conversation_ref": str(conversation),
+                        "message_id": str(uuid.uuid4()),
+                        "message_type": "incoming",
+                    }
+                ),
+                "received": received_at,
+            },
+        )
+    admin.dispose()
+
+    tid = uuid.UUID(TENANT)
+    principal = PrincipalScope(principal_types=("role",), principal_ids=("ai_agent",))
+
+    async def scenario() -> tuple[
+        object, _RecordingTransport, object, str, str | None, tuple[str, str, str]
+    ]:
+        engine = create_engine(APP_URL)
+        factory = _factory(engine)
+
+        async with factory() as session:
+            await _with_ctx(session, TENANT)
+            lease = await lease_service.acquire_or_get(
+                session, tenant_id=tid, conversation_ref_id=conversation
+            )
+            await session.commit()
+        expected_version = int(lease.lease_version)
+
+        class _BlockedGenerator(_FixedGenerator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.resume = asyncio.Event()
+
+            async def generate(self, question, evidence, **kwargs):
+                self.started.set()
+                await asyncio.wait_for(self.resume.wait(), timeout=10)
+                return await super().generate(question, evidence, **kwargs)
+
+        sender = _RecordingTransport()
+        generator = _BlockedGenerator()
+
+        async def run_old_turn() -> tuple[object, str, str | None, tuple[str, str, str]]:
+            async with factory() as session:
+                await _with_ctx(session, TENANT)
+                orchestrator = AgentOrchestrator(
+                    session,
+                    OrchestratorDeps(
+                        generator=generator,
+                        channel_sender=ChannelSender({"email": sender}),
+                    ),
+                )
+                outcome = await orchestrator.run(
+                    tenant_id=tid,
+                    conversation_ref_id=conversation,
+                    question="how long is the refund window?",
+                    principal=principal,
+                    channel_system="email",
+                    channel_address="buyer@example.test",
+                    channel_conversation_key=str(conversation),
+                    expected_lease_version=expected_version,
+                    source_event_id=source_event,
+                )
+                await mark_completed(session, source_event)
+                await session.commit()
+                await _with_ctx(session, TENANT)
+                from sqlalchemy import select
+
+                from platform_core.agent_runtime.models import AgentRun
+
+                run = (
+                    await session.execute(select(AgentRun).where(AgentRun.id == outcome.run_id))
+                ).scalar_one()
+                audit = (
+                    await session.execute(
+                        text(
+                            "SELECT action, decision, reason_code FROM audit_events "
+                            "WHERE tenant_id = :tenant AND resource_type = 'agent_run' "
+                            "AND resource_id = :run ORDER BY occurred_at DESC LIMIT 1"
+                        ),
+                        {"tenant": TENANT, "run": outcome.run_id},
+                    )
+                ).one()
+                return outcome, run.status, run.output_hash, tuple(audit)
+
+        run_task = asyncio.create_task(run_old_turn())
+        try:
+            await asyncio.wait_for(generator.started.wait(), timeout=10)
+            async with factory() as session:
+                await _with_ctx(session, TENANT)
+                newer = await persist_inbox_event(
+                    session,
+                    tenant_id=tid,
+                    delivery_id=f"new-turn-{uuid.uuid4()}",
+                    event_type="message_created",
+                    raw_body=b"",
+                    minimized_payload={
+                        "conversation_ref": str(conversation),
+                        "message_id": str(uuid.uuid4()),
+                        "message_type": "incoming",
+                    },
+                )
+                assert not newer.duplicate and newer.event_id is not None
+                await session.commit()
+
+            generator.resume.set()
+            outcome, status, output_hash, audit = await asyncio.wait_for(run_task, timeout=10)
+        finally:
+            generator.resume.set()
+            if not run_task.done():
+                run_task.cancel()
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    pass
+            await engine.dispose()
+        return outcome, sender, generator, status, output_hash, audit
+
+    outcome, sender, generator, status, output_hash, audit = _run(scenario())
+    assert generator.calls == 1
+    assert sender.calls == [], "the older draft must not send after a newer turn is accepted"
+    assert outcome.status.value == "superseded"
+    assert outcome.send_blocked_reason == "NEWER_CUSTOMER_MESSAGE"
+    assert status == "superseded"
+    assert output_hash is None
+    assert audit == ("agent_run.superseded", "superseded", "NEWER_CUSTOMER_MESSAGE")
 
 
 @pytest.mark.zero_tolerance("duplicate_replies")

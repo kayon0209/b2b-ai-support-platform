@@ -20,9 +20,9 @@ So the predicate lives here once, in two forms that must agree:
 
 Semantics (from docs/security.md, and matching what retrieval already did):
 
-    A resource carrying ACL entries is readable only if one of those entries
-    matches the caller's principal set. A resource carrying NO ACL entries is
-    readable by anyone in the tenant.
+    A resource carrying ACL entries is readable if at least one complete
+    (principal type, principal id) pair matches the caller's scope. A resource
+    carrying NO ACL entries is readable by anyone in the tenant.
 
 That second clause is the default-open case and is deliberate - documents are
 tenant-scoped by RLS, and requiring an explicit grant per document would make
@@ -62,18 +62,32 @@ class PrincipalScope:
 # hybrid.py expands to this. Kept as a named constant so a reader can find it
 # from either direction.
 ACL_FILTER_SQL = """
-  AND NOT EXISTS (
-    SELECT 1 FROM knowledge_acls a
-    WHERE a.tenant_id = CAST(:tid AS uuid)
-      AND (
-        (a.resource_type = 'space' AND a.resource_id = d.space_id)
-        OR (a.resource_type = 'document' AND a.resource_id = d.id)
-        OR (a.resource_type = 'version' AND a.resource_id = dv.id)
-      )
-      AND NOT (
-        a.principal_type = ANY(CAST(:p_types AS text[]))
-        AND a.principal_id = ANY(CAST(:p_ids AS text[]))
-      )
+  AND (
+    NOT EXISTS (
+      SELECT 1 FROM knowledge_acls a
+      WHERE a.tenant_id = CAST(:tid AS uuid)
+        AND (
+          (a.resource_type = 'space' AND a.resource_id = d.space_id)
+          OR (a.resource_type = 'document' AND a.resource_id = d.id)
+          OR (a.resource_type = 'version' AND a.resource_id = dv.id)
+        )
+    )
+    OR EXISTS (
+      SELECT 1 FROM knowledge_acls a
+      WHERE a.tenant_id = CAST(:tid AS uuid)
+        AND (
+          (a.resource_type = 'space' AND a.resource_id = d.space_id)
+          OR (a.resource_type = 'document' AND a.resource_id = d.id)
+          OR (a.resource_type = 'version' AND a.resource_id = dv.id)
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM unnest(CAST(:p_types AS text[]), CAST(:p_ids AS text[]))
+            AS principal_scope(principal_type, principal_id)
+          WHERE a.principal_type = principal_scope.principal_type
+            AND a.principal_id = principal_scope.principal_id
+        )
+    )
   )
 """
 
@@ -106,36 +120,65 @@ async def can_read_document(
         # as "no ACLs apply, therefore allowed".
         return False
 
-    ids = [i for i in (principal_id, role) if i]
+    principal_pairs = [("user", principal_id), ("role", role)]
+    principal_pairs = [(kind, value) for kind, value in principal_pairs if value]
     row = (
         await session.execute(
             text(
                 """
-                SELECT count(*) FROM knowledge_acls a
-                WHERE a.tenant_id = CAST(:tid AS uuid)
-                  AND (
-                    (a.resource_type = 'document' AND a.resource_id = CAST(:doc AS uuid))
-                    OR (a.resource_type = 'space'
-                        AND a.resource_id = (SELECT space_id FROM documents
-                                             WHERE id = CAST(:doc AS uuid)))
-                    OR (a.resource_type = 'version'
-                        AND a.resource_id IN (SELECT id FROM document_versions
-                                              WHERE document_id = CAST(:doc AS uuid)))
+                SELECT (
+                  NOT EXISTS (
+                    SELECT 1 FROM knowledge_acls a
+                    WHERE a.tenant_id = CAST(:tid AS uuid)
+                      AND (
+                        (a.resource_type = 'document' AND a.resource_id = CAST(:doc AS uuid))
+                        OR (a.resource_type = 'space' AND a.resource_id = (
+                            SELECT space_id FROM documents
+                            WHERE tenant_id = CAST(:tid AS uuid)
+                              AND id = CAST(:doc AS uuid)
+                        ))
+                        OR (a.resource_type = 'version' AND a.resource_id IN (
+                            SELECT id FROM document_versions
+                            WHERE tenant_id = CAST(:tid AS uuid)
+                              AND document_id = CAST(:doc AS uuid)
+                        ))
+                      )
                   )
-                  AND NOT (
-                    a.principal_type = ANY(CAST(:p_types AS text[]))
-                    AND a.principal_id = ANY(CAST(:p_ids AS text[]))
+                  OR EXISTS (
+                    SELECT 1 FROM knowledge_acls a
+                    WHERE a.tenant_id = CAST(:tid AS uuid)
+                      AND (
+                        (a.resource_type = 'document' AND a.resource_id = CAST(:doc AS uuid))
+                        OR (a.resource_type = 'space' AND a.resource_id = (
+                            SELECT space_id FROM documents
+                            WHERE tenant_id = CAST(:tid AS uuid)
+                              AND id = CAST(:doc AS uuid)
+                        ))
+                        OR (a.resource_type = 'version' AND a.resource_id IN (
+                            SELECT id FROM document_versions
+                            WHERE tenant_id = CAST(:tid AS uuid)
+                              AND document_id = CAST(:doc AS uuid)
+                        ))
+                      )
+                      AND EXISTS (
+                        SELECT 1
+                        FROM unnest(CAST(:p_types AS text[]), CAST(:p_ids AS text[]))
+                          AS principal_scope(principal_type, principal_id)
+                        WHERE a.principal_type = principal_scope.principal_type
+                          AND a.principal_id = principal_scope.principal_id
+                      )
                   )
+                )
                 """
             ),
             {
                 "tid": str(tenant_id),
                 "doc": str(document_id),
-                # A grant may name the principal by user id or by role, so the
-                # caller contributes both and either satisfies it.
-                "p_types": ["user", "role"],
-                "p_ids": ids,
+                # Preserve type/id pairs; independent ANY checks would
+                # cross-match a user's id with a role and grant access.
+                "p_types": [kind for kind, _value in principal_pairs],
+                "p_ids": [value for _kind, value in principal_pairs],
             },
         )
     ).scalar()
-    return int(row or 0) == 0
+    return bool(row)

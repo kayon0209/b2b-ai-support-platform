@@ -130,13 +130,20 @@ class LinearAdapter(ConnectorAdapter):
             return f"CONNECTOR_REJECTED: {message[:120]}"
         return None
 
-    async def _query(self, document: str, variables: dict[str, Any]) -> ExecutionResult:
+    async def _query(
+        self,
+        document: str,
+        variables: dict[str, Any],
+        *,
+        retry_safe: bool = True,
+    ) -> ExecutionResult:
         return await self.http_request(
             "POST",
             self._endpoint,
             headers=self._headers(),
             json_body={"query": document, "variables": variables},
             max_retries=1,
+            retry_safe=retry_safe,
         )
 
     # --- read surface ---
@@ -196,6 +203,7 @@ class LinearAdapter(ConnectorAdapter):
         result = await self._query(
             _CREATE_ISSUE_MUTATION,
             {"title": title[:255], "description": body, "teamId": self._team_id},
+            retry_safe=False,
         )
         failure = self._errors(result)
         if failure is not None:
@@ -236,7 +244,7 @@ class LinearAdapter(ConnectorAdapter):
         if not output:
             return None
         if output.get("ok") is not True:
-            return False
+            return None if output.get("ambiguous") else False
         issue_id = output.get("issue_id")
         if not issue_id:
             return None

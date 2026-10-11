@@ -3,6 +3,7 @@
 import uuid
 
 import pytest
+from sqlalchemy import JSON
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from platform_core.agent_runtime.chat_service import read_timeline, read_timeline_page
@@ -13,13 +14,18 @@ from platform_core.cases.canned_models import CannedReply
 @pytest.mark.asyncio
 async def test_latest_page_and_older_cursor_do_not_drop_new_replies() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(CannedReply.__table__.create)
-        await conn.run_sync(ConversationTurn.__table__.create)
-    tenant, ref = uuid.uuid4(), uuid.uuid4()
-    ids = [uuid.uuid4() for _ in range(5)]
-    factory = async_sessionmaker(engine, expire_on_commit=False)
+    source_refs_type = ConversationTurn.__table__.c.source_refs.type
+    # This is a SQLite-only test fixture. The production model remains
+    # PostgreSQL JSONB; SQLite's compiler needs its compatible JSON type to
+    # create the in-memory table used by this timeline-only test.
+    ConversationTurn.__table__.c.source_refs.type = JSON()
     try:
+        async with engine.begin() as conn:
+            await conn.run_sync(CannedReply.__table__.create)
+            await conn.run_sync(ConversationTurn.__table__.create)
+        tenant, ref = uuid.uuid4(), uuid.uuid4()
+        ids = [uuid.uuid4() for _ in range(5)]
+        factory = async_sessionmaker(engine, expire_on_commit=False)
         async with factory() as session:
             session.add_all(
                 [
@@ -56,4 +62,5 @@ async def test_latest_page_and_older_cursor_do_not_drop_new_replies() -> None:
                 "message-5",
             ]
     finally:
+        ConversationTurn.__table__.c.source_refs.type = source_refs_type
         await engine.dispose()

@@ -25,6 +25,8 @@ Contract notes:
   dispatch, because the lease can move between queueing and sending.
 """
 
+import hashlib
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
@@ -43,8 +45,10 @@ from platform_core.api import (
     ok_response,
     require_idempotency_key,
     require_policy,
+    require_write_idempotency,
     tenant_session,
 )
+from platform_core.audit import service as audit_service
 from platform_core.support_bridge.conversation_ref import parse_conversation_ref
 from platform_policy import Action
 
@@ -177,6 +181,94 @@ async def list_agent_runs(
         ]
 
     return ok_response({"items": items}, trace_id=new_trace_id())
+
+
+@router.post("/agent-runs/{run_id}/rerun")
+async def rerun_agent_run(request: Request, run_id: uuid.UUID) -> Any:
+    """Queue one explicitly confirmed, tenant-authorized failed-run rerun.
+
+    This creates a new queued run and leaves the failed run intact. The human
+    operator's idempotency key is hashed before persistence; the unique
+    `(tenant, failed run, key hash)` receipt makes a network retry return the
+    same replacement even after it has started or finished.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return error_response("AUTH_UNRESOLVED", "tenant context not resolved", status_code=401)
+    denied = require_policy(ctx, Action.CASE_UPDATE)
+    if denied is not None:
+        return denied
+    if ctx.actor_kind != "user" or ctx.actor_id is None:
+        return error_response(
+            "POLICY_DENIED", "a human operator must request a rerun", status_code=403
+        )
+    missing = require_write_idempotency(request, Action.CASE_UPDATE)
+    if missing is not None:
+        return missing
+    idempotency_key = require_idempotency_key(request)
+    if (
+        idempotency_key is None
+        or len(idempotency_key) > 255
+        or idempotency_key.strip() != idempotency_key
+        or any(ord(char) < 0x20 for char in idempotency_key)
+    ):
+        return error_response(
+            VALIDATION_FAILED,
+            "Idempotency-Key must be 1-255 printable characters without surrounding whitespace",
+            status_code=400,
+        )
+    request_key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    trace_id = new_trace_id()
+
+    from platform_core.agent_runtime.rerun import ReplayRefused, rerun_failed_run
+
+    async with tenant_session(ctx) as session:
+        try:
+            result = await rerun_failed_run(
+                session,
+                run_id=run_id,
+                tenant_id=ctx.tenant_id,
+                actor_ref=str(ctx.actor_id),
+                request_key_hash=request_key_hash,
+            )
+        except ReplayRefused as exc:
+            await audit_service.record(
+                session,
+                ctx=ctx,
+                action="agent_run.rerun_requested",
+                resource_type="agent_run",
+                resource_id=run_id,
+                decision="denied",
+                reason_code=exc.code,
+                metadata={"request_key_hash_prefix": request_key_hash[:12]},
+                trace_id=trace_id,
+            )
+            await session.commit()
+            status_code = 404 if exc.code == "NOT_FOUND" else 409
+            return error_response(exc.code, str(exc), status_code=status_code, trace_id=trace_id)
+
+        await audit_service.record(
+            session,
+            ctx=ctx,
+            action="agent_run.rerun_requested",
+            resource_type="agent_run",
+            resource_id=run_id,
+            decision="no_change" if result.reused else "allowed",
+            reason_code="IDEMPOTENT_REPLAY" if result.reused else "OK",
+            after={"new_run_id": str(result.new_run_id)},
+            metadata={"request_key_hash_prefix": request_key_hash[:12]},
+            trace_id=trace_id,
+        )
+        await session.commit()
+    return ok_response(
+        {
+            "run_id": str(result.new_run_id),
+            "rerun_of": str(result.rerun_of),
+            "status": result.status,
+            "idempotent_replay": result.reused,
+        },
+        trace_id=trace_id,
+    )
 
 
 @router.get("")

@@ -17,6 +17,12 @@ from typing import Any
 from platform_core.integrations.sdk import ConnectorAdapter, ConnectorContext
 
 
+def _jql_string_literal(value: str) -> str:
+    """Quote a value as a JQL string literal, escaping its delimiters."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 @dataclass(frozen=True)
 class JiraIssueSummary:
     """Canonical issue projection."""
@@ -111,12 +117,15 @@ class JiraAdapter(ConnectorAdapter):
 
     async def search_issues(self, query: str, max_results: int = 10) -> list[JiraIssueSummary]:
         """Search before create (docs/integrations.md: avoid duplicates)."""
-        jql = f'project = {self._project} AND summary ~ "{query}"'
+        jql = (
+            f"project = {_jql_string_literal(self._project)} "
+            f"AND summary ~ {_jql_string_literal(query)}"
+        )
         result = await self.http_request(
             "GET",
             f"{self._base}/rest/api/3/search",
             headers=self._headers(),
-            json_body={"jql": jql, "maxResults": max_results},
+            params={"jql": jql, "maxResults": max_results},
         )
         if not result.ok or not result.data:
             return []
@@ -183,7 +192,7 @@ class JiraAdapter(ConnectorAdapter):
         if not output:
             return None
         if output.get("ok") is not True:
-            return False
+            return None if output.get("ambiguous") else False
         issue_key = output.get("issue_key")
         if not issue_key:
             return None

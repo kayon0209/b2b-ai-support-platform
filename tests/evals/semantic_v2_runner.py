@@ -29,11 +29,15 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
+    from .metrics import ModelUsageSample, summarize_model_usage
     from .semantic_v2_dataset import cases_for_split, semantic_v2_cases
     from .semantic_v2_manifest import FROZEN_DATASET_HASH
+    from .tracing import local_observe, require_tracing
 else:
+    from metrics import ModelUsageSample, summarize_model_usage
     from semantic_v2_dataset import cases_for_split, semantic_v2_cases
     from semantic_v2_manifest import FROZEN_DATASET_HASH
+    from tracing import local_observe, require_tracing
 
 from platform_core.agent_runtime.intent import classify
 from platform_core.agent_runtime.semantic.context import SYSTEM_PROMPT_VERSION, build_context
@@ -43,6 +47,7 @@ from platform_core.agent_runtime.semantic.contracts import (
     SlotOrigin,
 )
 from platform_core.agent_runtime.semantic.service import (
+    MAX_CLASSIFY_RETRIES,
     REGISTERED_CONDITION_FIELDS,
     AnalysisRequest,
     SemanticBudget,
@@ -61,6 +66,7 @@ from platform_core.evaluation.semantic_eval import (
     assign_split,
     compare,
     dataset_hash,
+    score_intent_set,
     validate_dataset,
 )
 from platform_core.llm.factory import ChatTask, chat_model_for
@@ -70,6 +76,9 @@ from platform_core.llm.provider import ChatMessage, ChatResult
 _LAST_MODEL_RESPONSE: ContextVar[str | None] = ContextVar(
     "semantic_v2_last_model_response", default=None
 )
+_MODEL_REQUEST_ATTEMPTS: ContextVar[int] = ContextVar(
+    "semantic_v2_model_request_attempts", default=0
+)
 
 
 class NoThinkingGiteeProvider:
@@ -78,6 +87,7 @@ class NoThinkingGiteeProvider:
     def __init__(self, client: GiteeAiClient) -> None:
         self._client = client
 
+    @local_observe(span_type="llm", name="semantic_v2_model_call")
     async def complete(
         self,
         messages: list[ChatMessage],
@@ -86,6 +96,7 @@ class NoThinkingGiteeProvider:
         temperature: float = 0.0,
         model: str | None = None,
     ) -> ChatResult:
+        _MODEL_REQUEST_ATTEMPTS.set(_MODEL_REQUEST_ATTEMPTS.get() + 1)
         started = time.monotonic()
         selected_model = model or self._client._chat_model
         payload: dict[str, Any] = {
@@ -134,6 +145,8 @@ class CaseRun:
     queue_wait_ms: int
     prompt_tokens: int
     completion_tokens: int
+    model_request_attempts: int = 0
+    exact_intent_match: bool = False
 
 
 def _percentile(values: list[int], percentile: float) -> int | None:
@@ -312,6 +325,7 @@ async def _run_split(
     deadline_seconds: float,
     completion_tokens: int,
     diagnostic_sample: bool = False,
+    max_retries: int = 0,
 ) -> dict[str, Any]:
     all_cases = semantic_v2_cases()
     digest = dataset_hash(all_cases)
@@ -338,12 +352,13 @@ async def _run_split(
     provider = NoThinkingGiteeProvider(client)
     budget = SemanticBudget(
         deadline_seconds=deadline_seconds,
-        max_retries=0,
+        max_retries=max_retries,
         max_completion_tokens=completion_tokens,
     )
     semaphore = asyncio.Semaphore(max_concurrency)
     run_started_at = datetime.now(UTC)
 
+    @local_observe(span_type="agent", name="semantic_v2_case")
     async def run_one(case: Any) -> CaseRun:
         queued_at = time.monotonic()
         async with semaphore:
@@ -359,6 +374,7 @@ async def _run_split(
             )
             detection = classify(case.text)
             response_token = _LAST_MODEL_RESPONSE.set(None)
+            attempt_token = _MODEL_REQUEST_ATTEMPTS.set(0)
             try:
                 assessment = await analyze(
                     AnalysisRequest(
@@ -371,8 +387,10 @@ async def _run_split(
                     budget=budget,
                 )
                 raw_response = _LAST_MODEL_RESPONSE.get()
+                model_request_attempts = _MODEL_REQUEST_ATTEMPTS.get()
             finally:
                 _LAST_MODEL_RESPONSE.reset(response_token)
+                _MODEL_REQUEST_ATTEMPTS.reset(attempt_token)
             output = assessment.model_output
             intents = (
                 [output.primary_intent.value, *(item.value for item in output.secondary_intents)]
@@ -417,6 +435,8 @@ async def _run_split(
                 queue_wait_ms=int((started - queued_at) * 1000),
                 prompt_tokens=assessment.prompt_tokens,
                 completion_tokens=assessment.completion_tokens,
+                model_request_attempts=model_request_attempts,
+                exact_intent_match=score_intent_set(case.expected_intents, intents),
             )
 
     started = time.monotonic()
@@ -471,6 +491,22 @@ async def _run_split(
     reason_code_counts = Counter(code for result in results for code in result.reason_codes)
     latencies = [result.latency_ms for result in results]
     queue_waits = [result.queue_wait_ms for result in results]
+    usage = summarize_model_usage(
+        (
+            ModelUsageSample(
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                request_attempts=result.model_request_attempts,
+                valid_output=result.validation_status == "valid",
+                exact_intent_match=result.exact_intent_match,
+                timed_out="SEMANTIC_MODEL_TIMEOUT" in result.reason_codes,
+            )
+            for result in results
+        ),
+        prompt_cost_cents_per_1k=settings.cost_prompt_cents_per_1k,
+        completion_cost_cents_per_1k=settings.cost_completion_cents_per_1k,
+        max_retries=max_retries,
+    )
     return {
         "dataset_id": "semantic-v2-r1-balanced-highrisk-synthetic-2026-09-27",
         "dataset_hash": digest,
@@ -487,12 +523,12 @@ async def _run_split(
         "elapsed_ms": elapsed_ms,
         "max_concurrency": max_concurrency,
         "deadline_seconds": deadline_seconds,
+        "max_retries": max_retries,
         "valid_output_count": valid,
         "invalid_or_unavailable_count": len(results) - valid,
         "validation_failure_buckets": dict(sorted(validation_buckets.items())),
         "reason_code_counts": dict(sorted(reason_code_counts.items())),
-        "total_prompt_tokens": sum(result.prompt_tokens for result in results),
-        "total_completion_tokens": sum(result.completion_tokens for result in results),
+        "usage": usage,
         "tool_selection": tool_selection,
         "latency_ms": {
             "p50": _percentile(latencies, 0.50),
@@ -512,6 +548,13 @@ def main() -> None:
     parser.add_argument("--deadline-seconds", type=float, default=30.0)
     parser.add_argument("--completion-tokens", type=int, default=900)
     parser.add_argument(
+        "--max-retries",
+        type=int,
+        choices=range(MAX_CLASSIFY_RETRIES + 1),
+        default=0,
+        help="Retryable semantic-provider attempts per case; default 0 keeps cost bounded.",
+    )
+    parser.add_argument(
         "--diagnostic-sample",
         action="store_true",
         help="Select 12 dev-only cases (two phrase families per slice); never samples holdout.",
@@ -527,6 +570,7 @@ def main() -> None:
         parser.error("deadline-seconds must be at least 1")
     if args.completion_tokens < 1:
         parser.error("completion-tokens must be at least 1")
+    require_tracing()
     if args.diagnostic_sample and args.split != Split.DEV.value:
         parser.error("--diagnostic-sample requires --split dev")
 
@@ -537,6 +581,7 @@ def main() -> None:
             deadline_seconds=args.deadline_seconds,
             completion_tokens=args.completion_tokens,
             diagnostic_sample=args.diagnostic_sample,
+            max_retries=args.max_retries,
         )
     )
     output_path = args.output or Path("tests/artifacts") / f"semantic_v2_{args.split}.json"
@@ -555,8 +600,9 @@ def main() -> None:
                 "valid_output_count": report["valid_output_count"],
                 "invalid_or_unavailable_count": report["invalid_or_unavailable_count"],
                 "p95_ms": report["latency_ms"]["p95"],
-                "total_prompt_tokens": report["total_prompt_tokens"],
-                "total_completion_tokens": report["total_completion_tokens"],
+                "model_request_attempts": report["usage"]["model_request_attempts"],
+                "model_retry_attempts": report["usage"]["model_retry_attempts"],
+                "estimated_model_cost": report["usage"]["estimated_model_cost"],
             },
             ensure_ascii=False,
         )

@@ -83,6 +83,23 @@ def _seed(tenant_id: uuid.UUID) -> None:
         )
         conn.execute(
             text(
+                "INSERT INTO users (id, primary_email, display_name, is_service_account) "
+                "VALUES (:id, 'demo-crm-actor@example.test', 'Demo CRM actor', false) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {"id": USER_ID},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO memberships (id, tenant_id, user_id, role, status) "
+                "VALUES (gen_random_uuid(), :tenant, :actor, 'support_admin', 'active') "
+                "ON CONFLICT (tenant_id, user_id) DO UPDATE "
+                "SET role = 'support_admin', status = 'active'"
+            ),
+            {"tenant": tenant_id, "actor": USER_ID},
+        )
+        conn.execute(
+            text(
                 "INSERT INTO tool_definitions "
                 "(id, tenant_id, name, version, risk, input_schema, output_schema, "
                 "required_permissions, timeout_ms, idempotent, requires_confirmation) "
@@ -137,7 +154,17 @@ def _cleanup(tenant_id: uuid.UUID) -> None:
         conn.execute(
             text("DELETE FROM audit_events WHERE tenant_id = :tenant"), {"tenant": tenant_id}
         )
+        conn.execute(
+            text("DELETE FROM memberships WHERE tenant_id = :tenant"), {"tenant": tenant_id}
+        )
         conn.execute(text("DELETE FROM tenants WHERE id = :tenant"), {"tenant": tenant_id})
+        conn.execute(
+            text(
+                "DELETE FROM users WHERE id = :actor AND NOT EXISTS "
+                "(SELECT 1 FROM memberships WHERE user_id = :actor)"
+            ),
+            {"actor": USER_ID},
+        )
     admin.dispose()
 
 

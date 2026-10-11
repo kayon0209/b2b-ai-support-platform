@@ -47,6 +47,8 @@ from platform_core.api import (
     require_write_idempotency,
     tenant_session,
 )
+from platform_core.audit import service as audit_service
+from platform_core.evaluation.review_service import verified_review_evidence_for_prompt
 from platform_core.identity import tenant_context
 from platform_core.identity.tenant_context import TenantContext
 from platform_policy import Action, Decision, PolicyEngine, Principal
@@ -292,10 +294,37 @@ async def promote_prompt_version(
     if evidence is not None:
         evidence = _mark_p0(evidence)
 
+    promotion_version_id: uuid.UUID | None = None
     async with tenant_session(ctx) as session:
         try:
-            row = await promote(session, ctx=ctx, version_id=_uuid(version_id), evidence=evidence)
+            prompt_version_id = _uuid(version_id)
+            promotion_version_id = prompt_version_id
+            human_review_evidence = await verified_review_evidence_for_prompt(
+                session,
+                tenant_id=ctx.tenant_id,
+                prompt_version_id=prompt_version_id,
+            )
+            row = await promote(
+                session,
+                ctx=ctx,
+                version_id=prompt_version_id,
+                evidence=evidence,
+                human_review_evidence=human_review_evidence,
+            )
         except ReleaseError as exc:
+            if promotion_version_id is not None:
+                await audit_service.record(
+                    session,
+                    ctx=ctx,
+                    action="prompt.promotion_blocked",
+                    resource_type="prompt_version",
+                    resource_id=promotion_version_id,
+                    decision="denied",
+                    reason_code=exc.code,
+                    metadata={"gate_code": exc.code},
+                    trace_id=getattr(request.state, "trace_id", None),
+                )
+                await session.commit()
             return _release_error(exc)
         await session.commit()
         return _version_out(row)

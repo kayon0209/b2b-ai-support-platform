@@ -7,6 +7,8 @@ to forget.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from platform_core.agent_runtime.conversation import (
@@ -67,6 +69,23 @@ def test_a_tool_turn_is_pinned_regardless_of_its_text() -> None:
 
 def test_an_ordinary_turn_is_not_pinned() -> None:
     assert pin_reason(_customer("What is the refund window?")) == ""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Do not change the invoice recipient without asking me.",
+        "不要替我更改发票收件人。",
+    ],
+)
+def test_negative_constraints_survive_compression(text: str) -> None:
+    memory = ConversationMemory(
+        [_customer(text), *[_customer(f"older detail {i}") for i in range(8)]],
+        recent_turns=1,
+    )
+    context = memory.compact()
+    assert pin_reason(_customer(text)) == "negative_constraint"
+    assert any(text in pinned for pinned in context.pinned)
 
 
 # --- Compression -----------------------------------------------------------
@@ -189,6 +208,21 @@ def test_an_assistant_claim_is_not_memory() -> None:
     loop AGENTS.md forbids. Only the customer's statements count."""
     facts = extract_durable_facts([_agent("your plan is annual")])
     assert facts == ()
+
+
+def test_explicit_chinese_response_preference_is_durable() -> None:
+    facts = extract_durable_facts([_customer("以后请用中文回复我", ts=17)])
+    assert facts == (DurableFact("response_language", "中文", source_turn=0, ts=17),)
+
+
+def test_channel_local_contact_ids_do_not_merge_memory() -> None:
+    from platform_core.agent_runtime.conversation_store import contact_ref_from_external
+
+    tenant_id = uuid.UUID("01900000-0000-7000-8000-000000000041")
+    chatwoot = contact_ref_from_external(tenant_id, "same-provider-id")
+    assert chatwoot == contact_ref_from_external(tenant_id, "same-provider-id", channel="chatwoot")
+    assert chatwoot != contact_ref_from_external(tenant_id, "same-provider-id", channel="wechat")
+    assert chatwoot != contact_ref_from_external(tenant_id, "same-provider-id", channel="email")
 
 
 # --- Topic shift and rewriting ---------------------------------------------

@@ -63,6 +63,26 @@ spec:
         - protocol: TCP
           port: 8000
 ---
+# Prometheus may scrape workers, but only from the monitoring namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-metrics-scrape
+  namespace: b2b-support
+spec:
+  podSelector:
+    matchLabels:
+      worker_metrics: "true"
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8001
+---
 # Egress: DNS, Postgres, Redis, the LLM provider, object
 # storage, and the OIDC issuer. Each entry is a dependency the code actually
 # calls; anything not listed is not reachable, so a new outbound call fails

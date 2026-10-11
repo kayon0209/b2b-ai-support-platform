@@ -22,13 +22,17 @@ Truthfulness rules enforced here:
   key, so a retried HTTP call cannot become a second execution.
 """
 
+import hashlib
+import json
 import time
 import uuid
-from typing import Any
+from dataclasses import replace
+from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability_metrics import get_metrics
@@ -46,6 +50,8 @@ from platform_core.api import (
     tenant_session,
 )
 from platform_core.audit import service as audit_service
+from platform_core.identity.repository import lock_active_membership_role
+from platform_core.identity.tenant_context import TenantContext
 from platform_core.outbox_service import enqueue
 from platform_core.tool_gateway.gateway import (
     ToolGateway,
@@ -59,6 +65,8 @@ from platform_core.tool_gateway.models import (
     ProposalStatus,
     ToolDefinition,
     ToolExecution,
+    ToolExecutionCompensation,
+    ToolExecutionReconciliation,
     ToolProposal,
     ToolRisk,
 )
@@ -93,6 +101,25 @@ _STATUS_BY_CODE: dict[str, int] = {
     "CONFIRMATION_REQUIRED": 409,
     "CONFIRMATION_EXPIRED": 409,
     "CONFIRMATION_NOT_REQUIRED": 409,
+    "ACTOR_MEMBERSHIP_INACTIVE": 403,
+    "ACTOR_PERMISSION_REVOKED": 403,
+    "AUTHORIZATION_STATE_CHANGED": 409,
+    "COMPENSATION_NOT_SUPPORTED": 409,
+    "COMPENSATION_EXECUTION_NOT_VERIFIED": 409,
+    "COMPENSATION_TARGET_CHANGED": 409,
+    "COMPENSATION_CASE_NOT_FOUND": 409,
+    "TOOL_EXECUTION_IN_PROGRESS": 409,
+    "TOOL_EXECUTION_OUTCOME_UNKNOWN": 409,
+    "TOOL_EXECUTION_NOT_RECONCILABLE": 409,
+    "TOOL_EXECUTION_ALREADY_RESOLVED": 409,
+    "TASK_DEPENDENCY_BLOCKED": 409,
+    "TASK_LEASE_STALE": 409,
+    "TASK_LEASE_NOT_OWNED": 409,
+    "TASK_LEASE_MISSING": 409,
+    "TASK_LEASE_EXPIRED": 409,
+    "TASK_HUMAN_OWNERSHIP_REQUIRED": 409,
+    "TASK_PROPOSAL_NOT_PENDING": 409,
+    "IDEMPOTENCY_CONFLICT": 409,
     "TOOL_EXECUTOR_MISSING": 501,
     "TOOL_EXECUTION_ERROR": 502,
 }
@@ -122,6 +149,25 @@ class ToolProposalCommandIn(BaseModel):
     """
 
     reason: str = Field(default="", max_length=500)
+
+
+class ToolExecutionReconcileIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    decision: Literal["applied", "not_applied", "unresolved"]
+    # Store a provider record/search reference, never a pasted document or
+    # arbitrary free-form explanation.
+    evidence_reference: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+    )
+
+
+class ToolExecutionCompensateIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    reason_code: Literal["created_in_error", "duplicate_case", "incorrect_customer"]
 
 
 def gateway_error_response(exc: ToolGatewayError, *, trace_id: str) -> Any:
@@ -188,10 +234,68 @@ def _serialize_execution(execution: ToolExecution) -> dict[str, Any]:
     }
 
 
+def _serialize_reconciliation(row: ToolExecutionReconciliation) -> dict[str, Any]:
+    return {
+        "reconciliation_id": str(row.id),
+        "execution_id": str(row.execution_id),
+        "decision": row.decision,
+        "evidence_reference": row.evidence_reference,
+        "actor_id": str(row.actor_id),
+        "created_at": int(row.created_at),
+    }
+
+
+def _serialize_compensation(row: ToolExecutionCompensation) -> dict[str, Any]:
+    return {
+        "compensation_id": str(row.id),
+        "execution_id": str(row.execution_id),
+        "action": row.action,
+        "outcome": row.outcome,
+        "reason_code": row.reason_code,
+        "case_id": str(row.case_id) if row.case_id else None,
+        "result": row.result,
+        "created_at": int(row.created_at),
+    }
+
+
 async def _load_tool(session: AsyncSession, tool_definition_id: Any) -> ToolDefinition | None:
     return (
         await session.execute(select(ToolDefinition).where(ToolDefinition.id == tool_definition_id))
     ).scalar_one_or_none()
+
+
+async def _live_membership_permission_error(
+    session: AsyncSession, *, ctx: TenantContext, action: Action
+) -> ToolGatewayError | None:
+    """Lock current membership state before approval or execution is committed.
+
+    The membership row lock serializes a permission change with the durable
+    ToolExecution intent. Under REPEATABLE READ, a concurrent membership
+    update may instead invalidate this transaction's snapshot; that also
+    fails closed and asks the caller to retry with freshly resolved identity.
+    """
+    if ctx.actor_id is None:
+        return ToolGatewayError("ACTOR_MEMBERSHIP_INACTIVE")
+    try:
+        # Use a savepoint so a serialization failure does not poison the
+        # surrounding request transaction before it can record a denial.
+        async with session.begin_nested():
+            role = await lock_active_membership_role(
+                session,
+                tenant_id=ctx.tenant_id,
+                user_id=ctx.actor_id,
+            )
+    except DBAPIError as exc:
+        original = getattr(exc, "orig", None)
+        sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+        if sqlstate == "40001":
+            return ToolGatewayError("AUTHORIZATION_STATE_CHANGED")
+        raise
+    if role is None:
+        return ToolGatewayError("ACTOR_MEMBERSHIP_INACTIVE")
+    if check_policy(replace(ctx, role=role), action) != Decision.ALLOW:
+        return ToolGatewayError("ACTOR_PERMISSION_REVOKED")
+    return None
 
 
 async def _load_tools(
@@ -444,6 +548,22 @@ async def confirm_tool_call(request: Request, proposal_id: str) -> Any:
         # Confirming records a decision; it does not call the adapter.
         gateway = ToolGateway(session, {})
         try:
+            from platform_core.agent_runtime.tasks.gateway_lifecycle import (
+                lock_task_proposal_lease,
+            )
+
+            lease_blocker = await lock_task_proposal_lease(
+                session,
+                tenant_id=ctx.tenant_id,
+                proposal_id=proposal_uuid,
+            )
+            if lease_blocker is not None:
+                raise ToolGatewayError("TASK_LEASE_STALE", lease_blocker)
+            membership_error = await _live_membership_permission_error(
+                session, ctx=ctx, action=Action.CASE_UPDATE
+            )
+            if membership_error is not None:
+                raise membership_error
             confirmation = await gateway.confirm(
                 tenant_id=ctx.tenant_id,
                 proposal_id=proposal_uuid,
@@ -563,6 +683,44 @@ async def execute_tool_call(request: Request, proposal_id: str, body: ToolPropos
         if denied is not None:
             return denied
 
+        # Preserve idempotent receipt replays after completion, but bind any
+        # new external side effect to the linked task's current human lease.
+        existing_execution_status = (
+            await session.execute(
+                select(ToolExecution.status).where(
+                    ToolExecution.tenant_id == ctx.tenant_id,
+                    ToolExecution.idempotency_key == proposal.idempotency_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if (
+            existing_execution_status is None
+            or existing_execution_status == ProposalStatus.EXECUTING.value
+        ):
+            from platform_core.agent_runtime.tasks.gateway_lifecycle import (
+                lock_task_proposal_lease,
+            )
+
+            lease_blocker = await lock_task_proposal_lease(
+                session,
+                tenant_id=ctx.tenant_id,
+                proposal_id=proposal.id,
+            )
+            if lease_blocker is not None:
+                await audit_service.record(
+                    session,
+                    ctx=ctx,
+                    action="tool_execution.rejected",
+                    resource_type="tool_proposal",
+                    resource_id=proposal.id,
+                    decision="denied",
+                    reason_code=lease_blocker,
+                    trace_id=trace_id,
+                )
+                return gateway_error_response(
+                    ToolGatewayError("TASK_LEASE_STALE", lease_blocker), trace_id=trace_id
+                )
+
         # `confirmed_by` is only set when a matching confirmation exists;
         # the gateway re-checks the confirmation itself, so this is audit
         # context rather than the gate.
@@ -592,12 +750,39 @@ async def execute_tool_call(request: Request, proposal_id: str, body: ToolPropos
         )
 
         gateway = ToolGateway(session, executors)
+
+        async def check_task_precondition(
+            linked_proposal: ToolProposal, linked_tool: ToolDefinition
+        ) -> None:
+            current_permission = await _live_membership_permission_error(
+                session,
+                ctx=ctx,
+                action=RISK_TO_ACTION[linked_tool.risk],
+            )
+            if current_permission is not None:
+                raise current_permission
+            from platform_core.agent_runtime.tasks.dependencies import (
+                check_live_dependent_write_precondition,
+            )
+
+            blocker = await check_live_dependent_write_precondition(
+                session,
+                tenant_context=ctx,
+                write_proposal_id=linked_proposal.id,
+                write_tool_name=linked_tool.name,
+                request_idempotency_key=idem,
+                trace_id=trace_id,
+            )
+            if blocker is not None:
+                raise ToolGatewayError("TASK_DEPENDENCY_BLOCKED", blocker)
+
         try:
             execution = await gateway.execute(
                 tenant_id=ctx.tenant_id,
                 actor_id=ctx.actor_id,
                 proposal_id=proposal_uuid,
                 confirmed_by=confirmed_by,
+                pre_execution_check=check_task_precondition,
             )
         except ToolGatewayError as exc:
             failed_execution = (
@@ -611,10 +796,7 @@ async def execute_tool_call(request: Request, proposal_id: str, body: ToolPropos
                     .limit(1)
                 )
             ).scalar_one_or_none()
-            if (
-                failed_execution is not None
-                and failed_execution.status != ProposalStatus.EXECUTING.value
-            ):
+            if failed_execution is not None:
                 await _sync_linked_task_execution(
                     session,
                     ctx=ctx,
@@ -628,7 +810,11 @@ async def execute_tool_call(request: Request, proposal_id: str, body: ToolPropos
                 action="tool_execution.rejected",
                 resource_type="tool_proposal",
                 resource_id=proposal.id,
-                decision="denied",
+                decision=(
+                    "unknown"
+                    if exc.code in {"TOOL_EXECUTION_IN_PROGRESS", "TOOL_EXECUTION_OUTCOME_UNKNOWN"}
+                    else "denied"
+                ),
                 reason_code=exc.code,
                 trace_id=trace_id,
             )
@@ -667,6 +853,580 @@ async def execute_tool_call(request: Request, proposal_id: str, body: ToolPropos
         }
 
     return ok_response(payload, trace_id=trace_id)
+
+
+@router.post("/{proposal_id}/compensate")
+async def compensate_tool_execution(
+    request: Request, proposal_id: str, body: ToolExecutionCompensateIn
+) -> Any:
+    """Apply the one qualified business compensator: close an untouched Case.
+
+    External provider writes, notifications, and release confirmations do not
+    have a generic reverse path. This endpoint preserves the original Case and
+    only closes it when the domain service proves it is still NEW/version 1.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return error_response("AUTH_UNRESOLVED", "tenant context not resolved", status_code=401)
+    if ctx.actor_id is None or ctx.actor_kind != "user":
+        return error_response(
+            "POLICY_DENIED",
+            "business compensation must be attributable to a human actor",
+            status_code=403,
+        )
+    denied = require_policy(ctx, Action.CASE_CLOSE)
+    if denied is not None:
+        return denied
+    idem = require_idempotency_key(request)
+    if not idem:
+        return error_response(
+            IDEMPOTENCY_KEY_REQUIRED,
+            "compensating a tool execution requires an Idempotency-Key",
+            status_code=400,
+        )
+    try:
+        proposal_uuid = parse_uuid(proposal_id, field="proposal_id")
+    except ValueError as exc:
+        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+
+    idem_hash = hashlib.sha256(idem.encode("utf-8")).hexdigest()
+    request_hash = hashlib.sha256(
+        json.dumps(
+            {"proposal_id": str(proposal_uuid), "reason_code": body.reason_code},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    trace_id = new_trace_id()
+    now = int(time.time())
+
+    async with tenant_session(ctx) as session:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"{ctx.tenant_id}:compensation:{idem_hash}"},
+        )
+        prior = (
+            await session.execute(
+                select(ToolExecutionCompensation).where(
+                    ToolExecutionCompensation.tenant_id == ctx.tenant_id,
+                    ToolExecutionCompensation.idempotency_key_hash == idem_hash,
+                )
+            )
+        ).scalar_one_or_none()
+        if prior is not None:
+            if prior.request_hash != request_hash:
+                return error_response(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Idempotency-Key was already used for another compensation request",
+                    status_code=409,
+                    trace_id=trace_id,
+                )
+            membership_error = await _live_membership_permission_error(
+                session, ctx=ctx, action=Action.CASE_CLOSE
+            )
+            if membership_error is not None:
+                return gateway_error_response(membership_error, trace_id=trace_id)
+            return ok_response(
+                {"compensation": _serialize_compensation(prior), "replayed": True},
+                trace_id=trace_id,
+            )
+
+        proposal = (
+            await session.execute(
+                select(ToolProposal).where(
+                    ToolProposal.tenant_id == ctx.tenant_id,
+                    ToolProposal.id == proposal_uuid,
+                )
+            )
+        ).scalar_one_or_none()
+        if proposal is None:
+            return error_response(
+                PROPOSAL_NOT_FOUND, "proposal not found", status_code=404, trace_id=trace_id
+            )
+        tool = await _load_tool(session, proposal.tool_definition_id)
+        if tool is None:
+            return error_response(
+                "TOOL_NOT_REGISTERED",
+                "tool definition is missing",
+                status_code=404,
+                trace_id=trace_id,
+            )
+        if tool.name != "case.create":
+            return gateway_error_response(
+                ToolGatewayError("COMPENSATION_NOT_SUPPORTED"), trace_id=trace_id
+            )
+
+        from platform_core.agent_runtime.tasks.gateway_lifecycle import (
+            lock_task_proposal_reconciliation_owner,
+        )
+
+        lease_blocker = await lock_task_proposal_reconciliation_owner(
+            session,
+            tenant_id=ctx.tenant_id,
+            proposal_id=proposal.id,
+            actor_id=ctx.actor_id,
+            now=now,
+        )
+        if lease_blocker is not None:
+            return gateway_error_response(ToolGatewayError(lease_blocker), trace_id=trace_id)
+        membership_error = await _live_membership_permission_error(
+            session, ctx=ctx, action=Action.CASE_CLOSE
+        )
+        if membership_error is not None:
+            await audit_service.record(
+                session,
+                ctx=ctx,
+                action="tool_execution.compensation_rejected",
+                resource_type="tool_proposal",
+                resource_id=proposal.id,
+                decision="denied",
+                reason_code=membership_error.code,
+                trace_id=trace_id,
+            )
+            return gateway_error_response(membership_error, trace_id=trace_id)
+
+        proposal = (
+            await session.execute(
+                select(ToolProposal)
+                .where(
+                    ToolProposal.tenant_id == ctx.tenant_id,
+                    ToolProposal.id == proposal_uuid,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        execution = (
+            await session.execute(
+                select(ToolExecution)
+                .where(
+                    ToolExecution.tenant_id == ctx.tenant_id,
+                    ToolExecution.proposal_id == proposal.id,
+                )
+                .order_by(ToolExecution.started_at.desc(), ToolExecution.id.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            execution is None
+            or execution.status != ProposalStatus.EXECUTED.value
+            or execution.verification_status != "verified"
+            or not isinstance(execution.sanitized_output, dict)
+        ):
+            return gateway_error_response(
+                ToolGatewayError("COMPENSATION_EXECUTION_NOT_VERIFIED"), trace_id=trace_id
+            )
+        try:
+            case_id = uuid.UUID(str(execution.sanitized_output["case_id"]))
+        except (KeyError, ValueError, TypeError):
+            return gateway_error_response(
+                ToolGatewayError("COMPENSATION_EXECUTION_NOT_VERIFIED"), trace_id=trace_id
+            )
+
+        from platform_core.cases.service import CaseError, compensate_unmodified_tool_created_case
+
+        error_code: str | None = None
+        case_result: dict[str, Any] = {}
+        try:
+            async with session.begin_nested():
+                case_result = await compensate_unmodified_tool_created_case(
+                    session,
+                    tenant_id=ctx.tenant_id,
+                    case_id=case_id,
+                    reason_code=body.reason_code,
+                )
+        except CaseError as exc:
+            error_code = exc.code
+        except DBAPIError as exc:
+            original = getattr(exc, "orig", None)
+            sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+            if sqlstate == "40001":
+                error_code = "COMPENSATION_TARGET_CHANGED"
+            else:
+                raise
+
+        outcome = "failed" if error_code is not None else "succeeded"
+        action = "case_create_close_unmodified"
+        compensation = ToolExecutionCompensation(
+            tenant_id=ctx.tenant_id,
+            execution_id=execution.id,
+            proposal_id=proposal.id,
+            actor_id=ctx.actor_id,
+            idempotency_key_hash=idem_hash,
+            request_hash=request_hash,
+            action=action,
+            outcome=outcome,
+            reason_code=body.reason_code,
+            case_id=case_id,
+            result={"error_code": error_code} if error_code else case_result,
+            created_at=now,
+        )
+        session.add(compensation)
+        await session.flush()
+        if error_code is None:
+            await enqueue(
+                session,
+                tenant_id=ctx.tenant_id,
+                event_type="case.updated",
+                aggregate_type="case",
+                aggregate_id=str(case_id),
+                payload={
+                    "case_id": str(case_id),
+                    "command": "compensate_case_create",
+                    "status": case_result["status"],
+                    "version": case_result["version"],
+                },
+                trace_id=trace_id,
+            )
+        await audit_service.record(
+            session,
+            ctx=ctx,
+            action=(
+                "tool_execution.compensated"
+                if error_code is None
+                else "tool_execution.compensation_failed"
+            ),
+            resource_type="tool_execution",
+            resource_id=execution.id,
+            decision=outcome,
+            reason_code=error_code or body.reason_code.upper(),
+            metadata={
+                "proposal_id": str(proposal.id),
+                "compensation_id": str(compensation.id),
+                "action": action,
+                "case_id": str(case_id),
+                "reason_code": body.reason_code,
+                "result": compensation.result,
+            },
+            trace_id=trace_id,
+        )
+        get_metrics().tool_compensations_total.labels(action=action, outcome=outcome).inc()
+        return ok_response(
+            {"compensation": _serialize_compensation(compensation), "replayed": False},
+            trace_id=trace_id,
+        )
+
+
+@router.post("/{proposal_id}/reconcile")
+async def reconcile_tool_execution(
+    request: Request, proposal_id: str, body: ToolExecutionReconcileIn
+) -> Any:
+    """Record an authorized human lookup for an ambiguous provider outcome.
+
+    This endpoint never invokes the executor. An unresolved or lost-ack write
+    remains fenced by its original execution idempotency key; a verified
+    no-effect decision is terminal for that attempt and needs a new proposal
+    and confirmation before any later write.
+    """
+    ctx = get_context(request)
+    if ctx is None:
+        return error_response("AUTH_UNRESOLVED", "tenant context not resolved", status_code=401)
+    if ctx.actor_id is None:
+        return error_response(
+            "POLICY_DENIED",
+            "principal has no actor id; reconciliation must be attributable",
+            status_code=403,
+        )
+    denied = require_policy(ctx, Action.CASE_UPDATE)
+    if denied is not None:
+        return denied
+    idem = require_idempotency_key(request)
+    if not idem:
+        return error_response(
+            IDEMPOTENCY_KEY_REQUIRED,
+            "reconciling a tool execution requires an Idempotency-Key",
+            status_code=400,
+        )
+    try:
+        proposal_uuid = parse_uuid(proposal_id, field="proposal_id")
+    except ValueError as exc:
+        return error_response(VALIDATION_FAILED, str(exc), status_code=400)
+
+    idem_hash = hashlib.sha256(idem.encode("utf-8")).hexdigest()
+    request_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "proposal_id": str(proposal_uuid),
+                "decision": body.decision,
+                "evidence_reference": body.evidence_reference,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    trace_id = new_trace_id()
+    now = int(time.time())
+
+    async with tenant_session(ctx) as session:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"{ctx.tenant_id}:{idem_hash}"},
+        )
+        prior = (
+            await session.execute(
+                select(ToolExecutionReconciliation).where(
+                    ToolExecutionReconciliation.tenant_id == ctx.tenant_id,
+                    ToolExecutionReconciliation.idempotency_key_hash == idem_hash,
+                )
+            )
+        ).scalar_one_or_none()
+        if prior is not None:
+            if prior.request_hash != request_hash:
+                return error_response(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Idempotency-Key was already used for a different reconciliation",
+                    status_code=409,
+                    trace_id=trace_id,
+                )
+            proposal = (
+                await session.execute(
+                    select(ToolProposal).where(
+                        ToolProposal.tenant_id == ctx.tenant_id,
+                        ToolProposal.id == prior.proposal_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            execution = (
+                await session.execute(
+                    select(ToolExecution).where(
+                        ToolExecution.tenant_id == ctx.tenant_id,
+                        ToolExecution.id == prior.execution_id,
+                        ToolExecution.proposal_id == prior.proposal_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if proposal is None or execution is None:
+                return error_response(
+                    PROPOSAL_NOT_FOUND,
+                    "the reconciled execution is no longer available",
+                    status_code=404,
+                    trace_id=trace_id,
+                )
+            tool = await _load_tool(session, proposal.tool_definition_id)
+            if tool is None:
+                return error_response(
+                    "TOOL_NOT_REGISTERED",
+                    "tool definition is missing",
+                    status_code=404,
+                    trace_id=trace_id,
+                )
+            required_action = RISK_TO_ACTION.get(tool.risk)
+            if required_action is None:
+                return error_response(
+                    "TOOL_PROHIBITED",
+                    "tool is no longer executable",
+                    status_code=403,
+                    trace_id=trace_id,
+                )
+            denied = require_policy(ctx, required_action)
+            if denied is not None:
+                return denied
+            return ok_response(
+                {
+                    "proposal": _serialize_proposal(proposal, tool),
+                    "execution": _serialize_execution(execution),
+                    "reconciliation": _serialize_reconciliation(prior),
+                    "replayed": True,
+                },
+                trace_id=trace_id,
+            )
+
+        proposal = (
+            await session.execute(
+                select(ToolProposal).where(
+                    ToolProposal.tenant_id == ctx.tenant_id,
+                    ToolProposal.id == proposal_uuid,
+                )
+            )
+        ).scalar_one_or_none()
+        if proposal is None:
+            return error_response(
+                PROPOSAL_NOT_FOUND, "proposal not found", status_code=404, trace_id=trace_id
+            )
+        tool = await _load_tool(session, proposal.tool_definition_id)
+        if tool is None:
+            return error_response(
+                "TOOL_NOT_REGISTERED",
+                "tool definition is missing",
+                status_code=404,
+                trace_id=trace_id,
+            )
+        required_action = RISK_TO_ACTION.get(tool.risk)
+        if required_action is None:
+            return error_response(
+                "TOOL_PROHIBITED",
+                "tool is no longer executable",
+                status_code=403,
+                trace_id=trace_id,
+            )
+        denied = require_policy(ctx, required_action)
+        if denied is not None:
+            return denied
+
+        from platform_core.agent_runtime.tasks.gateway_lifecycle import (
+            lock_task_proposal_reconciliation_owner,
+        )
+
+        lease_blocker = await lock_task_proposal_reconciliation_owner(
+            session,
+            tenant_id=ctx.tenant_id,
+            proposal_id=proposal.id,
+            actor_id=ctx.actor_id,
+            now=now,
+        )
+        if lease_blocker is not None:
+            return gateway_error_response(ToolGatewayError(lease_blocker), trace_id=trace_id)
+
+        membership_error = await _live_membership_permission_error(
+            session, ctx=ctx, action=Action.CASE_UPDATE
+        )
+        if membership_error is None:
+            membership_error = await _live_membership_permission_error(
+                session, ctx=ctx, action=required_action
+            )
+        if membership_error is not None:
+            await audit_service.record(
+                session,
+                ctx=ctx,
+                action="tool_execution.reconciliation_rejected",
+                resource_type="tool_proposal",
+                resource_id=proposal.id,
+                decision="denied",
+                reason_code=membership_error.code,
+                trace_id=trace_id,
+            )
+            return gateway_error_response(membership_error, trace_id=trace_id)
+
+        proposal = (
+            await session.execute(
+                select(ToolProposal)
+                .where(
+                    ToolProposal.tenant_id == ctx.tenant_id,
+                    ToolProposal.id == proposal_uuid,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        execution = (
+            await session.execute(
+                select(ToolExecution)
+                .where(
+                    ToolExecution.tenant_id == ctx.tenant_id,
+                    ToolExecution.proposal_id == proposal.id,
+                )
+                .order_by(ToolExecution.started_at.desc(), ToolExecution.id.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if execution is None:
+            return error_response(
+                "TOOL_EXECUTION_NOT_RECONCILABLE",
+                "no persisted execution exists for this proposal",
+                status_code=409,
+                trace_id=trace_id,
+            )
+        previous_status = execution.status
+        if execution.status == ProposalStatus.EXECUTING.value:
+            recovery_after = execution.started_at + max(60, int(tool.timeout_ms / 1000) + 60)
+            if now < recovery_after:
+                return error_response(
+                    "TOOL_EXECUTION_IN_PROGRESS",
+                    "the execution is still inside its bounded provider window",
+                    status_code=409,
+                    trace_id=trace_id,
+                )
+            execution.status = ProposalStatus.UNKNOWN.value
+            execution.verification_status = "unknown"
+            execution.completed_at = now
+            execution.error_code = "EXECUTION_WORKER_LOST"
+            proposal.status = ProposalStatus.UNKNOWN.value
+        elif execution.status != ProposalStatus.UNKNOWN.value:
+            return error_response(
+                "TOOL_EXECUTION_ALREADY_RESOLVED",
+                "only an unresolved execution can be reconciled",
+                status_code=409,
+                trace_id=trace_id,
+            )
+
+        reconciliation = ToolExecutionReconciliation(
+            tenant_id=ctx.tenant_id,
+            execution_id=execution.id,
+            proposal_id=proposal.id,
+            actor_id=ctx.actor_id,
+            idempotency_key_hash=idem_hash,
+            request_hash=request_hash,
+            decision=body.decision,
+            evidence_reference=body.evidence_reference,
+            created_at=now,
+        )
+        session.add(reconciliation)
+        reconciliation_output = {
+            "method": "human_provider_lookup",
+            "decision": body.decision,
+            "evidence_reference": body.evidence_reference,
+            "recorded_at": now,
+        }
+        current_output = (
+            execution.sanitized_output if isinstance(execution.sanitized_output, dict) else {}
+        )
+        execution.sanitized_output = sanitize_arguments(
+            {**current_output, "reconciliation": reconciliation_output}
+        )
+        execution.completed_at = now
+        if body.decision == "applied":
+            execution.status = ProposalStatus.EXECUTED.value
+            execution.verification_status = "verified"
+            execution.error_code = None
+            proposal.status = ProposalStatus.VERIFIED.value
+        elif body.decision == "not_applied":
+            execution.status = ProposalStatus.FAILED.value
+            execution.verification_status = "failed"
+            execution.error_code = "RECONCILED_NOT_APPLIED"
+            proposal.status = ProposalStatus.FAILED.value
+        else:
+            execution.status = ProposalStatus.UNKNOWN.value
+            execution.verification_status = "unknown"
+            execution.error_code = "RECONCILIATION_UNRESOLVED"
+            proposal.status = ProposalStatus.UNKNOWN.value
+        await session.flush()
+
+        await _sync_linked_task_execution(
+            session,
+            ctx=ctx,
+            proposal_id=proposal.id,
+            execution=execution,
+            trace_id=trace_id,
+        )
+        await audit_service.record(
+            session,
+            ctx=ctx,
+            action="tool_execution.reconciled",
+            resource_type="tool_execution",
+            resource_id=execution.id,
+            decision=body.decision,
+            reason_code=f"RECONCILED_{body.decision.upper()}",
+            metadata={
+                "proposal_id": str(proposal.id),
+                "idempotency_key_hash": idem_hash,
+                "evidence_reference": body.evidence_reference,
+                "previous_status": previous_status,
+                "status": execution.status,
+                "reconciliation_id": str(reconciliation.id),
+            },
+            trace_id=trace_id,
+        )
+        return ok_response(
+            {
+                "proposal": _serialize_proposal(proposal, tool),
+                "execution": _serialize_execution(execution),
+                "reconciliation": _serialize_reconciliation(reconciliation),
+                "replayed": False,
+            },
+            trace_id=trace_id,
+        )
 
 
 async def _sync_linked_task_execution(
@@ -858,9 +1618,50 @@ async def get_tool_proposal(request: Request, proposal_id: str) -> Any:
             .scalars()
             .all()
         )
+        execution_ids = [row.id for row in executions]
+        reconciliations = (
+            (
+                await session.execute(
+                    select(ToolExecutionReconciliation)
+                    .where(
+                        ToolExecutionReconciliation.tenant_id == ctx.tenant_id,
+                        ToolExecutionReconciliation.execution_id.in_(execution_ids),
+                    )
+                    .order_by(
+                        ToolExecutionReconciliation.created_at,
+                        ToolExecutionReconciliation.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+            if execution_ids
+            else []
+        )
+        compensations = (
+            (
+                await session.execute(
+                    select(ToolExecutionCompensation)
+                    .where(
+                        ToolExecutionCompensation.tenant_id == ctx.tenant_id,
+                        ToolExecutionCompensation.execution_id.in_(execution_ids),
+                    )
+                    .order_by(
+                        ToolExecutionCompensation.created_at,
+                        ToolExecutionCompensation.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+            if execution_ids
+            else []
+        )
         payload = {
             "proposal": _serialize_proposal(proposal, tool),
             "executions": [_serialize_execution(e) for e in executions],
+            "reconciliations": [_serialize_reconciliation(row) for row in reconciliations],
+            "compensations": [_serialize_compensation(row) for row in compensations],
         }
 
     return ok_response(payload, trace_id=new_trace_id())

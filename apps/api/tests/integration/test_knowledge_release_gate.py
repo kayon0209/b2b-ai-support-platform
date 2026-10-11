@@ -548,7 +548,8 @@ def test_release_evaluation_requires_service_evidence_two_reviewers_and_supports
         with admin.connect() as conn:
             queue_receipt = conn.execute(
                 text(
-                    "SELECT status, attempts, processing_token, last_error "
+                    "SELECT status, attempts, processing_token, last_error, "
+                    "first_attempt_at, deadline_at, external_attempt_limit "
                     "FROM outbox_events WHERE event_id = :id"
                 ),
                 {"id": evaluation_request.json()["event_id"]},
@@ -557,6 +558,9 @@ def test_release_evaluation_requires_service_evidence_two_reviewers_and_supports
         assert queue_receipt.attempts == 1
         assert queue_receipt.processing_token is None
         assert queue_receipt.last_error is None
+        assert queue_receipt.first_attempt_at is not None
+        assert queue_receipt.deadline_at > queue_receipt.first_attempt_at
+        assert queue_receipt.external_attempt_limit > 0
         with admin.connect() as conn:
             release_row = conn.execute(
                 text(

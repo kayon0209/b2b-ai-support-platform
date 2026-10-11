@@ -28,6 +28,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -103,6 +104,12 @@ class ConversationTask(Base, PkMixin, TenantMixin):
             "sequence",
         ),
         Index("ix_conversation_tasks_actionable", "tenant_id", "status", "updated_at"),
+        Index(
+            "ix_conversation_tasks_proposal",
+            "tenant_id",
+            "proposal_id",
+            postgresql_where=text("proposal_id IS NOT NULL"),
+        ),
     )
 
     conversation_ref_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
@@ -141,6 +148,10 @@ class ConversationTask(Base, PkMixin, TenantMixin):
     # Why the task is blocked. Shown verbatim to the agent.
     blocked_reason: Mapped[str | None] = mapped_column(String(63), nullable=True)
     proposal_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    # The control lease version when this proposal entered human approval.
+    # Gateway confirm/execute re-check it after a restart rather than trusting
+    # a task panel that may have been open before ownership changed.
+    proposal_lease_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     execution_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     # What proved completion. Required before a terminal transition.
     completion_evidence: Mapped[str | None] = mapped_column(String(127), nullable=True)

@@ -16,6 +16,7 @@ cannot see:
 """
 
 import os
+import time
 import uuid
 
 import pytest
@@ -51,7 +52,14 @@ TENANT = "0190d000-0000-7000-8000-0000000000a1"
 TENANT_OTHER = "0190d000-0000-7000-8000-0000000000b1"
 TEMPLATE = "release_test_template"
 
-_CLEAN = "DELETE FROM prompt_versions WHERE tenant_id IN (:a, :b)"
+_CLEAN_STATEMENTS = (
+    "DELETE FROM quality_review_evidence WHERE tenant_id IN (:a, :b)",
+    "DELETE FROM quality_review_decisions WHERE tenant_id IN (:a, :b)",
+    "DELETE FROM quality_review_items WHERE tenant_id IN (:a, :b)",
+    "DELETE FROM quality_review_batches WHERE tenant_id IN (:a, :b)",
+    "DELETE FROM agent_runs WHERE tenant_id IN (:a, :b)",
+    "DELETE FROM prompt_versions WHERE tenant_id IN (:a, :b)",
+)
 
 
 def _run(coro):
@@ -116,10 +124,18 @@ def seed_tenants():
 def clean_prompts():
     admin = create_engine(ADMIN_URL)
     with admin.begin() as conn:
-        conn.execute(text(_CLEAN), {"a": TENANT, "b": TENANT_OTHER})
+        for statement in _CLEAN_STATEMENTS:
+            conn.execute(
+                text(statement),
+                {"a": TENANT, "b": TENANT_OTHER},
+            )
     yield
     with admin.begin() as conn:
-        conn.execute(text(_CLEAN), {"a": TENANT, "b": TENANT_OTHER})
+        for statement in _CLEAN_STATEMENTS:
+            conn.execute(
+                text(statement),
+                {"a": TENANT, "b": TENANT_OTHER},
+            )
     admin.dispose()
 
 
@@ -172,13 +188,88 @@ def _make_draft(body: str = "You answer using only the evidence.") -> str:
     return _run(_in_session(TENANT, _fn))
 
 
+def _seed_review_evidence(version_id: str) -> dict:
+    from platform_core.agent_runtime.models import AgentRun
+    from platform_core.evaluation.review_service import (
+        create_review_batch,
+        finalize_review_evidence,
+        record_review_decision,
+        verified_review_evidence_for_prompt,
+    )
+
+    prompt_version_id = uuid.UUID(version_id)
+
+    async def _fn(session):
+        now = int(time.time())
+        fixtures = (
+            ("completed", "knowledge_qa"),
+            ("abstained", "sensitive"),
+            ("handed_off", "human_required"),
+            ("failed", "business_read"),
+        )
+        for index, (status, route) in enumerate(fixtures):
+            session.add(
+                AgentRun(
+                    tenant_id=uuid.UUID(TENANT),
+                    conversation_ref_id=uuid.uuid4(),
+                    route=route,
+                    status=status,
+                    started_at=now,
+                    prompt_version_id=prompt_version_id,
+                    policy_version="test-policy-v1",
+                    code_version="test-code-v1",
+                    trace_id=f"review-{uuid.uuid4().hex[:12]}",
+                    input_hash=f"review-input-{index}-{uuid.uuid4().hex}",
+                    token_usage={},
+                    abstain_reason="NO_AUTHORIZED_EVIDENCE" if status == "abstained" else None,
+                )
+            )
+        await session.flush()
+        batch, items, _replayed = await create_review_batch(
+            session,
+            ctx=_ctx(),
+            window_seconds=86_400,
+            size=len(fixtures),
+            target_prompt_version_id=prompt_version_id,
+            idempotency_key=f"prompt-review-{uuid.uuid4()}",
+        )
+        for item in items:
+            await record_review_decision(
+                session,
+                ctx=_ctx(),
+                batch_id=batch.id,
+                agent_run_id=item.agent_run_id,
+                verdict="agree",
+                reason_code=None,
+                idempotency_key=f"prompt-review-decision-{uuid.uuid4()}",
+            )
+        await finalize_review_evidence(
+            session,
+            ctx=_ctx(),
+            batch_id=batch.id,
+            idempotency_key=f"prompt-review-finalize-{uuid.uuid4()}",
+        )
+        evidence = await verified_review_evidence_for_prompt(
+            session,
+            tenant_id=uuid.UUID(TENANT),
+            prompt_version_id=prompt_version_id,
+        )
+        assert evidence is not None
+        return evidence
+
+    return _run(_in_session(TENANT, _fn))
+
+
 def _promote(version_id: str, evidence: EvaluationEvidence | None = None) -> None:
+    review_evidence = _seed_review_evidence(version_id)
+
     async def _fn(session):
         return await promote(
             session,
             ctx=_ctx(),
             version_id=uuid.UUID(version_id),
             evidence=evidence or _clean_evidence(),
+            human_review_evidence=review_evidence,
         )
 
     _run(_in_session(TENANT, _fn))
@@ -251,6 +342,23 @@ def test_promote_requires_evidence() -> None:
     with pytest.raises(ReleaseError) as err:
         _run(_in_session(TENANT, _fn))
     assert err.value.code == "EVALUATION_REQUIRED"
+    assert _count_active() == 0
+
+
+def test_promote_requires_candidate_scoped_human_review() -> None:
+    draft = _make_draft()
+
+    async def _fn(session):
+        return await promote(
+            session,
+            ctx=_ctx(),
+            version_id=uuid.UUID(draft),
+            evidence=_clean_evidence(),
+        )
+
+    with pytest.raises(ReleaseError) as err:
+        _run(_in_session(TENANT, _fn))
+    assert err.value.code == "HUMAN_REVIEW_REQUIRED"
     assert _count_active() == 0
 
 
@@ -505,6 +613,7 @@ def test_http_draft_then_promote_flow() -> None:
     assert "id" in draft, draft
     assert draft["published"] is False
     assert draft["version"] == 1
+    _seed_review_evidence(draft["id"])
 
     promoted = owner.post(
         f"/v1/prompts/{draft['id']}/promote",
@@ -522,6 +631,23 @@ def test_http_draft_then_promote_flow() -> None:
     ).json()
     assert active["active"]["version"] == 1
 
+    admin = create_engine(ADMIN_URL)
+    try:
+        with admin.begin() as conn:
+            human_gate = conn.execute(
+                text(
+                    "SELECT metadata -> 'human_review_gate_assessment' "
+                    "FROM audit_events WHERE tenant_id = :tenant AND action = 'prompt.promoted' "
+                    "AND resource_id = :version ORDER BY occurred_at DESC LIMIT 1"
+                ),
+                {"tenant": TENANT, "version": draft["id"]},
+            ).scalar_one()
+    finally:
+        admin.dispose()
+    assert human_gate["passed"] is True
+    assert human_gate["evidence_hash"]
+    assert human_gate["thresholds"]["max_weighted_override_rate"] == 0.10
+
 
 def test_http_promote_without_body_is_refused() -> None:
     """Omitting evidence must not be read as "no regressions"."""
@@ -531,6 +657,37 @@ def test_http_promote_without_body_is_refused() -> None:
     resp = owner.post(f"/v1/prompts/{draft['id']}/promote", headers=_headers())
 
     assert resp.json()["error"]["code"] == "EVALUATION_REQUIRED"
+
+
+def test_http_promotion_without_review_is_blocked_and_audited() -> None:
+    owner = _client(TENANT, "tenant_owner")
+    draft = _create_via_http(owner, "review-required")
+    response = owner.post(
+        f"/v1/prompts/{draft['id']}/promote",
+        json={
+            "eval_run_id": "eval-without-human-review",
+            "scores": [{"category": "citation", "passed": 20, "total": 20}],
+            "regressions": [],
+        },
+        headers=_headers(),
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "HUMAN_REVIEW_REQUIRED"
+    admin = create_engine(ADMIN_URL)
+    try:
+        with admin.begin() as connection:
+            refusal = connection.execute(
+                text(
+                    "SELECT action, decision, reason_code FROM audit_events "
+                    "WHERE tenant_id = :tenant AND resource_id = :version "
+                    "AND action = 'prompt.promotion_blocked' ORDER BY occurred_at DESC LIMIT 1"
+                ),
+                {"tenant": TENANT, "version": draft["id"]},
+            ).one()
+    finally:
+        admin.dispose()
+    assert refusal == ("prompt.promotion_blocked", "denied", "HUMAN_REVIEW_REQUIRED")
 
 
 def test_http_client_cannot_downgrade_its_own_p0_regression() -> None:
@@ -613,15 +770,25 @@ def test_http_rollback_creates_an_audit_event() -> None:
     """Every release decision must be reconstructable after the fact."""
     owner = _client(TENANT, "tenant_owner")
     first = _create_via_http(owner, "one")
+    _seed_review_evidence(first["id"])
     owner.post(
         f"/v1/prompts/{first['id']}/promote",
-        json={"eval_run_id": "e1", "scores": [], "regressions": []},
+        json={
+            "eval_run_id": "e1",
+            "scores": [{"category": "citation", "passed": 20, "total": 20}],
+            "regressions": [],
+        },
         headers=_headers(),
     )
     second = _create_via_http(owner, "two")
+    _seed_review_evidence(second["id"])
     owner.post(
         f"/v1/prompts/{second['id']}/promote",
-        json={"eval_run_id": "e2", "scores": [], "regressions": []},
+        json={
+            "eval_run_id": "e2",
+            "scores": [{"category": "citation", "passed": 20, "total": 20}],
+            "regressions": [],
+        },
         headers=_headers(),
     )
     owner.post(

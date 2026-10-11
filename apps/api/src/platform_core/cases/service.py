@@ -21,6 +21,8 @@ from platform_core.cases.models import (
     CaseConversation,
     CaseEscalation,
     CaseStatus,
+    TransitionNotAllowed,
+    VersionConflict,
     check_transition,
     check_version,
     sla_deadline,
@@ -34,6 +36,46 @@ class CaseError(Exception):
     def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
+
+
+CASE_CREATE_COMPENSATION_REASONS = frozenset(
+    {"created_in_error", "duplicate_case", "incorrect_customer"}
+)
+
+
+async def compensate_unmodified_tool_created_case(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    case_id: uuid.UUID,
+    reason_code: str,
+) -> dict[str, Any]:
+    """Close only a still-new case created by the case.create tool.
+
+    This is a business compensator, not a delete: the case and its history stay
+    auditable. Version 1 plus the NEW -> CLOSED transition acts as a strict
+    precondition, so customer or operator work is never silently undone.
+    """
+    if reason_code not in CASE_CREATE_COMPENSATION_REASONS:
+        raise CaseError("COMPENSATION_REASON_INVALID")
+    try:
+        row = await CaseService(session).apply_command(
+            tenant_id=tenant_id,
+            case_id=case_id,
+            command="transition",
+            expected_version=1,
+            parameters={"target": CaseStatus.CLOSED.value},
+        )
+    except LookupError as exc:
+        raise CaseError("COMPENSATION_CASE_NOT_FOUND") from exc
+    except (TransitionNotAllowed, VersionConflict) as exc:
+        raise CaseError("COMPENSATION_TARGET_CHANGED") from exc
+    return {
+        "case_id": str(row.id),
+        "status": row.status,
+        "version": int(row.version),
+        "closed_at": row.closed_at,
+    }
 
 
 async def cases_for_conversation(

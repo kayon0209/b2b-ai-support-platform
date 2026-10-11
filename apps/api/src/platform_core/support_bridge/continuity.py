@@ -174,6 +174,29 @@ async def prior_conversations(
     ]
 
 
+async def conversation_refs_for_contact(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    external_contact_id: str,
+    channel: str,
+) -> list[uuid.UUID]:
+    """Conversation refs for one exact channel contact, for scoped erasure.
+
+    Channel is required: provider-local contact IDs are not a cross-channel
+    identity proof, and an erasure request must not guess that two IDs belong
+    to the same person.
+    """
+    rows = await session.execute(
+        select(ConversationContact.conversation_ref_id).where(
+            ConversationContact.tenant_id == tenant_id,
+            ConversationContact.external_contact_id == external_contact_id,
+            ConversationContact.channel == channel,
+        )
+    )
+    return list(rows.scalars().all())
+
+
 async def delivery_target(
     session: AsyncSession, *, tenant_id: uuid.UUID, conversation_ref_id: uuid.UUID
 ) -> tuple[str, str, str] | None:
@@ -258,6 +281,7 @@ __all__ = [
     "PriorConversation",
     "contact_for_conversation",
     "conversation_channels",
+    "conversation_refs_for_contact",
     "link_conversation",
     "prior_conversations",
 ]

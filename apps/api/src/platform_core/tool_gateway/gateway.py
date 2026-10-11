@@ -10,10 +10,9 @@ but never bypass:
 2. confirm: high-risk tools require an ActionConfirmation bound to the
    same actor, tool version and action hash, with expiry.
 3. execute: idempotent by (tenant_id, idempotency_key); the DB unique
-   constraint plus the executor's short-circuit make duplicate commands
-   single-execution. The short-circuit applies to *terminal* executions
-   only - a row left in EXECUTING by a killed worker is retried, because
-   returning it as a result is indistinguishable from returning success.
+   constraint plus a committed execution intent make duplicate commands
+   single-dispatch. An EXECUTING row left by a killed worker is unresolved:
+   it must be reconciled, never deleted and blindly re-sent.
 4. verify: postcondition check through a read or provider receipt. An
    execution is successful only after verification; transport success is
    insufficient. Ambiguous outcomes stay UNKNOWN.
@@ -23,6 +22,7 @@ import hashlib
 import json
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -32,6 +32,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_core.evaluation.pii import Sensitivity, classify_field
+from platform_core.execution_budget import (
+    ExecutionBudget,
+    current_execution_budget,
+    run_with_execution_budget,
+)
 from platform_core.tool_gateway.models import (
     ActionConfirmation,
     ProposalStatus,
@@ -40,6 +45,8 @@ from platform_core.tool_gateway.models import (
     ToolProposal,
     ToolRisk,
 )
+
+EXECUTION_RECOVERY_GRACE_SECONDS = 60
 
 
 class ToolGatewayError(Exception):
@@ -58,6 +65,56 @@ class ToolExecutionReceipt:
     status: str
     verification_status: str | None
     sanitized_output: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class VerifiedReadExecution:
+    """Minimal server-side view of one verified read execution."""
+
+    tool_name: str
+    sanitized_input: dict[str, Any]
+    sanitized_output: dict[str, Any]
+
+
+async def load_verified_read_execution(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    execution_id: uuid.UUID,
+) -> VerifiedReadExecution | None:
+    """Load facts only from a completed, postcondition-verified read tool.
+
+    Callers receive sanitized tool input/output, never the provider response or
+    an ORM row. Tool risk is resolved from the persisted catalog entry rather
+    than inferred from a task or model label.
+    """
+    row = (
+        await session.execute(
+            select(
+                ToolDefinition.name,
+                ToolExecution.sanitized_input,
+                ToolExecution.sanitized_output,
+            )
+            .join(ToolExecution, ToolExecution.tool_definition_id == ToolDefinition.id)
+            .where(
+                ToolExecution.tenant_id == tenant_id,
+                ToolExecution.id == execution_id,
+                ToolExecution.status == ProposalStatus.EXECUTED.value,
+                ToolExecution.verification_status == "verified",
+                ToolDefinition.risk == ToolRisk.READ.value,
+                (ToolDefinition.tenant_id == tenant_id) | ToolDefinition.tenant_id.is_(None),
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    if not isinstance(row.sanitized_input, dict) or not isinstance(row.sanitized_output, dict):
+        return None
+    return VerifiedReadExecution(
+        tool_name=str(row.name),
+        sanitized_input=row.sanitized_input,
+        sanitized_output=row.sanitized_output,
+    )
 
 
 # Errors that are the upstream provider's fault, not ours. The read-tool
@@ -394,7 +451,7 @@ class ToolGateway:
             raise ToolGatewayError("PROPOSAL_NOT_FOUND")
         if proposal.status not in (ProposalStatus.AUTHORIZED.value,):
             raise ToolGatewayError("PROPOSAL_NOT_CONFIRMABLE", proposal.status)
-        if proposal.expires_at < int(time.time()):
+        if proposal.expires_at <= int(time.time()):
             await self._mark(proposal, ProposalStatus.EXPIRED.value)
             raise ToolGatewayError("PROPOSAL_EXPIRED")
         if not proposal.required_confirmation:
@@ -460,13 +517,16 @@ class ToolGateway:
         actor_id: uuid.UUID,
         proposal_id: uuid.UUID,
         confirmed_by: uuid.UUID | None = None,
+        pre_execution_check: (
+            Callable[[ToolProposal, ToolDefinition], Awaitable[None]] | None
+        ) = None,
     ) -> ToolExecution:
         proposal = await self._get_proposal(tenant_id, proposal_id)
         if proposal is None:
             raise ToolGatewayError("PROPOSAL_NOT_FOUND")
         if proposal.status in (ProposalStatus.REJECTED.value, ProposalStatus.EXPIRED.value):
             raise ToolGatewayError("PROPOSAL_NOT_EXECUTABLE", proposal.status)
-        if proposal.expires_at < int(time.time()):
+        if proposal.expires_at <= int(time.time()):
             await self._mark(proposal, ProposalStatus.EXPIRED.value)
             raise ToolGatewayError("PROPOSAL_EXPIRED")
 
@@ -480,27 +540,26 @@ class ToolGateway:
 
         # Confirmation gate: high-risk tools need a matching confirmation
         # bound to the same action hash before any execution.
+        confirmation: ActionConfirmation | None = None
         if proposal.required_confirmation:
             confirmation = (
                 await self._session.execute(
-                    select(ActionConfirmation).where(
+                    select(ActionConfirmation)
+                    .where(
                         ActionConfirmation.proposal_id == proposal.id,
                         ActionConfirmation.action_hash == proposal.action_hash,
                     )
+                    .with_for_update()
                 )
             ).scalar_one_or_none()
             if confirmation is None:
                 raise ToolDenied("CONFIRMATION_REQUIRED")
-            if confirmation.expires_at < int(time.time()):
+            if confirmation.expires_at <= int(time.time()):
                 raise ToolGatewayError("CONFIRMATION_EXPIRED")
 
-        # Idempotency: an execution that reached a terminal state short-circuits
-        # (no second adapter call). A row still in EXECUTING is the debris a
-        # killed worker leaves behind - the process died between committing the
-        # row and recording the outcome - and must NOT be returned as a result:
-        # the caller cannot tell it apart from a completed one, and the two call
-        # for opposite handling. Discard it and run the tool again; the
-        # executor's own idempotency key keeps the external side effect single.
+        # A committed EXECUTING row may belong to a live request or a process
+        # that died after the provider accepted the write. Never delete and
+        # re-run it: this adapter may not have provider-side idempotency.
         existing = (
             await self._session.execute(
                 select(ToolExecution).where(
@@ -509,15 +568,50 @@ class ToolGateway:
                 )
             )
         ).scalar_one_or_none()
-        if existing is not None and existing.status != ProposalStatus.EXECUTING.value:
-            return existing
         if existing is not None:
-            await self._session.delete(existing)
+            if existing.status != ProposalStatus.EXECUTING.value:
+                return existing
+            recovery_after = existing.started_at + max(
+                EXECUTION_RECOVERY_GRACE_SECONDS,
+                int(tool.timeout_ms / 1000) + EXECUTION_RECOVERY_GRACE_SECONDS,
+            )
+            if int(time.time()) < recovery_after:
+                raise ToolGatewayError(
+                    "TOOL_EXECUTION_IN_PROGRESS",
+                    "a durable execution intent exists; no second provider call was made",
+                )
+            existing.status = ProposalStatus.UNKNOWN.value
+            existing.verification_status = "unknown"
+            existing.completed_at = int(time.time())
+            existing.error_code = "EXECUTION_WORKER_LOST"
+            proposal.status = ProposalStatus.UNKNOWN.value
             await self._session.flush()
+            raise ToolGatewayError(
+                "TOOL_EXECUTION_OUTCOME_UNKNOWN",
+                "the prior provider call has no recorded receipt; reconcile before retrying",
+            )
 
         executor = self._executors.get(tool.name)
         if executor is None:
             raise ToolGatewayError("TOOL_EXECUTOR_MISSING", tool.name)
+
+        # Optional application-level guard. It runs only after the proposal,
+        # actor, expiry, confirmation and terminal-idempotency checks, and
+        # immediately before a new execution receipt and external call.
+        if pre_execution_check is not None:
+            await pre_execution_check(proposal, tool)
+
+        # Authorization is evaluated again at the no-return point. A slow
+        # live-precondition check must not let an approval or proposal expire
+        # between the early request check and the durable provider intent.
+        if proposal.expires_at <= int(time.time()):
+            proposal.status = ProposalStatus.EXPIRED.value
+            await self._session.flush()
+            raise ToolGatewayError("PROPOSAL_EXPIRED")
+        if proposal.required_confirmation and (
+            confirmation is None or confirmation.expires_at <= int(time.time())
+        ):
+            raise ToolGatewayError("CONFIRMATION_EXPIRED")
 
         execution = ToolExecution(
             tenant_id=tenant_id,
@@ -531,10 +625,23 @@ class ToolGateway:
         )
         self._session.add(execution)
         await self._session.flush()
+        # Make intent durable before crossing the provider boundary. The
+        # tenant_session listener re-binds RLS after this commit. If the
+        # process dies after a provider accepts the request, the next request
+        # sees EXECUTING and refuses to issue a second write.
+        proposal.status = ProposalStatus.EXECUTING.value
+        await self._session.flush()
+        await self._session.commit()
+        budget = current_execution_budget() or ExecutionBudget.for_seconds(
+            deadline_seconds=max(0.1, tool.timeout_ms / 1000),
+            max_attempts=3,
+            operation_limits={"model": 0, "tool": 3, "outbound": 0},
+        )
 
         try:
-            output = await executor.execute(
-                tool.name, proposal.sanitized_input, proposal.idempotency_key
+            output = await run_with_execution_budget(
+                budget,
+                executor.execute(tool.name, proposal.sanitized_input, proposal.idempotency_key),
             )
         except Exception as exc:  # noqa: BLE001 - classified below
             code = classify_execution_error(exc)
@@ -548,8 +655,11 @@ class ToolGateway:
         execution.completed_at = int(time.time())
 
         # Postcondition verification decides the final status.
-        verified = await executor.verify_postcondition(
-            tool.name, proposal.sanitized_input, execution.sanitized_output
+        verified = await run_with_execution_budget(
+            budget,
+            executor.verify_postcondition(
+                tool.name, proposal.sanitized_input, execution.sanitized_output
+            ),
         )
         if verified is True:
             execution.status = ProposalStatus.EXECUTED.value

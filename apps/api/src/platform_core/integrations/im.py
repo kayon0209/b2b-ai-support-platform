@@ -130,7 +130,7 @@ class _WebhookNotifier(ConnectorAdapter):
         if not output:
             return None
         if output.get("ok") is not True:
-            return False
+            return None if output.get("ambiguous") else False
         # Webhook acceptance is the provider receipt; there is nothing further
         # to read back from a chat message.
         return True

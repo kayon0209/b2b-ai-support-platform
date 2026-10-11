@@ -29,11 +29,16 @@ from platform_core.api import (
     IDEMPOTENCY_KEY_REQUIRED,
     error_response,
     require_idempotency_key,
+    require_policy,
     tenant_session,
 )
 from platform_core.evaluation.categories import category_report
 from platform_core.evaluation.category_service import CategoryStateError, set_category_state
 from platform_core.evaluation.channels import aggregate_channel_distribution
+from platform_core.evaluation.customer_feedback_service import (
+    CustomerFeedbackError,
+    customer_outcome_summary,
+)
 from platform_core.evaluation.metrics import (
     aggregate_intent_distribution,
     aggregate_quality_metrics,
@@ -48,6 +53,7 @@ router = APIRouter(prefix="/v1/quality", tags=["quality"])
 
 # Bounded so a dashboard cannot be used to run an unbounded scan.
 MAX_WINDOW_SECONDS = 30 * 24 * 3600
+DEFAULT_CONFIRMATION_WINDOW_SECONDS = 7 * 24 * 3600
 
 
 class QualityMetricsOut(BaseModel):
@@ -85,6 +91,37 @@ class QualityMetricsOut(BaseModel):
     # Corrections awaiting review (7.8) - reviewed knowledge that has not been
     # written yet.
     pending_corrections: int = 0
+
+
+@router.get("/outcomes")
+async def get_customer_outcomes(
+    request: Request,
+    window_seconds: int = Query(default=30 * 24 * 3600, ge=1, le=MAX_WINDOW_SECONDS),
+    confirmation_window_seconds: int = Query(
+        default=DEFAULT_CONFIRMATION_WINDOW_SECONDS,
+        ge=1,
+        le=MAX_WINDOW_SECONDS,
+    ),
+) -> Any:
+    """Customer confirmation and mature no-response outcomes, tenant-scoped."""
+    ctx = tenant_context.get_tenant_context()
+    if ctx is None:
+        return error_response("AUTH_UNRESOLVED", "tenant context not resolved", status_code=401)
+    denied = require_policy(ctx, Action.AUDIT_READ)
+    if denied is not None:
+        return denied
+    try:
+        async with tenant_session(ctx) as session:
+            summary = await customer_outcome_summary(
+                session,
+                tenant_id=ctx.tenant_id,
+                window_seconds=window_seconds,
+                confirmation_window_seconds=confirmation_window_seconds,
+            )
+    except CustomerFeedbackError as exc:
+        status_code = 413 if exc.code == "OUTCOME_WINDOW_TOO_LARGE" else 400
+        return error_response(exc.code, exc.detail, status_code=status_code)
+    return {"outcomes": summary}
 
 
 def _principal_from_ctx(ctx: TenantContext) -> Principal:

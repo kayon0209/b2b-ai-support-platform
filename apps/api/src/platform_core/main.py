@@ -1,6 +1,7 @@
 """FastAPI application entrypoint.
 
-Exposes /healthz plus one router per bounded context:
+Exposes /healthz (liveness), /readyz (database readiness), plus one router
+per bounded context:
 
 - audit:          append-only audit read API
 - cases:          case lifecycle and the command API
@@ -65,6 +66,7 @@ from platform_core.evaluation.agent_metrics_router import (
 from platform_core.evaluation.experiment_router import (
     router as experiment_router,
 )
+from platform_core.evaluation.review_router import router as quality_reviews_router
 from platform_core.evaluation.router import router as quality_router
 from platform_core.http_metrics import HttpMetricsMiddleware
 from platform_core.identity.branding import router as tenant_branding_router
@@ -318,6 +320,7 @@ app.include_router(support_router)
 app.include_router(tool_gateway_router)
 app.include_router(tool_catalog_router)
 app.include_router(quality_router)
+app.include_router(quality_reviews_router)
 app.include_router(agent_metrics_router)
 app.include_router(csat_router)
 app.include_router(experiment_router)
@@ -381,10 +384,41 @@ app.add_middleware(
 app.add_middleware(HttpMetricsMiddleware)
 
 
-@app.get("/healthz")
+@app.get("/healthz", include_in_schema=False)
 def healthz() -> dict[str, str]:
     settings: Settings = get_settings()
     return {"status": "ok", "environment": settings.environment}
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readyz() -> JSONResponse:
+    """Readiness is distinct from liveness and checks the required data store.
+
+    Kubernetes may restart a dead process, but it should stop routing requests
+    to an API whose database pool cannot connect. The body stays deliberately
+    coarse: probe failures never echo a DSN, provider response or exception.
+    Redis is an optional accelerator with a bounded local fallback, so it does
+    not make the API unready; connector health is tenant-specific and remains
+    on the authenticated connector inventory.
+    """
+    from sqlalchemy import text
+
+    try:
+        engine = db.get_engine(db.app_role_url())
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+    except Exception:
+        logging.getLogger("platform.health").warning(
+            "readiness_dependency_unavailable", extra={"dependency": "database"}
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "checks": {"database": "unavailable"}},
+        )
+    return JSONResponse(
+        status_code=200,
+        content={"status": "ready", "checks": {"database": "ok"}},
+    )
 
 
 # Last route registered wins last match, so the browser-router fallback goes

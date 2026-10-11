@@ -167,6 +167,23 @@ _WRITE_SUBJECT_NOUNS: dict[str, tuple[str, ...]] = {
     "im.send_notification": ("notify", "notification", "alert", "escalate", "通知", "告警", "升级"),
 }
 
+# Tools the async multi-intent planner may attach to individual tasks. This is
+# narrower than the global catalog: `crm.update_account` is omitted because
+# its free-form field patch cannot be derived deterministically, and
+# `case.eq_confirm` is human-approval-only. Connector availability, current
+# risk, and each tool's input schema are checked before candidates reach the model.
+TASK_PLANNING_TOOL_KINDS: dict[str, frozenset[str]] = {
+    "order.get_status": frozenset({"read"}),
+    "shipment.track": frozenset({"read"}),
+    "billing.get_invoice": frozenset({"read"}),
+    "inventory.check_stock": frozenset({"read"}),
+    "case.read": frozenset({"read"}),
+    "jira.create_issue": frozenset({"write"}),
+    "linear.create_issue": frozenset({"write"}),
+    "im.send_notification": frozenset({"write"}),
+    "case.create": frozenset({"write"}),
+}
+
 # Same reasoning as `_READ_PRIORITY`, with one difference: the values here
 # reproduce the order the alphabetical tie-break already produced (`im` <
 # `jira` < `linear`), so declaring it changes nothing about what runs today.

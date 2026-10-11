@@ -30,8 +30,9 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from observability import JsonLogger, new_trace_context
 from observability_metrics import get_metrics
@@ -40,6 +41,7 @@ from platform_core.agent_runtime.models import RunStatus
 from platform_core.agent_runtime.orchestrator import AgentOrchestrator, OrchestratorDeps
 from platform_core.agent_runtime.semantic.validator import CapabilityView
 from platform_core.db import app_role_url, session_scope_with_url
+from platform_core.execution_budget import ExecutionBudget, run_with_execution_budget
 from platform_core.identity.tenant_context import TenantContext, tenant_session
 from platform_core.retrieval.hybrid import PrincipalScope
 from platform_core.support_bridge.conversation_ref import conversation_ref_for
@@ -110,10 +112,16 @@ class ClaimedEvent:
     # and the customer can still wait minutes, so run latency alone does not
     # describe the experience.
     received_at: int = 0
+    attempts: int = 0
+    first_started_at: int = 0
 
 
 async def claim_events(
-    session: AsyncSession, *, batch: int = 20, priority: bool = False
+    session: AsyncSession,
+    *,
+    batch: int = 20,
+    priority: bool = False,
+    max_attempts: int | None = None,
 ) -> list[ClaimedEvent]:
     """Atomically claim unprocessed inbox rows.
 
@@ -127,14 +135,39 @@ async def claim_events(
     """
     rows: list[InboxEvent] = []
     now = int(time.time())
+    if max_attempts is None:
+        from platform_core.config import get_settings
+
+        max_attempts = get_settings().inbox_max_attempts
+    exhausted = await session.execute(
+        update(InboxEvent)
+        .where(
+            InboxEvent.status == InboxEventStatus.RECEIVED.value,
+            InboxEvent.attempts >= max_attempts,
+        )
+        .values(
+            status=InboxEventStatus.FAILED.value,
+            processed_at=now,
+            last_error="inbox_attempt_budget_exhausted",
+        )
+    )
+    exhausted_count = int(getattr(exhausted, "rowcount", 0) or 0)
+    if exhausted_count:
+        logger.error("inbox_attempt_budget_exhausted", count=exhausted_count)
+        get_metrics().inbox_events_total.labels(result="retry_budget_exhausted").inc(
+            exhausted_count
+        )
+    no_earlier_conversation_event = ~_has_earlier_active_conversation_event()
     if priority:
         escalated = (
             select(InboxEvent)
             .where(
                 InboxEvent.status == InboxEventStatus.RECEIVED.value,
+                InboxEvent.attempts < max_attempts,
                 InboxEvent.conversation_ref_id.in_(select(case_conversation_ref())),
+                no_earlier_conversation_event,
             )
-            .order_by(InboxEvent.received_at)
+            .order_by(InboxEvent.received_at, InboxEvent.id)
             .limit(batch)
             .with_for_update(skip_locked=True)
         )
@@ -146,15 +179,30 @@ async def claim_events(
             select(InboxEvent)
             .where(
                 InboxEvent.status == InboxEventStatus.RECEIVED.value,
+                InboxEvent.attempts < max_attempts,
+                no_earlier_conversation_event,
                 *([InboxEvent.id.not_in(claimed_ids)] if claimed_ids else []),
             )
-            .order_by(InboxEvent.received_at)
+            .order_by(InboxEvent.received_at, InboxEvent.id)
             .limit(remaining)
             .with_for_update(skip_locked=True)
         )
         rows = rows + list((await session.execute(stmt)).scalars().all())
     if not rows:
         return []
+    claimed = [
+        ClaimedEvent(
+            event_id=row.id,
+            tenant_id=row.tenant_id,
+            delivery_id=row.delivery_id,
+            event_type=row.event_type,
+            minimized_payload=row.minimized_payload or {},
+            received_at=int(row.received_at or 0),
+            attempts=int(row.attempts or 0) + 1,
+            first_started_at=int(row.first_started_at or now),
+        )
+        for row in rows
+    ]
     await session.execute(
         update(InboxEvent)
         .where(InboxEvent.id.in_([r.id for r in rows]))
@@ -167,19 +215,47 @@ async def claim_events(
             claimed_at=now,
             heartbeat_at=now,
             worker_id=WORKER_ID,
+            attempts=InboxEvent.attempts + 1,
+            first_started_at=func.coalesce(InboxEvent.first_started_at, now),
         )
     )
-    return [
-        ClaimedEvent(
-            event_id=row.id,
-            tenant_id=row.tenant_id,
-            delivery_id=row.delivery_id,
-            event_type=row.event_type,
-            minimized_payload=row.minimized_payload or {},
-            received_at=int(row.received_at or 0),
+    return claimed
+
+
+def _has_earlier_active_conversation_event() -> Any:
+    """Correlated predicate that prevents workers skipping an older message.
+
+    `SKIP LOCKED` by itself gives global throughput, but two workers can claim
+    separate messages from one conversation at the same time: the second
+    worker skips the locked first row and takes the next one. Treat every
+    earlier `received` or `processing` event as a per-conversation queue head,
+    with UUID as the deterministic tie-break when second-resolution timestamps
+    match. Conversations without a routing ref remain independently claimable.
+    """
+    older = aliased(InboxEvent)
+    current_ref = func.coalesce(
+        InboxEvent.minimized_payload["conversation_ref"].as_string(),
+        InboxEvent.minimized_payload["conversation_id"].as_string(),
+    )
+    older_ref = func.coalesce(
+        older.minimized_payload["conversation_ref"].as_string(),
+        older.minimized_payload["conversation_id"].as_string(),
+    )
+    older_active = (
+        select(older.id)
+        .where(
+            older.tenant_id == InboxEvent.tenant_id,
+            older.status.in_((InboxEventStatus.RECEIVED.value, InboxEventStatus.PROCESSING.value)),
+            current_ref.is_not(None),
+            older_ref == current_ref,
+            or_(
+                older.received_at < InboxEvent.received_at,
+                and_(older.received_at == InboxEvent.received_at, older.id < InboxEvent.id),
+            ),
         )
-        for row in rows
-    ]
+        .exists()
+    )
+    return older_active
 
 
 async def mark_completed(session: AsyncSession, event_id: uuid.UUID) -> None:
@@ -203,7 +279,10 @@ async def mark_failed(session: AsyncSession, event_id: uuid.UUID, error: str) ->
 
 
 async def reclaim_stale_processing(
-    session: AsyncSession, *, timeout_seconds: int = STALE_PROCESSING_SECONDS
+    session: AsyncSession,
+    *,
+    timeout_seconds: int = STALE_PROCESSING_SECONDS,
+    max_attempts: int | None = None,
 ) -> int:
     """Return rows abandoned in PROCESSING to RECEIVED. Returns the count.
 
@@ -229,13 +308,18 @@ async def reclaim_stale_processing(
     rule. `received_at` is otherwise untouched and remains the FIFO key.
     """
     cutoff = int(time.time()) - timeout_seconds
+    if max_attempts is None:
+        from platform_core.config import get_settings
+
+        max_attempts = get_settings().inbox_max_attempts
     liveness = func.coalesce(InboxEvent.heartbeat_at, InboxEvent.claimed_at, InboxEvent.received_at)
+    stale = (
+        InboxEvent.status == InboxEventStatus.PROCESSING.value,
+        liveness < cutoff,
+    )
     result = await session.execute(
         update(InboxEvent)
-        .where(
-            InboxEvent.status == InboxEventStatus.PROCESSING.value,
-            liveness < cutoff,
-        )
+        .where(*stale, InboxEvent.attempts < max_attempts)
         .values(
             status=InboxEventStatus.RECEIVED.value,
             # The next worker gets a clean claim; leaving the dead worker's
@@ -246,7 +330,25 @@ async def reclaim_stale_processing(
             worker_id=None,
         )
     )
-    return result.rowcount or 0  # type: ignore[attr-defined]
+    exhausted = await session.execute(
+        update(InboxEvent)
+        .where(*stale, InboxEvent.attempts >= max_attempts)
+        .values(
+            status=InboxEventStatus.FAILED.value,
+            processed_at=int(time.time()),
+            claimed_at=None,
+            heartbeat_at=None,
+            worker_id=None,
+            last_error="inbox_attempt_budget_exhausted",
+        )
+    )
+    exhausted_count = int(getattr(exhausted, "rowcount", 0) or 0)
+    if exhausted_count:
+        logger.error("inbox_stale_attempt_budget_exhausted", count=exhausted_count)
+        get_metrics().inbox_events_total.labels(result="retry_budget_exhausted").inc(
+            exhausted_count
+        )
+    return int(getattr(result, "rowcount", 0) or 0)
 
 
 async def heartbeat_claim(event_id: uuid.UUID) -> None:
@@ -514,7 +616,11 @@ async def _persist_memory(
     if conversation_ref_id is None:
         return None
     now = int(time.time())
-    customer_turn = Turn(role=TurnRole.CUSTOMER, text=question, ts=now)
+    # Inbound acceptance time is stable across retries and worker restarts.
+    # Using `now` here would let a delayed old event look newer than a later
+    # customer correction when durable facts are ordered.
+    source_ts = int(event.received_at or now)
+    customer_turn = Turn(role=TurnRole.CUSTOMER, text=question, ts=source_ts)
     # `source` names where the turn actually came from. Every turn is the
     # platform's now: `/support` and the channel adapters all persist through
     # `append_customer_turn`. Labelling one "chatwoot" credited a system of
@@ -575,7 +681,11 @@ async def _persist_memory(
     await conversation_store.upsert_facts(
         session,
         tenant_id=event.tenant_id,
-        contact_ref=conversation_store.contact_ref_from_external(event.tenant_id, str(contact_id)),
+        contact_ref=conversation_store.contact_ref_from_external(
+            event.tenant_id,
+            str(contact_id),
+            channel=str(event.minimized_payload.get("channel_system") or "chatwoot"),
+        ),
         facts=conversation_store.fact_tuples(facts),
         source_turn_id=turn_id,
         now=now,
@@ -721,7 +831,9 @@ async def process_event(
             session,
             tenant_id=event.tenant_id,
             contact_ref=conversation_store.contact_ref_from_external(
-                event.tenant_id, str(contact_id_early)
+                event.tenant_id,
+                str(contact_id_early),
+                channel=str(event.minimized_payload.get("channel_system") or "chatwoot"),
             ),
         )
     # Feature 2.5: resolve the visitor's ownership proof before the run. "" =
@@ -731,31 +843,62 @@ async def process_event(
     # collapsing a missing key to "" would gate operators out of their own reads.
     _va = event.minimized_payload.get("verified_account")
     verified_account = _va if isinstance(_va, str) else None
+    raw_run_id = event.minimized_payload.get("agent_run_id")
+    if raw_run_id is None:
+        queued_run_id = None
+    elif isinstance(raw_run_id, str):
+        try:
+            queued_run_id = uuid.UUID(raw_run_id)
+        except ValueError as exc:
+            raise ValueError("inbox event has an invalid agent_run_id") from exc
+    else:
+        raise ValueError("inbox event has an invalid agent_run_id")
+    allow_legacy_queued_run = queued_run_id is None and event.delivery_id.startswith("agent-run:")
 
-    outcome = await orchestrator.run(
-        tenant_id=event.tenant_id,
-        conversation_ref_id=conversation_ref_id,
-        question=question,
-        principal=AI_PRINCIPAL,
-        trace=trace,
-        channel_conversation_key=str(event.minimized_payload.get("conversation_id") or ""),
-        history=history,
-        known_facts=known_facts,
-        contact_id=str(contact_id_early) if contact_id_early else None,
-        # 1.3: what the customer attached, as content types only. The
-        # minimiser already dropped everything else; this just carries the
-        # metadata through so a handoff can say evidence was supplied.
-        attachment_types=_attachment_types(event),
-        # Feature 2.5: "" = anonymous visitor (gate fires); None = operator run
-        # (no gate); a non-empty string = the verified account the run may read.
-        verified_account=verified_account,
-        # ADR 0014: which channel to answer on. Absent for the platform's own
-        # surface, where `_dispatch` already knows what to do - so this is
-        # None, not "".
-        channel_system=str(event.minimized_payload.get("channel_system") or "") or None,
-        # Where to answer: the customer's email address, or the WeChat openid.
-        # The channel route stores it as `contact_id`.
-        channel_address=str(contact_id_early) if contact_id_early else None,
+    from platform_core.config import get_settings
+
+    settings = get_settings()
+    first_started_at = event.first_started_at or int(time.time())
+    remaining_deadline = settings.agent_run_deadline_seconds - (time.time() - first_started_at)
+    budget = ExecutionBudget.for_seconds(
+        deadline_seconds=max(0.0, remaining_deadline),
+        max_attempts=settings.agent_run_max_external_attempts,
+        operation_limits={
+            "model": settings.agent_run_max_model_attempts,
+            "tool": settings.agent_run_max_tool_attempts,
+            "outbound": 2,
+        },
+    )
+    outcome = await run_with_execution_budget(
+        budget,
+        orchestrator.run(
+            tenant_id=event.tenant_id,
+            conversation_ref_id=conversation_ref_id,
+            question=question,
+            queued_run_id=queued_run_id,
+            allow_legacy_queued_run=allow_legacy_queued_run,
+            source_event_id=event.event_id,
+            principal=AI_PRINCIPAL,
+            trace=trace,
+            channel_conversation_key=str(event.minimized_payload.get("conversation_id") or ""),
+            history=history,
+            known_facts=known_facts,
+            contact_id=str(contact_id_early) if contact_id_early else None,
+            # 1.3: what the customer attached, as content types only. The
+            # minimiser already dropped everything else; this just carries the
+            # metadata through so a handoff can say evidence was supplied.
+            attachment_types=_attachment_types(event),
+            # Feature 2.5: "" = anonymous visitor (gate fires); None = operator run
+            # (no gate); a non-empty string = the verified account the run may read.
+            verified_account=verified_account,
+            # ADR 0014: which channel to answer on. Absent for the platform's own
+            # surface, where `_dispatch` already knows what to do - so this is
+            # None, not "".
+            channel_system=str(event.minimized_payload.get("channel_system") or "") or None,
+            # Where to answer: the customer's email address, or the WeChat openid.
+            # The channel route stores it as the contact id.
+            channel_address=str(contact_id_early) if contact_id_early else None,
+        ),
     )
     stored_turn_id = await _persist_memory(session, event=event, question=question, outcome=outcome)
     if stored_turn_id is None:
@@ -847,7 +990,6 @@ async def _plan_conversation_tasks(
         SemanticBudget,
         analyze,
     )
-    from platform_core.agent_runtime.semantic.shadow import capabilities_for_shadow
     from platform_core.agent_runtime.tasks.planning_seam import run_task_planning
     from platform_core.config import get_settings
     from platform_core.knowledge import flag_service
@@ -878,7 +1020,7 @@ async def _plan_conversation_tasks(
             return 0
 
         await registry.ensure_tool_definitions(session, tenant_id=tenant_id)
-        capabilities = capabilities_for_shadow(await _tenant_tool_names(session, tenant_id))
+        capabilities = await _task_planning_capabilities(session, tenant_id)
 
         ctx = build_context(
             current_turn_id=turn_id or str(turn_created_at),
@@ -1034,25 +1176,77 @@ async def _enqueue_shadow(
         return False
 
 
-async def _tenant_tool_names(
+async def _task_planning_capabilities(
     session: AsyncSession, tenant_id: uuid.UUID
 ) -> dict[str, CapabilityView]:
-    """The tenant's registered tools, with the registry's own risk class.
+    """Project only executable, schema-backed tools into task planning.
 
-    Read through the tenant session, so RLS already restricts this to the
-    tenant's rows plus the platform catalog. The risk class is the registry's
-    value, never anything a model supplied.
+    Shadow analysis intentionally sees the whole catalog so it can measure
+    over-proposal. Assist mode is different: its output becomes durable tasks,
+    so it sees only tools this tenant can resolve now, with registered schemas
+    and task kinds the Gateway can serve.
     """
+    from platform_core.integrations.models import Connector, ConnectorStatus
     from platform_core.tool_gateway.models import ToolDefinition
+    from platform_core.tool_gateway.registry import (
+        PLATFORM_TOOLS,
+        ConnectorExecutorResolver,
+    )
+    from platform_core.tool_gateway.selector import TASK_PLANNING_TOOL_KINDS
 
-    rows = (
+    connector_rows = (
         await session.execute(
-            select(ToolDefinition).where(
-                (ToolDefinition.tenant_id == tenant_id) | ToolDefinition.tenant_id.is_(None)
+            select(Connector).where(
+                Connector.tenant_id == tenant_id,
+                Connector.status == ConnectorStatus.ACTIVE.value,
             )
         )
     ).scalars()
-    return {row.name: CapabilityView(tool_name=row.name, risk_class=row.risk) for row in rows}
+    connectors_by_provider: dict[str, Connector] = {}
+    for connector in connector_rows:
+        connectors_by_provider.setdefault(connector.provider, connector)
+
+    tool_rows = (
+        await session.execute(select(ToolDefinition).where(ToolDefinition.tenant_id == tenant_id))
+    ).scalars()
+    capabilities: dict[str, CapabilityView] = {}
+    for row in tool_rows:
+        allowed_kinds = TASK_PLANNING_TOOL_KINDS.get(row.name)
+        expected_kind = (
+            "read"
+            if row.risk == "read"
+            else "write"
+            if row.risk in {"low_write", "confirmed_write"}
+            else None
+        )
+        if not allowed_kinds or expected_kind not in allowed_kinds:
+            continue
+        if row.name not in PLATFORM_TOOLS and (
+            ConnectorExecutorResolver.resolve_connector(row.name, connectors_by_provider) is None
+        ):
+            continue
+
+        schema = row.input_schema if isinstance(row.input_schema, dict) else {}
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        property_names = (
+            tuple(sorted(name for name in properties if isinstance(name, str)))
+            if isinstance(properties, dict)
+            else ()
+        )
+        required_names = (
+            tuple(sorted(name for name in required if isinstance(name, str)))
+            if isinstance(required, list)
+            else ()
+        )
+        capabilities[row.name] = CapabilityView(
+            tool_name=row.name,
+            risk_class=row.risk,
+            allowed_task_kinds=allowed_kinds,
+            parameter_names=property_names,
+            required_parameters=required_names,
+        )
+    return capabilities
 
 
 async def drain_once(

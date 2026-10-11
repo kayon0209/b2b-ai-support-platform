@@ -100,6 +100,34 @@ RESTRICTED_BY_DESIGN: dict[str, tuple[frozenset[str], str]] = {
         "append-only idempotency receipts; retries reuse the stored task and "
         "never rewrite the receipt",
     ),
+    "tool_execution_reconciliations": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only human provider reconciliation evidence",
+    ),
+    "tool_execution_compensations": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only outcomes for qualified business compensations",
+    ),
+    "customer_resolution_feedback_events": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only customer feedback exposure and responses",
+    ),
+    "quality_review_batches": (
+        frozenset({"UPDATE", "DELETE"}),
+        "immutable review batch scope and sampling receipt",
+    ),
+    "quality_review_items": (
+        frozenset({"UPDATE", "DELETE"}),
+        "immutable selected-run review sample",
+    ),
+    "quality_review_decisions": (
+        frozenset({"UPDATE", "DELETE"}),
+        "append-only reviewer decisions",
+    ),
+    "quality_review_evidence": (
+        frozenset({"UPDATE", "DELETE"}),
+        "immutable finalized human-review evidence",
+    ),
 }
 
 PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")

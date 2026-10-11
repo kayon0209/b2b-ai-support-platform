@@ -8,16 +8,19 @@ enforcement point for "customer PII does not gain a second copy at rest".
 """
 
 import hashlib
+import re
 import time
 import uuid
+from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_core.agent_runtime.conversation import Turn, TurnRole
+from platform_core.agent_runtime.conversation import DURABLE_FACT_KEYS, Turn, TurnRole
 from platform_core.agent_runtime.models import ContactFact, ConversationTurn
-from platform_core.evaluation.pii import redact_text
+from platform_core.evaluation.pii import DEFAULT_RETENTION, redact_text
 
 
 def _role_value(role: TurnRole | str) -> str:
@@ -165,16 +168,34 @@ async def upsert_facts(
     source_turn_id: uuid.UUID | None = None,
     now: int | None = None,
 ) -> int:
-    """Write durable facts; current statements override history (plan 2.5).
+    """Write facts from a customer turn, rejecting late-arriving history.
 
-    `ON CONFLICT DO UPDATE` is the whole conflict policy: the customer
-    changing their answer IS the update. Values are redacted at extraction
-    time already (`extract_durable_facts` refuses PII-shaped turns); a final
-    redact here is defence in depth on the write boundary.
+    Source order comes from the persisted turn, never from when a worker
+    happened to process it. The database trigger repeats this check so an
+    older application process in a rolling deployment cannot bypass it.
+    Values are redacted at extraction time already; a final redact here is
+    defence in depth on the write boundary.
     """
-    if not facts:
+    if not facts or source_turn_id is None:
         return 0
+    if any(key not in DURABLE_FACT_KEYS for key, _value in facts):
+        raise ValueError("unsupported durable fact type")
     ts = now if now is not None else int(time.time())
+    source = (
+        await session.execute(
+            select(ConversationTurn.ts).where(
+                ConversationTurn.tenant_id == tenant_id,
+                ConversationTurn.id == source_turn_id,
+                ConversationTurn.role == TurnRole.CUSTOMER.value,
+            )
+        )
+    ).scalar_one_or_none()
+    if source is None:
+        # Missing, cross-tenant, or non-customer provenance is not durable
+        # memory. This is a fail-closed no-op, not a fallback to worker time.
+        return 0
+    source_ts = int(source)
+    expires_at = source_ts + DEFAULT_RETENTION.contact_fact_days * 86400
     written = 0
     for key, value in facts:
         redacted_value, _count = redact_text(value)
@@ -186,20 +207,34 @@ async def upsert_facts(
                 key=key[:63],
                 value=redacted_value[:255],
                 source_turn_id=source_turn_id,
+                source_ts=source_ts,
+                revision=1,
                 confidence=100,
                 updated_at=ts,
+                expires_at=expires_at,
             )
             .on_conflict_do_update(
                 constraint="uq_contact_fact_key",
                 set_={
                     "value": redacted_value[:255],
                     "source_turn_id": source_turn_id,
+                    "source_ts": source_ts,
+                    "revision": ContactFact.revision + 1,
                     "updated_at": ts,
+                    "expires_at": expires_at,
                 },
+                where=or_(
+                    ContactFact.source_turn_id.is_(None),
+                    ContactFact.source_ts < source_ts,
+                    and_(
+                        ContactFact.source_ts == source_ts,
+                        ContactFact.source_turn_id < source_turn_id,
+                    ),
+                ),
             )
         )
-        await session.execute(stmt)
-        written += 1
+        result = await session.execute(stmt.returning(ContactFact.id))
+        written += int(result.scalar_one_or_none() is not None)
     return written
 
 
@@ -208,9 +243,11 @@ async def load_facts(
     *,
     tenant_id: uuid.UUID,
     contact_ref: uuid.UUID,
+    now: int | None = None,
 ) -> list[tuple[str, str]]:
-    """Current facts for a contact, newest-statement wins by construction."""
+    """Unexpired facts for one tenant- and channel-scoped contact."""
 
+    current_time = now if now is not None else int(time.time())
     rows = (
         (
             await session.execute(
@@ -218,6 +255,8 @@ async def load_facts(
                 .where(
                     ContactFact.tenant_id == tenant_id,
                     ContactFact.contact_ref == contact_ref,
+                    ContactFact.expires_at.is_not(None),
+                    ContactFact.expires_at > current_time,
                 )
                 .order_by(ContactFact.key)
             )
@@ -228,13 +267,59 @@ async def load_facts(
     return [(row.key, row.value) for row in rows]
 
 
-def contact_ref_from_external(tenant_id: uuid.UUID, external_contact_id: str) -> uuid.UUID:
-    """Stable per-tenant ref for a channel contact.
+async def erase_memory_rows(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    contact_ref: uuid.UUID,
+    conversation_ref_ids: list[uuid.UUID],
+) -> dict[str, int]:
+    """Erase stored conversation memory; operational tasks and audit stay put.
 
-    The legacy namespace is frozen: changing it would split existing
-    conversations when an external contact id is mapped again.
+    Summaries are derived on each run and are not stored. Removing turns also
+    removes the source from which any later summary could be rebuilt.
     """
-    return uuid.uuid5(tenant_id, f"chatwoot:contact:{external_contact_id}")
+    facts_result = await session.execute(
+        delete(ContactFact).where(
+            ContactFact.tenant_id == tenant_id,
+            ContactFact.contact_ref == contact_ref,
+        )
+    )
+    turns_deleted = 0
+    if conversation_ref_ids:
+        turns_result = await session.execute(
+            delete(ConversationTurn).where(
+                ConversationTurn.tenant_id == tenant_id,
+                ConversationTurn.conversation_ref_id.in_(conversation_ref_ids),
+            )
+        )
+        turns_deleted = int(cast(CursorResult[Any], turns_result).rowcount or 0)
+    return {
+        "contact_facts_deleted": int(cast(CursorResult[Any], facts_result).rowcount or 0),
+        "conversation_turns_deleted": turns_deleted,
+    }
+
+
+def contact_ref_from_external(
+    tenant_id: uuid.UUID,
+    external_contact_id: str,
+    *,
+    channel: str = "chatwoot",
+) -> uuid.UUID:
+    """Stable per-tenant and per-channel ref for an external contact.
+
+    Chatwoot keeps its frozen legacy namespace. Other channels get distinct
+    refs so equal provider-local identifiers cannot merge unrelated people.
+    """
+    normalized_channel = channel.strip().casefold()
+    if not normalized_channel or not re.fullmatch(r"[a-z0-9_-]{1,31}", normalized_channel):
+        raise ValueError("channel must be a normalized provider identifier")
+    if not external_contact_id:
+        raise ValueError("external_contact_id is required")
+    namespace = (
+        "chatwoot:contact" if normalized_channel == "chatwoot" else f"{normalized_channel}:contact"
+    )
+    return uuid.uuid5(tenant_id, f"{namespace}:{external_contact_id}")
 
 
 def fact_tuples(facts: object) -> list[tuple[str, str]]:

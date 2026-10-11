@@ -44,6 +44,8 @@ spec:
       labels:
         app.kubernetes.io/name: platform
         app.kubernetes.io/component: worker-interactive
+        worker_metrics: "true"
+        worker_queue: interactive
     spec:
       serviceAccountName: platform
       terminationGracePeriodSeconds: 60
@@ -90,11 +92,9 @@ spec:
                 secretKeyRef:
                   name: platform-secrets
                   key: APP_LLM_API_KEY
-          # No HTTP probes: this process exposes no port. A probe here would be
-          # either a fiction or would force the worker to run a web server it
-          # does not need. Liveness comes from the process exiting on a fatal
-          # error, and the idle-only backoff in the poll loop keeps it cheap
-          # when there is no work.
+          # No health probes: this process-local port serves metrics only.
+          # Liveness remains the process exit; the metrics listener is not a
+          # readiness claim about database or queue health.
           resources:
             requests:
               cpu: "200m"
@@ -154,6 +154,8 @@ spec:
       labels:
         app.kubernetes.io/name: platform
         app.kubernetes.io/component: worker-ingestion
+        worker_metrics: "true"
+        worker_queue: ingestion
     spec:
       serviceAccountName: platform
       # Ingestion batches are long: a 200-page document spends minutes in
@@ -254,6 +256,8 @@ spec:
       labels:
         app.kubernetes.io/name: platform
         app.kubernetes.io/component: worker-outbox
+        worker_metrics: "true"
+        worker_queue: outbox
     spec:
       serviceAccountName: platform
       terminationGracePeriodSeconds: 60
@@ -335,6 +339,8 @@ spec:
       labels:
         app.kubernetes.io/name: platform
         app.kubernetes.io/component: worker-retention
+        worker_metrics: "true"
+        worker_queue: retention
     spec:
       serviceAccountName: platform
       terminationGracePeriodSeconds: 300
@@ -415,6 +421,8 @@ spec:
       labels:
         app.kubernetes.io/name: platform
         app.kubernetes.io/component: worker-sla
+        worker_metrics: "true"
+        worker_queue: sla
     spec:
       serviceAccountName: platform
       # Above the 60-second sweep interval, so a rollout does not interrupt a
@@ -475,3 +483,21 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform-worker-metrics
+  namespace: b2b-support
+  labels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: worker-metrics
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: platform
+    worker_metrics: "true"
+  ports:
+    - name: metrics
+      port: 8001
+      targetPort: 8001

@@ -274,6 +274,9 @@ class RetentionPolicy:
     # Chatwoot is the system of record for raw content, so the local memory
     # copy is a cache and must not outlive its usefulness.
     conversation_turn_days: int = 90
+    # Contact facts are derived from customer turns and must not outlive either
+    # their own retention window or the source-turn retention window.
+    contact_fact_days: int = 90
 
 
 DEFAULT_RETENTION = RetentionPolicy()
@@ -362,6 +365,23 @@ async def sweep_expired_data(
         )
     )
     counts["conversation_turns_pruned"] = _affected(result)
+
+    # 5) Derived contact memory expires with its source evidence. The source
+    # cutoff also cleans rows left by an older writer that did not set
+    # expires_at.
+    from platform_core.agent_runtime.models import ContactFact
+
+    fact_cutoff = max(
+        now - policy.contact_fact_days * 86400,
+        turn_cutoff,
+    )
+    result = await session.execute(
+        delete(ContactFact).where(
+            ContactFact.tenant_id == tenant_id,
+            (ContactFact.expires_at <= now) | (ContactFact.source_ts < fact_cutoff),
+        )
+    )
+    counts["contact_facts_pruned"] = _affected(result)
     return counts
 
 

@@ -107,6 +107,17 @@ def test_every_documented_endpoint_exists(openapi_spec: dict) -> None:
     assert not missing, f"documented but not served: {missing}"
 
 
+def test_openapi_operation_ids_are_unique(openapi_spec: dict) -> None:
+    seen: dict[str, list[str]] = {}
+    for path, operations in openapi_spec["paths"].items():
+        for operation in operations.values():
+            operation_id = operation.get("operationId")
+            if operation_id:
+                seen.setdefault(operation_id, []).append(path)
+    duplicates = {key: paths for key, paths in seen.items() if len(paths) > 1}
+    assert duplicates == {}, f"duplicate OpenAPI operationId values: {duplicates}"
+
+
 def test_the_contract_document_is_not_empty_of_endpoints() -> None:
     """Guard the parser above.
 
