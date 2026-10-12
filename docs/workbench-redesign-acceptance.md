@@ -1,5 +1,7 @@
 # 工作台改版验收标准与记录
 
+> 历史环境验证快照（2026-09-24），不是当前版本状态表。后续实现与本地验证见 [四阶段摘要](implementation/production-agent-roadmap.md)，现行环境要求见 [生产接入条件](production-readiness.md)。下文保留原结果，不把早期未执行项自动改成通过。
+
 日期：2026-09-24。设计规格见 [workbench-redesign-spec.md](workbench-redesign-spec.md)，实施与发布条件见 [workbench-redesign-implementation.md](workbench-redesign-implementation.md)。状态分为“通过”“部分通过”“待验证”；只有本次真实可复现的证据才记为通过。
 
 ## A. UI 验收

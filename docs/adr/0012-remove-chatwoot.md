@@ -1,5 +1,7 @@
 # ADR 0012: The Platform Hosts Its Own Customer Channel; Chatwoot Leaves The Stack
 
+> Implemented migration decision. Inventory and stage wording below are historical. The old `/chat` UI was subsequently retired by the conversation-first workbench; current routes and controls are documented in [ADR 0015](0015-conversation-first-workbench.md).
+
 - Status: **Done** (2026-09-22). All four stages have run: the surviving
   channel works, nothing routes through Chatwoot, the adapter is deleted, and
   `AGENTS.md` rules 1 and 2 were rewritten in the same change that made them
@@ -210,29 +212,6 @@ which must be **re-pointed at the channel or `/support` path, never simply delet
 **Order within Stage 2:** re-point the zero-tolerance tests, confirm the gate still reports
 `duplicate_replies`, and only then delete the adapter. Doing it the other way round is how a security
 gate gets quietly weakened by a "cleanup".
-
-## What Stage 2 changed, measured
-
-- **`duplicate_replies` kept its four carriers.** The prerequisite was met
-  first: `test_channel_webhooks.py` already carried the marker, and
-  `test_e2e_acceptance.py` / `test_orchestrator_lease_race.py` were re-pointed at
-  the channel and the platform surface rather than deleted. The gate still
-  reports `duplicate_replies: 4 passing test(s)`.
-- **Two things the removal exposed, both fixed here.**
-  1. `_finish_abstain` and `_finish_clarify` dispatched without a channel, so on
-     email or WeChat the *notice* — "a human is coming" — fell through to the
-     platform-surface branch, returned `""` (which means **delivered**), and
-     reached nobody. The channel now travels with the notice.
-  2. The routing team (7.3) and the handoff context lived only in the Chatwoot
-     private note. Deleting the note would have made them values nothing reads,
-     so they are recorded on the handoff's audit event `metadata` — the record
-     an operator or reviewer actually opens. (`after=` is hashed and unreadable;
-     `metadata` is the documented exception for an event's own parameters.)
-- **`external_resource_refs` now has no production reader or writer.** It was
-  the Chatwoot account→tenant mapping. The table and its model stay (dropping a
-  table is a contract migration, not a cleanup), but this is the repository's
-  recurring defect shape and is recorded here rather than left to be discovered:
-  either onboarding writes to it again, or a later migration drops it.
 
 ## What Stage 2 changed, measured
 

@@ -1,7 +1,6 @@
 # ADR 0010: The Customer Surface Is Chatwoot; `/chat` Is Internal
 
-- Status: Accepted (amended by
-  [ADR 0011](0011-customer-chat-is-a-visitor-session.md))
+- Status: Superseded by [ADR 0012](0012-remove-chatwoot.md) and [ADR 0015](0015-conversation-first-workbench.md); the operator-only API boundary remains, while the old `/chat` UI is retired.
 - Date: 2026-09-21
 
 ## Context

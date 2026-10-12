@@ -1,9 +1,6 @@
 # Production deployment (Kubernetes)
 
-`docs/development-plan.md` Phase 5 lists "High-availability production
-templates". `infra/` held only `compose/`, which is a single-host development
-stack: one API process, one of each worker, no disruption budget, no policy, no
-way to roll a change without downtime. This directory is the production shape.
+This directory defines the platform deployment topology, migration Job, API/Worker workloads, network policies, monitoring resources and scheduled backup/restore tasks. PostgreSQL, Redis, object storage, enterprise identity and model/business providers are external deployment dependencies. See [deployment guide](../../docs/deployment-and-operations.md) and [production conditions](../../docs/production-readiness.md).
 
 Plain manifests plus a Kustomization - no Helm. A Helm chart would add
 templating, a values schema and a release lifecycle for six Deployments that
@@ -28,7 +25,7 @@ kubectl apply -f 00-namespace.yaml
 kubectl apply -f 10-configmap.yaml -f 20-migrate-job.yaml
 kubectl -n b2b-support wait --for=condition=complete job/platform-migrate --timeout=600s
 
-# 3. Everything else.
+# 3. Everything else, after Operator CRDs and all dependencies are available.
 kubectl apply -k .
 
 # 4. Rollouts are explicit. `latest` is not a tag you should ever see here.
@@ -43,23 +40,11 @@ carries `ttlSecondsAfterFinished: 86400`, so wait a day or delete it first:
 kubectl -n b2b-support delete job/platform-migrate --ignore-not-found
 ```
 
-## What is verified, and what is not
+## Validation scope
 
-Honest statement of the checks that were actually run, because a manifest
-directory that looks validated and is not is worse than one that admits it:
+Repository tests assert manifest properties, and historical local records include Kustomize rendering. Rendering and unit assertions do not replace API-server admission, installed CRDs, enforced CNI policy, actual scheduling or rollout checks. No real-cluster deployment result is introduced by this documentation update.
 
-| Check | Status |
-|---|---|
-| `kubectl kustomize infra/kubernetes` builds, 20 objects | **run** |
-| Every HA property is asserted by `apps/api/tests/unit/test_kubernetes_manifests.py` (29 tests) | **run** |
-| `kubectl apply --dry-run=client` | **not run** - it needs API discovery, so it cannot work without a cluster |
-| Any of it applied to a real cluster | **not run** |
-
-The unit test is the substitute for server-side validation, and it covers the
-things a rollout would otherwise discover: a container missing a
-`securityContext` under an enforced `restricted` profile, a credential written
-as a literal value, a worker whose grace period is shorter than its poll
-interval, an HPA on a poll loop.
+Before rollout, replace example host/image/storage/identity values, create the real Secrets, install Prometheus Operator CRDs and supply reachable data services. Validate resources with the target API server and exercise the selected business scope. The default Ingress has no `/api` prefix rewrite; the frontend/API-base choice must follow the deployment guide.
 
 ## Decisions worth reading before editing
 
@@ -82,10 +67,7 @@ rule allows 443 anywhere (the providers' address ranges change and pinning them
 would break on their schedule), and the metadata-service exclusion is what stops
 that rule from being "everything".
 
-**`/metrics` is not routed.** API and worker metrics are scraped in-cluster
-through separate Services. NetworkPolicy admits only the monitoring namespace.
-Workers expose their process-local Prometheus registry on port 8001; the
-worker role is attached as a bounded `worker_queue` target label.
+**Metrics require explicit public-route restrictions.** API and Worker targets use separate internal scrape Services. Worker metrics on port 8001 are admitted from the monitoring namespace. However the API metrics endpoint shares port 8000 with customer/API traffic, `APP_METRICS_ENABLED` is enabled in the sample ConfigMap, and the sample Ingress forwards the `/` prefix. Neither a separate Service nor an L3/L4 NetworkPolicy blocks `/metrics` by URL. The deployment gateway must deny public `/metrics`, `/docs`, `/redoc` and `/openapi.json` access while preserving internal scrapes; confirm this with external probes.
 
 **No CPU limit on the API, a memory limit on everything.** A CFS quota makes a
 bursty request handler slower under load while it holds a connection; memory is
@@ -95,16 +77,13 @@ what actually needs bounding.
 between batches, so a CPU-based HPA would scale a backlog *down*. Scaling it
 needs queue depth, which is a custom metric and a separate piece of work.
 
-## What is still missing
+## Cluster configuration requirements
 
-- **A cluster to run it on.** These manifests have never been applied. Several
-  cluster-specific facts - the ingress class, the storage class for Postgres,
-  whether the CNI enforces NetworkPolicy at all - are configuration decisions,
-  not omissions.
+- **Target cluster configuration.** Confirm ingress class, TLS, service discovery, CNI NetworkPolicy enforcement, availability budgets and actual resource limits. Repository-local tests do not prove these environment properties.
 - **Postgres and Redis are referenced, not deployed.** Both are StatefulSet
   problems with backup, failover and upgrade questions of their own, and
   `docs/deployment-and-operations.md` already says the restores are what matter.
   `scripts/backup_restore_drill.py` is the executable half of that.
-- **A ServiceMonitor rather than `prometheus.io/*` annotations** if the cluster
-  runs the Prometheus Operator. The annotations are what the metrics Service
-  carries today because they work with a plain scrape config.
+- **Prometheus Operator and receivers.** `70-alerts.yaml` and `71-servicemonitor.yaml` are already included in Kustomization. Install their CRDs before apply, confirm API/Worker targets are scraped, and verify alert delivery. Configure an OTLP collector for exported tracing.
+
+Outbound mail deployments must also allow the configured SMTP port. The sample dependency egress rule permits external 443, not arbitrary SMTP ports; review it against the selected transport rather than assuming mail connectivity.
