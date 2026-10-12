@@ -1,6 +1,8 @@
 # 最终外形与最后一公里（设计决策）
 
-> 本文保留早期产品形态决策。当前坐席工作台的执行规格、参考图与状态请以 [工作台改版规格](workbench-redesign-spec.md) 为准。
+> 历史分析快照，归档于 2026-10-12。本文保留当时的判断与证据，不代表当前实现或生产状态。现行说明见 [能力矩阵](../../capabilities.md) 和 [生产接入条件](../../production-readiness.md)。
+
+> 本文保留早期产品形态决策。当前坐席工作台的执行规格、参考图与状态请以 [工作台改版规格](../../workbench-redesign-spec.md) 为准。
 
 > 依据：已上线产品的实测做法（Intercom Fin、Zendesk AI agents、Dynamics 365 Copilot、Decagon/Sierra，
 > 以及国内合力亿捷的 62%→19% 改造实录）+ 本仓库现状（`docs/product-gap-analysis.md`）。

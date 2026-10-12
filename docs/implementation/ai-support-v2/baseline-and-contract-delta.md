@@ -1,5 +1,7 @@
 # T00 基线核对与契约差异记录
 
+> 历史基线记录，其中工作区和提交状态只描述当时环境。当前实现见 [四阶段摘要](../production-agent-roadmap.md)。
+
 日期：2026-09-26
 执行分支：`codex/ai-support-v2-r1`
 基线 commit：`13eef064f8f37c878482669c3bf886b727837ed9`（`master`，与执行包规划基线一致）

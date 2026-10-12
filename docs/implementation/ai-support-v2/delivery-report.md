@@ -1,5 +1,7 @@
 # R1 修复轮交付说明（Codex 验收 B1-01 – B1-07）
 
+> 历史交付与复验过程。各段只适用于其日期/提交/环境，不作为当前任务状态。后续实现见 [四阶段摘要](../production-agent-roadmap.md)，当前范围见 [能力矩阵](../../capabilities.md)。
+
 日期：2026-09-26
 分支：`codex/ai-support-v2-r1-fix`
 基线：`96c81ad`（`origin/master`，已含验收报告所述的 11 个提交）

@@ -1,4 +1,4 @@
-# Security and Trust Plan
+# Security and Trust Boundaries
 
 ## Security objectives
 
@@ -34,7 +34,7 @@ Data crossing a boundary must be authenticated, authorized, minimized and traced
 ### Retrieval
 
 - Tenant and ACL filters are applied before lexical/vector candidate retrieval.
-- Cache keys include tenant, principal scope and retrieval configuration version.
+- Any enabled cache must key by tenant, principal scope and retrieval configuration version. The support answer path does not cache personal query embeddings or retrieval result sets.
 - Reranking receives only authorized candidates.
 - Citation resolution rechecks document authorization.
 
@@ -43,24 +43,21 @@ Data crossing a boundary must be authenticated, authorized, minimized and traced
 - Object keys begin with tenant UUID.
 - Use pre-signed short-lived URLs.
 - Validate content type and file signature.
-- Malware-scan uploads before parsing.
-- Encrypt at rest and maintain tenant-aware retention rules.
+- Use a real malware scanner before admitting untrusted files to production parsing/retrieval. The shipped `ContentScanner` checks format/magic bytes, not general malware. The scan state machine exists; `APP_REQUIRE_SCANNED_DOCUMENTS` defaults to false and should be enabled only after scanner integration and existing-corpus processing.
+- Configure encryption at rest and validate tenant-aware retention rules in the deployed object store.
 
 ## Authentication and SSO
 
-Pilot:
+Implemented identity paths and deployment requirements:
 
-- Keycloak OIDC Authorization Code + PKCE.
+- OIDC Authorization Code + PKCE; Keycloak is the local integration option, not a mandatory enterprise identity provider.
 - MFA delegated to the enterprise IdP.
 - Short-lived access tokens and rotated refresh tokens.
 - Service-to-service client credentials with narrow audiences.
 
-Productization:
-
-- SAML federation.
-- SCIM user/group provisioning.
-- Domain discovery and tenant-specific IdP routing.
-- Just-in-time provisioning controlled by tenant policy.
+- SAML federation and SCIM provisioning endpoints are present; provider metadata, certificate/token handling and enterprise journeys require deployment configuration and validation.
+- Domain discovery and tenant-specific identity routing use server-owned mappings.
+- Provisioning must follow tenant policy; endpoint existence does not imply arbitrary IdP compatibility.
 
 ## Authorization
 
@@ -168,10 +165,10 @@ Audit storage has separate retention and restricted access.
 | Document tells agent to ignore policy | Treat retrieval as data, not instructions |
 | Duplicate webhook sends two replies | Delivery deduplication and outbound idempotency |
 | Human takes over during generation | Versioned control lease re-check before send |
-| Tool timeout actually completed remotely | Idempotency key and postcondition verification |
+| Tool timeout actually completed remotely | Durable execution intent, UNKNOWN outcome and authorized reconciliation; no blind replay |
 | Expired document remains indexed | Effective-date filter and version lifecycle |
 | Logs expose customer messages | Allowlists, redaction and restricted raw-event store |
-| Connector token stolen | Secret manager, encryption, rotation, narrow scopes |
+| Connector token stolen | Server-side credential references; deployment must provide secret management, rotation and narrow scopes |
 
 ## Security release gates
 
@@ -181,3 +178,7 @@ Audit storage has separate retention and restricted access.
 - Dependency vulnerabilities have accepted risk or remediation.
 - Threat model updated for new boundaries.
 - Backup and audit access controls verified.
+
+## Deployment validation
+
+This document defines controls and obligations, not a blanket security certification. Enterprise identity revocation, storage configuration, scanning service, external providers and production network boundaries are assessed in the target environment; see [Production conditions](production-readiness.md).

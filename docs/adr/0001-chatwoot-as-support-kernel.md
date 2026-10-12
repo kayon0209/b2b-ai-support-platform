@@ -1,6 +1,6 @@
 # ADR 0001: Use Chatwoot as the Customer-Support Kernel
 
-- Status: Accepted
+- Status: Superseded by [ADR 0012](0012-remove-chatwoot.md). Retained as historical rationale; not the current architecture.
 - Date: 2026-09-16
 
 ## Context

@@ -28,11 +28,11 @@ Build a trustworthy B2B enterprise AI customer support platform. Optimize for te
 
 - Python 3.12+, FastAPI, Pydantic, SQLAlchemy 2, Alembic
 - PostgreSQL 16 with pgvector and RLS
-- Redis and Celery for custom asynchronous work, on their own instance
+- Redis for rate limiting/short-term coordination; PostgreSQL-backed Inbox/Outbox and independent poll-loop workers for asynchronous work
 - MinIO/S3 for immutable document originals and attachments
 - React, Vite, TypeScript for the enterprise admin UI
-- Keycloak for OIDC; SAML and SCIM after pilot
-- OpenTelemetry, Prometheus, Grafana, Loki, Sentry, Langfuse-compatible traces
+- OIDC (Keycloak for local integration), with SAML/SCIM endpoints; enterprise IdP configuration and validation are deployment-specific
+- OpenTelemetry-compatible tracing and Prometheus API/worker metrics; collectors, alert receivers and dashboards are deployment dependencies
 - Docker Compose locally; Kubernetes only for production environments that need it
 
 ## Repository shape
@@ -123,6 +123,8 @@ A feature is not complete until it has:
 - rollback/feature flag where applicable
 - user-facing acceptance test
 - updated documentation
+
+Documentation must follow `docs/documentation-policy.md`: current product docs describe supported capabilities and deployment conditions; completed implementation lists and dated reviews are historical evidence, not active product status. Never turn synthetic checks into production claims.
 
 ## Multi-stage implementation tracking
 

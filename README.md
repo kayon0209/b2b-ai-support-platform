@@ -10,7 +10,7 @@ https://github.com/user-attachments/assets/cc422933-2efc-4302-b3ee-a13b6db52d5f
 
 影片展示桌面网页客户入口、坐席工作台和内部审批；画面使用合成演示数据，移动端和服务端 API 操作不在影片范围内。可复现的[视频工程](media/product-promo/)包含功能来源、分镜、组件接入和音画验收记录。
 
-> **定位说明**：仓库展示的是可运行、可测试、带生产控制边界的平台实现。真实企业身份源、ERP、消息渠道、对象存储、静态托管和生产容量仍需部署配置与验收；代码合并和 CI 通过不代表任意环境已经生产就绪。当前逐项状态见[工作台验收记录](docs/workbench-redesign-acceptance.md)。
+> **产品范围**：平台提供客户会话、坐席接待、知识回答、受控工具与运营治理能力。当前功能见[能力矩阵](docs/capabilities.md)，企业身份、业务数据、模型与运行环境要求见[生产接入条件](docs/production-readiness.md)。功能实现、自动化测试与企业环境验证分别记录。
 
 ## 它解决什么问题
 
@@ -64,9 +64,9 @@ Tool Gateway 把“模型提出动作”和“系统执行动作”分开：
 - Inbox/Outbox 将业务提交与异步工作解耦；Worker 按队列处理交互运行、知识摄取、事件投递、SLA 与保留任务。
 - 评估流程包含引用支持、答案质量、拒答与高风险动作样例；Release Evidence job 对发布证据做门禁检查。
 - API 暴露健康与运行指标；日志和追踪遵循敏感数据最小化要求。
-- 最近完成的 R2/R3 扩展包括默认关闭的情绪建议、坐席发起的四种标准流程，以及带候选评测、签名证据、双人审批、发布后检查和回滚的知识发布门禁。情绪建议不会自动修改 Case 优先级、SLA、负责人或客户回复；订单/质量/技术演练只在 `local`/`test` 使用合成数据，发票流程只创建平台内部申请 Case。
+- 扩展能力包括按租户开关启用的情绪建议、坐席发起的四种标准流程，以及带候选评测、签名证据、双人审批、发布后检查和回滚的知识发布门禁。情绪建议不会自动修改 Case 优先级、SLA、负责人或客户回复；订单/质量/技术演练只在 `local`/`test` 使用合成数据，发票流程只创建平台内部申请 Case。
 - `local`/`test` 还提供合成预售资料和 Demo CRM 商机写入演练，经 Tool Gateway 展示权限校验、人工确认、幂等和读回验证；这不代表接入真实 CRM/ERP，合成报价不能作为客户报价。
-- 真实评测集、密钥、费用预算和 staging 演练尚未配置，知识发布及相关生产开关保持关闭。完整实现边界与逐项验收见[AI 能力增强实施包](docs/implementation/ai-support-v2/README.md)。
+- 增强能力按租户和部署配置授权启用；知识发布需要获批评测集、签名信任配置与执行预算。功能范围见[能力矩阵](docs/capabilities.md)，详细接口见[AI 增强能力契约](docs/implementation/ai-support-v2/README.md)。
 
 ## 核心架构
 
@@ -82,7 +82,7 @@ Tool Gateway 把“模型提出动作”和“系统执行动作”分开：
 | Async Runtime | Inbox/Outbox 消费、交互、摄取、SLA 和保留 Worker | `apps/worker/` |
 | Operator UI | 客户支持页、坐席工作台和运营控制台 | `apps/admin-web/` |
 
-**技术栈**：Python 3.12、FastAPI、Pydantic、SQLAlchemy 2、Alembic、PostgreSQL 16/pgvector、Redis、React、TypeScript、Vite、Docker Compose。Kubernetes 清单用于表达生产部署形状；目前尚未在真实集群应用验证。
+**技术栈**：Python 3.12+、FastAPI、Pydantic、SQLAlchemy 2、Alembic、PostgreSQL 16/pgvector、Redis、React、TypeScript、Vite、Docker Compose。API 镜像包含前端静态产物；Kubernetes 配置与集群依赖见[部署指南](docs/deployment-and-operations.md)。
 
 ## 仓库结构
 
@@ -165,19 +165,17 @@ npm --prefix apps/admin-web run build
 kubectl kustomize infra/kubernetes
 ```
 
-**生产验收状态以文档中的实测证据为准。** 完整浏览器 OIDC/注销、真实外部渠道投递、S3/MinIO 上传安全、生产 ERP/报价、HTTPS/CSP 静态托管、浏览器无障碍与生产近似负载仍需要部署级验证。当前本地 100 并发工作台队列 p95 为 753ms，高于 500ms 验收目标；在达到目标及完成剩余部署门禁前，不应把该仓库描述为已通过生产放量验收。
+**验证范围**：CI 验证仓库自动化检查，不代表企业环境已完成部署。历史性能样本、合成评测与当前实现限制统一见[生产接入条件](docs/production-readiness.md)；质量阈值、发布检查和恢复流程见[Runbook](docs/launch-checklist-and-runbook.md)。
 
-## 深入阅读
+## 文档入口
 
 | 主题 | 文档 |
 |---|---|
-| AI 能力增强执行包、WorkBuddy 任务与 Codex 验收 | [实施执行包](docs/implementation/ai-support-v2/README.md) |
-| 当前架构与系统边界 | [docs/architecture.md](docs/architecture.md) |
-| Agent Runtime 与安全运行方式 | [docs/agent.md](docs/agent.md) |
-| 多租户安全、身份与威胁模型 | [docs/security.md](docs/security.md) |
-| API、事件和幂等契约 | [docs/api-contracts.md](docs/api-contracts.md) |
-| 坐席工作台需求和信息架构 | [docs/workbench-redesign-spec.md](docs/workbench-redesign-spec.md) |
-| UI/UX、安全与生产验收记录 | [docs/workbench-redesign-acceptance.md](docs/workbench-redesign-acceptance.md) |
-| 产品缺口和剩余工作 | [docs/product-gap-analysis.md](docs/product-gap-analysis.md) |
-| 部署、配置和运维限制 | [docs/deployment-and-operations.md](docs/deployment-and-operations.md) |
-| 架构决策 | [docs/adr/](docs/adr/) |
+| 完整导航 | [产品与工程文档](docs/README.md) |
+| 当前功能与边界 | [能力矩阵](docs/capabilities.md) |
+| 安装、前端构建与运行配置 | [部署与运维](docs/deployment-and-operations.md) |
+| 企业接入与运行限制 | [生产接入条件](docs/production-readiness.md) |
+| 系统设计 | [架构](docs/architecture.md) · [AI Runtime](docs/agent.md) |
+| 安全与接口 | [安全](docs/security.md) · [API 契约](docs/api-contracts.md) |
+| 测试、质量与事件处置 | [测试与评估](docs/testing-and-evaluation.md) · [Runbook](docs/launch-checklist-and-runbook.md) |
+| 版本与历史 | [发布记录](docs/releases/README.md) · [历史资料](docs/archive/README.md) |

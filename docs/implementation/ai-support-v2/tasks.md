@@ -1,5 +1,7 @@
 # WorkBuddy 开发任务单
 
+> 历史开发任务单，保留编号以兼容契约和证据引用，不作为当前待办。现行实现见 [能力矩阵](../../capabilities.md) 与 [四阶段摘要](../production-agent-roadmap.md)。
+
 执行范围：R1 T00–T09，按依赖顺序交付；未完成任务标记阻塞，不以占位 UI 计完成。下面的验收 ID 对应 [acceptance.md](acceptance.md)。
 
 ## 执行纪律

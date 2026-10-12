@@ -1,38 +1,97 @@
-# 部署与运维（当前自有渠道架构）
+# 部署与运维
 
-状态：当前部署约束；旧 Chatwoot 部署说明不再适用。见 ADR 0012 与 [发布验收](workbench-redesign-acceptance.md)。
+当前架构：FastAPI API 与独立异步 Worker、自有网页客服和渠道适配器。API 镜像包含 React SPA，部署不依赖第三方客服内核。能力范围见 [能力矩阵](capabilities.md)，环境验证要求见 [生产接入条件](production-readiness.md)。
 
-## 本地 Compose
+## 本地开发
 
-`infra/compose/docker-compose.yml` 定义平台 PostgreSQL、平台 Redis、MinIO、Keycloak、API 与分队列 worker。Chatwoot 不在服务图中。Admin Web 当前以 Vite 本地服务运行，仓库还没有生产静态站点 Deployment/Service，需要在发布目标中补齐。
+`infra/compose/docker-compose.yml` 定义 PostgreSQL/pgvector、Redis、MinIO、Keycloak、API 和分队列 Worker。示例账号、口令与 `start-dev` 仅用于 local；Compose 不是生产配置。
 
-## 必需配置
+```bash
+cp .env.example .env
+docker compose -f infra/compose/docker-compose.yml up -d --wait ai-postgres ai-redis
+```
 
-- `APP_ENVIRONMENT` 必须显式区分 local/test/staging/production。
-- staging/production 配置 `APP_SECRET_KEY` 与 `APP_OIDC_ISSUER`；bootstrap token 只允许 local/test。
-- staging/production 配置由密钥管理器注入的 `APP_DATABASE_APP_URL`，连接专用非 owner、无 `BYPASSRLS` 角色；迁移使用独立数据库凭据。Compose 本地通过 `infra/compose/postgres-init/01-platform-app-role.sql` 建立演示用角色和密码。
-- production 禁用 demo ERP 和公开参考价目表；业务 API、价目表和渠道出站凭据必须由租户/部署方明确配置。
-- API 使用平台数据库应用角色，数据库强制 RLS；worker 使用同一套租户上下文与 transactional outbox。
-- 连接池上限由 `APP_DATABASE_POOL_SIZE`/`APP_DATABASE_MAX_OVERFLOW` 与 `APP_DATABASE_APP_POOL_SIZE`/`APP_DATABASE_APP_MAX_OVERFLOW` 分别控制 owner 和 RLS app 角色，且都是“每进程、每数据库 URL”的上限。Compose 本地 API 配置 owner 10/0、app 50/0，每个 worker 两种角色均为 2/0；五个 worker 全满时上限约 80 个连接，为 PostgreSQL 默认 100 个连接保留管理余量。生产需按副本数、API 的 owner/app 双池、worker 数和 `max_connections` 重新核算。
-- **连接池等待上限由 `DATABASE_POOL_TIMEOUT` 控制（默认 5 秒，两个角色共用）**，不设置则继承 SQLAlchemy 的 30 秒默认值，而那正是要避开的：30 秒长于任何合理的上游超时，池满时每个请求会挂满 30 秒才被拒绝，此时调用方早已在上游超时放弃——等待没换来任何答案，还占着槽位让本该成功的请求排队。池耗尽会返回 `503` + `DATABASE_SATURATED`（可重试），与真正的内部错误（`500` + `INTERNAL_ERROR`）区分开，因为前者会自行恢复、后者不会。**这个值应小于上游超时预算**；调大它不会提高吞吐，只会让饱和持续更久。
-- 交互 API 默认每租户 600 次/分钟；工作台的队列/会话 GET 单独使用每租户 24,000 次/分钟预算，以覆盖 1000 个窗口每 5 秒轮询队列和当前会话。工作台写操作仍使用通用 600 次/分钟限制。部署需按席位数、轮询间隔和数据库容量显式校准，不得把该读预算扩展到全体 API。
-- **入口网关的网段必须填入 `APP_RATE_LIMIT_TRUSTED_PROXIES`**，否则客户侧限流退化。应用按地址分桶时看到的是网关 Pod 的地址，于是整条客户面共用一个桶（实测：200 并发访客被拒 14.4%，Redis 里只有一个键）。填入网关控制器所在网段后，同一压测拒绝率降为 0%，桶按客户端地址与访客凭据分裂。留空是安全默认（不轻信任何转发头），但**部署到入口网关后面就必须显式填写**，取值以集群实际的 Ingress/负载均衡器网段为准，例如 `10.244.0.0/16,10.96.0.0/16`。
-  `python scripts/report_trusted_proxies.py --namespace <ns>` 会打印该部署应填的值、当前 API Pod 地址，以及**验证是否生效的命令**（`redis-cli --scan --pattern 'ratelimit:api:addr:*' | wc -l`——一个键说明仍未生效，N 个说明已生效）。它不修改任何配置，集群不可达时以退出码 2 明确报告「被阻塞」而不是猜测一个值填进去。
-- 客户面另有每访客预算 `APP_RATE_LIMIT_VISITOR_REQUESTS`（默认 60 次/分钟），与地址桶叠加：地址桶挡来源滥用，访客桶挡单个客户在企业 NAT 后面耗尽所有人的额度。两者都通过才放行。
-- **告警与链路追踪需要集群侧组件**：`infra/kubernetes/70-alerts.yaml`（`PrometheusRule`）与 `71-servicemonitor.yaml`（`ServiceMonitor`）是 Prometheus Operator 的 CRD，必须先在集群装好 Operator 及其 CRD，否则 `kubectl apply -k` 会以 `no matches for kind` 失败——这个失败是刻意的，它比「装了 Operator 却没有告警」更诚实，因为后者看起来和健康部署一模一样。填入 `OTEL_EXPORTER_OTLP_ENDPOINT` 后链路追踪才会真正上报；留空时 `observability_tracing` 降级为进程内环形缓冲，行为不变但什么都不外发。`OTEL_SERVICE_NAME` 已在各工作负载清单中按角色区分（API 与五个 worker 各自独立），否则采集端无法区分交互式回答与入库重试。
-- MinIO/S3 私有桶、短时签名 URL、备份和恢复演练必须验证。
-- **前端由 API 镜像自身提供**：`api.Dockerfile` 是多阶段构建，先用 Node 构建 `apps/admin-web`，只把 `dist/` 复制进运行镜像；`platform_core.spa` 在 `/assets` 提供带哈希名的静态文件，并把浏览器路由的路径（`/`、`/support/*`、`/admin/*`、`/auth/*`）回退到 `index.html`，因此深链刷新可用。不需要额外的静态托管组件、证书或跨域策略。若改用独立前端部署，必须同时移除该镜像层与 `APP_SPA_DIST`，并自行承担 SPA fallback。
-- 没有前端构建产物时（例如只跑后端测试），API 不挂载任何东西，`/support` 保持与改动前一致的 401，启动日志会打印缺失目录路径——这是刻意的：一个没有构建产物的检出不该变成一个看起来正常、实则空白的页面。
-- 前端通过 HTTPS 提供；设置 CSP、HSTS、X-Content-Type-Options、Referrer-Policy。生产构建关闭公开 sourcemap。`/assets` 下的文件名带内容哈希，可长缓存；`index.html` 不可长缓存。
-- 配置 `VITE_OIDC_ISSUER`、`VITE_OIDC_CLIENT_ID` 和 IdP 注册的 `${origin}/auth/callback`。`npm run build:release` 会拒绝缺少 HTTPS issuer/client id 或嵌入 API token 的构建。
+后端依赖、迁移、API 与 Vite 启动步骤见 [README](../README.md)。Vite 开发服务器默认在 5173，将 `/api` 代理到 8000 并剥离前缀。文件摄取需要对象存储，交互式 AI Worker 需要有效的 `APP_LLM_API_KEY`；未配置模型时不能把普通交互 Worker 启动成功作为预期。无需模型的路径可运行 outbox/retention 等对应 Worker。
 
-## 健康与发布
+完整 Compose 镜像构建：
 
-- API：`/healthz` 只检查进程存活，`/readyz` 检查应用数据库连接；Redis 不可用时限流有界降级到进程内实现，不作为 readiness 阻断项。Connector 状态由租户授权的 connector API 显示；对象存储健康需由部署探针/监控验证，不从公开探针暴露。
-- 发布前执行数据库迁移、RLS 权限校验、单租户验收和出站渠道小流量投递。
-- Worker 必须证明至少一个客户渠道可投递；未配置渠道时应停止发送能力，不能记录虚假成功。
-- 新工作台先在测试租户验证，无数据删除式回滚：禁用新入口或退回上一前端构建，保留已写租约和审计记录。
+```bash
+docker compose -f infra/compose/docker-compose.yml build ai-api
+```
 
-## 当前限制
+按实际凭据、对象存储与迁移状态启动对应服务；不能把完整 Compose 首次启动等同于数据库已迁移或 AI 已配置。
 
-本次本地 Docker 已运行 PostgreSQL、Redis、API 与 worker，并完成迁移和人工主流程验收。MinIO 未启动；真实 OIDC Provider、生产静态托管、ERP 与渠道凭据、跨租户安全测试和负载测试仍需部署方配置/验证。未完成这些门禁前不标记为生产已验收。
+## 前端交付与 API 地址
+
+`infra/compose/api.Dockerfile` 使用 Node 构建前端，只把 `dist/` 复制到 Python 运行镜像。`platform_core.spa` 提供 `/assets` 和 `/`、`/support`、`/admin/*`、`/auth/*` 的 SPA fallback。运行时不需要 Node 或单独静态服务。没有有效 `dist/` 时，不挂载 SPA。
+
+**构建期与运行期配置不同**：`VITE_OIDC_ISSUER`、`VITE_OIDC_CLIENT_ID`、`VITE_API_BASE_URL` 会编译进 JavaScript；给运行容器添加环境变量不能改变已有前端。当前 Dockerfile 使用普通 `npm run build`，没有声明这些值的 build ARG，也没有执行 `build:release`；发布流程应使用带获准构建配置的构建阶段/镜像方案，不能假定现有镜像已经通过发布身份门禁。
+
+在受控构建环境验证前端配置：
+
+```bash
+cd apps/admin-web
+# 由构建系统注入实际 VITE_OIDC_ISSUER、VITE_OIDC_CLIENT_ID 和 VITE_API_BASE_URL
+npm ci
+npm run build:release
+```
+
+- Vite dev 的默认 API base 为 `/api`；这条代理只存在于开发服务器。
+- API 服务真实路由为 `/v1/*`，SPA 服务器不会自动剥离 `/api`。
+- 当前 `SupportChat.tsx` 将客户 API 前缀固定为 `/api`；`VITE_API_BASE_URL` 只改变 operator 客户端，不能统一改变客户入口。
+- 因此保留当前代码部署完整产品时，同源网关必须增加 `/api/*` 到 API 的剥离前缀规则；当前 Kubernetes Ingress 没有该重写。规则只改写 `/api`，应保留 `/`、`/support`、`/admin`、`/auth` 和 `/assets` 的 SPA/静态路径。
+- Operator 可单独使用完整 HTTPS API origin，但客户 `/api` 仍需要同源代理；跨域 operator API 还需 CORS 和身份策略。origin 不加尾随 `/`，因为客户端直接拼接以 `/` 开头的路径。
+- 不应设置 `VITE_API_BASE_URL=/`：当前拼接会形成 `//v1/...`，而且 `build:release` 仅接受 `/api` 或 HTTPS URL。
+- IdP 注册实际 `${origin}/auth/callback` 和注销地址；API issuer/audience 与前端 client id 分别配置。
+
+所有方案均需 HTTPS。配置 CSP、HSTS、X-Content-Type-Options、Referrer-Policy；公开 `.map` 文件数应为零。`/assets` 哈希产物可长缓存，`index.html` 不可长缓存。不要把开发 token 或密钥编译进前端。
+
+## 身份、数据与模型
+
+- `APP_ENVIRONMENT` 显式设为 local/test/staging/production。bootstrap token 仅允许 local/test。
+- staging/production 使用真实 `APP_SECRET_KEY`、`APP_OIDC_ISSUER` 和 `APP_DATABASE_APP_URL`；应用角色非 owner、非 superuser、无 BYPASSRLS。迁移凭据独立保管。
+- 请求 tenant 来自认证映射/签名访客凭证；API 与租户业务 Worker 通过 tenant-bound 事务执行 RLS。
+- 队列元数据发现/领取使用专用 bookkeeping session；这不等于普通业务可以复用 owner 连接。
+- production 拒绝 Demo ERP 和公开参考价；企业数据通过受权 connector/credential reference 接入。
+- 模型数据目的地、语料、密钥、预算与开关由部署方明确授权；缺模型、工具或渠道时不能伪造成功。
+
+## 连接池与限流
+
+连接上限按每进程、每数据库 URL 计算，核算 API/Worker 副本、owner/app 双池、overflow 和 PostgreSQL `max_connections`。Compose 的池配置是本地示例，不是生产容量承诺。
+
+`DATABASE_POOL_TIMEOUT` 默认 5 秒，应小于上游请求预算。池耗尽返回 503/`DATABASE_SATURATED`；其他数据库异常不应被混同为容量饱和。
+
+- 默认租户 API 预算：600 次/分钟。
+- Workbench 队列/详情读取预算：24,000 次/分钟；写入仍使用通用预算。
+- 访客预算：60 次/分钟，与地址桶叠加。
+- 根据席位、轮询、模型吞吐和数据库容量校准；全局背压不是租户公平排队。
+- `APP_RATE_LIMIT_TRUSTED_PROXIES` 仅填写实际可信代理地址/CIDR；不能照抄示例集群网段。留空是不信任转发头的安全默认，但网关后面必须核验客户地址归因。
+
+```bash
+python scripts/report_trusted_proxies.py --namespace <namespace>
+```
+
+该工具报告地址和验证命令，不修改部署；无法连接集群时退出 2。
+
+## 对象存储、扫描与恢复
+
+使用私有 MinIO/S3 兼容桶、短时签名 URL 和企业批准的保留策略。平台有格式检查、扫描状态机和对象清理；内置格式扫描器不等于恶意软件扫描。配置真实扫描服务、处理历史文档后再启用 `APP_REQUIRE_SCANNED_DOCUMENTS`；不能仅凭 `clean` 字段宣称病毒扫描完成。
+
+定期执行 `scripts/backup_restore_drill.py`。Kubernetes 提供计划备份和季度恢复演练 CronJob；对象桶、独立备份桶、凭据、保留与恢复结果必须实际核验。详见 [Kubernetes 指南](../infra/kubernetes/README.md)。
+
+## 监控与健康
+
+- `/healthz`：进程存活；`/readyz`：应用数据库就绪。
+- Redis 不可用时限流有界降级，不作为数据库 readiness 条件。
+- Connector 健康属于租户接口；对象存储用部署探针/监控检查。
+- API/Worker metrics 应仅内网采集。当前示例 Ingress 的 `/` 前缀会覆盖 API `/metrics`，而示例 ConfigMap 启用它；API 的 8000 端口共享业务与指标。部署网关须显式拒绝公网 `/metrics`、`/docs`、`/redoc`、`/openapi.json`，不能把独立 metrics Service 或 NetworkPolicy 当作 URL 级限制。Worker 8001 有独立监控网络策略。
+- `70-alerts.yaml`、`71-servicemonitor.yaml` 使用 Prometheus Operator CRD；集群先安装 Operator/CRD，再应用资源并确认告警到达接收方。
+- 配置 `OTEL_EXPORTER_OTLP_ENDPOINT` 后追踪才外发；未配置时进程内缓冲不是集中追踪。
+
+## 发布与回滚
+
+按 [Kubernetes 指南](../infra/kubernetes/README.md) 完成配置和迁移，再 rollout 固定版本镜像；本仓库 CI 不是 CD。执行所选企业场景、RLS/授权负例、模型/连接器故障、容量及恢复验证。
+
+网页回复读取已持久化时间线；网页-only 部署不需要 SMTP/微信传输。使用邮件/微信时应验证所选 provider 的发送与线程关联；外部 SMTP 还需允许实际端口，示例 NetworkPolicy 只放行外部 443。传输受理不表示客户已读，未知结果保持 UNKNOWN/人工对账。
+
+按租户启用获准能力，记录业务与质量指标。回滚优先关闭新行为、恢复 Prompt/上一兼容构建；保留会话租约、业务回执和审计，不执行数据删除式回滚。
